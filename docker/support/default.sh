@@ -28,7 +28,8 @@ CHECKPOINT_MODELS=(
     # #"https://huggingface.co/stabilityai/stable-diffusion-2-1/resolve/main/v2-1_768-ema-pruned.ckpt"
     # "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors"
     # "https://huggingface.co/stabilityai/stable-diffusion-xl-refiner-1.0/resolve/main/sd_xl_refiner_1.0.safetensors"
-    "https://drive.google.com/uc?export=download&id=1sMSM9gu4CgBRxlk1Zz6XNWTEHcixd3Mq"
+    # "https://drive.google.com/uc?export=download&id=1sMSM9gu4CgBRxlk1Zz6XNWTEHcixd3Mq"
+    "https://civitai.com/api/download/models/494387?type=Model&format=SafeTensor&size=full&fp=fp16"
 )
 
 UNET_MODELS=(
