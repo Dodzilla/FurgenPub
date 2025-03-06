@@ -214,7 +214,7 @@ function provisioning_download() {
     
     # Create directory and set permissions
     mkdir -p "$output_dir"
-    chmod 777 "$output_dir"
+    # chmod 777 "$output_dir"
     
     # Download attempts - try 3 times
     max_retries=3
@@ -254,7 +254,7 @@ function provisioning_download() {
             file_size=$(du -h "$file" | cut -f1)
             echo "✅ Successfully downloaded: $file ($file_size)"
             # Give everyone access to the file
-            chmod 666 "$file"
+            # chmod 666 "$file"
         done
         return 0
     else
