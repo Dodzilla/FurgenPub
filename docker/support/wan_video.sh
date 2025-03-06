@@ -106,7 +106,7 @@ function provisioning_start() {
     mkdir -p "${WORKSPACE}/ComfyUI/models/frame_interpolation"
     
     # Give full permissions
-    chmod -R 777 "${WORKSPACE}/ComfyUI/models"
+    # chmod -R 777 "${WORKSPACE}/ComfyUI/models"
     
     # Download base nodes
     provisioning_get_nodes "${NODES[@]}"
