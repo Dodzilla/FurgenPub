@@ -35,13 +35,7 @@ DIFFUSION_MODELS=(
     # "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-T2V-14B_fp8_e4m3fn.safetensors"
     # "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors"
     # "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-I2V-14B-720P_fp8_e4m3fn.safetensors"
-    "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/diffusion_pytorch_model-00001-of-00007.safetensors"
-    "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/diffusion_pytorch_model-00002-of-00007.safetensors"
-    "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/diffusion_pytorch_model-00003-of-00007.safetensors"
-    "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/diffusion_pytorch_model-00004-of-00007.safetensors"
-    "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/diffusion_pytorch_model-00005-of-00007.safetensors"
-    "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/diffusion_pytorch_model-00006-of-00007.safetensors"
-    "https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P/resolve/main/diffusion_pytorch_model-00007-of-00007.safetensors"
+    "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_i2v_720p_14B_bf16.safetensors"
 )
 
 # Text encoders
