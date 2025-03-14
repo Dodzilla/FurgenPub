@@ -51,6 +51,9 @@ LORA_MODELS=(
     "https://furgen-models.b-cdn.net/models/wan_cowgirl_v1.1.safetensors"
     "https://furgen-models.b-cdn.net/models/wan_female_masturbation.safetensors"
     "https://furgen-models.b-cdn.net/models/wan-nsfw-e14-fixed.safetensors"
+    "https://furgen-models.b-cdn.net/models/male-masturbation-90.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan_missionary_side.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan_pov_blowjob.safetensors"
 )
 
 # WanVideo VAE
