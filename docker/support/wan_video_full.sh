@@ -166,6 +166,9 @@ function provisioning_start() {
     # Check downloaded models
     echo "Checking downloaded models..."
     provisioning_verify_downloads
+
+    echo "Installing sageattention"
+    pip install sageattention
     
     # Completion message
     provisioning_print_end
