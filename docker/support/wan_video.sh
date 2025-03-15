@@ -35,6 +35,8 @@ DIFFUSION_MODELS=(
     # "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-T2V-14B_fp8_e4m3fn.safetensors"
     # "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors"
     "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-I2V-14B-720P_fp8_e4m3fn.safetensors"
+    # "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_i2v_480p_14B_bf16.safetensors"
+    # "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_i2v_720p_14B_fp16.safetensors"
 )
 
 # Text encoders
@@ -42,6 +44,16 @@ TEXTENCODERS_MODELS=(
     "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/open-clip-xlm-roberta-large-vit-huge-14_visual_fp16.safetensors"
     "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors"
     "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+)
+
+# LoRA models
+LORA_MODELS=(
+    "https://furgen-models.b-cdn.net/models/wan_cowgirl_v1.1.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan_female_masturbation.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan-nsfw-e14-fixed.safetensors"
+    "https://furgen-models.b-cdn.net/models/male-masturbation-90.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan_missionary_side.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan_pov_blowjob.safetensors"
 )
 
 # WanVideo VAE
@@ -129,6 +141,12 @@ function provisioning_start() {
         provisioning_download "$model" "${WORKSPACE}/ComfyUI/models/vae"
         # Even if download fails, continue with the next model
     done
+
+    echo "Downloading LoRA models..."
+    for model in "${LORA_MODELS[@]}"; do
+        provisioning_download "$model" "${WORKSPACE}/ComfyUI/models/loras"
+        # Even if download fails, continue with the next model
+    done
     
     echo "Downloading CLIP Vision models..."
     for model in "${CLIPVISION_MODELS[@]}"; do
@@ -148,6 +166,9 @@ function provisioning_start() {
     # Check downloaded models
     echo "Checking downloaded models..."
     provisioning_verify_downloads
+
+    echo "Installing sageattention"
+    pip install sageattention
     
     # Completion message
     provisioning_print_end
