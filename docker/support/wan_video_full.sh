@@ -56,6 +56,7 @@ LORA_MODELS=(
     "https://furgen-models.b-cdn.net/models/wan_pov_blowjob.safetensors"
     "https://furgen-models.b-cdn.net/models/wan_doggy_POV_v1_1.safetensors"
     "https://furgen-models.b-cdn.net/models/wan_doggy_side.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan-SideSex-Wan-i2v-v10-000010_converted.safetensors"
 )
 
 # WanVideo VAE
