@@ -43,7 +43,7 @@ declare -A TEXTENCODERS_MODELS=()
 
 # LoRA models
 declare -A LORA_MODELS=(
-    ["https://civitai.com/api/download/models/244808?type=Model&format=SafeTensor"]="princess_xl_v2.safetensors"
+    ["https://civitai.com/api/download/models/244808?type=Model&format=SafeTensor&token=b8cc031807c6d51055559e7206"]="princess_xl_v2.safetensors"
 )
 
 # WanVideo VAE
@@ -251,21 +251,17 @@ function provisioning_download() {
             # If we have a token, use it in the Authorization header
             if [[ -n "$token" ]]; then
                 echo "Using Civitai API token in Authorization header"
-                curl -L -o "$output_dir/$filename" \
-                     -H "Authorization: Bearer $token" \
-                     --retry 3 \
-                     --retry-delay 2 \
-                     --connect-timeout 30 \
-                     --max-time 3600 \
-                     "$url" && success=true
+                wget --header="Authorization: Bearer $token" \
+                     --content-disposition \
+                     --show-progress \
+                     --continue \
+                     -O "$output_dir/$filename" "$url" && success=true
             else
                 echo "No token found for Civitai API, attempting download anyway"
-                curl -L -o "$output_dir/$filename" \
-                     --retry 3 \
-                     --retry-delay 2 \
-                     --connect-timeout 30 \
-                     --max-time 3600 \
-                     "$url" && success=true
+                wget --content-disposition \
+                     --show-progress \
+                     --continue \
+                     -O "$output_dir/$filename" "$url" && success=true
             fi
         # Use HF_TOKEN if available and URL is from huggingface.co
         elif [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
