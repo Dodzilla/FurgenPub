@@ -70,6 +70,10 @@ function provisioning_start() {
     # Start message
     provisioning_print_header
     
+    # Install gdown for Google Drive downloads
+    echo "Installing gdown for Google Drive downloads..."
+    pip install gdown
+    
     # Set ComfyUI to the correct branch
     echo "Checking ComfyUI branch..."
     if [[ "$COMFYUI_BRANCH" != "master" ]]; then
@@ -269,42 +273,14 @@ function provisioning_download() {
             
             echo "Downloading from Google Drive with file ID: $fileid"
             
-            # Create a temporary cookies file
-            cookies_file=$(mktemp)
-            
-            # Get confirmation code
-            confirm=$(wget --quiet --save-cookies "$cookies_file" \
-                          --keep-session-cookies --no-check-certificate \
-                          "https://docs.google.com/uc?export=download&id=$fileid" -O- | \
-                          sed -rn 's/.*confirm=([0-9A-Za-z_]+).*/\1\n/p')
-            
-            # If no confirm code is found, it might be a small file without confirmation
-            if [[ -z "$confirm" ]]; then
-                echo "No confirmation code found, trying direct download"
-                if wget --load-cookies "$cookies_file" \
-                       --no-check-certificate \
-                       --content-disposition \
-                       --show-progress \
-                       "https://docs.google.com/uc?export=download&id=$fileid" \
-                       -O "$output_dir/$filename"; then
-                    success=true
-                fi
+            # Use gdown for Google Drive downloads
+            if gdown --id "$fileid" -O "$output_dir/$filename" --no-cookies --fuzzy; then
+                success=true
+                echo "gdown download successful!"
             else
-                echo "Google Drive confirmation code: $confirm"
-                
-                # Download the file with the confirmation code
-                if wget --load-cookies "$cookies_file" \
-                       --no-check-certificate \
-                       --content-disposition \
-                       --show-progress \
-                       "https://docs.google.com/uc?export=download&confirm=${confirm}&id=${fileid}" \
-                       -O "$output_dir/$filename"; then
-                    success=true
-                fi
+                echo "gdown download failed. Will retry..."
             fi
             
-            # Clean up cookies file
-            rm -f "$cookies_file"
         # Special handling for Civitai URLs
         elif [[ "$url" == *"civitai.com/api/download"* ]]; then
             echo "🔑 Processing Civitai URL (attempt $((retry_count+1))/$max_retries)..."
