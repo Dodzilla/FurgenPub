@@ -27,7 +27,7 @@ NODES=(
 
 # Model files
 declare -A MODELS=(
-    ["https://civitai.com/api/download/models/494387?type=Model&format=SafeTensor&size=full&fp=fp16&token=b8cc031807c6d51055559e7206"]="oneFORALLPonyFantasy_v20DPO.safetensors"
+    ["https://civitai.com/api/download/models/494387?type=Model&format=SafeTensor&size=full&fp=fp16"]="oneFORALLPonyFantasy_v20DPO.safetensors"
 )
 
 declare -A DIFFUSION_MODELS=(
@@ -43,7 +43,7 @@ declare -A TEXTENCODERS_MODELS=()
 
 # LoRA models
 declare -A LORA_MODELS=(
-    ["https://civitai.com/api/download/models/244808?type=Model&format=SafeTensor&token=b8cc031807c6d51055559e7206"]="princess_xl_v2.safetensors"
+    ["https://civitai.com/api/download/models/244808?type=Model&format=SafeTensor"]="princess_xl_v2.safetensors"
 )
 
 # WanVideo VAE
@@ -235,13 +235,40 @@ function provisioning_download() {
     # Create directory and set permissions
     mkdir -p "$output_dir"
     
+    # Extract token from URL if present
+    token="b8cc031807c6d51055559e7206"
+    
     # Download attempts - try 3 times
     max_retries=3
     retry_count=0
     success=false
     
     while [ $retry_count -lt $max_retries ] && [ "$success" != "true" ]; do
-        if [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
+        # Special handling for Civitai URLs
+        if [[ "$url" == *"civitai.com/api/download"* ]]; then
+            echo "🔑 Processing Civitai URL (attempt $((retry_count+1))/$max_retries)..."
+            
+            # If we have a token, use it in the Authorization header
+            if [[ -n "$token" ]]; then
+                echo "Using Civitai API token in Authorization header"
+                curl -L -o "$output_dir/$filename" \
+                     -H "Authorization: Bearer $token" \
+                     --retry 3 \
+                     --retry-delay 2 \
+                     --connect-timeout 30 \
+                     --max-time 3600 \
+                     "$url" && success=true
+            else
+                echo "No token found for Civitai API, attempting download anyway"
+                curl -L -o "$output_dir/$filename" \
+                     --retry 3 \
+                     --retry-delay 2 \
+                     --connect-timeout 30 \
+                     --max-time 3600 \
+                     "$url" && success=true
+            fi
+        # Use HF_TOKEN if available and URL is from huggingface.co
+        elif [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
             echo "🔑 Using Hugging Face token (attempt $((retry_count+1))/$max_retries)..."
             wget --header="Authorization: Bearer $HF_TOKEN" \
                  --content-disposition \
