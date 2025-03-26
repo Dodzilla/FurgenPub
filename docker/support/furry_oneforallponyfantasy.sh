@@ -43,7 +43,7 @@ declare -A TEXTENCODERS_MODELS=()
 
 # LoRA models
 declare -A LORA_MODELS=(
-    ["https://drive.google.com/file/d/1pOrz8KJEEjaUrJnLBdGtZoYNmXdsnYzM/view?usp=drive_link"]="princess_xl_v2.safetensors"
+    ["https://furgenai.b-cdn.net/models/princess_xl_v2.safetensors"]="princess_xl_v2.safetensors"
 )
 
 # WanVideo VAE
