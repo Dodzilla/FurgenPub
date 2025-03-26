@@ -238,7 +238,7 @@ function provisioning_get_nodes() {
                 micromamba run -n comfyui pip install --no-cache-dir -r "$requirements"
             fi
         fi
-        install_script="${path}/install-manual.py"
+        install_script="${path}/install.py"
         if [[ -e $install_script ]]; then
             printf "Running install script: %s\n" "${install_script}"
             "$COMFYUI_VENV_PYTHON" "${install_script}"
