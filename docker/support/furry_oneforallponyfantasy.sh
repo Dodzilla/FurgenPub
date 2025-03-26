@@ -188,9 +188,6 @@ function provisioning_start() {
     # Check downloaded models
     echo "Checking downloaded models..."
     provisioning_verify_downloads
-
-    echo "Installing sageattention"
-    pip install sageattention
     
     # Create provisioning completion marker
     echo "Creating provisioning completion marker..."
