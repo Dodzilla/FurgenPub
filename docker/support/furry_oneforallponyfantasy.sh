@@ -244,16 +244,19 @@ function provisioning_download() {
         # Special handling for Civitai URLs
         if [[ "$url" == *"civitai.com/api/download"* ]]; then
             echo "🔑 Processing Civitai URL (attempt $((retry_count+1))/$max_retries)..."
-            # First get the actual download URL
-            actual_url=$(curl -s -L -w "%{url_effective}" "$url" -o /dev/null)
-            if [[ -n "$actual_url" ]]; then
-                echo "Found actual download URL: $actual_url"
-                wget --content-disposition \
-                     --show-progress \
-                     --continue \
-                     -O "$output_dir/$filename" "$actual_url" && success=true
+            # Use curl with proper headers for Civitai
+            if curl -L \
+                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" \
+                -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+                -H "Accept-Language: en-US,en;q=0.5" \
+                -H "Connection: keep-alive" \
+                -H "Upgrade-Insecure-Requests: 1" \
+                -H "Cache-Control: max-age=0" \
+                --output "$output_dir/$filename" \
+                "$url"; then
+                success=true
             else
-                echo "Failed to get actual download URL from Civitai"
+                echo "Failed to download from Civitai"
                 retry_count=$((retry_count+1))
                 continue
             fi
