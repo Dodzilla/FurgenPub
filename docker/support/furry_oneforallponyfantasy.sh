@@ -13,6 +13,7 @@ NODES=(
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/cubiq/ComfyUI_essentials"
     "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
+    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
     "https://github.com/Fannovel16/comfyui_controlnet_aux"
     "https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb"
     "https://github.com/BlenderNeko/ComfyUI_Noise"
@@ -22,7 +23,6 @@ NODES=(
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/kijai/ComfyUI-DepthAnythingV2"
     "https://github.com/Isi-dev/ComfyUI-Img2DrawingAssistants"
-    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
 )
 
 # Model files
@@ -43,7 +43,7 @@ declare -A TEXTENCODERS_MODELS=()
 
 # LoRA models
 declare -A LORA_MODELS=(
-    ["https://huggingface.co/Keltezaa/all-disney-princess-xl-lora-model-from-ralph-breaks-the-internet/resolve/main/princess_xl_v2.safetensors"]="princess_xl_v2.safetensors"
+    ["https://drive.google.com/file/d/1pOrz8KJEEjaUrJnLBdGtZoYNmXdsnYzM/view?usp=drive_link"]="princess_xl_v2.safetensors"
 )
 
 # WanVideo VAE
