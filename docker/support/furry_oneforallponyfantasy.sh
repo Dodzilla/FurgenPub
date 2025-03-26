@@ -321,25 +321,6 @@ function provisioning_download() {
                     fi
                 fi
             fi
-        # Special handling for Civitai URLs
-        elif [[ "$url" == *"civitai.com/api/download"* ]]; then
-            echo "🔑 Processing Civitai URL (attempt $((retry_count+1))/$max_retries)..."
-            
-            # If we have a token, use it in the Authorization header
-            if [[ -n "$token" ]]; then
-                echo "Using Civitai API token in Authorization header"
-                wget --header="Authorization: Bearer $token" \
-                     --content-disposition \
-                     --show-progress \
-                     --continue \
-                     -O "$output_dir/$filename" "$url" && success=true
-            else
-                echo "No token found for Civitai API, attempting download anyway"
-                wget --content-disposition \
-                     --show-progress \
-                     --continue \
-                     -O "$output_dir/$filename" "$url" && success=true
-            fi
         # Use HF_TOKEN if available and URL is from huggingface.co
         elif [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
             echo "🔑 Using Hugging Face token (attempt $((retry_count+1))/$max_retries)..."
