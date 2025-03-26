@@ -73,8 +73,8 @@ function provisioning_start() {
     # Install gdown for Google Drive downloads
     echo "Installing gdown for Google Drive downloads..."
     if [[ -z $MAMBA_BASE ]]; then
-        echo "Installing gdown using standard Python pip..."
-        $COMFYUI_VENV_PIP install --no-cache-dir gdown || pip install --no-cache-dir gdown || \
+        echo "Installing gdown using standard Python venv..."
+        $COMFYUI_VENV_PIP install --no-cache-dir gdown || \
         echo "⚠️ WARNING: gdown installation failed, downloads from Google Drive may not work correctly"
     else
         echo "Installing gdown using micromamba..."
@@ -82,15 +82,21 @@ function provisioning_start() {
         echo "⚠️ WARNING: gdown installation failed, downloads from Google Drive may not work correctly"
     fi
     
-    # Make sure gdown is available in PATH
-    export PATH=$PATH:~/.local/bin
-    
-    # Test if gdown is working
-    if command -v gdown &> /dev/null; then
-        echo "✅ gdown successfully installed!"
-    else
-        echo "⚠️ WARNING: gdown command not found after installation, falling back to direct download methods for Google Drive files"
-    fi
+    # Define gdown function to run through the correct environment
+    function run_gdown() {
+        local file_id="$1"
+        local output_file="$2"
+        
+        if [[ -z $MAMBA_BASE ]]; then
+            echo "Running gdown via Python venv..."
+            $COMFYUI_VENV_PYTHON -m gdown --id "$file_id" -O "$output_file" --no-cookies --fuzzy
+            return $?
+        else
+            echo "Running gdown via micromamba..."
+            micromamba run -n comfyui python -m gdown --id "$file_id" -O "$output_file" --no-cookies --fuzzy
+            return $?
+        fi
+    }
     
     # Set ComfyUI to the correct branch
     echo "Checking ComfyUI branch..."
@@ -291,14 +297,30 @@ function provisioning_download() {
             
             echo "Downloading from Google Drive with file ID: $fileid"
             
-            # Use gdown for Google Drive downloads
-            if gdown --id "$fileid" -O "$output_dir/$filename" --no-cookies --fuzzy; then
+            # Try downloading using our run_gdown function
+            echo "Using gdown for download..."
+            if run_gdown "$fileid" "$output_dir/$filename"; then
                 success=true
                 echo "gdown download successful!"
             else
-                echo "gdown download failed. Will retry..."
+                echo "gdown download failed. Will try alternative method..."
+                
+                # Try direct URL approach as fallback
+                direct_url="https://drive.google.com/uc?export=download&id=$fileid"
+                echo "Attempting direct download: $direct_url"
+                if wget --content-disposition --show-progress --continue \
+                     -O "$output_dir/$filename" "$direct_url"; then
+                    
+                    # Check if we got an HTML file instead of the actual file
+                    if grep -q "<!DOCTYPE html>" "$output_dir/$filename"; then
+                        echo "Received HTML instead of file. Google Drive may require authentication for large files."
+                        echo "Please manually download the file from: $url"
+                    else
+                        success=true
+                        echo "Direct download successful!"
+                    fi
+                fi
             fi
-            
         # Special handling for Civitai URLs
         elif [[ "$url" == *"civitai.com/api/download"* ]]; then
             echo "🔑 Processing Civitai URL (attempt $((retry_count+1))/$max_retries)..."
