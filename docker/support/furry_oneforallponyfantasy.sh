@@ -27,7 +27,7 @@ NODES=(
 
 # Model files
 declare -A MODELS=(
-    ["https://civitai.com/api/download/models/494387?type=Model&format=SafeTensor&size=full&fp=fp16"]="oneFORALLPonyFantasy_v20DPO.safetensors"
+    ["https://drive.google.com/file/d/1sMSM9gu4CgBRxlk1Zz6XNWTEHcixd3Mq/view?usp=drive_link"]="oneFORALLPonyFantasy_v20DPO.safetensors"
 )
 
 declare -A DIFFUSION_MODELS=(
@@ -43,7 +43,7 @@ declare -A TEXTENCODERS_MODELS=()
 
 # LoRA models
 declare -A LORA_MODELS=(
-    ["https://civitai.com/api/download/models/244808?type=Model&format=SafeTensor&token=b8cc031807c6d51055559e7206"]="princess_xl_v2.safetensors"
+    ["https://huggingface.co/Keltezaa/all-disney-princess-xl-lora-model-from-ralph-breaks-the-internet/resolve/main/princess_xl_v2.safetensors"]="princess_xl_v2.safetensors"
 )
 
 # WanVideo VAE
@@ -238,14 +238,75 @@ function provisioning_download() {
     # Extract token from URL if present
     token="b8cc031807c6d51055559e7206"
     
+    # Extract Google Drive file ID if present
+    if [[ "$url" == *"drive.google.com"* || "$url" == *"docs.google.com"* ]]; then
+        # Extract file ID from URLs like drive.google.com/file/d/FILE_ID/view
+        if [[ "$url" == *"/file/d/"* ]]; then
+            fileid=$(echo "$url" | sed -E 's|.*/file/d/([^/]+).*|\1|')
+        # Extract file ID from URLs with id= parameter
+        elif [[ "$url" == *"id="* ]]; then
+            fileid=$(echo "$url" | grep -oP 'id=\K[^&]+')
+        fi
+        echo "Found Google Drive file ID: $fileid"
+    fi
+    
     # Download attempts - try 3 times
     max_retries=3
     retry_count=0
     success=false
     
     while [ $retry_count -lt $max_retries ] && [ "$success" != "true" ]; do
+        # Special handling for Google Drive URLs
+        if [[ "$url" == *"drive.google.com"* || "$url" == *"docs.google.com"* ]]; then
+            echo "🔑 Processing Google Drive URL (attempt $((retry_count+1))/$max_retries)..."
+            
+            # Check if we have a file ID
+            if [[ -z "$fileid" ]]; then
+                echo "❌ ERROR: Could not extract Google Drive file ID from URL"
+                retry_count=$((retry_count+1))
+                continue
+            fi
+            
+            echo "Downloading from Google Drive with file ID: $fileid"
+            
+            # Create a temporary cookies file
+            cookies_file=$(mktemp)
+            
+            # Get confirmation code
+            confirm=$(wget --quiet --save-cookies "$cookies_file" \
+                          --keep-session-cookies --no-check-certificate \
+                          "https://docs.google.com/uc?export=download&id=$fileid" -O- | \
+                          sed -rn 's/.*confirm=([0-9A-Za-z_]+).*/\1\n/p')
+            
+            # If no confirm code is found, it might be a small file without confirmation
+            if [[ -z "$confirm" ]]; then
+                echo "No confirmation code found, trying direct download"
+                if wget --load-cookies "$cookies_file" \
+                       --no-check-certificate \
+                       --content-disposition \
+                       --show-progress \
+                       "https://docs.google.com/uc?export=download&id=$fileid" \
+                       -O "$output_dir/$filename"; then
+                    success=true
+                fi
+            else
+                echo "Google Drive confirmation code: $confirm"
+                
+                # Download the file with the confirmation code
+                if wget --load-cookies "$cookies_file" \
+                       --no-check-certificate \
+                       --content-disposition \
+                       --show-progress \
+                       "https://docs.google.com/uc?export=download&confirm=${confirm}&id=${fileid}" \
+                       -O "$output_dir/$filename"; then
+                    success=true
+                fi
+            fi
+            
+            # Clean up cookies file
+            rm -f "$cookies_file"
         # Special handling for Civitai URLs
-        if [[ "$url" == *"civitai.com/api/download"* ]]; then
+        elif [[ "$url" == *"civitai.com/api/download"* ]]; then
             echo "🔑 Processing Civitai URL (attempt $((retry_count+1))/$max_retries)..."
             
             # If we have a token, use it in the Authorization header
