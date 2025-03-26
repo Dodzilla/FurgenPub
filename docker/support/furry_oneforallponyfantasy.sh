@@ -27,7 +27,7 @@ NODES=(
 
 # Model files
 declare -A MODELS=(
-    ["https://civitai.com/api/download/models/494387?type=Model&format=SafeTensor&size=full&fp=fp16"]="oneFORALLPonyFantasy_v20DPO.safetensors"
+    ["https://civitai.com/api/download/models/494387?type=Model&format=SafeTensor&size=full&fp=fp16&token=b8cc031807c6d51055559e7206"]="oneFORALLPonyFantasy_v20DPO.safetensors"
 )
 
 declare -A DIFFUSION_MODELS=(
@@ -43,7 +43,7 @@ declare -A TEXTENCODERS_MODELS=()
 
 # LoRA models
 declare -A LORA_MODELS=(
-    ["https://civitai.com/api/download/models/244808?type=Model&format=SafeTensor"]="princess_xl_v2.safetensors"
+    ["https://civitai.com/api/download/models/244808?type=Model&format=SafeTensor&token=b8cc031807c6d51055559e7206"]="princess_xl_v2.safetensors"
 )
 
 # WanVideo VAE
@@ -241,27 +241,7 @@ function provisioning_download() {
     success=false
     
     while [ $retry_count -lt $max_retries ] && [ "$success" != "true" ]; do
-        # Special handling for Civitai URLs
-        if [[ "$url" == *"civitai.com/api/download"* ]]; then
-            echo "🔑 Processing Civitai URL (attempt $((retry_count+1))/$max_retries)..."
-            # Use curl with proper headers for Civitai
-            if curl -L \
-                -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" \
-                -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
-                -H "Accept-Language: en-US,en;q=0.5" \
-                -H "Connection: keep-alive" \
-                -H "Upgrade-Insecure-Requests: 1" \
-                -H "Cache-Control: max-age=0" \
-                --output "$output_dir/$filename" \
-                "$url"; then
-                success=true
-            else
-                echo "Failed to download from Civitai"
-                retry_count=$((retry_count+1))
-                continue
-            fi
-        # Use HF_TOKEN if available and URL is from huggingface.co
-        elif [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
+        if [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
             echo "🔑 Using Hugging Face token (attempt $((retry_count+1))/$max_retries)..."
             wget --header="Authorization: Bearer $HF_TOKEN" \
                  --content-disposition \
