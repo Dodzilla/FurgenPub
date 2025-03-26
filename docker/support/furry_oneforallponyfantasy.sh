@@ -72,7 +72,25 @@ function provisioning_start() {
     
     # Install gdown for Google Drive downloads
     echo "Installing gdown for Google Drive downloads..."
-    pip install gdown
+    if [[ -z $MAMBA_BASE ]]; then
+        echo "Installing gdown using standard Python pip..."
+        $COMFYUI_VENV_PIP install --no-cache-dir gdown || pip install --no-cache-dir gdown || \
+        echo "⚠️ WARNING: gdown installation failed, downloads from Google Drive may not work correctly"
+    else
+        echo "Installing gdown using micromamba..."
+        micromamba run -n comfyui pip install --no-cache-dir gdown || \
+        echo "⚠️ WARNING: gdown installation failed, downloads from Google Drive may not work correctly"
+    fi
+    
+    # Make sure gdown is available in PATH
+    export PATH=$PATH:~/.local/bin
+    
+    # Test if gdown is working
+    if command -v gdown &> /dev/null; then
+        echo "✅ gdown successfully installed!"
+    else
+        echo "⚠️ WARNING: gdown command not found after installation, falling back to direct download methods for Google Drive files"
+    fi
     
     # Set ComfyUI to the correct branch
     echo "Checking ComfyUI branch..."
