@@ -26,11 +26,11 @@ NODES=(
 )
 
 # Model files
-MODELS=(
+declare -A MODELS=(
     ["https://civitai.com/api/download/models/494387?type=Model&format=SafeTensor&size=full&fp=fp16"]="oneFORALLPonyFantasy_v20DPO.safetensors"
 )
 
-DIFFUSION_MODELS=(
+declare -A DIFFUSION_MODELS=(
     # ["https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-T2V-14B_fp8_e4m3fn.safetensors"]="Wan2_1-T2V-14B_fp8_e4m3fn.safetensors"
     # ["https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors"]="Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors"
     # ["https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-I2V-14B-720P_fp8_e4m3fn.safetensors"]="Wan2_1-I2V-14B-720P_fp8_e4m3fn.safetensors"
@@ -39,24 +39,21 @@ DIFFUSION_MODELS=(
 )
 
 # Text encoders
-TEXTENCODERS_MODELS=(
-)
+declare -A TEXTENCODERS_MODELS=()
 
 # LoRA models
-LORA_MODELS=(
+declare -A LORA_MODELS=(
     ["https://civitai.com/api/download/models/244808?type=Model&format=SafeTensor"]="princess_xl_v2.safetensors"
 )
 
 # WanVideo VAE
-VAE_MODELS=(
-)
+declare -A VAE_MODELS=()
 
 # CLIP Vision models
-CLIPVISION_MODELS=(
-)
+declare -A CLIPVISION_MODELS=()
 
 # Upscale models
-UPSCALE_MODELS=(
+declare -A UPSCALE_MODELS=(
     ["https://furgenai.b-cdn.net/models/4x_NMKD-Siax_200k.pth"]="4x_NMKD-Siax_200k.pth"
 )
 
@@ -120,36 +117,43 @@ function provisioning_start() {
     # Download model files
     echo "Downloading models..."
     for url in "${!MODELS[@]}"; do
+        echo "Processing model: $url -> ${MODELS[$url]}"
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/checkpoints" "${MODELS[$url]}"
     done
     
     echo "Downloading diffusion models..."
     for url in "${!DIFFUSION_MODELS[@]}"; do
+        echo "Processing diffusion model: $url -> ${DIFFUSION_MODELS[$url]}"
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/diffusion_models" "${DIFFUSION_MODELS[$url]}"
     done
     
     echo "Downloading text encoder models..."
     for url in "${!TEXTENCODERS_MODELS[@]}"; do
+        echo "Processing text encoder: $url -> ${TEXTENCODERS_MODELS[$url]}"
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/text_encoders" "${TEXTENCODERS_MODELS[$url]}"
     done
     
     echo "Downloading VAE models..."
     for url in "${!VAE_MODELS[@]}"; do
+        echo "Processing VAE model: $url -> ${VAE_MODELS[$url]}"
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/vae" "${VAE_MODELS[$url]}"
     done
 
     echo "Downloading LoRA models..."
     for url in "${!LORA_MODELS[@]}"; do
+        echo "Processing LoRA model: $url -> ${LORA_MODELS[$url]}"
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/loras" "${LORA_MODELS[$url]}"
     done
     
     echo "Downloading CLIP Vision models..."
     for url in "${!CLIPVISION_MODELS[@]}"; do
+        echo "Processing CLIP Vision model: $url -> ${CLIPVISION_MODELS[$url]}"
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/clip_vision" "${CLIPVISION_MODELS[$url]}"
     done
 
     echo "Downloading upscale models..."
     for url in "${!UPSCALE_MODELS[@]}"; do
+        echo "Processing upscale model: $url -> ${UPSCALE_MODELS[$url]}"
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/upscale_models" "${UPSCALE_MODELS[$url]}"
     done
     
