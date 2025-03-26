@@ -22,6 +22,7 @@ NODES=(
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/kijai/ComfyUI-DepthAnythingV2"
     "https://github.com/Isi-dev/ComfyUI-Img2DrawingAssistants"
+    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
 )
 
 # Model files
@@ -152,11 +153,6 @@ function provisioning_start() {
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/upscale_models" "${UPSCALE_MODELS[$url]}"
     done
     
-    # Set default workflow
-    if [[ -n "$DEFAULT_WORKFLOW" ]]; then
-        provisioning_get_default_workflow
-    fi
-    
     # Check downloaded models
     echo "Checking downloaded models..."
     provisioning_verify_downloads
@@ -216,17 +212,6 @@ function provisioning_get_nodes() {
             "$COMFYUI_VENV_PYTHON" "${install_script}"
         fi
     done
-}
-
-function provisioning_get_default_workflow() {
-    echo "Downloading default workflow: ${DEFAULT_WORKFLOW}"
-    workflow_json=$(curl -s "$DEFAULT_WORKFLOW")
-    if [[ -n $workflow_json ]]; then
-        echo "export const defaultGraph = $workflow_json;" > /opt/ComfyUI/web/scripts/defaultGraph.js
-        echo "✅ Default workflow set successfully."
-    else
-        echo "❌ ERROR: Could not download the default workflow!"
-    fi
 }
 
 function provisioning_download() {
