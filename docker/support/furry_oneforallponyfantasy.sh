@@ -241,8 +241,24 @@ function provisioning_download() {
     success=false
     
     while [ $retry_count -lt $max_retries ] && [ "$success" != "true" ]; do
+        # Special handling for Civitai URLs
+        if [[ "$url" == *"civitai.com/api/download"* ]]; then
+            echo "🔑 Processing Civitai URL (attempt $((retry_count+1))/$max_retries)..."
+            # First get the actual download URL
+            actual_url=$(curl -s -L -w "%{url_effective}" "$url" -o /dev/null)
+            if [[ -n "$actual_url" ]]; then
+                echo "Found actual download URL: $actual_url"
+                wget --content-disposition \
+                     --show-progress \
+                     --continue \
+                     -O "$output_dir/$filename" "$actual_url" && success=true
+            else
+                echo "Failed to get actual download URL from Civitai"
+                retry_count=$((retry_count+1))
+                continue
+            fi
         # Use HF_TOKEN if available and URL is from huggingface.co
-        if [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
+        elif [[ -n "$HF_TOKEN" && "$url" == *"huggingface.co"* ]]; then
             echo "🔑 Using Hugging Face token (attempt $((retry_count+1))/$max_retries)..."
             wget --header="Authorization: Bearer $HF_TOKEN" \
                  --content-disposition \
