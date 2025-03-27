@@ -141,9 +141,6 @@ function provisioning_start() {
     mkdir -p "${WORKSPACE}/ComfyUI/models/vae"
     mkdir -p "${WORKSPACE}/ComfyUI/models/frame_interpolation"
     
-    # Give full permissions
-    # chmod -R 777 "${WORKSPACE}/ComfyUI/models"
-    
     # Download base nodes
     provisioning_get_nodes "${NODES[@]}"
     
@@ -197,8 +194,8 @@ function provisioning_start() {
     done
     
     # Check downloaded models
-    echo "Checking downloaded models..."
-    provisioning_verify_downloads
+    # echo "Checking downloaded models..."
+    # provisioning_verify_downloads
     
     # Create provisioning completion marker
     echo "Creating provisioning completion marker..."
