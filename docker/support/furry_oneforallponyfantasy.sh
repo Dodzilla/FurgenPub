@@ -27,7 +27,7 @@ NODES=(
 
 # Model files
 declare -A MODELS=(
-    ["https://drive.google.com/file/d/1sMSM9gu4CgBRxlk1Zz6XNWTEHcixd3Mq/view?usp=drive_link"]="oneFORALLPonyFantasy_v20DPO.safetensors"
+    ["https://huggingface.co/LoopsBoops/furarch/resolve/main/oneFORALLPonyFantasy_v20DPO.safetensors"]="oneFORALLPonyFantasy_v20DPO.safetensors"
 )
 
 declare -A DIFFUSION_MODELS=(
@@ -43,12 +43,12 @@ declare -A TEXTENCODERS_MODELS=()
 
 # Controlnet models
 declare -A CONTROLNET_MODELS=(
-    ["https://drive.google.com/file/d/123lwQTWTFO6N89KhiPTu5hIol8ZUNAw-/view?usp=drive_link"]="xinsir_controlnet_promax.safetensors"
+    ["https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"]="xinsir_controlnet_promax.safetensors"
 )
 
 # LoRA models
 declare -A LORA_MODELS=(
-    ["https://furgenai.b-cdn.net/models/princess_xl_v2.safetensors"]="princess_xl_v2.safetensors"
+    ["https://huggingface.co/LoopsBoops/furarch/resolve/main/princess_xl_v2.safetensors"]="princess_xl_v2.safetensors"
 )
 
 # WanVideo VAE
@@ -59,7 +59,7 @@ declare -A CLIPVISION_MODELS=()
 
 # Upscale models
 declare -A UPSCALE_MODELS=(
-    ["https://furgenai.b-cdn.net/models/4x_NMKD-Siax_200k.pth"]="4x_NMKD-Siax_200k.pth"
+    ["https://huggingface.co/LoopsBoops/furarch/resolve/main/4x_NMKD-Siax_200k.pth"]="4x_NMKD-Siax_200k.pth"
 )
 
 ### SCRIPT FUNCTIONS ###
