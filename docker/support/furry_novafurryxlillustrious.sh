@@ -41,14 +41,8 @@ declare -A DIFFUSION_MODELS=(
 # Text encoders
 declare -A TEXTENCODERS_MODELS=()
 
-# Controlnet models
-declare -A CONTROLNET_MODELS=(
-    ["https://drive.google.com/file/d/123lwQTWTFO6N89KhiPTu5hIol8ZUNAw-/view?usp=drive_link"]="xinsir_controlnet_promax.safetensors"
-)
-
 # LoRA models
 declare -A LORA_MODELS=(
-    ["https://furgenai.b-cdn.net/models/princess_xl_v2.safetensors"]="princess_xl_v2.safetensors"
 )
 
 # WanVideo VAE
@@ -170,12 +164,6 @@ function provisioning_start() {
     for url in "${!VAE_MODELS[@]}"; do
         echo "Processing VAE model: $url -> ${VAE_MODELS[$url]}"
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/vae" "${VAE_MODELS[$url]}"
-    done
-
-    echo "Downloading Controlnet models..."
-    for url in "${!CONTROLNET_MODELS[@]}"; do
-        echo "Processing Controlnet model: $url -> ${CONTROLNET_MODELS[$url]}"
-        provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/controlnet" "${CONTROLNET_MODELS[$url]}"
     done
 
     echo "Downloading LoRA models..."
