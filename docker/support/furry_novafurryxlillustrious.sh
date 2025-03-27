@@ -27,7 +27,7 @@ NODES=(
 
 # Model files
 declare -A MODELS=(
-    ["https://drive.google.com/file/d/1sMSM9gu4CgBRxlk1Zz6XNWTEHcixd3Mq/view?usp=drive_link"]="oneFORALLPonyFantasy_v20DPO.safetensors"
+    ["https://huggingface.co/LoopsBoops/furarch/resolve/main/novaFurryXL_illustriousV50.safetensors"]="novaFurryXL_illustriousV50.safetensors"
 )
 
 declare -A DIFFUSION_MODELS=(
@@ -41,6 +41,11 @@ declare -A DIFFUSION_MODELS=(
 # Text encoders
 declare -A TEXTENCODERS_MODELS=()
 
+# Controlnet models
+declare -A CONTROLNET_MODELS=(
+    ["https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"]="xinsir_controlnet_promax.safetensors"
+)
+
 # LoRA models
 declare -A LORA_MODELS=(
 )
@@ -53,7 +58,7 @@ declare -A CLIPVISION_MODELS=()
 
 # Upscale models
 declare -A UPSCALE_MODELS=(
-    ["https://furgenai.b-cdn.net/models/4x_NMKD-Siax_200k.pth"]="4x_NMKD-Siax_200k.pth"
+    ["https://huggingface.co/LoopsBoops/furarch/resolve/main/4x_NMKD-Siax_200k.pth"]="4x_NMKD-Siax_200k.pth"
 )
 
 ### SCRIPT FUNCTIONS ###
@@ -135,9 +140,6 @@ function provisioning_start() {
     mkdir -p "${WORKSPACE}/ComfyUI/models/vae"
     mkdir -p "${WORKSPACE}/ComfyUI/models/frame_interpolation"
     
-    # Give full permissions
-    # chmod -R 777 "${WORKSPACE}/ComfyUI/models"
-    
     # Download base nodes
     provisioning_get_nodes "${NODES[@]}"
     
@@ -166,6 +168,12 @@ function provisioning_start() {
         provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/vae" "${VAE_MODELS[$url]}"
     done
 
+    echo "Downloading Controlnet models..."
+    for url in "${!CONTROLNET_MODELS[@]}"; do
+        echo "Processing Controlnet model: $url -> ${CONTROLNET_MODELS[$url]}"
+        provisioning_download "$url" "${WORKSPACE}/ComfyUI/models/controlnet" "${CONTROLNET_MODELS[$url]}"
+    done
+
     echo "Downloading LoRA models..."
     for url in "${!LORA_MODELS[@]}"; do
         echo "Processing LoRA model: $url -> ${LORA_MODELS[$url]}"
@@ -185,12 +193,12 @@ function provisioning_start() {
     done
     
     # Check downloaded models
-    echo "Checking downloaded models..."
-    provisioning_verify_downloads
+    # echo "Checking downloaded models..."
+    # provisioning_verify_downloads
     
     # Create provisioning completion marker
     echo "Creating provisioning completion marker..."
-    echo "Provisioning completed at $(date)" > "${WORKSPACE}/ComfyUI/input/provisioned_furry_oneforallponyfantasy.txt"
+    echo "Provisioning completed at $(date)" > "${WORKSPACE}/ComfyUI/input/provisioned_furry_novafurryxlillustrious.txt"
     
     # Completion message
     provisioning_print_end
