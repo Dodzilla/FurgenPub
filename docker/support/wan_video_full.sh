@@ -171,7 +171,7 @@ function provisioning_start() {
     provisioning_verify_downloads
 
     echo "Installing sageattention"
-    pip install sageattention
+    "$COMFYUI_VENV_PIP" install sageattention
     
     # Completion message
     provisioning_print_end
