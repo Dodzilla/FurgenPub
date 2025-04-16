@@ -173,6 +173,10 @@ function provisioning_start() {
 
     echo "Installing sageattention"
     "$COMFYUI_VENV_PIP" install sageattention
+
+    # Create provisioning completion marker
+    echo "Creating provisioning completion marker..."
+    echo "Provisioning completed at $(date)" > "${WORKSPACE}/ComfyUI/input/provisioned_wan_video_full.txt"
     
     # Completion message
     provisioning_print_end
