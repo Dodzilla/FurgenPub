@@ -43,7 +43,7 @@ DIFFUSION_MODELS=(
 TEXTENCODERS_MODELS=(
     "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/open-clip-xlm-roberta-large-vit-huge-14_visual_fp16.safetensors"
     "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors"
-    "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+    # "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
 )
 
 # LoRA models
@@ -53,7 +53,11 @@ LORA_MODELS=(
     "https://furgen-models.b-cdn.net/models/wan-nsfw-e14-fixed.safetensors"
     "https://furgen-models.b-cdn.net/models/male-masturbation-90.safetensors"
     "https://furgen-models.b-cdn.net/models/wan_missionary_side.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan_pov_missionary.safetensors"
     "https://furgen-models.b-cdn.net/models/wan_pov_blowjob.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan_doggy_POV_v1_1.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan_doggy_side.safetensors"
+    "https://furgen-models.b-cdn.net/models/wan-SideSex-Wan-i2v-v10-000010_converted.safetensors"
 )
 
 # WanVideo VAE
