@@ -146,6 +146,10 @@ function provisioning_print_header() {
 }
 
 function provisioning_print_end() {
+    # Create provisioning completion marker
+    echo "Creating provisioning completion marker..."
+    echo "Provisioning completed at $(date)" > "${WORKSPACE}/ComfyUI/input/provisioned_furry_all.txt"
+
     printf "\nProvisioning complete:  Application will start now\n\n"
 }
 
