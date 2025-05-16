@@ -29,7 +29,7 @@ NODES=(
     "https://github.com/kijai/ComfyUI-DepthAnythingV2"
     "https://github.com/Isi-dev/ComfyUI-Img2DrawingAssistants"
     "https://github.com/giriss/comfy-image-saver"
-    "https://github.com/felixszeto/ComfyUI-RequestNodes"
+    "https://github.com/wmatson/easy-comfy-nodes"
 )
 
 WORKFLOWS=(
