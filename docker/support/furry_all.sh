@@ -29,7 +29,7 @@ NODES=(
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/kijai/ComfyUI-DepthAnythingV2"
     "https://github.com/Isi-dev/ComfyUI-Img2DrawingAssistants"
-    "https://github.com/wmatson/easy-comfy-nodes"
+    "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/yolain/ComfyUI-Easy-Use"
 )
 
