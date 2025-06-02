@@ -31,6 +31,7 @@ NODES=(
     "https://github.com/Isi-dev/ComfyUI-Img2DrawingAssistants"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/yolain/ComfyUI-Easy-Use"
+    "https://github.com/comfyanonymous/ComfyUI_TensorRT"
 )
 
 WORKFLOWS=(
