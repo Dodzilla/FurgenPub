@@ -20,14 +20,12 @@ NODES=(
     "https://github.com/cubiq/ComfyUI_essentials"
     "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
     "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
-    "https://github.com/Fannovel16/comfyui_controlnet_aux"
     "https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb"
     "https://github.com/BlenderNeko/ComfyUI_Noise"
     "https://github.com/jags111/efficiency-nodes-comfyui"
     "https://github.com/WASasquatch/was-node-suite-comfyui"
     "https://github.com/city96/SD-Latent-Upscaler"
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
-    "https://github.com/kijai/ComfyUI-DepthAnythingV2"
     "https://github.com/Isi-dev/ComfyUI-Img2DrawingAssistants"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/yolain/ComfyUI-Easy-Use"
@@ -41,6 +39,11 @@ WORKFLOWS=(
 CHECKPOINT_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaAnimalXL_illustriousV4b.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaFurryXL_illustriousV7b.safetensors"
+)
+
+TENSORRT_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/NovaAnimal4b_5090.engine"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/NovaFurry7b_5090.engine"
 )
 
 BBOX_MODELS=(
@@ -57,11 +60,9 @@ VAE_MODELS=(
 )
 
 UPSCALE_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/4x_NMKD-Siax_200k.pth"
 )
 
 CONTROLNET_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
 )
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
@@ -74,6 +75,9 @@ function provisioning_start() {
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/tensorrt" \
+        "${TENSORRT_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/ultralytics/bbox" \
         "${BBOX_MODELS[@]}"
