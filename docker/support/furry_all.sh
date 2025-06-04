@@ -31,7 +31,6 @@ NODES=(
     "https://github.com/Isi-dev/ComfyUI-Img2DrawingAssistants"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/yolain/ComfyUI-Easy-Use"
-    "https://github.com/comfyanonymous/ComfyUI_TensorRT"
 )
 
 WORKFLOWS=(
@@ -39,8 +38,8 @@ WORKFLOWS=(
 )
 
 CHECKPOINT_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaAnimalXL_illustriousV20.safetensors"
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaFurryXL_illustriousV50.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaAnimalXL_illustriousV4b.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaFurryXL_illustriousV7b.safetensors"
 )
 
 BBOX_MODELS=(
@@ -54,14 +53,6 @@ LORA_MODELS=(
 )
 
 VAE_MODELS=(
-)
-
-UPSCALE_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/4x_NMKD-Siax_200k.pth"
-)
-
-CONTROLNET_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
 )
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
