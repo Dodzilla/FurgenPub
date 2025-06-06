@@ -11,8 +11,6 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    "sageattention"
-    "onnxruntime"
 )
 
 NODES=(
