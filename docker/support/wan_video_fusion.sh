@@ -42,13 +42,7 @@ WORKFLOWS=(
 CHECKPOINT_MODELS=(
 )
 
-TENSORRT_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/NovaAnimal4b_5090.engine"
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/NovaFurry7b_5090.engine"
-)
-
 BBOX_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/face_yolov8m.pt"
 )
 
 UNET_MODELS=(
@@ -106,9 +100,6 @@ function provisioning_start() {
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/tensorrt" \
-        "${TENSORRT_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/ultralytics/bbox" \
         "${BBOX_MODELS[@]}"
