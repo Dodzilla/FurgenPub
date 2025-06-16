@@ -79,7 +79,8 @@ CONTROLNET_MODELS=(
 
 # Added arrays to mirror wan_video_full.sh
 DIFFUSION_MODELS=(
-    "https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX/resolve/main/Wan14Bi2vFusioniX_fp16.safetensors"
+    #"https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX/resolve/main/Wan14Bi2vFusioniX_fp16.safetensors"
+    "https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX/resolve/main/Wan14Bi2vFusioniX.safetensors"
 )
 
 CLIPVISION_MODELS=(
