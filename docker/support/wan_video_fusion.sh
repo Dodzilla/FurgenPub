@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -x
+
 source /venv/main/bin/activate
 COMFYUI_DIR=${WORKSPACE}/ComfyUI
 
@@ -93,18 +95,26 @@ FRAME_INTERPOLATION_MODELS=(
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
 function provisioning_update_comfyui() {
+    echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
         printf "Updating ComfyUI to pinned version (483b3e6)...\n"
         git config --global --add safe.directory "${COMFYUI_DIR}"
         (
             cd "${COMFYUI_DIR}"
+            echo "DEBUG: Current directory: $(pwd)"
+            echo "DEBUG: Fetching git updates..."
             git fetch
+            echo "DEBUG: Checking out pinned commit..."
             git checkout 483b3e6
         )
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
             pip install --no-cache-dir -r "${COMFYUI_DIR}/requirements.txt"
+        else
+            echo "DEBUG: requirements.txt not found in ${COMFYUI_DIR}"
         fi
+    else
+        echo "DEBUG: ComfyUI git repository not found."
     fi
 }
 
@@ -260,6 +270,10 @@ function provisioning_download() {
 }
 
 # Allow user to disable provisioning if they started with a script they didn't want
+echo "DEBUG: Checking for /.noprovisioning file..."
 if [[ ! -f /.noprovisioning ]]; then
+    echo "DEBUG: /.noprovisioning not found. Starting provisioning process."
     provisioning_start
+else
+    echo "DEBUG: /.noprovisioning found. Skipping provisioning."
 fi
