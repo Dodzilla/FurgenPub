@@ -98,9 +98,9 @@ function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
         printf "Updating ComfyUI to pinned version (483b3e6)...\n"
-        git config --global --add safe.directory "${COMFYUI_DIR}"
         (
             cd "${COMFYUI_DIR}"
+            git config --global --add safe.directory "$(pwd)"
             echo "DEBUG: Current directory: $(pwd)"
             echo "DEBUG: Fetching git updates..."
             git fetch
