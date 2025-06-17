@@ -35,6 +35,9 @@ NODES=(
     # WanVideo nodes
     "https://github.com/kijai/ComfyUI-WanVideoWrapper"
     "https://github.com/kijai/ComfyUI-KJNodes"
+
+    # Other nodes
+    "https://github.com/Dodzilla/easy-comfy-nodes-async"
 )
 
 WORKFLOWS=(
