@@ -95,6 +95,7 @@ FRAME_INTERPOLATION_MODELS=(
 function provisioning_update_comfyui() {
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
         printf "Updating ComfyUI to pinned version (483b3e6)...\n"
+        git config --global --add safe.directory "${COMFYUI_DIR}"
         (
             cd "${COMFYUI_DIR}"
             git fetch
