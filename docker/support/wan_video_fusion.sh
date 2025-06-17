@@ -92,8 +92,24 @@ FRAME_INTERPOLATION_MODELS=(
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
+function provisioning_update_comfyui() {
+    if [[ -d "${COMFYUI_DIR}/.git" ]]; then
+        printf "Updating ComfyUI to pinned version (483b3e6)...\n"
+        (
+            cd "${COMFYUI_DIR}"
+            git fetch
+            git checkout 483b3e6
+        )
+        if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
+            printf "Installing ComfyUI requirements...\n"
+            pip install --no-cache-dir -r "${COMFYUI_DIR}/requirements.txt"
+        fi
+    fi
+}
+
 function provisioning_start() {
     provisioning_print_header
+    provisioning_update_comfyui
     provisioning_get_apt_packages
     provisioning_get_nodes
     provisioning_get_pip_packages
