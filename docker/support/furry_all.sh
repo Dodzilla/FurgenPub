@@ -55,8 +55,33 @@ VAE_MODELS=(
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
+function provisioning_update_comfyui() {
+    echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
+    if [[ -d "${COMFYUI_DIR}/.git" ]]; then
+        printf "Updating ComfyUI to pinned version (483b3e6)...\n"
+        (
+            cd "${COMFYUI_DIR}"
+            git config --global --add safe.directory "$(pwd)"
+            echo "DEBUG: Current directory: $(pwd)"
+            echo "DEBUG: Fetching git updates..."
+            git fetch
+            echo "DEBUG: Checking out pinned commit..."
+            git checkout 483b3e6
+        )
+        if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
+            printf "Installing ComfyUI requirements...\n"
+            pip install --no-cache-dir -r "${COMFYUI_DIR}/requirements.txt"
+        else
+            echo "DEBUG: requirements.txt not found in ${COMFYUI_DIR}"
+        fi
+    else
+        echo "DEBUG: ComfyUI git repository not found."
+    fi
+}
+
 function provisioning_start() {
     provisioning_print_header
+    provisioning_update_comfyui
     provisioning_get_apt_packages
     provisioning_get_nodes
     provisioning_get_pip_packages

@@ -54,16 +54,13 @@ UNET_MODELS=(
 )
 
 LORA_MODELS=(
-    "https://furgen-models.b-cdn.net/models/wan_cowgirl_v1.1.safetensors"
-    "https://furgen-models.b-cdn.net/models/wan_female_masturbation.safetensors"
-    "https://furgen-models.b-cdn.net/models/wan-nsfw-e14-fixed.safetensors"
-    "https://furgen-models.b-cdn.net/models/male-masturbation-90.safetensors"
-    "https://furgen-models.b-cdn.net/models/wan_missionary_side.safetensors"
-    "https://furgen-models.b-cdn.net/models/wan_pov_missionary.safetensors"
-    "https://furgen-models.b-cdn.net/models/wan_pov_blowjob.safetensors"
-    "https://furgen-models.b-cdn.net/models/wan_doggy_POV_v1_1.safetensors"
-    "https://furgen-models.b-cdn.net/models/wan_doggy_side.safetensors"
-    "https://furgen-models.b-cdn.net/models/wan-SideSex-Wan-i2v-v10-000010_converted.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_cowgirl_v1.3.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_doggy_POV_v1_1.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/furry_nsfw_1.1_e22.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_female_masturbation_v1_0.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_fingering_i2v_e248.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_missionary_side_v1_0.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_pov_missionary_i2v_v1.1.safetensors"
 )
 
 VAE_MODELS=(
