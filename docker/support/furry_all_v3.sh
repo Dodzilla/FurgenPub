@@ -55,8 +55,7 @@ LORA_MODELS=(
 )
 
 VAE_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaAnimalXL_illustriousV4b_vae.safetensors"
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaFurryXL_illustriousV7b_vae.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/sdxl-fp16-fix.vae.safetensors"
 )
 
 TEXT_ENCODERS_MODELS=(
