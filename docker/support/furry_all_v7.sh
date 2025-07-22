@@ -26,6 +26,7 @@ NODES=(
     "https://github.com/Isi-dev/ComfyUI-Img2DrawingAssistants"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
+    "https://github.com/Danand/ComfyUI-ComfyCouple"
     "https://github.com/yolain/ComfyUI-Easy-Use"
     "https://github.com/Jordach/comfy-plasma"
 )
