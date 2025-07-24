@@ -14,21 +14,15 @@ PIP_PACKAGES=(
 )
 
 NODES=(
+    "https://github.com/Fannovel16/comfyui_controlnet_aux"
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
+    "https://github.com/kijai/ComfyUI-KJNodes"
+    "https://github.com/neverbiasu/ComfyUI-SAM2"
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/cubiq/ComfyUI_essentials"
-    "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
-    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
-    "https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb"
-    "https://github.com/jags111/efficiency-nodes-comfyui"
     "https://github.com/WASasquatch/was-node-suite-comfyui"
-    "https://github.com/city96/SD-Latent-Upscaler"
-    "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
-    "https://github.com/Isi-dev/ComfyUI-Img2DrawingAssistants"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
-    "https://github.com/Danand/ComfyUI-ComfyCouple"
-    "https://github.com/yolain/ComfyUI-Easy-Use"
-    "https://github.com/Jordach/comfy-plasma"
 )
 
 WORKFLOWS=(
@@ -51,6 +45,12 @@ LORA_MODELS=(
 
 VAE_MODELS=(
 )
+
+CONTROLNET_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
+)
+
+
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
