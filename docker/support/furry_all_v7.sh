@@ -18,6 +18,7 @@ NODES=(
     "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
     "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
     "https://github.com/kijai/ComfyUI-KJNodes"
+    "https://github.com/kijai/ComfyUI-depth-fm"
     "https://github.com/neverbiasu/ComfyUI-SAM2"
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/cubiq/ComfyUI_essentials"
@@ -25,15 +26,16 @@ NODES=(
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
+    
 )
 
 WORKFLOWS=(
-
 )
 
 CHECKPOINT_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaAnimalXL_illustriousV5b.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaFurryXL_illustriousV9b.safetensors"
+    "https://huggingface.co/Kijai/depth-fm-pruned/resolve/main/depthfm-v1_fp16.safetensors"
 )
 
 BBOX_MODELS=(
@@ -46,6 +48,7 @@ LORA_MODELS=(
 )
 
 VAE_MODELS=(
+    "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors"
 )
 
 CONTROLNET_MODELS=(
