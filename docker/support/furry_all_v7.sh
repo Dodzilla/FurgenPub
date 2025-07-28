@@ -31,8 +31,6 @@ WORKFLOWS=(
 )
 
 CHECKPOINT_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaAnimalXL_illustriousV60.safetensors"
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaFurryXL_illustriousV9b.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
 )
 
@@ -47,7 +45,7 @@ LORA_MODELS=(
 )
 
 VAE_MODELS=(
-    "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors"
+    # "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors"
 )
 
 CONTROLNET_MODELS=(
