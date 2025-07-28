@@ -35,6 +35,7 @@ CHECKPOINT_MODELS=(
 )
 
 BBOX_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/face_yolov8m.pt"
 )
 
 UNET_MODELS=(
