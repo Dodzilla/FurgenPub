@@ -18,23 +18,22 @@ NODES=(
     "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
     "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
     "https://github.com/kijai/ComfyUI-KJNodes"
-    "https://github.com/kijai/ComfyUI-depth-fm"
-    "https://github.com/neverbiasu/ComfyUI-SAM2"
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/cubiq/ComfyUI_essentials"
     "https://github.com/WASasquatch/was-node-suite-comfyui"
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
+    "https://github.com/Dodzilla/LoopsGroundingDino"
 )
 
 WORKFLOWS=(
 )
 
 CHECKPOINT_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaAnimalXL_illustriousV5b.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaAnimalXL_illustriousV60.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/novaFurryXL_illustriousV9b.safetensors"
-    "https://huggingface.co/Kijai/depth-fm-pruned/resolve/main/depthfm-v1_fp16.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
 )
 
 BBOX_MODELS=(
@@ -44,6 +43,7 @@ UNET_MODELS=(
 )
 
 LORA_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/N1-DreamerTooth.safetensors"
 )
 
 VAE_MODELS=(
