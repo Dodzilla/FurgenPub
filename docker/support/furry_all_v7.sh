@@ -42,6 +42,7 @@ UNET_MODELS=(
 
 LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/N1-DreamerTooth.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
 )
 
 VAE_MODELS=(
