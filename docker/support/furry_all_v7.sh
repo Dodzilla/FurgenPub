@@ -41,6 +41,15 @@ BBOX_MODELS=(
 UNET_MODELS=(
 )
 
+GROUNDING_MODELS=(
+    "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/GroundingDINO_SwinB.cfg.py"
+    "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/groundingdino_swinb_cogcoor.pth"
+)
+
+SAM2_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/sam2_1_hiera_large.pt"
+)
+
 LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/N1-DreamerTooth.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
@@ -88,6 +97,12 @@ function provisioning_start() {
     provisioning_get_apt_packages
     provisioning_get_nodes
     provisioning_get_pip_packages
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/sam2" \
+        "${SAM2_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/grounding-dino" \
+        "${GROUNDING_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
