@@ -6,7 +6,7 @@ COMFYUI_DIR=${WORKSPACE}/ComfyUI
 # Packages are installed after nodes so we can fix them...
 
 APT_PACKAGES=(
-    #"package-1"
+    "onnxruntime-gpu"
     #"package-2"
 )
 
@@ -25,7 +25,6 @@ NODES=(
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
     "https://github.com/Dodzilla/LoopsGroundingDino"
-    "https://github.com/Dodzilla/easy-comfy-nodes-async"
 )
 
 WORKFLOWS=(
