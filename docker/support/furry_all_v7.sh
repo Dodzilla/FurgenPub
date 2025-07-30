@@ -6,11 +6,11 @@ COMFYUI_DIR=${WORKSPACE}/ComfyUI
 # Packages are installed after nodes so we can fix them...
 
 APT_PACKAGES=(
-    "onnxruntime-gpu"
     #"package-2"
 )
 
 PIP_PACKAGES=(
+    "onnxruntime-gpu"
 )
 
 NODES=(
