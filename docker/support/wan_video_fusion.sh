@@ -28,6 +28,7 @@ NODES=(
 
     # Helper nodes
     "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
+    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
     "https://github.com/rgthree/rgthree-comfy"
     "https://github.com/pythongosssss/ComfyUI-Custom-Scripts"
     "https://github.com/WASasquatch/was-node-suite-comfyui"
@@ -35,6 +36,12 @@ NODES=(
     # WanVideo nodes
     "https://github.com/kijai/ComfyUI-WanVideoWrapper"
     "https://github.com/kijai/ComfyUI-KJNodes"
+
+    # Furry/ControlNet nodes
+    "https://github.com/Fannovel16/comfyui_controlnet_aux"
+    "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
+    "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
+    "https://github.com/Dodzilla/LoopsGroundingDino"
 
     # Other nodes
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
@@ -45,15 +52,27 @@ WORKFLOWS=(
 )
 
 CHECKPOINT_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
 )
 
 BBOX_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/face_yolov8m.pt"
 )
 
 UNET_MODELS=(
 )
 
+GROUNDING_MODELS=(
+    "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/GroundingDINO_SwinB.cfg.py"
+    "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/groundingdino_swinb_cogcoor.pth"
+)
+
+SAM2_MODELS=(
+    "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt"
+)
+
 LORA_MODELS=(
+    # WanVideo LoRAs
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_cowgirl_v1.3.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_doggy_POV_v1_1.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/furry_nsfw_1.1_e22.safetensors"
@@ -79,6 +98,9 @@ LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_P003-Sexy-Dance-i2v-v10-000010_converted.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_doggy_side_view_diffusers_v1_0.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_P001-SideSex-Wan-i2v-v10-000010_converted.safetensors"
+    
+    # Furry Image LoRAs
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
 )
 
 VAE_MODELS=(
@@ -94,6 +116,7 @@ UPSCALE_MODELS=(
 )
 
 CONTROLNET_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
 )
 
 # Added arrays to mirror wan_video_full.sh
@@ -142,6 +165,12 @@ function provisioning_start() {
     provisioning_get_apt_packages
     provisioning_get_nodes
     provisioning_get_pip_packages
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/sam2" \
+        "${SAM2_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/grounding-dino" \
+        "${GROUNDING_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
