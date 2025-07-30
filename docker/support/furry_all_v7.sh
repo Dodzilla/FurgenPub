@@ -25,6 +25,7 @@ NODES=(
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
     "https://github.com/Dodzilla/LoopsGroundingDino"
+    "https://github.com/Dodzilla/easy-comfy-nodes-async"
 )
 
 WORKFLOWS=(
