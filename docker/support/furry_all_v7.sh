@@ -47,7 +47,7 @@ GROUNDING_MODELS=(
 )
 
 SAM2_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/sam2_1_hiera_large.pt"
+    "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt"
 )
 
 LORA_MODELS=(
