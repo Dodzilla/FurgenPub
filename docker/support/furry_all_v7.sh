@@ -38,6 +38,10 @@ BBOX_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/face_yolov8m.pt"
 )
 
+EMBEDDING_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/embeddings_safe_neg.pt"
+)
+
 UNET_MODELS=(
 )
 
@@ -96,6 +100,9 @@ function provisioning_start() {
     provisioning_get_apt_packages
     provisioning_get_nodes
     provisioning_get_pip_packages
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/embeddings" \
+        "${EMBEDDING_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/sam2" \
         "${SAM2_MODELS[@]}"
