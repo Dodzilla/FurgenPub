@@ -10,7 +10,7 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    "onnxruntime-gpu"
+    #"onnxruntime-gpu"
 )
 
 NODES=(
