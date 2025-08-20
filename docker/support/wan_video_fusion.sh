@@ -94,7 +94,7 @@ LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_facesit_i2v_480p_v2.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_spanking_for_wan_v1_e128.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/Wan_Pussy_LoRA_Hearmeman_v1_0.safetensors"
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_let's dancing_wan_i2v2.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_lets dancing_wan_i2v2.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_P003-Sexy-Dance-i2v-v10-000010_converted.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_doggy_side_view_diffusers_v1_0.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan_P001-SideSex-Wan-i2v-v10-000010_converted.safetensors"
