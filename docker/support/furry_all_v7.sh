@@ -26,6 +26,7 @@ NODES=(
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
     "https://github.com/Dodzilla/LoopsGroundingDino"
     "https://github.com/1038lab/ComfyUI-RMBG"
+    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
 )
 
 WORKFLOWS=(
