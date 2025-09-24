@@ -106,6 +106,7 @@ LORA_MODELS=(
 
 VAE_MODELS=(
     "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors"
+    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_2_VAE_bf16.safetensors"
 )
 
 TEXT_ENCODERS_MODELS=(
