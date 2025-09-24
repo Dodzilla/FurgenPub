@@ -8,8 +8,8 @@ COMFYUI_DIR=${WORKSPACE}/ComfyUI
 # Packages are installed after nodes so we can fix them...
 
 APT_PACKAGES=(
-    #"package-1"
-    #"package-2"
+    "flash_attn"
+    "triton"
 )
 
 PIP_PACKAGES=(
@@ -102,11 +102,12 @@ LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
 
     "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank32.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22_lightning_high_noise_model.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22_lightning_low_noise_model.safetensors"
 )
 
 VAE_MODELS=(
     "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors"
-    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_2_VAE_bf16.safetensors"
 )
 
 TEXT_ENCODERS_MODELS=(
@@ -150,7 +151,7 @@ function provisioning_update_comfyui() {
             echo "DEBUG: Fetching git updates..."
             git fetch
             echo "DEBUG: Checking out pinned commit..."
-            git checkout 483b3e6
+            git checkout b873051
         )
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
