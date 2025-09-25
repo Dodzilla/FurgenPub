@@ -8,11 +8,11 @@ COMFYUI_DIR=${WORKSPACE}/ComfyUI
 # Packages are installed after nodes so we can fix them...
 
 APT_PACKAGES=(
-    "flash_attn"
-    "triton"
 )
 
 PIP_PACKAGES=(
+    "flash_attn"
+    "triton"
     "sageattention"
     "onnxruntime"
 )
@@ -51,7 +51,7 @@ WORKFLOWS=(
 )
 
 CHECKPOINT_MODELS=(
-    # "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
 )
 
 BBOX_MODELS=(
@@ -124,8 +124,6 @@ CONTROLNET_MODELS=(
 
 # Added arrays to mirror wan_video_full.sh
 DIFFUSION_MODELS=(
-    #"https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX/resolve/main/Wan14Bi2vFusioniX_fp16.safetensors"
-    # "https://huggingface.co/vrgamedevgirl84/Wan14BT2VFusioniX/resolve/main/Wan14Bi2vFusioniX.safetensors"
     "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors"
     "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"
 )
