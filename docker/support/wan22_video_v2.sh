@@ -181,6 +181,59 @@ FRAME_INTERPOLATION_MODELS=(
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
+# Modular pinning for custom nodes
+# Map: folder name -> commit/tag. Extend/override via COMFY_NODE_PINS env var.
+# Example: COMFY_NODE_PINS="ComfyUI-Impact-Pack=4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259,ComfyUI-Manager=v2.22"
+declare -A NODE_PINS
+# Defaults from furry_all_v7.sh where available; latest HEAD otherwise
+NODE_PINS[ComfyUI-Impact-Pack]="4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259"
+NODE_PINS[comfyui_controlnet_aux]="cc6b232f4a47f0cdf70f4e1bfa24b74bd0d75bf1"
+NODE_PINS[ComfyUI-Impact-Subpack]="50c7b71a6a224734cc9b21963c6d1926816a97f1"
+NODE_PINS[ComfyUI-KJNodes]="3fcd22f2fe2be69c3229f192362b91888277cbcb"
+NODE_PINS[ComfyUI-Manager]="b5a2bed5396e6be8a2d1970793f5ce2f1e74c8c2"
+NODE_PINS[ComfyUI_essentials]="9d9f4bedfc9f0321c19faf71855e228c93bd0dc9"
+NODE_PINS[was-node-suite-comfyui]="ea935d1044ae5a26efa54ebeb18fe9020af49a45"
+NODE_PINS[ComfyUI_Comfyroll_CustomNodes]="d78b780ae43fcf8c6b7c6505e6ffb4584281ceca"
+NODE_PINS[easy-comfy-nodes-async]="45cc063f5fe5dd81d9bfc7204000509e76baa7fb"
+NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
+NODE_PINS[LoopsGroundingDino]="8d84e5501d147d974ba4b6bfeb5de67c324523a0"
+NODE_PINS[ComfyUI-VideoHelperSuite]="08e8df15db24da292d4b7f943c460dc2ab442b24"
+
+# New repos (latest as of now)
+NODE_PINS[ComfyUI-Frame-Interpolation]="a969c01dbccd9e5510641be04eb51fe93f6bfc3d"
+NODE_PINS[ComfyUI-GGUF]="be2a08330d7ec232d684e50ab938870d7529471e"
+NODE_PINS[rgthree-comfy]="2b9eb36d3e1741e88dbfccade0e08137f7fa2bfb"
+NODE_PINS[ComfyUI-Custom-Scripts]="f2838ed5e59de4d73cde5c98354b87a8d3200190"
+NODE_PINS[ComfyUI-WanVideoWrapper]="4c4e7defc20e89d1e0e3f95ce2b9ec9cd743db74"
+
+function load_node_pins_from_env() {
+    [[ -z "$COMFY_NODE_PINS" ]] && return 0
+    local payload entries
+    payload="$COMFY_NODE_PINS"
+    payload="${payload// /,}"
+    IFS=',' read -r -a entries <<< "$payload"
+    for entry in "${entries[@]}"; do
+        [[ -z "$entry" ]] && continue
+        local name="${entry%%=*}"
+        local ref="${entry#*=}"
+        if [[ -n "$name" && -n "$ref" ]]; then
+            NODE_PINS["$name"]="$ref"
+        fi
+    done
+}
+
+function pin_node_if_requested() {
+    local dir="$1"; shift
+    local path="$1"
+    local pin_ref="${NODE_PINS[$dir]}"
+    if [[ -n "$pin_ref" ]]; then
+        printf "Pinning %s to %s...\n" "$dir" "$pin_ref"
+        (
+            cd "$path" && git fetch --all --tags && git checkout --force "$pin_ref"
+        ) || echo "WARN: Failed to pin $dir to $pin_ref"
+    fi
+}
+
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
@@ -209,6 +262,7 @@ function provisioning_start() {
     provisioning_print_header
     provisioning_update_comfyui
     provisioning_get_apt_packages
+    load_node_pins_from_env
     provisioning_get_nodes
     provisioning_get_pip_packages
     provisioning_get_files \
@@ -268,19 +322,22 @@ function provisioning_get_pip_packages() {
 function provisioning_get_nodes() {
     for repo in "${NODES[@]}"; do
         dir="${repo##*/}"
+        dir="${dir%.git}"
         path="${COMFYUI_DIR}/custom_nodes/${dir}"
         requirements="${path}/requirements.txt"
         if [[ -d $path ]]; then
             if [[ ${AUTO_UPDATE,,} != "false" ]]; then
                 printf "Updating node: %s...\n" "${repo}"
                 ( cd "$path" && git config --global --add safe.directory "$(pwd)" && git pull )
-                if [[ -e $requirements ]]; then
-                   pip install --no-cache-dir -r "$requirements"
-                fi
+            fi
+            pin_node_if_requested "$dir" "$path"
+            if [[ -e $requirements ]]; then
+               pip install --no-cache-dir -r "$requirements"
             fi
         else
             printf "Downloading node: %s...\n" "${repo}"
             git clone "${repo}" "${path}" --recursive
+            pin_node_if_requested "$dir" "$path"
             if [[ -e $requirements ]]; then
                 pip install --no-cache-dir -r "${requirements}"
             fi
