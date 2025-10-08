@@ -72,6 +72,41 @@ CONTROLNET_MODELS=(
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
+# Modular pinning for custom nodes
+# Map: folder name -> commit/tag. Extend/override via COMFY_NODE_PINS env var.
+# Example: COMFY_NODE_PINS="ComfyUI-Impact-Pack=4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259,ComfyUI-Manager=v2.22"
+declare -A NODE_PINS
+# Default pin per request
+NODE_PINS[ComfyUI-Impact-Pack]="4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259"
+
+function load_node_pins_from_env() {
+    [[ -z "$COMFY_NODE_PINS" ]] && return 0
+    local payload entries
+    payload="$COMFY_NODE_PINS"
+    payload="${payload// /,}"
+    IFS=',' read -r -a entries <<< "$payload"
+    for entry in "${entries[@]}"; do
+        [[ -z "$entry" ]] && continue
+        local name="${entry%%=*}"
+        local ref="${entry#*=}"
+        if [[ -n "$name" && -n "$ref" ]]; then
+            NODE_PINS["$name"]="$ref"
+        fi
+    done
+}
+
+function pin_node_if_requested() {
+    local dir="$1"; shift
+    local path="$1"
+    local pin_ref="${NODE_PINS[$dir]}"
+    if [[ -n "$pin_ref" ]]; then
+        printf "Pinning %s to %s...\n" "$dir" "$pin_ref"
+        (
+            cd "$path" && git fetch --all --tags && git checkout --force "$pin_ref"
+        ) || echo "WARN: Failed to pin $dir to $pin_ref"
+    fi
+}
+
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
@@ -100,6 +135,7 @@ function provisioning_start() {
     provisioning_print_header
     provisioning_update_comfyui
     provisioning_get_apt_packages
+    load_node_pins_from_env
     provisioning_get_nodes
     provisioning_get_pip_packages
     provisioning_get_files \
@@ -150,19 +186,22 @@ function provisioning_get_pip_packages() {
 function provisioning_get_nodes() {
     for repo in "${NODES[@]}"; do
         dir="${repo##*/}"
+        dir="${dir%.git}"
         path="${COMFYUI_DIR}/custom_nodes/${dir}"
         requirements="${path}/requirements.txt"
         if [[ -d $path ]]; then
             if [[ ${AUTO_UPDATE,,} != "false" ]]; then
                 printf "Updating node: %s...\n" "${repo}"
                 ( cd "$path" && git pull )
-                if [[ -e $requirements ]]; then
-                   pip install --no-cache-dir -r "$requirements"
-                fi
+            fi
+            pin_node_if_requested "$dir" "$path"
+            if [[ -e $requirements ]]; then
+               pip install --no-cache-dir -r "$requirements"
             fi
         else
             printf "Downloading node: %s...\n" "${repo}"
             git clone "${repo}" "${path}" --recursive
+            pin_node_if_requested "$dir" "$path"
             if [[ -e $requirements ]]; then
                 pip install --no-cache-dir -r "${requirements}"
             fi
