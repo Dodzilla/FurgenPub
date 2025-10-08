@@ -42,6 +42,7 @@ NODES=(
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
     "https://github.com/Dodzilla/LoopsGroundingDino"
+    "https://github.com/1038lab/ComfyUI-RMBG"
 
     # Other nodes
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
@@ -197,6 +198,7 @@ NODE_PINS[ComfyUI_Comfyroll_CustomNodes]="d78b780ae43fcf8c6b7c6505e6ffb4584281ce
 NODE_PINS[easy-comfy-nodes-async]="45cc063f5fe5dd81d9bfc7204000509e76baa7fb"
 NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
 NODE_PINS[LoopsGroundingDino]="8d84e5501d147d974ba4b6bfeb5de67c324523a0"
+NODE_PINS[ComfyUI-RMBG]="b28ce10b51e1d505a2ebf2608184119f0cf662d3"
 NODE_PINS[ComfyUI-VideoHelperSuite]="08e8df15db24da292d4b7f943c460dc2ab442b24"
 
 # New repos (latest as of now)
