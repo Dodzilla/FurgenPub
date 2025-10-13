@@ -147,6 +147,8 @@ LORA_MODELS=(
     # https://civitai.com/models/1875500/mating-press-wan-22?modelVersionId=2122806
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22_mating_press_high.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22_mating_press_low.safetensors"
+
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
 )
 
 VAE_MODELS=(
