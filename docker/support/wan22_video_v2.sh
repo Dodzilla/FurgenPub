@@ -148,6 +148,10 @@ LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22_mating_press_high.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22_mating_press_low.safetensors"
 
+    # https://civitai.com/models/1811313?modelVersionId=2190476
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22_DR34ML4Y_I2V_14B_HIGH.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22_DR34ML4Y_I2V_14B_LOW.safetensors"
+
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
 )
 
