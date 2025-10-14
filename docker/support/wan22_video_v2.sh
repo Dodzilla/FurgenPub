@@ -15,6 +15,9 @@ PIP_PACKAGES=(
     "triton"
     "sageattention"
     "onnxruntime"
+    # Ensure Impact-Pack imports succeed even if its requirements
+    # fail due to VCS deps (e.g., git+sam2). piexif is small and safe.
+    "piexif"
 )
 
 NODES=(
@@ -245,7 +248,7 @@ function pin_node_if_requested() {
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
-        printf "Updating ComfyUI to pinned version (483b3e6)...\n"
+        printf "Updating ComfyUI to pinned version (b873051)...\n"
         (
             cd "${COMFYUI_DIR}"
             git config --global --add safe.directory "$(pwd)"
@@ -272,6 +275,8 @@ function provisioning_start() {
     provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes
+    # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
+    provisioning_ensure_node_requirements
     provisioning_get_pip_packages
     provisioning_get_files \
         "${COMFYUI_DIR}/models/sam2" \
@@ -350,6 +355,19 @@ function provisioning_get_nodes() {
                 pip install --no-cache-dir -r "${requirements}"
             fi
         fi
+    done
+}
+
+# Best-effort: for all custom nodes with a requirements.txt,
+# attempt to apply them again to cover cases where a VCS line
+# (e.g., git+https) caused the resolver to abort before installing
+# lightweight deps like piexif used by Impact-Pack.
+function provisioning_ensure_node_requirements() {
+    shopt -s nullglob
+    local req
+    for req in "${COMFYUI_DIR}"/custom_nodes/*/requirements.txt; do
+        printf "Re-applying requirements: %s\n" "$req"
+        pip install --no-cache-dir -r "$req" || true
     done
 }
 
