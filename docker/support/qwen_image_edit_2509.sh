@@ -25,7 +25,7 @@ EMBEDDING_MODELS=(
 )
 UNET_MODELS=(
     # Qwen Image Edit 2509 diffusion model (UNet) – FP8
-    "https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors"
+    "https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image/qwen_image_fp8_e4m3fn_scaled.safetensors"
 )
 TEXT_ENCODER_MODELS=(
     # Qwen 2.5 VL (7B) text encoder FP8
@@ -37,7 +37,7 @@ VAE_MODELS=(
 )
 LORA_MODELS=(
     # (optional) Qwen-Image-Edit Lightning LoRA for faster convergence (8-step version)
-    "https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image-Lightning-8steps-V1.0.safetensors"
+    "https://huggingface.co/lightx2v/Qwen-Image-Lightning/resolve/main/Qwen-Image-Lightning-4steps-V2.0.safetensors"
 )
 
 CONTROLNET_MODELS=(
