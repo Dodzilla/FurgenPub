@@ -26,7 +26,7 @@ EMBEDDING_MODELS=(
 )
 UNET_MODELS=(
     # Qwen Image Edit 2509 diffusion model (UNet) – FP8
-    "https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/blob/main/split_files/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors"
+    "https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors"
 )
 TEXT_ENCODER_MODELS=(
     # Qwen 2.5 VL (7B) text encoder FP8
