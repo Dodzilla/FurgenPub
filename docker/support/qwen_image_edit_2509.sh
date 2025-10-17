@@ -10,6 +10,7 @@ APT_PACKAGES=(
 PIP_PACKAGES=(
 )
 NODES=(
+    "https://github.com/Dodzilla/easy-comfy-nodes-async"
 )
 WORKFLOWS=()
 
