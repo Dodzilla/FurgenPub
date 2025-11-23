@@ -77,6 +77,7 @@ NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
 NODE_PINS[LoopsGroundingDino]="8d84e5501d147d974ba4b6bfeb5de67c324523a0"
 NODE_PINS[ComfyUI-RMBG]="b28ce10b51e1d505a2ebf2608184119f0cf662d3"
 NODE_PINS[ComfyUI-VideoHelperSuite]="08e8df15db24da292d4b7f943c460dc2ab442b24"
+NODE_PINS[Comfyui-SecNodes]="06174be0ac4267b472adb7b2d1b4e05c138ee1a3"
 
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
