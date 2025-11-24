@@ -10,8 +10,6 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    "transformers>=4.37.0,<5.0.0"
-    "peft>=0.10.0"
 )
 
 NODES=(
@@ -22,7 +20,7 @@ NODES=(
     "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
     "https://github.com/Fannovel16/comfyui_controlnet_aux"
     "https://github.com/1038lab/ComfyUI-RMBG"
-    "https://github.com/9nate-drake/Comfyui-SecNodes"
+    "https://github.com/PozzettiAndrea/ComfyUI-SAM3"
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
@@ -41,8 +39,8 @@ BBOX_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/face_yolov8m.pt"
 )
 
-SAMS_MODELS=(
-    "https://huggingface.co/VeryAladeen/Sec-4B/resolve/main/SeC-4B-bf16.safetensors"
+SAM3_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/sam3.pt"
 )
 
 UNET_MODELS=(
@@ -78,7 +76,6 @@ NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
 NODE_PINS[LoopsGroundingDino]="8d84e5501d147d974ba4b6bfeb5de67c324523a0"
 NODE_PINS[ComfyUI-RMBG]="b28ce10b51e1d505a2ebf2608184119f0cf662d3"
 NODE_PINS[ComfyUI-VideoHelperSuite]="08e8df15db24da292d4b7f943c460dc2ab442b24"
-NODE_PINS[Comfyui-SecNodes]="06174be0ac4267b472adb7b2d1b4e05c138ee1a3"
 
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
@@ -140,8 +137,8 @@ function provisioning_start() {
     provisioning_get_nodes
     provisioning_get_pip_packages
     provisioning_get_files \
-        "${COMFYUI_DIR}/models/sams" \
-        "${SAMS_MODELS[@]}"
+        "${COMFYUI_DIR}/models/sam3" \
+        "${SAM3_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
