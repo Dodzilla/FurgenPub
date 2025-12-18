@@ -75,6 +75,9 @@ SAM2_MODELS=(
 )
 
 LORA_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/SVI_Wan2.2-I2V-A14B_high_noise_lora_v2.0.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/SVI_Wan2.2-I2V-A14B_low_noise_lora_v2.0.safetensors"
+
     # https://civitai.com/models/1954774?modelVersionId=2212384
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22-cunilingus-I2V-106epoc-high.safetensors"
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22-cunilingus-I2V-72epoc-low.safetensors"
