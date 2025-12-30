@@ -75,8 +75,8 @@ SAM2_MODELS=(
 )
 
 LORA_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/SVI_Wan2.2-I2V-A14B_high_noise_lora_v2.0.safetensors"
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/SVI_Wan2.2-I2V-A14B_low_noise_lora_v2.0.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/SVI_Wan2.2-I2V-A14B_high_noise_lora_v2.0_pro.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/SVI_Wan2.2-I2V-A14B_low_noise_lora_v2.0_pro.safetensors"
 
     # https://civitai.com/models/1954774?modelVersionId=2212384
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/wan22-cunilingus-I2V-106epoc-high.safetensors"
@@ -199,7 +199,7 @@ declare -A NODE_PINS
 NODE_PINS[ComfyUI-Impact-Pack]="4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259"
 NODE_PINS[comfyui_controlnet_aux]="cc6b232f4a47f0cdf70f4e1bfa24b74bd0d75bf1"
 NODE_PINS[ComfyUI-Impact-Subpack]="50c7b71a6a224734cc9b21963c6d1926816a97f1"
-NODE_PINS[ComfyUI-KJNodes]="3fcd22f2fe2be69c3229f192362b91888277cbcb"
+NODE_PINS[ComfyUI-KJNodes]="7b1327192e4729085788a3020a9cbb095e0c7811"
 NODE_PINS[ComfyUI-Manager]="b5a2bed5396e6be8a2d1970793f5ce2f1e74c8c2"
 NODE_PINS[ComfyUI_essentials]="9d9f4bedfc9f0321c19faf71855e228c93bd0dc9"
 NODE_PINS[was-node-suite-comfyui]="ea935d1044ae5a26efa54ebeb18fe9020af49a45"
@@ -215,7 +215,7 @@ NODE_PINS[ComfyUI-Frame-Interpolation]="a969c01dbccd9e5510641be04eb51fe93f6bfc3d
 NODE_PINS[ComfyUI-GGUF]="be2a08330d7ec232d684e50ab938870d7529471e"
 NODE_PINS[rgthree-comfy]="2b9eb36d3e1741e88dbfccade0e08137f7fa2bfb"
 NODE_PINS[ComfyUI-Custom-Scripts]="f2838ed5e59de4d73cde5c98354b87a8d3200190"
-NODE_PINS[ComfyUI-WanVideoWrapper]="4c4e7defc20e89d1e0e3f95ce2b9ec9cd743db74"
+NODE_PINS[ComfyUI-WanVideoWrapper]="b982b4ef0c41cb1c83ae53980860c3598a53814e"
 
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
