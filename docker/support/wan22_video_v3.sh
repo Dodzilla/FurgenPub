@@ -66,12 +66,6 @@ UNET_MODELS=(
 )
 
 GROUNDING_MODELS=(
-    "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/GroundingDINO_SwinB.cfg.py"
-    "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/groundingdino_swinb_cogcoor.pth"
-)
-
-SAM2_MODELS=(
-    "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt"
 )
 
 LORA_MODELS=(
@@ -163,6 +157,7 @@ VAE_MODELS=(
 
 TEXT_ENCODERS_MODELS=(
     "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-fp8_e4m3fn.safetensors"
 )
 
 UPSCALE_MODELS=(
@@ -193,10 +188,10 @@ FRAME_INTERPOLATION_MODELS=(
 
 # Modular pinning for custom nodes
 # Map: folder name -> commit/tag. Extend/override via COMFY_NODE_PINS env var.
-# Example: COMFY_NODE_PINS="ComfyUI-Impact-Pack=4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259,ComfyUI-Manager=v2.22"
+# Example: COMFY_NODE_PINS="ComfyUI-Impact-Pack=61bd8397a18e7e7668e6a24e95168967768c2bed,ComfyUI-Manager=v2.22"
 declare -A NODE_PINS
 # Defaults from furry_all_v7.sh where available; latest HEAD otherwise
-NODE_PINS[ComfyUI-Impact-Pack]="4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259"
+NODE_PINS[ComfyUI-Impact-Pack]="61bd8397a18e7e7668e6a24e95168967768c2bed"
 NODE_PINS[comfyui_controlnet_aux]="cc6b232f4a47f0cdf70f4e1bfa24b74bd0d75bf1"
 NODE_PINS[ComfyUI-Impact-Subpack]="50c7b71a6a224734cc9b21963c6d1926816a97f1"
 NODE_PINS[ComfyUI-KJNodes]="7b1327192e4729085788a3020a9cbb095e0c7811"
@@ -248,7 +243,7 @@ function pin_node_if_requested() {
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
-        printf "Updating ComfyUI to pinned version (b873051)...\n"
+        printf "Updating ComfyUI to pinned version (d7111e4)...\n"
         (
             cd "${COMFYUI_DIR}"
             git config --global --add safe.directory "$(pwd)"
@@ -256,7 +251,7 @@ function provisioning_update_comfyui() {
             echo "DEBUG: Fetching git updates..."
             git fetch
             echo "DEBUG: Checking out pinned commit..."
-            git checkout b873051
+            git checkout d7111e426a48127a97922227b03d31391eb4eba2
         )
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
@@ -278,12 +273,6 @@ function provisioning_start() {
     # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
     provisioning_ensure_node_requirements
     provisioning_get_pip_packages
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/sam2" \
-        "${SAM2_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/grounding-dino" \
-        "${GROUNDING_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
