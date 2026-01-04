@@ -33,6 +33,9 @@ WORKFLOWS=(
 
 CHECKPOINT_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
+)
+
+DIFFUSION_MODELS=(
     "https://huggingface.co/tewea/z_image_turbo_bf16_nsfw/resolve/main/z_image_turbo_bf16_nsfw_v2.safetensors"
 )
 
@@ -150,6 +153,9 @@ function provisioning_start() {
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/diffusion_models" \
+        "${DIFFUSION_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/ultralytics/bbox" \
         "${BBOX_MODELS[@]}"
