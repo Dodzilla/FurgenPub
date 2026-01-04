@@ -44,6 +44,10 @@ SAM3_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/sam3.pt"
 )
 
+TEXT_ENCODERS=(
+    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
+)
+
 UNET_MODELS=(
 )
 
@@ -53,6 +57,10 @@ LORA_MODELS=(
 
 CONTROLNET_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
+)
+
+VAE_MODELS=(
+    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors"
 )
 
 
@@ -160,6 +168,9 @@ function provisioning_start() {
     provisioning_get_files \
         "${COMFYUI_DIR}/models/upscale_models" \
         "${UPSCALE_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/text_encoders" \
+        "${TEXT_ENCODERS[@]}"
     provisioning_print_end
 }
 
