@@ -20,6 +20,13 @@ HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}"
 [[ "$__xtrace_was_on" -eq 1 ]] && set -x
 unset __xtrace_was_on
 
+# PyTorch: ensure we meet minimum version required by some nodes/workflows.
+# Default: 2.9.0 (override via env `PYTORCH_MIN_VERSION`).
+PYTORCH_MIN_VERSION="${PYTORCH_MIN_VERSION:-2.9.0}"
+# Optional override for where to install torch wheels from (e.g. https://download.pytorch.org/whl/cu124).
+# If unset, we infer it from the currently installed torch CUDA build (or fall back to CPU wheels).
+PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-${TORCH_INDEX_URL:-}}"
+
 # Packages are installed after nodes so we can fix them...
 
 APT_PACKAGES=(
@@ -67,6 +74,7 @@ NODES=(
     # Other nodes
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/evanspearman/ComfyMath"
+    "https://github.com/ClownsharkBatwing/RES4LYF"
 )
 
 WORKFLOWS=(
@@ -89,6 +97,7 @@ GROUNDING_MODELS=(
 
 LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
+    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-lora-384.safetensors"
 )
 
 VAE_MODELS=(
@@ -212,9 +221,101 @@ function provisioning_update_comfyui() {
     fi
 }
 
+function provisioning_update_pytorch() {
+    # Allow opting out in case the base image already provides a working build.
+    if [[ "${PYTORCH_UPDATE,,}" == "false" || "${PYTORCH_UPDATE}" == "0" ]]; then
+        echo "Skipping PyTorch update (PYTORCH_UPDATE=${PYTORCH_UPDATE})."
+        return 0
+    fi
+
+    local kv min current cuda index need
+    kv="$(
+        PYTORCH_MIN_VERSION="${PYTORCH_MIN_VERSION}" \
+        PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL}" \
+        python - <<'PY'
+import os
+import re
+
+min_version = os.environ.get("PYTORCH_MIN_VERSION") or "2.9.0"
+index_url = os.environ.get("PYTORCH_INDEX_URL") or ""
+
+def normalize(v: str):
+    v = v.split("+", 1)[0]
+    try:
+        from packaging.version import Version  # type: ignore
+        return Version(v)
+    except Exception:
+        nums = [int(x) for x in re.findall(r"\d+", v)[:3]]
+        while len(nums) < 3:
+            nums.append(0)
+        return tuple(nums)
+
+current = ""
+cuda = ""
+try:
+    import torch  # type: ignore
+    current = getattr(torch, "__version__", "") or ""
+    cuda = getattr(getattr(torch, "version", None), "cuda", "") or ""
+except Exception:
+    pass
+
+need_upgrade = 1
+if current:
+    try:
+        need_upgrade = 1 if normalize(current) < normalize(min_version) else 0
+    except Exception:
+        need_upgrade = 1
+
+if not index_url:
+    if cuda:
+        m = re.match(r"^(\d+)\.(\d+)", str(cuda))
+        if m:
+            index_url = f"https://download.pytorch.org/whl/cu{m.group(1)}{m.group(2)}"
+        else:
+            index_url = "https://download.pytorch.org/whl/cpu"
+    else:
+        index_url = "https://download.pytorch.org/whl/cpu"
+
+print(f"PYTORCH_MIN_VERSION={min_version}")
+print(f"CURRENT_TORCH_VERSION={current}")
+print(f"CURRENT_CUDA_VERSION={cuda}")
+print(f"INDEX_URL={index_url}")
+print(f"NEED_UPGRADE={need_upgrade}")
+PY
+    )"
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            PYTORCH_MIN_VERSION) min="$value" ;;
+            CURRENT_TORCH_VERSION) current="$value" ;;
+            CURRENT_CUDA_VERSION) cuda="$value" ;;
+            INDEX_URL) index="$value" ;;
+            NEED_UPGRADE) need="$value" ;;
+        esac
+    done <<< "$kv"
+
+    if [[ "${need:-1}" == "0" ]]; then
+        echo "PyTorch already ${current} (>= ${min}); skipping."
+        return 0
+    fi
+
+    echo "Upgrading PyTorch (current=${current:-none}, cuda=${cuda:-none}) -> >= ${min} using ${index} ..."
+    if ! pip install --no-cache-dir --upgrade --index-url "${index}" "torch>=${min}" torchvision torchaudio; then
+        echo "WARN: PyTorch upgrade failed; continuing provisioning."
+        return 1
+    fi
+
+    python - <<'PY'
+import torch  # type: ignore
+print(f"PyTorch now: {torch.__version__}")
+print(f"CUDA: {getattr(torch.version, 'cuda', None)}")
+PY
+}
+
 function provisioning_start() {
     provisioning_print_header
     provisioning_update_comfyui
+    provisioning_update_pytorch
     provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes
