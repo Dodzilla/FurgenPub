@@ -74,6 +74,7 @@ WORKFLOWS=(
 
 CHECKPOINT_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
+    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-fp8.safetensors"
 )
 
 BBOX_MODELS=(
@@ -114,6 +115,10 @@ CLIPVISION_MODELS=(
     "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"
 )
 
+LATENT_UPSCALE_MODELS=(
+    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+)
+
 FRAME_INTERPOLATION_MODELS=(
     "https://huggingface.co/nguu/film-pytorch/resolve/887b2c42bebcb323baf6c3b6d59304135699b575/film_net_fp32.pt"
 )
@@ -125,7 +130,7 @@ FRAME_INTERPOLATION_MODELS=(
 # - `GEMMA_REPO_ID` (default below)
 # - `GEMMA_DEST_DIR` (default below)
 GEMMA_REPO_ID="${GEMMA_REPO_ID:-google/gemma-3-12b-it-qat-q4_0-unquantized}"
-GEMMA_DEST_DIR="${GEMMA_DEST_DIR:-${COMFYUI_DIR}/models/llm/${GEMMA_REPO_ID##*/}}"
+GEMMA_DEST_DIR="${GEMMA_DEST_DIR:-${COMFYUI_DIR}/models/text_encoders/${GEMMA_REPO_ID##*/}}"
 GEMMA_DOWNLOAD="${GEMMA_DOWNLOAD:-true}"
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
@@ -250,6 +255,9 @@ function provisioning_start() {
     provisioning_get_files \
         "${COMFYUI_DIR}/models/frame_interpolation" \
         "${FRAME_INTERPOLATION_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/latent_upscale_models" \
+        "${LATENT_UPSCALE_MODELS[@]}"
     provisioning_print_end
 }
 
