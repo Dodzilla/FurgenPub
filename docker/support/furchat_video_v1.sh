@@ -1,31 +1,54 @@
 #!/bin/bash
 
+set -x
+
 source /venv/main/bin/activate
 COMFYUI_DIR=${WORKSPACE}/ComfyUI
 
 # Packages are installed after nodes so we can fix them...
 
 APT_PACKAGES=(
-    #"package-2"
 )
 
 PIP_PACKAGES=(
+    "flash_attn"
+    "triton"
+    "sageattention"
+    "onnxruntime"
+    # Ensure Impact-Pack imports succeed even if its requirements
+    # fail due to VCS deps (e.g., git+sam2). piexif is small and safe.
+    "piexif"
 )
 
 NODES=(
-    "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
-    "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
-    "https://github.com/cubiq/ComfyUI_essentials"
-    "https://github.com/WASasquatch/was-node-suite-comfyui"
-    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
-    "https://github.com/Fannovel16/comfyui_controlnet_aux"
-    "https://github.com/1038lab/ComfyUI-RMBG"
-    "https://github.com/PozzettiAndrea/ComfyUI-SAM3"
     "https://github.com/ltdrdata/ComfyUI-Manager"
-    "https://github.com/Dodzilla/easy-comfy-nodes-async"
-    "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
-    "https://github.com/kijai/ComfyUI-KJNodes"
+    "https://github.com/cubiq/ComfyUI_essentials"
+
+    # Video processing nodes
+    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
+    "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation"
+    "https://github.com/city96/ComfyUI-GGUF"
+    "https://github.com/Lightricks/ComfyUI-LTXVideo"
+
+    # Helper nodes
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
     "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
+    "https://github.com/rgthree/rgthree-comfy"
+    "https://github.com/pythongosssss/ComfyUI-Custom-Scripts"
+    "https://github.com/WASasquatch/was-node-suite-comfyui"
+
+    # WanVideo nodes
+    "https://github.com/kijai/ComfyUI-WanVideoWrapper"
+    "https://github.com/kijai/ComfyUI-KJNodes"
+
+    # Furry/ControlNet nodes
+    "https://github.com/Fannovel16/comfyui_controlnet_aux"
+    "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
+    "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
+    "https://github.com/Dodzilla/LoopsGroundingDino"
+
+    # Other nodes
+    "https://github.com/Dodzilla/easy-comfy-nodes-async"
 )
 
 WORKFLOWS=(
@@ -35,47 +58,56 @@ CHECKPOINT_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
 )
 
-DIFFUSION_MODELS=(
-    "https://huggingface.co/tewea/z_image_turbo_bf16_nsfw/resolve/main/z_image_turbo_bf16_nsfw_v2.safetensors"
-)
-
 BBOX_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/face_yolov8m.pt"
 )
 
-SAM3_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/sam3.pt"
-)
-
-TEXT_ENCODERS=(
-    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors"
-)
-
 UNET_MODELS=(
+)
+
+GROUNDING_MODELS=(
 )
 
 LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
 )
 
+VAE_MODELS=(
+    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_fp32.safetensors"
+)
+
+TEXT_ENCODERS_MODELS=(
+    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-fp8_e4m3fn.safetensors"
+)
+
+UPSCALE_MODELS=(
+    "https://huggingface.co/ai-forever/Real-ESRGAN/resolve/main/RealESRGAN_x2.pth"
+)
+
 CONTROLNET_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
 )
 
-VAE_MODELS=(
-    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors"
+# Added arrays to mirror wan_video_full.sh
+DIFFUSION_MODELS=(
 )
 
+CLIPVISION_MODELS=(
+    "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"
+)
 
+FRAME_INTERPOLATION_MODELS=(
+    "https://huggingface.co/nguu/film-pytorch/resolve/887b2c42bebcb323baf6c3b6d59304135699b575/film_net_fp32.pt"
+)
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
 # Modular pinning for custom nodes
 # Map: folder name -> commit/tag. Extend/override via COMFY_NODE_PINS env var.
-# Example: COMFY_NODE_PINS="ComfyUI-Impact-Pack=4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259,ComfyUI-Manager=v2.22"
+# Example: COMFY_NODE_PINS="ComfyUI-Impact-Pack=61bd8397a18e7e7668e6a24e95168967768c2bed,ComfyUI-Manager=v2.22"
 declare -A NODE_PINS
-# Default pin per request
-NODE_PINS[ComfyUI-Impact-Pack]="4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259"
+# Defaults from furry_all_v7.sh where available; latest HEAD otherwise
+NODE_PINS[ComfyUI-Impact-Pack]="61bd8397a18e7e7668e6a24e95168967768c2bed"
 NODE_PINS[comfyui_controlnet_aux]="cc6b232f4a47f0cdf70f4e1bfa24b74bd0d75bf1"
 NODE_PINS[ComfyUI-Impact-Subpack]="50c7b71a6a224734cc9b21963c6d1926816a97f1"
 NODE_PINS[ComfyUI-KJNodes]="7b1327192e4729085788a3020a9cbb095e0c7811"
@@ -87,6 +119,13 @@ NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
 NODE_PINS[LoopsGroundingDino]="8d84e5501d147d974ba4b6bfeb5de67c324523a0"
 NODE_PINS[ComfyUI-RMBG]="b28ce10b51e1d505a2ebf2608184119f0cf662d3"
 NODE_PINS[ComfyUI-VideoHelperSuite]="08e8df15db24da292d4b7f943c460dc2ab442b24"
+
+# New repos (latest as of now)
+NODE_PINS[ComfyUI-Frame-Interpolation]="a969c01dbccd9e5510641be04eb51fe93f6bfc3d"
+NODE_PINS[ComfyUI-GGUF]="be2a08330d7ec232d684e50ab938870d7529471e"
+NODE_PINS[rgthree-comfy]="2b9eb36d3e1741e88dbfccade0e08137f7fa2bfb"
+NODE_PINS[ComfyUI-Custom-Scripts]="f2838ed5e59de4d73cde5c98354b87a8d3200190"
+NODE_PINS[ComfyUI-WanVideoWrapper]="b982b4ef0c41cb1c83ae53980860c3598a53814e"
 
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
@@ -119,7 +158,7 @@ function pin_node_if_requested() {
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
-        printf "Updating ComfyUI to pinned version (9a552df)...\n"
+        printf "Updating ComfyUI to pinned version (3cd7b32)...\n"
         (
             cd "${COMFYUI_DIR}"
             git config --global --add safe.directory "$(pwd)"
@@ -127,7 +166,7 @@ function provisioning_update_comfyui() {
             echo "DEBUG: Fetching git updates..."
             git fetch
             echo "DEBUG: Checking out pinned commit..."
-            git checkout 9a552df898ec57f066784cc1f7c475644099b3c1
+            git checkout 3cd7b32f1b7e7e90395cefe7d9f9b1f89276d8ce
         )
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
@@ -146,16 +185,12 @@ function provisioning_start() {
     provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes
+    # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
+    provisioning_ensure_node_requirements
     provisioning_get_pip_packages
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/sam3" \
-        "${SAM3_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/diffusion_models" \
-        "${DIFFUSION_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/ultralytics/bbox" \
         "${BBOX_MODELS[@]}"
@@ -172,11 +207,20 @@ function provisioning_start() {
         "${COMFYUI_DIR}/models/vae" \
         "${VAE_MODELS[@]}"
     provisioning_get_files \
+        "${COMFYUI_DIR}/models/text_encoders" \
+        "${TEXT_ENCODERS_MODELS[@]}"
+    provisioning_get_files \
         "${COMFYUI_DIR}/models/upscale_models" \
         "${UPSCALE_MODELS[@]}"
     provisioning_get_files \
-        "${COMFYUI_DIR}/models/text_encoders" \
-        "${TEXT_ENCODERS[@]}"
+        "${COMFYUI_DIR}/models/diffusion_models" \
+        "${DIFFUSION_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/clip_vision" \
+        "${CLIPVISION_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/frame_interpolation" \
+        "${FRAME_INTERPOLATION_MODELS[@]}"
     provisioning_print_end
 }
 
@@ -201,7 +245,7 @@ function provisioning_get_nodes() {
         if [[ -d $path ]]; then
             if [[ ${AUTO_UPDATE,,} != "false" ]]; then
                 printf "Updating node: %s...\n" "${repo}"
-                ( cd "$path" && git pull )
+                ( cd "$path" && git config --global --add safe.directory "$(pwd)" && git pull )
             fi
             pin_node_if_requested "$dir" "$path"
             if [[ -e $requirements ]]; then
@@ -215,6 +259,19 @@ function provisioning_get_nodes() {
                 pip install --no-cache-dir -r "${requirements}"
             fi
         fi
+    done
+}
+
+# Best-effort: for all custom nodes with a requirements.txt,
+# attempt to apply them again to cover cases where a VCS line
+# (e.g., git+https) caused the resolver to abort before installing
+# lightweight deps like piexif used by Impact-Pack.
+function provisioning_ensure_node_requirements() {
+    shopt -s nullglob
+    local req
+    for req in "${COMFYUI_DIR}"/custom_nodes/*/requirements.txt; do
+        printf "Re-applying requirements: %s\n" "$req"
+        pip install --no-cache-dir -r "$req" || true
     done
 }
 
@@ -293,6 +350,10 @@ function provisioning_download() {
 }
 
 # Allow user to disable provisioning if they started with a script they didn't want
+echo "DEBUG: Checking for /.noprovisioning file..."
 if [[ ! -f /.noprovisioning ]]; then
+    echo "DEBUG: /.noprovisioning not found. Starting provisioning process."
     provisioning_start
+else
+    echo "DEBUG: /.noprovisioning found. Skipping provisioning."
 fi
