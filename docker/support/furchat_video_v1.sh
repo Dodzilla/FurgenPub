@@ -8,6 +8,7 @@ COMFYUI_DIR=${WORKSPACE}/ComfyUI
 # NOTE:
 # - Do NOT put Hugging Face tokens in this file (or in git clone URLs).
 # - Export `HF_TOKEN` (or `HUGGINGFACE_HUB_TOKEN`) in the container environment instead.
+# - If you get HTTP 403 for Gemma repos, you likely need to accept the model license on Hugging Face first.
 
 # Allow either env var name; keep existing `HF_TOKEN` usage below.
 # Avoid leaking tokens in logs if xtrace is enabled.
@@ -29,6 +30,8 @@ PIP_PACKAGES=(
     "triton"
     "sageattention"
     "onnxruntime"
+    # For authenticated snapshot downloads from Hugging Face (avoids git/LFS auth issues)
+    "huggingface_hub>=0.20.0"
     # Ensure Impact-Pack imports succeed even if its requirements
     # fail due to VCS deps (e.g., git+sam2). piexif is small and safe.
     "piexif"
@@ -114,6 +117,16 @@ CLIPVISION_MODELS=(
 FRAME_INTERPOLATION_MODELS=(
     "https://huggingface.co/nguu/film-pytorch/resolve/887b2c42bebcb323baf6c3b6d59304135699b575/film_net_fp32.pt"
 )
+
+# Hugging Face repo snapshots (download the whole repo into a folder).
+# Used for LLM/GGUF/etc where a single "resolve/main/file" URL isn't enough.
+#
+# Override via env:
+# - `GEMMA_REPO_ID` (default below)
+# - `GEMMA_DEST_DIR` (default below)
+GEMMA_REPO_ID="${GEMMA_REPO_ID:-google/gemma-3-12b-it-qat-q4_0-unquantized}"
+GEMMA_DEST_DIR="${GEMMA_DEST_DIR:-${COMFYUI_DIR}/models/llm/${GEMMA_REPO_ID##*/}}"
+GEMMA_DOWNLOAD="${GEMMA_DOWNLOAD:-true}"
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
@@ -203,6 +216,7 @@ function provisioning_start() {
     # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
     provisioning_ensure_node_requirements
     provisioning_get_pip_packages
+    provisioning_download_gemma_repo
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
@@ -339,6 +353,94 @@ function provisioning_has_valid_hf_token() {
     else
         return 1
     fi
+}
+
+# Best-effort check whether the token can access a given model repo.
+# Returns:
+# - 0: accessible (200)
+# - 1: not accessible (401/403/429/other)
+function provisioning_hf_can_access_repo() {
+    local repo_id="$1"
+    [[ -n "$HF_TOKEN" ]] || return 1
+    local url="https://huggingface.co/api/models/${repo_id}"
+    local code
+
+    # Avoid leaking tokens in logs if xtrace is enabled.
+    local xtrace_was_on=0
+    case "$-" in
+        *x*) xtrace_was_on=1; set +x ;;
+    esac
+
+    code="$(curl -o /dev/null -s -w "%{http_code}" -X GET "$url" -H "Authorization: Bearer $HF_TOKEN")"
+
+    [[ "$xtrace_was_on" -eq 1 ]] && set -x
+    [[ "$code" -eq 200 ]]
+}
+
+function provisioning_download_hf_snapshot() {
+    local repo_id="$1"
+    local dest_dir="$2"
+
+    mkdir -p "$dest_dir"
+
+    if [[ -z "$HF_TOKEN" ]]; then
+        echo "WARN: HF_TOKEN is not set; skipping Hugging Face snapshot download for ${repo_id}"
+        echo "      Set HF_TOKEN (or HUGGINGFACE_HUB_TOKEN) in your container environment and reprovision."
+        return 0
+    fi
+
+    # Avoid leaking tokens in logs if xtrace is enabled.
+    local xtrace_was_on=0
+    case "$-" in
+        *x*) xtrace_was_on=1; set +x ;;
+    esac
+
+    HF_REPO_ID="$repo_id" HF_DEST_DIR="$dest_dir" python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+repo_id = os.environ["HF_REPO_ID"]
+dest_dir = os.environ["HF_DEST_DIR"]
+token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+snapshot_download(
+    repo_id=repo_id,
+    local_dir=dest_dir,
+    local_dir_use_symlinks=False,
+    resume_download=True,
+    token=token,
+)
+print(f"Downloaded {repo_id} -> {dest_dir}")
+PY
+
+    [[ "$xtrace_was_on" -eq 1 ]] && set -x
+}
+
+function provisioning_download_gemma_repo() {
+    local repo_id="$GEMMA_REPO_ID"
+    local dest_dir="$GEMMA_DEST_DIR"
+
+    if [[ "${GEMMA_DOWNLOAD,,}" == "false" || "${GEMMA_DOWNLOAD}" == "0" ]]; then
+        echo "Skipping Gemma download (GEMMA_DOWNLOAD=${GEMMA_DOWNLOAD})."
+        return 0
+    fi
+
+    echo "Preparing Gemma download: ${repo_id} -> ${dest_dir}"
+
+    if [[ -z "$HF_TOKEN" ]]; then
+        echo "WARN: HF_TOKEN not set; skipping Gemma download."
+        echo "      Set HF_TOKEN (or HUGGINGFACE_HUB_TOKEN) in your container environment."
+        return 0
+    fi
+
+    # Quick hint for common 403 cause (gated models).
+    if ! provisioning_hf_can_access_repo "$repo_id"; then
+        echo "WARN: Cannot confirm access to ${repo_id} with current HF_TOKEN."
+        echo "      If you see HTTP 403, open the model page on Hugging Face and accept the license/terms for this repo."
+        echo "      If you see HTTP 429, your egress IP may be rate-limited; changing outbound IP is the usual fix."
+    fi
+
+    provisioning_download_hf_snapshot "$repo_id" "$dest_dir"
 }
 
 function provisioning_has_valid_civitai_token() {
