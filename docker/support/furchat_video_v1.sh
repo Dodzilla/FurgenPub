@@ -67,6 +67,7 @@ NODES=(
     # Other nodes
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/evanspearman/ComfyMath"
+    "https://github.com/ClownsharkBatwing/RES4LYF"
 )
 
 WORKFLOWS=(
