@@ -73,8 +73,8 @@ WORKFLOWS=(
 )
 
 CHECKPOINT_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
-    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-fp8.safetensors"
+    #"https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
+    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp4.safetensors"
 )
 
 BBOX_MODELS=(
@@ -96,7 +96,7 @@ VAE_MODELS=(
 )
 
 TEXT_ENCODERS_MODELS=(
-    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-fp8_e4m3fn.safetensors"
+    #"https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-fp8_e4m3fn.safetensors"
 )
 
 UPSCALE_MODELS=(
@@ -104,7 +104,7 @@ UPSCALE_MODELS=(
 )
 
 CONTROLNET_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
+    #"https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
 )
 
 # Added arrays to mirror wan_video_full.sh
@@ -112,7 +112,7 @@ DIFFUSION_MODELS=(
 )
 
 CLIPVISION_MODELS=(
-    "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"
+    #"https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"
 )
 
 LATENT_UPSCALE_MODELS=(
