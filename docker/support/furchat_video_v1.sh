@@ -2,8 +2,11 @@
 
 set -x
 
+export WORKSPACE="${WORKSPACE:-/workspace}"
+
 source /venv/main/bin/activate
-COMFYUI_DIR=${WORKSPACE}/ComfyUI
+COMFYUI_DIR="${WORKSPACE}/ComfyUI"
+export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$COMFYUI_DIR}"
 
 # NOTE:
 # - Do NOT put Hugging Face tokens in this file (or in git clone URLs).
@@ -498,6 +501,67 @@ function provisioning_download() {
         wget -qnc --content-disposition --show-progress -e dotbytes="${3:-4M}" -P "$2" "$1"
     fi
 }
+
+function dependency_manager_start_agent() {
+    # Allow opt-out.
+    if [[ "${DM_AGENT_DISABLE,,}" == "1" || "${DM_AGENT_DISABLE,,}" == "true" ]]; then
+        echo "Dependency manager: DM_AGENT_DISABLE set; skipping agent start."
+        return 0
+    fi
+
+    local agent_path log_path agent_url
+    agent_path="${DM_AGENT_PATH:-${WORKSPACE}/dependency_agent_v1.py}"
+    log_path="${DM_AGENT_LOG_PATH:-${WORKSPACE}/dependency_agent.log}"
+    agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
+
+    # If already running, do nothing.
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -f "$agent_path" >/dev/null 2>&1; then
+            echo "Dependency manager: agent already running ($agent_path)."
+            return 0
+        fi
+    fi
+
+    # Ensure base dirs exist (agent uses disk_usage on DM_COMFYUI_DIR, which must exist).
+    mkdir -p "$(dirname "$agent_path")" || true
+    mkdir -p "${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}" || true
+
+    # Install agent to WORKSPACE (prefer explicit URL, else bundled copy, else GitHub raw fallback).
+    if [[ -n "$agent_url" ]]; then
+        echo "Dependency manager: downloading agent from DM_AGENT_URL/AGENT_URL."
+        curl -fsSL "$agent_url" -o "$agent_path" || {
+            echo "WARN: Dependency manager: failed to download agent from $agent_url"
+            return 0
+        }
+    else
+        local script_dir bundled_path fallback_url
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        bundled_path="${script_dir}/../scripts/dependency_agent_v1.py"
+        if [[ -f "$bundled_path" ]]; then
+            echo "Dependency manager: installing bundled agent from $bundled_path."
+            cp -f "$bundled_path" "$agent_path" || {
+                echo "WARN: Dependency manager: failed to copy bundled agent from $bundled_path"
+                return 0
+            }
+        else
+            fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/main/docker/scripts/dependency_agent_v1.py"
+            echo "Dependency manager: downloading agent from fallback URL ($fallback_url)."
+            curl -fsSL "$fallback_url" -o "$agent_path" || {
+                echo "WARN: Dependency manager: failed to download agent from fallback URL"
+                return 0
+            }
+        fi
+    fi
+
+    chmod +x "$agent_path" || true
+
+    # Start in background. Use bash -lc so template-injected env vars are visible (per docs).
+    echo "Dependency manager: starting agent; log=$log_path"
+    nohup bash -lc "source /venv/main/bin/activate && python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
+}
+
+# Start the dependency manager agent (best-effort; safe if required env vars are missing).
+dependency_manager_start_agent
 
 # Allow user to disable provisioning if they started with a script they didn't want
 echo "DEBUG: Checking for /.noprovisioning file..."
