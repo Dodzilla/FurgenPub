@@ -15,17 +15,12 @@ PIP_PACKAGES=(
 NODES=(
     "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
-    "https://github.com/cubiq/ComfyUI_essentials"
     "https://github.com/WASasquatch/was-node-suite-comfyui"
-    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
     "https://github.com/Fannovel16/comfyui_controlnet_aux"
-    "https://github.com/1038lab/ComfyUI-RMBG"
     "https://github.com/PozzettiAndrea/ComfyUI-SAM3"
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
-    "https://github.com/kijai/ComfyUI-KJNodes"
-    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
 )
 
 WORKFLOWS=(
@@ -40,7 +35,6 @@ DIFFUSION_MODELS=(
 )
 
 BBOX_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/face_yolov8m.pt"
 )
 
 SAM3_MODELS=(

@@ -10,23 +10,17 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    #"onnxruntime-gpu"
 )
 
 NODES=(
-    "https://github.com/Fannovel16/comfyui_controlnet_aux"
     "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
-    "https://github.com/ltdrdata/ComfyUI-Impact-Subpack"
-    "https://github.com/kijai/ComfyUI-KJNodes"
-    "https://github.com/ltdrdata/ComfyUI-Manager"
-    "https://github.com/cubiq/ComfyUI_essentials"
-    "https://github.com/WASasquatch/was-node-suite-comfyui"
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
+    "https://github.com/WASasquatch/was-node-suite-comfyui"
+    "https://github.com/Fannovel16/comfyui_controlnet_aux"
+    "https://github.com/PozzettiAndrea/ComfyUI-SAM3"
+    "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
-    "https://github.com/Dodzilla/LoopsGroundingDino"
-    "https://github.com/1038lab/ComfyUI-RMBG"
-    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
 )
 
 WORKFLOWS=(
@@ -34,38 +28,34 @@ WORKFLOWS=(
 
 CHECKPOINT_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/waiIllustriousSDXL_v160.safetensors"
+)
+
+DIFFUSION_MODELS=(
 )
 
 BBOX_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/face_yolov8m.pt"
 )
 
-EMBEDDING_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/embeddings_safe_neg.pt"
+SAM3_MODELS=(
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/sam3.pt"
+)
+
+TEXT_ENCODERS=(
 )
 
 UNET_MODELS=(
-)
-
-GROUNDING_MODELS=(
-    "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/GroundingDINO_SwinB.cfg.py"
-    "https://huggingface.co/ShilongLiu/GroundingDINO/resolve/main/groundingdino_swinb_cogcoor.pth"
-)
-
-SAM2_MODELS=(
-    "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt"
 )
 
 LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
 )
 
-VAE_MODELS=(
-    # "https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors"
-)
-
 CONTROLNET_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
+)
+
+VAE_MODELS=(
 )
 
 
@@ -80,12 +70,11 @@ declare -A NODE_PINS
 NODE_PINS[ComfyUI-Impact-Pack]="4186fbd4f4d7fff87c2a5dac8e69ab1031ca1259"
 NODE_PINS[comfyui_controlnet_aux]="cc6b232f4a47f0cdf70f4e1bfa24b74bd0d75bf1"
 NODE_PINS[ComfyUI-Impact-Subpack]="50c7b71a6a224734cc9b21963c6d1926816a97f1"
-NODE_PINS[ComfyUI-KJNodes]="3fcd22f2fe2be69c3229f192362b91888277cbcb"
+NODE_PINS[ComfyUI-KJNodes]="7b1327192e4729085788a3020a9cbb095e0c7811"
 NODE_PINS[ComfyUI-Manager]="b5a2bed5396e6be8a2d1970793f5ce2f1e74c8c2"
 NODE_PINS[ComfyUI_essentials]="9d9f4bedfc9f0321c19faf71855e228c93bd0dc9"
 NODE_PINS[was-node-suite-comfyui]="ea935d1044ae5a26efa54ebeb18fe9020af49a45"
 NODE_PINS[ComfyUI_Comfyroll_CustomNodes]="d78b780ae43fcf8c6b7c6505e6ffb4584281ceca"
-NODE_PINS[easy-comfy-nodes-async]="45cc063f5fe5dd81d9bfc7204000509e76baa7fb"
 NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
 NODE_PINS[LoopsGroundingDino]="8d84e5501d147d974ba4b6bfeb5de67c324523a0"
 NODE_PINS[ComfyUI-RMBG]="b28ce10b51e1d505a2ebf2608184119f0cf662d3"
@@ -122,7 +111,7 @@ function pin_node_if_requested() {
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
-        printf "Updating ComfyUI to pinned version (483b3e6)...\n"
+        printf "Updating ComfyUI to pinned version (9a552df)...\n"
         (
             cd "${COMFYUI_DIR}"
             git config --global --add safe.directory "$(pwd)"
@@ -130,7 +119,7 @@ function provisioning_update_comfyui() {
             echo "DEBUG: Fetching git updates..."
             git fetch
             echo "DEBUG: Checking out pinned commit..."
-            git checkout 483b3e6
+            git checkout 9a552df898ec57f066784cc1f7c475644099b3c1
         )
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
@@ -151,17 +140,14 @@ function provisioning_start() {
     provisioning_get_nodes
     provisioning_get_pip_packages
     provisioning_get_files \
-        "${COMFYUI_DIR}/models/embeddings" \
-        "${EMBEDDING_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/sam2" \
-        "${SAM2_MODELS[@]}"
-    provisioning_get_files \
-        "${COMFYUI_DIR}/models/grounding-dino" \
-        "${GROUNDING_MODELS[@]}"
+        "${COMFYUI_DIR}/models/sam3" \
+        "${SAM3_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/diffusion_models" \
+        "${DIFFUSION_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/ultralytics/bbox" \
         "${BBOX_MODELS[@]}"
@@ -180,6 +166,9 @@ function provisioning_start() {
     provisioning_get_files \
         "${COMFYUI_DIR}/models/upscale_models" \
         "${UPSCALE_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/text_encoders" \
+        "${TEXT_ENCODERS[@]}"
     provisioning_print_end
 }
 
