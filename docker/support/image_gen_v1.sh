@@ -15,6 +15,7 @@ PIP_PACKAGES=(
 NODES=(
     "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
+    "https://github.com/cubiq/ComfyUI_essentials"
     "https://github.com/WASasquatch/was-node-suite-comfyui"
     "https://github.com/Fannovel16/comfyui_controlnet_aux"
     "https://github.com/PozzettiAndrea/ComfyUI-SAM3"
@@ -49,6 +50,7 @@ UNET_MODELS=(
 
 LORA_MODELS=(
     "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
+    "https://huggingface.co/LoopsBoops/furarch/resolve/main/dmd2_sdxl_4step_lora_fp16.safetensors"
 )
 
 CONTROLNET_MODELS=(
