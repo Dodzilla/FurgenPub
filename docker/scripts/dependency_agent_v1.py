@@ -33,6 +33,8 @@ Optional knobs:
   - MAX_PARALLEL_DOWNLOADS  (default: 1)
   - DM_STATE_PATH           (default: $WORKSPACE/dependency_agent_state.json)
   - DM_ALLOWED_DOMAINS      (comma-separated allowlist; default: huggingface.co,civitai.com)
+  - DM_DOWNLOAD_TIMEOUT_SECONDS (socket timeout for downloads; default: 300)
+  - DM_DOWNLOAD_CHUNK_MIB        (download read chunk size in MiB; default: 1)
   - DM_DYNAMIC_EVICTION_ENABLED   (override profile.dynamicPolicy.enabled; default: false)
   - DM_DYNAMIC_MIN_FREE_BYTES     (override profile.dynamicPolicy.minFreeBytes; supports 10GB/500MiB)
   - DM_DYNAMIC_MAX_BYTES          (override profile.dynamicPolicy.maxDynamicBytes; supports 50GB/2TiB)
@@ -67,7 +69,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.2.0"
+AGENT_VERSION = "dm-agent-py/0.3.0"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -324,10 +326,12 @@ class LocalState:
     failed: Set[str]
     # For dynamic deps only: depId -> {destRelativePath, sizeBytes, lastTouchedAtMs}
     lru: Dict[str, Dict[str, Any]]
+    # Download retry schedule: depId -> {itemId, resolved, attempts, nextAttemptAtMs, lastError, lastAttemptAtMs}
+    retry: Dict[str, Dict[str, Any]]
 
     @staticmethod
     def empty() -> "LocalState":
-        return LocalState(installed_static=set(), installed_dynamic=set(), failed=set(), lru={})
+        return LocalState(installed_static=set(), installed_dynamic=set(), failed=set(), lru={}, retry={})
 
 
 class DependencyAgent:
@@ -346,6 +350,11 @@ class DependencyAgent:
         self.heartbeat_seconds = _env_float("DM_HEARTBEAT_SECONDS", 30.0)
         self.max_parallel = max(1, min(4, _env_int("MAX_PARALLEL_DOWNLOADS", 1)))
         self.verbose_progress = (_env_str("DM_VERBOSE_PROGRESS") or "").lower() in ("1", "true", "yes", "on")
+
+        self.download_timeout_seconds = max(30.0, min(3600.0, _env_float("DM_DOWNLOAD_TIMEOUT_SECONDS", 300.0)))
+        chunk_mib = _env_int("DM_DOWNLOAD_CHUNK_MIB", 1)
+        chunk_mib = max(1, min(32, chunk_mib))
+        self.download_chunk_size = int(chunk_mib) * 1024 * 1024
 
         allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.com"]
         self.allowed_domains = {d.lower() for d in allowed if d}
@@ -648,7 +657,31 @@ class DependencyAgent:
                             "sizeBytes": int(size) if size > 0 else 0,
                             "lastTouchedAtMs": int(touched),
                         }
-            return LocalState(installed_static=installed_static, installed_dynamic=installed_dynamic, failed=failed, lru=lru)
+            retry_raw = data.get("retry") if isinstance(data, dict) else None
+            retry: Dict[str, Dict[str, Any]] = {}
+            if isinstance(retry_raw, dict):
+                now = _now_ms()
+                for dep_id, entry in retry_raw.items():
+                    if not isinstance(dep_id, str) or not dep_id:
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    item_id = entry.get("itemId") if isinstance(entry.get("itemId"), str) else dep_id
+                    resolved = entry.get("resolved") if isinstance(entry.get("resolved"), dict) else None
+                    attempts = int(entry.get("attempts")) if isinstance(entry.get("attempts"), (int, float)) else 0
+                    next_at = int(entry.get("nextAttemptAtMs")) if isinstance(entry.get("nextAttemptAtMs"), (int, float)) else now
+                    last_err = entry.get("lastError") if isinstance(entry.get("lastError"), str) else None
+                    last_attempt = int(entry.get("lastAttemptAtMs")) if isinstance(entry.get("lastAttemptAtMs"), (int, float)) else 0
+                    if resolved:
+                        retry[dep_id] = {
+                            "itemId": item_id,
+                            "resolved": resolved,
+                            "attempts": max(0, attempts),
+                            "nextAttemptAtMs": max(0, next_at),
+                            "lastError": last_err or "",
+                            "lastAttemptAtMs": max(0, last_attempt),
+                        }
+            return LocalState(installed_static=installed_static, installed_dynamic=installed_dynamic, failed=failed, lru=lru, retry=retry)
         except Exception:
             return LocalState.empty()
 
@@ -659,6 +692,7 @@ class DependencyAgent:
             "installed_dynamic": sorted(self._state.installed_dynamic),
             "failed": sorted(self._state.failed),
             "lru": self._state.lru,
+            "retry": self._state.retry,
             "updatedAtMs": _now_ms(),
         }
         tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -794,6 +828,74 @@ class DependencyAgent:
             return f"Bearer {self.civitai_token}"
         raise RuntimeError(f"Unsupported auth type: {auth}")
 
+    def _is_retryable_download_error(self, err: Exception) -> bool:
+        msg = str(err).lower()
+        # Configuration / policy errors won't resolve without human action.
+        non_retry_substrings = [
+            "missing resolved download info",
+            "missing hf_token",
+            "missing civitai_token",
+            "unsupported auth type",
+            "download domain not allowed",
+            "invalid download url",
+            "destrelativepath must be relative",
+            "destrelativepath escapes base dir",
+        ]
+        return not any(s in msg for s in non_retry_substrings)
+
+    def _compute_retry_delay_seconds(self, attempts: int, last_error: str) -> float:
+        # Exponential backoff with jitter. Capped so we keep making progress.
+        base = 120.0  # 2 minutes
+        cap = 30.0 * 60.0  # 30 minutes
+        delay = min(cap, base * (2 ** max(0, int(attempts) - 1)))
+
+        le = (last_error or "").lower()
+        if "429" in le or "too many requests" in le:
+            delay = max(delay, 5.0 * 60.0)
+        if "timed out" in le or "timeout" in le:
+            delay = max(delay, 2.0 * 60.0)
+
+        jitter = delay * 0.2
+        return max(10.0, delay + random.uniform(-jitter, jitter))
+
+    def _format_backoff_error(self, dep_id: str, last_error: str, next_attempt_at_ms: int) -> str:
+        seconds = max(0, int((next_attempt_at_ms - _now_ms()) / 1000))
+        prefix = f"Backoff active for {dep_id}; next attempt in ~{seconds}s."
+        if last_error:
+            return f"{prefix} Last error: {last_error}"
+        return prefix
+
+    def _schedule_download_retry(self, item: Dict[str, Any], err: Exception) -> int:
+        dep_id = item.get("depId")
+        if not isinstance(dep_id, str) or not dep_id:
+            return _now_ms() + 60_000
+
+        resolved = item.get("resolved")
+        if not isinstance(resolved, dict):
+            # We can't retry without resolved info; keep it as a hard failure.
+            return _now_ms() + 60_000
+
+        err_msg = str(err)[:500]
+        now = _now_ms()
+        with self._lock:
+            prev = self._state.retry.get(dep_id) if isinstance(self._state.retry.get(dep_id), dict) else {}
+            attempts = int(prev.get("attempts")) if isinstance(prev.get("attempts"), int) else 0
+            attempts = max(0, attempts) + 1
+            delay_s = self._compute_retry_delay_seconds(attempts, err_msg)
+            next_at = now + int(delay_s * 1000)
+            self._state.retry[dep_id] = {
+                "itemId": item.get("itemId") or dep_id,
+                "resolved": resolved,
+                "attempts": attempts,
+                "nextAttemptAtMs": next_at,
+                "lastError": err_msg,
+                "lastAttemptAtMs": now,
+            }
+            self._state.failed.add(dep_id)
+            self._downloading.discard(dep_id)
+            self._save_state()
+        return next_at
+
     def _download_item(self, item: Dict[str, Any]) -> None:
         dep_id = item.get("depId")
         if not isinstance(dep_id, str) or not dep_id:
@@ -846,6 +948,7 @@ class DependencyAgent:
                             self._state.installed_dynamic.discard(dep_id)
                             self._state.installed_static.add(dep_id)
                         self._state.failed.discard(dep_id)
+                        self._state.retry.pop(dep_id, None)
                         self._downloading.discard(dep_id)
                         self._save_state()
                     return
@@ -860,6 +963,7 @@ class DependencyAgent:
                         self._state.installed_dynamic.discard(dep_id)
                         self._state.installed_static.add(dep_id)
                     self._state.failed.discard(dep_id)
+                    self._state.retry.pop(dep_id, None)
                     self._downloading.discard(dep_id)
                     self._save_state()
                 return
@@ -877,7 +981,8 @@ class DependencyAgent:
                 url=url,
                 dest_partial=partial,
                 auth_header=auth_header,
-                timeout_seconds=60.0,
+                timeout_seconds=float(self.download_timeout_seconds),
+                chunk_size=int(self.download_chunk_size),
                 allowed_domains=self.allowed_domains,
                 verbose=self.verbose_progress,
             )
@@ -907,6 +1012,7 @@ class DependencyAgent:
                 self._state.installed_dynamic.discard(dep_id)
                 self._state.installed_static.add(dep_id)
             self._state.failed.discard(dep_id)
+            self._state.retry.pop(dep_id, None)
             self._downloading.discard(dep_id)
 
             policy = self._dynamic_policy()
@@ -958,36 +1064,56 @@ class DependencyAgent:
             return
 
         if op == "download":
-            with self._lock:
-                if dep_id:
+            now = _now_ms()
+            if dep_id:
+                with self._lock:
+                    retry_entry = self._state.retry.get(dep_id) if isinstance(self._state.retry.get(dep_id), dict) else None
+                    next_at = int(retry_entry.get("nextAttemptAtMs")) if retry_entry and isinstance(retry_entry.get("nextAttemptAtMs"), int) else None
+                    last_err = retry_entry.get("lastError") if retry_entry and isinstance(retry_entry.get("lastError"), str) else ""
+                if next_at is not None and now < next_at:
+                    # Avoid hammering the same dep when we're intentionally backing off.
+                    self._post_status(item, "retrying", error=self._format_backoff_error(dep_id, last_err, next_at))
+                    return
+
+            if dep_id:
+                with self._lock:
                     self._downloading.add(dep_id)
             self._post_status(item, "running")
 
-            # Small retry loop to handle transient failures.
-            last_err: Optional[str] = None
-            for attempt in range(1, 4):
-                try:
-                    self._download_item(item)
-                    self._post_status(item, "succeeded")
-                    # Ensure backend inventory is updated quickly so reserved jobs can proceed.
-                    if _now_ms() - int(self._last_heartbeat_ms) >= 2000:
-                        try:
-                            self._heartbeat(queue_depth=None)
-                        except Exception:
-                            pass
+            try:
+                self._download_item(item)
+                self._post_status(item, "succeeded")
+                # Ensure backend inventory is updated quickly so reserved jobs can proceed.
+                if _now_ms() - int(self._last_heartbeat_ms) >= 2000:
+                    try:
+                        self._heartbeat(queue_depth=None)
+                    except Exception:
+                        pass
+                return
+            except Exception as e:
+                err_msg = str(e)
+                retryable = self._is_retryable_download_error(e)
+                if retryable:
+                    next_at = self._schedule_download_retry(item, e)
+                    if dep_id:
+                        logging.warning(
+                            "Download failed; will retry. itemId=%s depId=%s nextAttemptInSec=%d err=%s",
+                            item_id,
+                            dep_id,
+                            max(0, int((next_at - _now_ms()) / 1000)),
+                            err_msg,
+                        )
+                    self._post_status(item, "retrying", error=self._format_backoff_error(dep_id or item_id, err_msg, next_at))
                     return
-                except Exception as e:
-                    last_err = str(e)
-                    logging.warning("Download failed (attempt %d/3) itemId=%s depId=%s: %s", attempt, item_id, dep_id, last_err)
-                    _sleep_with_jitter(5.0 * attempt)
 
-            with self._lock:
-                if dep_id:
-                    self._state.failed.add(dep_id)
-                    self._downloading.discard(dep_id)
-                    self._save_state()
-            self._post_status(item, "failed", error=last_err or "download failed")
-            return
+                with self._lock:
+                    if dep_id:
+                        self._state.failed.add(dep_id)
+                        self._downloading.discard(dep_id)
+                        self._save_state()
+                logging.warning("Download failed (non-retryable) itemId=%s depId=%s: %s", item_id, dep_id, err_msg)
+                self._post_status(item, "failed", error=err_msg)
+                return
 
         # touch
         self._post_status(item, "running")
@@ -1027,6 +1153,11 @@ class DependencyAgent:
         logging.info("ComfyUI dir: %s", str(self.comfyui_dir))
         logging.info("State file: %s", str(self.state_path))
         logging.info("Allowed download domains: %s", ",".join(sorted(self.allowed_domains)))
+        logging.info(
+            "Download settings: timeout=%.1fs chunkMiB=%d",
+            float(self.download_timeout_seconds),
+            int(self.download_chunk_size / (1024 * 1024)),
+        )
         logging.info("Polling every %.1fs, heartbeat every %.1fs, max_parallel=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         policy = self._dynamic_policy()
         if policy.get("enabled"):
@@ -1053,6 +1184,11 @@ class DependencyAgent:
                 # Fetch queue and dispatch work.
                 items = self._fetch_queue(limit=25)
                 queue_depth = len(items)
+                queued_dep_ids: Set[str] = set()
+                for it in items:
+                    d = it.get("depId")
+                    if isinstance(d, str) and d:
+                        queued_dep_ids.add(d)
                 if queue_depth > 0 and now - self._last_heartbeat_ms >= int(5 * 1000):
                     # Opportunistically include queueDepth without waiting full heartbeat interval.
                     self._heartbeat(queue_depth=queue_depth + len(inflight))
@@ -1073,6 +1209,46 @@ class DependencyAgent:
                     if len(inflight) >= self.max_parallel:
                         break
                     inflight.add(executor.submit(self._process_item, item))
+
+                # Also retry previously-failed downloads when their backoff expires (covers prefetch deps).
+                if len(inflight) < self.max_parallel:
+                    due_retry_items: List[Dict[str, Any]] = []
+                    retry_changed = False
+                    retry_cap = max(0, int(self.max_parallel) - len(inflight))
+                    with self._lock:
+                        downloading_now = set(self._downloading)
+                        for dep_id, entry in list(self._state.retry.items()):
+                            if len(due_retry_items) >= retry_cap:
+                                break
+                            if dep_id in queued_dep_ids or dep_id in downloading_now:
+                                continue
+                            if not isinstance(entry, dict):
+                                continue
+                            next_at = entry.get("nextAttemptAtMs")
+                            if not isinstance(next_at, int) or next_at > now:
+                                continue
+                            resolved = entry.get("resolved")
+                            if not isinstance(resolved, dict):
+                                # Corrupt/incomplete retry entry; drop it.
+                                self._state.retry.pop(dep_id, None)
+                                retry_changed = True
+                                continue
+                            due_retry_items.append(
+                                {
+                                    "itemId": entry.get("itemId") if isinstance(entry.get("itemId"), str) else dep_id,
+                                    "depId": dep_id,
+                                    "op": "download",
+                                    "resolved": resolved,
+                                }
+                            )
+
+                        if retry_changed:
+                            self._save_state()
+
+                    for it in due_retry_items:
+                        if self._stop.is_set() or len(inflight) >= self.max_parallel:
+                            break
+                        inflight.add(executor.submit(self._process_item, it))
 
                 _sleep_with_jitter(self.poll_seconds)
             except ApiError as e:
