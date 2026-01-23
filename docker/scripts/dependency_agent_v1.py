@@ -678,6 +678,14 @@ class DependencyAgent:
         headers = {}
         if self.shared_secret:
             headers["X-DM-Secret"] = self.shared_secret
+        logging.info(
+            "Registering dependency agent: api=%s serverType=%s instanceId=%s instanceIp=%s secretSet=%s",
+            self.api_base_url,
+            self.server_type,
+            self.instance_id or "-",
+            instance_ip or "-",
+            "yes" if self.shared_secret else "no",
+        )
 
         body: Dict[str, Any] = {
             "serverType": self.server_type,
@@ -997,6 +1005,17 @@ class DependencyAgent:
             try:
                 self._register()
                 break
+            except ApiError as e:
+                if e.status == 401:
+                    logging.error(
+                        "Register failed: unauthorized (check DEPENDENCY_MANAGER_SHARED_SECRET and FCS_API_BASE_URL)."
+                    )
+                    if e.body:
+                        logging.error("Register response body: %s", e.body)
+                else:
+                    logging.error("Register failed: %s", e)
+                _sleep_with_jitter(backoff)
+                backoff = min(60.0, backoff * 1.5)
             except Exception as e:
                 logging.error("Register failed: %s", e)
                 _sleep_with_jitter(backoff)
