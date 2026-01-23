@@ -28,8 +28,6 @@ WORKFLOWS=(
 )
 
 CHECKPOINT_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/yiffymix_v62Noobxl.safetensors"
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/waiIllustriousSDXL_v160.safetensors"
 )
 
 DIFFUSION_MODELS=(
@@ -39,7 +37,6 @@ BBOX_MODELS=(
 )
 
 SAM3_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/sam3.pt"
 )
 
 TEXT_ENCODERS=(
@@ -49,12 +46,10 @@ UNET_MODELS=(
 )
 
 LORA_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/FurryRealism.safetensors"
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/dmd2_sdxl_4step_lora_fp16.safetensors"
+
 )
 
 CONTROLNET_MODELS=(
-    "https://huggingface.co/LoopsBoops/furarch/resolve/main/xinsir_controlnet_promax.safetensors"
 )
 
 VAE_MODELS=(
