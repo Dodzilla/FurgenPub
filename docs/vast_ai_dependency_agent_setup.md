@@ -61,7 +61,7 @@ set -euo pipefail
 export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$WORKSPACE/ComfyUI}"
 
-AGENT_URL="https://<your-public-host>/dependency_agent_v1.py"
+AGENT_URL="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
 AGENT_PATH="$WORKSPACE/dependency_agent_v1.py"
 LOG_PATH="$WORKSPACE/dependency_agent.log"
 
