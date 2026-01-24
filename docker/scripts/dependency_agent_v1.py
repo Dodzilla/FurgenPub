@@ -69,7 +69,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.3.0"
+AGENT_VERSION = "dm-agent-py/0.3.1"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -270,21 +270,24 @@ def http_download(
     url: str,
     dest_partial: Path,
     auth_header: Optional[str],
+    expected_size_bytes: int = 0,
     timeout_seconds: float = 30.0,
     chunk_size: int = 8 * 1024 * 1024,
     user_agent: str = "dm-agent-download/1.0",
     allowed_domains: Optional[Set[str]] = None,
     verbose: bool = False,
 ) -> None:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("Invalid download URL")
+
     if allowed_domains:
-        try:
-            parsed = urllib.parse.urlparse(url)
-            host = (parsed.hostname or "").lower()
-            ok = any(host == d or host.endswith("." + d) for d in allowed_domains)
-            if not ok:
-                raise ValueError(f"Download domain not allowed: {host}")
-        except Exception:
-            raise ValueError("Invalid download URL") from None
+        ok = any(host == d or host.endswith("." + d) for d in allowed_domains)
+        if not ok:
+            raise ValueError(f"Download domain not allowed: {host}")
+
+    safe_url = f"{parsed.scheme or 'https'}://{host}{parsed.path}"
 
     dest_partial.parent.mkdir(parents=True, exist_ok=True)
 
@@ -292,31 +295,147 @@ def http_download(
     if auth_header:
         headers["Authorization"] = auth_header
 
-    req = urllib.request.Request(url, headers=headers, method="GET")
     opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
 
-    # Always write to a temp file, then atomically rename to final path.
+    # Resume from existing partial downloads when possible to improve reliability with large files.
+    existing_bytes = 0
+    try:
+        if dest_partial.exists():
+            existing_bytes = int(dest_partial.stat().st_size)
+    except Exception:
+        existing_bytes = 0
+
+    if expected_size_bytes > 0 and existing_bytes > expected_size_bytes:
+        # Corrupt partial (or wrong file); restart.
+        try:
+            dest_partial.unlink()
+        except Exception:
+            pass
+        existing_bytes = 0
+
+    if expected_size_bytes > 0 and existing_bytes == expected_size_bytes:
+        # Previous attempt fully downloaded but crashed before rename.
+        return
+
+    req_headers = dict(headers)
+    if existing_bytes > 0:
+        req_headers["Range"] = f"bytes={existing_bytes}-"
+
+    req = urllib.request.Request(url, headers=req_headers, method="GET")
+
     start = time.time()
-    downloaded = 0
+    downloaded = max(0, int(existing_bytes))
     last_log = 0.0
 
-    with opener.open(req, timeout=timeout_seconds) as resp:
-        # urllib doesn't expose status reliably on all handlers; best-effort.
-        with dest_partial.open("wb") as f:
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if verbose:
-                    now = time.time()
-                    if now - last_log >= 10:
-                        elapsed = max(0.001, now - start)
-                        mb = downloaded / (1024 * 1024)
-                        rate = mb / elapsed
-                        logging.info("downloaded %.1f MiB (%.2f MiB/s) -> %s", mb, rate, str(dest_partial))
-                        last_log = now
+    expected_total: Optional[int] = int(expected_size_bytes) if expected_size_bytes > 0 else None
+
+    try:
+        with opener.open(req, timeout=timeout_seconds) as resp:
+            status = getattr(resp, "status", None)
+            if not isinstance(status, int):
+                try:
+                    status = int(resp.getcode())
+                except Exception:
+                    status = 200
+
+            # Determine whether we're appending (resume) or restarting.
+            mode = "wb"
+            if existing_bytes > 0 and status == 206:
+                mode = "ab"
+
+                # Best-effort validation + total size detection.
+                cr = None
+                try:
+                    cr = resp.headers.get("Content-Range")
+                except Exception:
+                    cr = None
+                if isinstance(cr, str) and cr:
+                    m = re.match(r"^bytes\\s+(\\d+)-(\\d+)/(\\d+|\\*)$", cr.strip())
+                    if m:
+                        start_b = int(m.group(1))
+                        total_s = m.group(3)
+                        if start_b != existing_bytes:
+                            raise RuntimeError(
+                                f"Resume mismatch for {safe_url}: expected start {existing_bytes}, got {start_b}"
+                            )
+                        if expected_total is None and total_s.isdigit():
+                            expected_total = int(total_s)
+                if expected_total is None:
+                    try:
+                        cl = resp.headers.get("Content-Length")
+                        if isinstance(cl, str) and cl.isdigit():
+                            expected_total = existing_bytes + int(cl)
+                    except Exception:
+                        pass
+            else:
+                # If the server ignored Range (200) we restart from scratch.
+                if existing_bytes > 0 and status == 200:
+                    logging.info("Server did not honor Range; restarting download: %s", safe_url)
+                    existing_bytes = 0
+                    downloaded = 0
+                mode = "wb"
+
+                if expected_total is None:
+                    try:
+                        cl = resp.headers.get("Content-Length")
+                        if isinstance(cl, str) and cl.isdigit():
+                            expected_total = int(cl)
+                    except Exception:
+                        pass
+
+            with dest_partial.open(mode) as f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if verbose:
+                        now = time.time()
+                        if now - last_log >= 10:
+                            elapsed = max(0.001, now - start)
+                            mb = downloaded / (1024 * 1024)
+                            rate = mb / elapsed
+                            logging.info("downloaded %.1f MiB (%.2f MiB/s) -> %s", mb, rate, str(dest_partial))
+                            last_log = now
+
+        if expected_total is not None:
+            actual_size = 0
+            try:
+                actual_size = int(dest_partial.stat().st_size)
+            except Exception:
+                actual_size = 0
+            if actual_size != int(expected_total):
+                raise RuntimeError(f"Incomplete download for {safe_url}: got {actual_size} bytes, expected {expected_total} bytes")
+    except urllib.error.HTTPError as e:
+        code = int(getattr(e, "code", 0) or 0)
+        if code == 416 and existing_bytes > 0:
+            # Range not satisfiable; treat as complete if local size matches total.
+            total: Optional[int] = None
+            try:
+                cr = e.headers.get("Content-Range") if getattr(e, "headers", None) is not None else None
+                if isinstance(cr, str) and cr:
+                    m = re.match(r"^bytes\\s+\\*/(\\d+)$", cr.strip())
+                    if m:
+                        total = int(m.group(1))
+            except Exception:
+                total = None
+
+            if total is not None:
+                try:
+                    if int(dest_partial.stat().st_size) >= int(total):
+                        return
+                except Exception:
+                    pass
+
+        raise RuntimeError(f"HTTP error downloading {safe_url}: {e}") from None
+    except Exception as e:
+        partial_bytes = 0
+        try:
+            partial_bytes = int(dest_partial.stat().st_size) if dest_partial.exists() else 0
+        except Exception:
+            partial_bytes = 0
+        raise RuntimeError(f"Download error ({safe_url}) after {partial_bytes} bytes: {e}") from None
 
 
 @dataclass
@@ -981,6 +1100,7 @@ class DependencyAgent:
                 url=url,
                 dest_partial=partial,
                 auth_header=auth_header,
+                expected_size_bytes=int(expected_size_bytes),
                 timeout_seconds=float(self.download_timeout_seconds),
                 chunk_size=int(self.download_chunk_size),
                 allowed_domains=self.allowed_domains,
@@ -990,13 +1110,21 @@ class DependencyAgent:
             if isinstance(sha256_expected, str) and sha256_expected:
                 actual = sha256_file(partial)
                 if actual.lower() != sha256_expected.lower():
+                    try:
+                        if partial.exists():
+                            partial.unlink()
+                    except Exception:
+                        pass
                     raise RuntimeError(f"sha256 mismatch for {dep_id}: expected {sha256_expected}, got {actual}")
-        except Exception:
-            try:
-                if partial.exists():
-                    partial.unlink()
-            except Exception:
-                pass
+        except Exception as e:
+            # Keep partial downloads for retryable errors so future retries can resume.
+            retryable = self._is_retryable_download_error(e)
+            if not retryable:
+                try:
+                    if partial.exists():
+                        partial.unlink()
+                except Exception:
+                    pass
             raise
 
         os.replace(str(partial), str(dest_abs))
