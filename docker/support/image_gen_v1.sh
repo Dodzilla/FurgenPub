@@ -30,7 +30,7 @@ NODES=(
     "https://github.com/ltdrdata/ComfyUI-Manager"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
-    "https://github.com/ChenDarYen/ComfyUI-NAG"
+    "https://github.com/scottmudge/ComfyUI-NAG"
 )
 
 
