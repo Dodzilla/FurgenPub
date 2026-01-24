@@ -48,7 +48,6 @@ NODE_PINS[ComfyUI_essentials]="9d9f4bedfc9f0321c19faf71855e228c93bd0dc9"
 NODE_PINS[was-node-suite-comfyui]="ea935d1044ae5a26efa54ebeb18fe9020af49a45"
 NODE_PINS[ComfyUI_Comfyroll_CustomNodes]="d78b780ae43fcf8c6b7c6505e6ffb4584281ceca"
 NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
-NODE_PINS[ComfyUI-NAG]="ef8a641be08983cf5f06669f70719b6eecce3c7f"
 
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
