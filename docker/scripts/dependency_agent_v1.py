@@ -32,9 +32,11 @@ Optional knobs:
   - DM_HEARTBEAT_SECONDS    (default: 30)
   - MAX_PARALLEL_DOWNLOADS  (default: 1)
   - DM_STATE_PATH           (default: $WORKSPACE/dependency_agent_state.json)
-  - DM_ALLOWED_DOMAINS      (comma-separated allowlist; default: huggingface.co,civitai.com)
+  - DM_ALLOWED_DOMAINS      (comma-separated allowlist; default: huggingface.co,hf.co,civitai.com)
+  - DM_DOWNLOAD_TOOL             (default: wget; options: wget, python)
   - DM_DOWNLOAD_TIMEOUT_SECONDS (socket timeout for downloads; default: 300)
   - DM_DOWNLOAD_CHUNK_MIB        (download read chunk size in MiB; default: 1)
+  - DM_DOWNLOAD_DEBUG            (enable extra download diagnostics; default: false)
   - DM_DYNAMIC_EVICTION_ENABLED   (override profile.dynamicPolicy.enabled; default: false)
   - DM_DYNAMIC_MIN_FREE_BYTES     (override profile.dynamicPolicy.minFreeBytes; supports 10GB/500MiB)
   - DM_DYNAMIC_MAX_BYTES          (override profile.dynamicPolicy.maxDynamicBytes; supports 50GB/2TiB)
@@ -58,6 +60,8 @@ import random
 import re
 import shutil
 import signal
+import socket
+import subprocess
 import threading
 import time
 import urllib.error
@@ -69,7 +73,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.3.1"
+AGENT_VERSION = "dm-agent-py/0.3.2"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -266,6 +270,26 @@ def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def _safe_url_for_logs(url: str) -> str:
+    try:
+        p = urllib.parse.urlparse(url)
+        host = (p.hostname or "").lower()
+        scheme = p.scheme or "https"
+        path = p.path or "/"
+        if not host:
+            return "<invalid-url>"
+        return f"{scheme}://{host}{path}"
+    except Exception:
+        return "<invalid-url>"
+
+
+def _command_exists(cmd: str) -> bool:
+    try:
+        return shutil.which(cmd) is not None
+    except Exception:
+        return False
+
+
 def http_download(
     url: str,
     dest_partial: Path,
@@ -276,6 +300,7 @@ def http_download(
     user_agent: str = "dm-agent-download/1.0",
     allowed_domains: Optional[Set[str]] = None,
     verbose: bool = False,
+    debug: bool = False,
 ) -> None:
     parsed = urllib.parse.urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -287,7 +312,7 @@ def http_download(
         if not ok:
             raise ValueError(f"Download domain not allowed: {host}")
 
-    safe_url = f"{parsed.scheme or 'https'}://{host}{parsed.path}"
+    safe_url = _safe_url_for_logs(url)
 
     dest_partial.parent.mkdir(parents=True, exist_ok=True)
 
@@ -304,6 +329,20 @@ def http_download(
             existing_bytes = int(dest_partial.stat().st_size)
     except Exception:
         existing_bytes = 0
+
+    if debug:
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            ips: List[str] = []
+            for info in infos:
+                sockaddr = info[4]
+                ip = sockaddr[0] if isinstance(sockaddr, tuple) and len(sockaddr) > 0 else None
+                if isinstance(ip, str) and ip and ip not in ips:
+                    ips.append(ip)
+            if ips:
+                logging.info("download dns: host=%s ips=%s", host, ",".join(ips[:8]))
+        except Exception as e:
+            logging.info("download dns failed: host=%s err=%s", host, e)
 
     if expected_size_bytes > 0 and existing_bytes > expected_size_bytes:
         # Corrupt partial (or wrong file); restart.
@@ -328,6 +367,12 @@ def http_download(
     last_log = 0.0
 
     expected_total: Optional[int] = int(expected_size_bytes) if expected_size_bytes > 0 else None
+    status: Optional[int] = None
+    safe_final_url: Optional[str] = None
+    content_length: Optional[str] = None
+    content_range: Optional[str] = None
+    accept_ranges: Optional[str] = None
+    etag: Optional[str] = None
 
     try:
         with opener.open(req, timeout=timeout_seconds) as resp:
@@ -337,6 +382,46 @@ def http_download(
                     status = int(resp.getcode())
                 except Exception:
                     status = 200
+            try:
+                safe_final_url = _safe_url_for_logs(resp.geturl())
+            except Exception:
+                safe_final_url = None
+
+            final_host = ""
+            try:
+                final_host = (urllib.parse.urlparse(resp.geturl()).hostname or "").lower()
+            except Exception:
+                final_host = ""
+            if allowed_domains and final_host:
+                ok = any(final_host == d or final_host.endswith("." + d) for d in allowed_domains)
+                if not ok:
+                    raise RuntimeError(f"Redirected to disallowed host: {final_host}")
+
+            try:
+                content_length = resp.headers.get("Content-Length")
+                content_range = resp.headers.get("Content-Range")
+                accept_ranges = resp.headers.get("Accept-Ranges")
+                etag = resp.headers.get("ETag")
+            except Exception:
+                content_length = None
+                content_range = None
+                accept_ranges = None
+                etag = None
+
+            if debug:
+                logging.info(
+                    "download start: url=%s final=%s existingBytes=%d expectedBytes=%d timeout=%.1fs status=%s cl=%s cr=%s ar=%s etag=%s",
+                    safe_url,
+                    safe_final_url or "-",
+                    int(existing_bytes),
+                    int(expected_size_bytes or 0),
+                    float(timeout_seconds),
+                    str(status),
+                    content_length or "-",
+                    content_range or "-",
+                    accept_ranges or "-",
+                    (etag[:60] + "...") if isinstance(etag, str) and len(etag) > 60 else (etag or "-"),
+                )
 
             # Determine whether we're appending (resume) or restarting.
             mode = "wb"
@@ -344,13 +429,8 @@ def http_download(
                 mode = "ab"
 
                 # Best-effort validation + total size detection.
-                cr = None
-                try:
-                    cr = resp.headers.get("Content-Range")
-                except Exception:
-                    cr = None
-                if isinstance(cr, str) and cr:
-                    m = re.match(r"^bytes\\s+(\\d+)-(\\d+)/(\\d+|\\*)$", cr.strip())
+                if isinstance(content_range, str) and content_range:
+                    m = re.match(r"^bytes\\s+(\\d+)-(\\d+)/(\\d+|\\*)$", content_range.strip())
                     if m:
                         start_b = int(m.group(1))
                         total_s = m.group(3)
@@ -362,9 +442,8 @@ def http_download(
                             expected_total = int(total_s)
                 if expected_total is None:
                     try:
-                        cl = resp.headers.get("Content-Length")
-                        if isinstance(cl, str) and cl.isdigit():
-                            expected_total = existing_bytes + int(cl)
+                        if isinstance(content_length, str) and content_length.isdigit():
+                            expected_total = existing_bytes + int(content_length)
                     except Exception:
                         pass
             else:
@@ -377,9 +456,8 @@ def http_download(
 
                 if expected_total is None:
                     try:
-                        cl = resp.headers.get("Content-Length")
-                        if isinstance(cl, str) and cl.isdigit():
-                            expected_total = int(cl)
+                        if isinstance(content_length, str) and content_length.isdigit():
+                            expected_total = int(content_length)
                     except Exception:
                         pass
 
@@ -428,14 +506,190 @@ def http_download(
                 except Exception:
                     pass
 
-        raise RuntimeError(f"HTTP error downloading {safe_url}: {e}") from None
+        retry_after = None
+        try:
+            retry_after = e.headers.get("Retry-After") if getattr(e, "headers", None) is not None else None
+        except Exception:
+            retry_after = None
+
+        err_url = None
+        try:
+            err_url = _safe_url_for_logs(e.geturl())
+        except Exception:
+            err_url = safe_url
+
+        extra = f" retry_after={retry_after}" if retry_after else ""
+        raise RuntimeError(f"HTTP {code} downloading {err_url}:{extra} {e}") from None
     except Exception as e:
         partial_bytes = 0
         try:
             partial_bytes = int(dest_partial.stat().st_size) if dest_partial.exists() else 0
         except Exception:
             partial_bytes = 0
-        raise RuntimeError(f"Download error ({safe_url}) after {partial_bytes} bytes: {e}") from None
+        parts: List[str] = [
+            f"type={type(e).__name__}",
+            f"url={safe_url}",
+        ]
+        if safe_final_url:
+            parts.append(f"final={safe_final_url}")
+        if isinstance(status, int):
+            parts.append(f"status={status}")
+        if existing_bytes > 0:
+            parts.append("resume=1")
+
+        size_part = f"bytes={partial_bytes}"
+        if expected_total is not None:
+            size_part += f"/{expected_total}"
+        elif expected_size_bytes > 0:
+            size_part += f"/{int(expected_size_bytes)}"
+        parts.append(size_part)
+
+        if isinstance(content_length, str) and content_length:
+            parts.append(f"cl={content_length}")
+        if isinstance(content_range, str) and content_range:
+            parts.append("cr=1")
+        if isinstance(accept_ranges, str) and accept_ranges:
+            parts.append(f"ar={accept_ranges}")
+
+        ctx = " ".join(parts)
+        raise RuntimeError(f"Download error ({ctx}): {e}") from None
+
+
+def wget_download(
+    url: str,
+    dest_partial: Path,
+    auth_header: Optional[str],
+    expected_size_bytes: int = 0,
+    timeout_seconds: float = 300.0,
+    allowed_domains: Optional[Set[str]] = None,
+    debug: bool = False,
+    user_agent: str = "dm-agent-wget/1.0",
+) -> None:
+    if not _command_exists("wget"):
+        raise RuntimeError("wget not found on PATH (install wget or set DM_DOWNLOAD_TOOL=python).")
+
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("Invalid download URL")
+
+    if allowed_domains:
+        ok = any(host == d or host.endswith("." + d) for d in allowed_domains)
+        if not ok:
+            raise ValueError(f"Download domain not allowed: {host}")
+
+    safe_url = _safe_url_for_logs(url)
+    dest_partial.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_bytes = 0
+    try:
+        if dest_partial.exists():
+            existing_bytes = int(dest_partial.stat().st_size)
+    except Exception:
+        existing_bytes = 0
+
+    if expected_size_bytes > 0 and existing_bytes > expected_size_bytes:
+        try:
+            dest_partial.unlink()
+        except Exception:
+            pass
+        existing_bytes = 0
+
+    if expected_size_bytes > 0 and existing_bytes == expected_size_bytes:
+        return
+
+    if debug:
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            ips: List[str] = []
+            for info in infos:
+                sockaddr = info[4]
+                ip = sockaddr[0] if isinstance(sockaddr, tuple) and len(sockaddr) > 0 else None
+                if isinstance(ip, str) and ip and ip not in ips:
+                    ips.append(ip)
+            if ips:
+                logging.info("download dns: host=%s ips=%s", host, ",".join(ips[:8]))
+        except Exception as e:
+            logging.info("download dns failed: host=%s err=%s", host, e)
+
+    cmd: List[str] = [
+        "wget",
+        "--server-response",
+        "--max-redirect=20",
+        "--timeout",
+        str(int(max(1.0, float(timeout_seconds)))),
+        "--tries=3",
+        "--waitretry=5",
+        "--retry-connrefused",
+        "--continue",
+        "--user-agent",
+        user_agent,
+        "--output-document",
+        str(dest_partial),
+    ]
+
+    if auth_header:
+        cmd += ["--header", f"Authorization: {auth_header}"]
+
+    if debug:
+        logging.info(
+            "wget start: url=%s existingBytes=%d expectedBytes=%d timeout=%.1fs",
+            safe_url,
+            int(existing_bytes),
+            int(expected_size_bytes or 0),
+            float(timeout_seconds),
+        )
+
+    proc = subprocess.run(cmd + [url], capture_output=True, text=True)
+
+    stderr = proc.stderr or ""
+    locations: List[str] = []
+    statuses: List[int] = []
+    retry_after: Optional[str] = None
+    for line in stderr.splitlines():
+        m = re.search(r"^\\s*Location:\\s*(\\S+)\\s*$", line, flags=re.IGNORECASE)
+        if m:
+            locations.append(m.group(1))
+            continue
+        m = re.search(r"\\bHTTP/\\S+\\s+(\\d{3})\\b", line)
+        if m:
+            try:
+                statuses.append(int(m.group(1)))
+            except Exception:
+                pass
+            continue
+        m = re.search(r"^\\s*Retry-After:\\s*(\\S+)\\s*$", line, flags=re.IGNORECASE)
+        if m:
+            retry_after = m.group(1)
+
+    if allowed_domains and locations:
+        for loc in locations[-10:]:
+            lh = ""
+            try:
+                lh = (urllib.parse.urlparse(loc).hostname or "").lower()
+            except Exception:
+                lh = ""
+            if lh:
+                ok = any(lh == d or lh.endswith("." + d) for d in allowed_domains)
+                if not ok:
+                    raise ValueError(f"Download domain not allowed: {lh}")
+
+    if proc.returncode != 0:
+        tail = "\n".join(stderr.splitlines()[-30:])
+        status_part = f" http={statuses[-1]}" if statuses else ""
+        retry_part = f" retry_after={retry_after}" if retry_after else ""
+        raise RuntimeError(f"wget failed (exit={proc.returncode}{status_part}{retry_part}) for {safe_url}: {tail}")
+
+    if expected_size_bytes > 0:
+        actual_size = 0
+        try:
+            actual_size = int(dest_partial.stat().st_size)
+        except Exception:
+            actual_size = 0
+        if actual_size != int(expected_size_bytes):
+            raise RuntimeError(
+                f"Incomplete download for {safe_url}: got {actual_size} bytes, expected {int(expected_size_bytes)} bytes"
+            )
 
 
 @dataclass
@@ -469,6 +723,8 @@ class DependencyAgent:
         self.heartbeat_seconds = _env_float("DM_HEARTBEAT_SECONDS", 30.0)
         self.max_parallel = max(1, min(4, _env_int("MAX_PARALLEL_DOWNLOADS", 1)))
         self.verbose_progress = (_env_str("DM_VERBOSE_PROGRESS") or "").lower() in ("1", "true", "yes", "on")
+        self.download_debug = _env_bool("DM_DOWNLOAD_DEBUG", False)
+        self.download_tool = (_env_str("DM_DOWNLOAD_TOOL") or "wget").strip().lower()
 
         self.download_timeout_seconds = max(30.0, min(3600.0, _env_float("DM_DOWNLOAD_TIMEOUT_SECONDS", 300.0)))
         chunk_mib = _env_int("DM_DOWNLOAD_CHUNK_MIB", 1)
@@ -959,6 +1215,8 @@ class DependencyAgent:
             "invalid download url",
             "destrelativepath must be relative",
             "destrelativepath escapes base dir",
+            "wget not found",
+            "dm_download_tool",
         ]
         return not any(s in msg for s in non_retry_substrings)
 
@@ -1096,16 +1354,30 @@ class DependencyAgent:
                 pass
 
         try:
-            http_download(
-                url=url,
-                dest_partial=partial,
-                auth_header=auth_header,
-                expected_size_bytes=int(expected_size_bytes),
-                timeout_seconds=float(self.download_timeout_seconds),
-                chunk_size=int(self.download_chunk_size),
-                allowed_domains=self.allowed_domains,
-                verbose=self.verbose_progress,
-            )
+            if self.download_tool == "wget":
+                wget_download(
+                    url=url,
+                    dest_partial=partial,
+                    auth_header=auth_header,
+                    expected_size_bytes=int(expected_size_bytes),
+                    timeout_seconds=float(self.download_timeout_seconds),
+                    allowed_domains=self.allowed_domains,
+                    debug=self.download_debug,
+                )
+            elif self.download_tool == "python":
+                http_download(
+                    url=url,
+                    dest_partial=partial,
+                    auth_header=auth_header,
+                    expected_size_bytes=int(expected_size_bytes),
+                    timeout_seconds=float(self.download_timeout_seconds),
+                    chunk_size=int(self.download_chunk_size),
+                    allowed_domains=self.allowed_domains,
+                    verbose=self.verbose_progress,
+                    debug=self.download_debug,
+                )
+            else:
+                raise RuntimeError(f"Unsupported DM_DOWNLOAD_TOOL: {self.download_tool}")
 
             if isinstance(sha256_expected, str) and sha256_expected:
                 actual = sha256_file(partial)
@@ -1282,9 +1554,12 @@ class DependencyAgent:
         logging.info("State file: %s", str(self.state_path))
         logging.info("Allowed download domains: %s", ",".join(sorted(self.allowed_domains)))
         logging.info(
-            "Download settings: timeout=%.1fs chunkMiB=%d",
+            "Download settings: tool=%s timeout=%.1fs chunkMiB=%d verbose=%s debug=%s",
+            self.download_tool,
             float(self.download_timeout_seconds),
             int(self.download_chunk_size / (1024 * 1024)),
+            "yes" if self.verbose_progress else "no",
+            "yes" if self.download_debug else "no",
         )
         logging.info("Polling every %.1fs, heartbeat every %.1fs, max_parallel=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         policy = self._dynamic_policy()
