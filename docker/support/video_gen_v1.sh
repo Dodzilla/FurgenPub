@@ -3,10 +3,15 @@
 set -x
 
 export WORKSPACE="${WORKSPACE:-/workspace}"
+export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$WORKSPACE/ComfyUI}"
+
+if [[ -z "$DM_INSTANCE_ID" && -n "$VAST_CONTAINERLABEL" ]]; then
+    DM_INSTANCE_ID="${VAST_CONTAINERLABEL#C.}"
+    export DM_INSTANCE_ID
+fi
 
 source /venv/main/bin/activate
-COMFYUI_DIR="${WORKSPACE}/ComfyUI"
-export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$COMFYUI_DIR}"
+COMFYUI_DIR="${DM_COMFYUI_DIR}"
 
 # NOTE:
 # - Do NOT put Hugging Face tokens in this file (or in git clone URLs).
@@ -418,14 +423,10 @@ function dependency_manager_start_agent() {
     nohup bash -lc "source /venv/main/bin/activate && python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
 }
 
+# Allow user to disable provisioning if they started with a script they didn't want
+if [[ ! -f /.noprovisioning ]]; then
+    provisioning_start
+fi
+
 # Start the dependency manager agent (best-effort; safe if required env vars are missing).
 dependency_manager_start_agent
-
-# Allow user to disable provisioning if they started with a script they didn't want
-echo "DEBUG: Checking for /.noprovisioning file..."
-if [[ ! -f /.noprovisioning ]]; then
-    echo "DEBUG: /.noprovisioning not found. Starting provisioning process."
-    provisioning_start
-else
-    echo "DEBUG: /.noprovisioning found. Skipping provisioning."
-fi
