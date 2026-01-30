@@ -123,7 +123,7 @@ function pin_node_if_requested() {
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
-        printf "Updating ComfyUI to pinned version (3cd7b32)...\n"
+        printf "Updating ComfyUI to pinned version (bbe2c13)...\n"
         (
             cd "${COMFYUI_DIR}"
             git config --global --add safe.directory "$(pwd)"
@@ -131,7 +131,7 @@ function provisioning_update_comfyui() {
             echo "DEBUG: Fetching git updates..."
             git fetch
             echo "DEBUG: Checking out pinned commit..."
-            git checkout 3cd7b32f1b7e7e90395cefe7d9f9b1f89276d8ce
+            git checkout bbe2c13a7075bcf4de3b6744f96d84d12c334350
         )
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
