@@ -50,7 +50,7 @@ NODES=(
 
     # Video processing nodes
     "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
-    "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation"
+    "https://github.com/GACLove/ComfyUI-VFI"
     "https://github.com/Lightricks/ComfyUI-LTXVideo"
 
     # WanVideo nodes
