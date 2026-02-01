@@ -18,6 +18,7 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
+    "flash-attn"
 )
 
 NODES=(
