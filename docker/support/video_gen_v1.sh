@@ -33,7 +33,7 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    "flash_attn"
+    "flash-attn"
     "triton"
     "sageattention"
     "onnxruntime"

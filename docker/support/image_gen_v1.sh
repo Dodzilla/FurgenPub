@@ -32,6 +32,7 @@ NODES=(
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
     "https://github.com/scottmudge/ComfyUI-NAG"
+    "https://github.com/DarioFT/ComfyUI-Qwen3-TTS"
 )
 
 
@@ -109,6 +110,7 @@ function provisioning_start() {
     provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes
+    provisioning_install_qwen3_tts_requirements
     provisioning_get_pip_packages
     # models are now installed by DM agent
     provisioning_print_end
@@ -150,6 +152,19 @@ function provisioning_get_nodes() {
             fi
         fi
     done
+}
+
+function provisioning_install_qwen3_tts_requirements() {
+    local node_path requirements_path
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-Qwen3-TTS"
+    requirements_path="${node_path}/requirements.txt"
+
+    if [[ -e "${requirements_path}" ]]; then
+        printf "Installing ComfyUI-Qwen3-TTS requirements (explicit pass)...\n"
+        pip install --no-cache-dir -r "${requirements_path}"
+    else
+        printf "WARN: ComfyUI-Qwen3-TTS requirements.txt not found: %s\n" "${requirements_path}"
+    fi
 }
 
 function provisioning_get_files() {
