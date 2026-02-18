@@ -10,6 +10,7 @@ fi
 
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
+export SERVER_TYPE="image_gen_v2"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
@@ -226,10 +227,26 @@ function provisioning_install_trellis2_runtime_requirements() {
     # Trellis2 Linux wheels are built against CUDA 12 runtime and require these binary wheels.
     if [[ -d "${wheels_dir}" ]]; then
         printf "Installing Trellis2 binary wheels from %s...\n" "${wheels_dir}"
+        # o_voxel wheel depends on git-sourced cumesh/flex_gemm. We install those wheels directly
+        # and install o_voxel without deps to avoid rebuilding against a mismatched local CUDA toolkit.
+        pip install --no-cache-dir plyfile zstandard
         for wheel in "${wheels_dir}"/*.whl; do
             [[ -e "${wheel}" ]] || continue
-            pip install --no-cache-dir "${wheel}"
+            local wheel_name
+            wheel_name="$(basename "${wheel}")"
+            if [[ "${wheel_name}" == o_voxel-* ]]; then
+                pip install --no-cache-dir --no-deps "${wheel}"
+            else
+                pip install --no-cache-dir "${wheel}"
+            fi
         done
+        if ! /venv/main/bin/python -c "import o_voxel" >/dev/null 2>&1; then
+            local ovoxel_wheel
+            ovoxel_wheel="$(find "${wheels_dir}" -maxdepth 1 -type f -name "o_voxel-*.whl" | head -n 1)"
+            if [[ -n "${ovoxel_wheel}" ]]; then
+                pip install --no-cache-dir --no-deps "${ovoxel_wheel}" || true
+            fi
+        fi
     else
         printf "WARN: Trellis2 wheels directory missing: %s\n" "${wheels_dir}"
     fi
