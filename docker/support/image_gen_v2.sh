@@ -40,17 +40,8 @@ PIP_PACKAGES=(
 )
 
 NODES=(
-    "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
-    "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/cubiq/ComfyUI_essentials"
-    "https://github.com/WASasquatch/was-node-suite-comfyui"
-    "https://github.com/Fannovel16/comfyui_controlnet_aux"
-    "https://github.com/PozzettiAndrea/ComfyUI-SAM3"
-    "https://github.com/ltdrdata/ComfyUI-Manager"
-    "https://github.com/Dodzilla/easy-comfy-nodes-async"
-    "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
     "https://github.com/scottmudge/ComfyUI-NAG"
-    "https://github.com/DarioFT/ComfyUI-Qwen3-TTS"
     "https://github.com/visualbruno/ComfyUI-Trellis2"
 )
 
@@ -136,7 +127,6 @@ function provisioning_start() {
     provisioning_install_trellis2_runtime_requirements
     provisioning_configure_trellis2_runtime
     printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
-    provisioning_install_qwen3_tts_requirements
     provisioning_get_pip_packages
     # models are now installed by DM agent
     provisioning_print_end
