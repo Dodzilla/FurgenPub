@@ -11,14 +11,24 @@ fi
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
 
+TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
+TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
+TRELLIS2_MODEL_REPO="${TRELLIS2_MODEL_REPO:-microsoft/TRELLIS.2-4B}"
+TRELLIS2_DINOV3_REPO="${TRELLIS2_DINOV3_REPO:-facebook/dinov3-vitl16-pretrain-lvd1689m}"
+TRELLIS2_DINOV3_FALLBACK_REPO="${TRELLIS2_DINOV3_FALLBACK_REPO:-camenduru/dinov3-vitl16-pretrain-lvd1689m}"
+TRELLIS2_INSTALL_DINOV3="${TRELLIS2_INSTALL_DINOV3:-true}"
+
+# If flash-attn install fails, we automatically fall back to xformers.
+TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
+
 # Packages are installed after nodes so we can fix them...
 
 APT_PACKAGES=(
-    #"package-2"
+    "libopengl0"
 )
 
 PIP_PACKAGES=(
-    "flash-attn"
+    #"package-2"
 )
 
 NODES=(
@@ -33,6 +43,7 @@ NODES=(
     "https://github.com/Dodzilla/ComfyUI-ComfyCouple"
     "https://github.com/scottmudge/ComfyUI-NAG"
     "https://github.com/DarioFT/ComfyUI-Qwen3-TTS"
+    "https://github.com/visualbruno/ComfyUI-Trellis2"
 )
 
 
@@ -54,6 +65,7 @@ NODE_PINS[ComfyUI-NAG]="c6f27116a8259f5b501d498a09e51c82fa72e35f"
 NODE_PINS[ComfyUI-SAM3]="978bb763cfadcad41363eba016e57686b414c27b"
 NODE_PINS[easy-comfy-nodes-async]="d4c651a65e885a05ce5ce09468a2597ab1f7925c"
 NODE_PINS[ComfyUI-Qwen3-TTS]="a2b5176d84ff101e3f2ab49876e9d9f2c38b7ee2"
+NODE_PINS[ComfyUI-Trellis2]="07574666fbe7c82939cec5f69373b8f0958caae1"
 
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
@@ -113,6 +125,9 @@ function provisioning_start() {
     provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes
+    provisioning_install_trellis2_runtime_requirements
+    provisioning_configure_trellis2_runtime
+    printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
     provisioning_install_qwen3_tts_requirements
     provisioning_get_pip_packages
     # models are now installed by DM agent
@@ -168,6 +183,216 @@ function provisioning_install_qwen3_tts_requirements() {
     else
         printf "WARN: ComfyUI-Qwen3-TTS requirements.txt not found: %s\n" "${requirements_path}"
     fi
+}
+
+function provisioning_install_trellis2_runtime_requirements() {
+    if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
+        return 0
+    fi
+
+    local node_path wheels_dir
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-Trellis2"
+    wheels_dir="${node_path}/wheels/Linux/Torch291"
+
+    if [[ ! -d "${node_path}" ]]; then
+        printf "WARN: Trellis2 node directory not found: %s\n" "${node_path}"
+        return 0
+    fi
+
+    # Trellis2 Linux wheels are built against CUDA 12 runtime and require these binary wheels.
+    if [[ -d "${wheels_dir}" ]]; then
+        printf "Installing Trellis2 binary wheels from %s...\n" "${wheels_dir}"
+        for wheel in "${wheels_dir}"/*.whl; do
+            [[ -e "${wheel}" ]] || continue
+            pip install --no-cache-dir "${wheel}"
+        done
+    else
+        printf "WARN: Trellis2 wheels directory missing: %s\n" "${wheels_dir}"
+    fi
+
+    printf "Installing CUDA 12 runtime compatibility package for Trellis2...\n"
+    pip install --no-cache-dir nvidia-cuda-runtime-cu12
+
+    printf "Installing rembg + onnxruntime-gpu for Trellis2 preprocessing...\n"
+    pip install --no-cache-dir "onnxruntime-gpu==1.22.0" "rembg[gpu]==2.0.69"
+
+    TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
+    if [[ "${TRELLIS2_RESOLVED_ATTN_BACKEND,,}" == "flash_attn" ]]; then
+        if ! /venv/main/bin/python -c "import flash_attn" >/dev/null 2>&1; then
+            printf "Installing flash-attn (no build isolation)...\n"
+            if ! pip install --no-cache-dir --no-build-isolation flash-attn; then
+                TRELLIS2_RESOLVED_ATTN_BACKEND="xformers"
+                printf "WARN: flash-attn install failed; falling back to xformers backend.\n"
+            fi
+        fi
+    fi
+}
+
+function provisioning_configure_trellis2_runtime() {
+    if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
+        return 0
+    fi
+
+    local launch_script
+    launch_script="/opt/supervisor-scripts/comfyui.sh"
+    if [[ ! -f "${launch_script}" ]]; then
+        printf "WARN: Trellis2 runtime launch script not found: %s\n" "${launch_script}"
+        return 0
+    fi
+
+    if ! grep -q "Trellis2 CUDA 12 wheel compatibility" "${launch_script}"; then
+        sed -i '/# Activate the venv/a\
+\
+# Trellis2 CUDA 12 wheel compatibility (cumesh/o_voxel wheels require libcudart.so.12)\
+CUDA12_LIB="/venv/main/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"\
+CUDA13_LIB="/venv/main/lib/python3.12/site-packages/nvidia/cu13/lib"\
+export LD_LIBRARY_PATH="${CUDA12_LIB}:${CUDA13_LIB}:${LD_LIBRARY_PATH:-}"\
+' "${launch_script}"
+    fi
+
+    if grep -q '^export ATTN_BACKEND=' "${launch_script}"; then
+        sed -i "s|^export ATTN_BACKEND=.*|export ATTN_BACKEND=\"\\\${ATTN_BACKEND:-${TRELLIS2_RESOLVED_ATTN_BACKEND}}\"|" "${launch_script}"
+    else
+        sed -i "/export LD_LIBRARY_PATH=.*cuda_runtime\\/lib/a export ATTN_BACKEND=\"\\\${ATTN_BACKEND:-${TRELLIS2_RESOLVED_ATTN_BACKEND}}\"" "${launch_script}"
+    fi
+}
+
+function provisioning_ensure_trellis2_core_models() {
+    if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
+        return 0
+    fi
+
+    local model_dir
+    model_dir="${COMFYUI_DIR}/models/microsoft/TRELLIS.2-4B"
+
+    printf "Ensuring Trellis2 core checkpoints are present...\n"
+    /venv/main/bin/python - "${model_dir}" "${TRELLIS2_MODEL_REPO}" <<'PY'
+import os
+import sys
+from huggingface_hub import hf_hub_download
+
+local_dir = sys.argv[1]
+repo_id = sys.argv[2]
+
+required_files = [
+    "pipeline.json",
+    "ckpts/ss_flow_img_dit_1_3B_64_bf16.json",
+    "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+    "ckpts/shape_dec_next_dc_f16c32_fp16.json",
+    "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors",
+    "ckpts/shape_enc_next_dc_f16c32_fp16.json",
+    "ckpts/shape_enc_next_dc_f16c32_fp16.safetensors",
+    "ckpts/tex_dec_next_dc_f16c32_fp16.json",
+    "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
+    "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.json",
+    "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+    "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.json",
+    "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+    "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.json",
+    "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
+]
+
+for rel_path in required_files:
+    abs_path = os.path.join(local_dir, rel_path)
+    if os.path.exists(abs_path):
+        continue
+    print(f"Downloading missing Trellis2 file: {rel_path}", flush=True)
+    hf_hub_download(repo_id=repo_id, filename=rel_path, local_dir=local_dir)
+PY
+}
+
+function provisioning_download_hf_file_to_path() {
+    local url output_path
+    url="$1"
+    output_path="$2"
+
+    mkdir -p "$(dirname "${output_path}")"
+
+    if [[ -n $HF_TOKEN && $url =~ ^https://([a-zA-Z0-9_-]+\.)?huggingface\.co(/|$|\?) ]]; then
+        curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${url}" -o "${output_path}"
+    else
+        curl -fsSL "${url}" -o "${output_path}"
+    fi
+}
+
+function provisioning_validate_trellis2_dinov3_config() {
+    local config_path
+    config_path="$1"
+
+    /venv/main/bin/python - "${config_path}" <<'PY'
+import json
+import sys
+
+cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+if int(cfg.get("hidden_size", 0)) != 1024:
+    raise SystemExit(1)
+PY
+}
+
+function provisioning_download_trellis2_dinov3_repo() {
+    local repo model_dir
+    repo="$1"
+    model_dir="${COMFYUI_DIR}/models/facebook/dinov3-vitl16-pretrain-lvd1689m"
+
+    local files=(
+        "config.json"
+        "model.safetensors"
+        "preprocessor_config.json"
+        "README.md"
+        "LICENSE.md"
+        ".gitattributes"
+    )
+
+    for file in "${files[@]}"; do
+        local url
+        url="https://huggingface.co/${repo}/resolve/main/${file}?download=true"
+        provisioning_download_hf_file_to_path "${url}" "${model_dir}/${file}" || return 1
+    done
+}
+
+function provisioning_ensure_trellis2_dinov3_model() {
+    if [[ "${TRELLIS2_ENABLE,,}" != "true" || "${TRELLIS2_INSTALL_DINOV3,,}" != "true" ]]; then
+        return 0
+    fi
+
+    local model_dir current_hidden
+    model_dir="${COMFYUI_DIR}/models/facebook/dinov3-vitl16-pretrain-lvd1689m"
+    current_hidden=""
+
+    if [[ -f "${model_dir}/config.json" ]]; then
+        current_hidden=$(/venv/main/bin/python - "${model_dir}/config.json" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+print(cfg.get("hidden_size", ""))
+PY
+)
+    fi
+
+    if [[ -f "${model_dir}/model.safetensors" && "${current_hidden}" == "1024" ]]; then
+        printf "Trellis2 Dinov3 model already present and valid.\n"
+        return 0
+    fi
+
+    printf "Downloading Trellis2 Dinov3 model from %s...\n" "${TRELLIS2_DINOV3_REPO}"
+    if provisioning_download_trellis2_dinov3_repo "${TRELLIS2_DINOV3_REPO}" && \
+        provisioning_validate_trellis2_dinov3_config "${model_dir}/config.json"; then
+        printf "Trellis2 Dinov3 model download complete.\n"
+        return 0
+    fi
+
+    if [[ "${TRELLIS2_DINOV3_FALLBACK_REPO}" != "${TRELLIS2_DINOV3_REPO}" ]]; then
+        printf "WARN: Primary Dinov3 repo failed. Retrying with fallback: %s\n" "${TRELLIS2_DINOV3_FALLBACK_REPO}"
+        if provisioning_download_trellis2_dinov3_repo "${TRELLIS2_DINOV3_FALLBACK_REPO}" && \
+            provisioning_validate_trellis2_dinov3_config "${model_dir}/config.json"; then
+            printf "Trellis2 Dinov3 fallback download complete.\n"
+            return 0
+        fi
+    fi
+
+    printf "WARN: Unable to download a valid Trellis2 Dinov3 model. Trellis2 runtime generation may fail.\n"
+    return 0
 }
 
 function provisioning_get_files() {
