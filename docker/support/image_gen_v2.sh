@@ -39,6 +39,10 @@ PIP_PACKAGES=(
     #"package-2"
 )
 
+TRELLIS2_RUNTIME_PIP_PACKAGES=(
+    "trimesh"
+)
+
 NODES=(
     "https://github.com/cubiq/ComfyUI_essentials"
     "https://github.com/scottmudge/ComfyUI-NAG"
@@ -250,6 +254,11 @@ function provisioning_install_trellis2_runtime_requirements() {
     printf "Installing rembg + onnxruntime-gpu for Trellis2 preprocessing...\n"
     pip install --no-cache-dir "onnxruntime-gpu==1.22.0" "rembg[gpu]==2.0.69"
 
+    if ! /venv/main/bin/python -c "import trimesh" >/dev/null 2>&1; then
+        printf "Installing additional Trellis2 runtime Python deps: %s\n" "${TRELLIS2_RUNTIME_PIP_PACKAGES[*]}"
+        pip install --no-cache-dir "${TRELLIS2_RUNTIME_PIP_PACKAGES[@]}"
+    fi
+
     # Make CUDA runtime libraries discoverable for both current shell and future service runs.
     local cuda_runtime_paths=()
     while IFS= read -r runtime_path; do
@@ -344,45 +353,17 @@ function provisioning_configure_trellis2_runtime() {
     fi
 
     if ! grep -q "Trellis2 CUDA runtime compatibility block" "${launch_script}"; then
-        local tmp_launch first_line
-        tmp_launch="$(mktemp)"
-        first_line="$(head -n 1 "${launch_script}" || true)"
-
-        if [[ "${first_line}" == "#!"* ]]; then
-            {
-                printf "%s\n\n" "${first_line}"
-                cat <<'EOF'
+        cat <<'EOF' >> "${launch_script}"
 # Trellis2 CUDA runtime compatibility block
 for _trellis_cuda_lib in \
     /venv/main/lib/python3.12/site-packages/nvidia/cuda_runtime/lib \
     /venv/main/lib/python3.12/site-packages/nvidia/cu13/lib; do
-    if [[ -d "${_trellis_cuda_lib}" ]]; then
+    if [ -d "${_trellis_cuda_lib}" ]; then
         export LD_LIBRARY_PATH="${_trellis_cuda_lib}:${LD_LIBRARY_PATH:-}"
     fi
 done
 unset _trellis_cuda_lib
 EOF
-                tail -n +2 "${launch_script}"
-            } > "${tmp_launch}"
-        else
-            {
-                cat <<'EOF'
-# Trellis2 CUDA runtime compatibility block
-for _trellis_cuda_lib in \
-    /venv/main/lib/python3.12/site-packages/nvidia/cuda_runtime/lib \
-    /venv/main/lib/python3.12/site-packages/nvidia/cu13/lib; do
-    if [[ -d "${_trellis_cuda_lib}" ]]; then
-        export LD_LIBRARY_PATH="${_trellis_cuda_lib}:${LD_LIBRARY_PATH:-}"
-    fi
-done
-unset _trellis_cuda_lib
-EOF
-                cat "${launch_script}"
-            } > "${tmp_launch}"
-        fi
-
-        cat "${tmp_launch}" > "${launch_script}"
-        rm -f "${tmp_launch}"
     fi
 
     if grep -q '^export ATTN_BACKEND=' "${launch_script}"; then
