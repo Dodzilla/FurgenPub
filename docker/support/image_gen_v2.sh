@@ -15,10 +15,10 @@ export SERVER_TYPE="image_gen_v2"
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
 TRELLIS2_MODEL_REPO="${TRELLIS2_MODEL_REPO:-microsoft/TRELLIS.2-4B}"
-TRELLIS2_DINOV3_REPO="${TRELLIS2_DINOV3_REPO:-facebook/dinov3-vitl16-pretrain-lvd1689m}"
+TRELLIS2_DINOV3_REPO="${TRELLIS2_DINOV3_REPO:-camenduru/dinov3-vitl16-pretrain-lvd1689m}"
 TRELLIS2_DINOV3_FALLBACK_REPO="${TRELLIS2_DINOV3_FALLBACK_REPO:-camenduru/dinov3-vitl16-pretrain-lvd1689m}"
 TRELLIS2_INSTALL_DINOV3="${TRELLIS2_INSTALL_DINOV3:-true}"
-TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD="${TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD:-false}"
+TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD="${TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD:-true}"
 TRELLIS2_FLASH_ATTN_SOURCE_BUILD_TIMEOUT_SECONDS="${TRELLIS2_FLASH_ATTN_SOURCE_BUILD_TIMEOUT_SECONDS:-900}"
 
 # If flash-attn install fails, we automatically fall back to xformers.
@@ -28,8 +28,11 @@ TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
 
 APT_PACKAGES=(
     "sox"
+    "build-essential"
+    "ninja-build"
     "libgl1"
     "libopengl0"
+    "libglib2.0-0"
 )
 
 PIP_PACKAGES=(
@@ -252,7 +255,7 @@ function provisioning_install_trellis2_runtime_requirements() {
     fi
 
     printf "Installing CUDA 12 runtime compatibility package for Trellis2...\n"
-    pip install --no-cache-dir nvidia-cuda-runtime-cu12
+    pip install --no-cache-dir --upgrade nvidia-cuda-runtime-cu12
 
     printf "Installing rembg + onnxruntime-gpu for Trellis2 preprocessing...\n"
     pip install --no-cache-dir "onnxruntime-gpu==1.22.0" "rembg[gpu]==2.0.69"
@@ -262,7 +265,7 @@ function provisioning_install_trellis2_runtime_requirements() {
     while IFS= read -r runtime_path; do
         [[ -z "${runtime_path}" ]] && continue
         cuda_runtime_paths+=("${runtime_path}")
-    done < <(find /venv/main/lib -type d \( -path "*/site-packages/nvidia/cuda_runtime/lib" -o -path "*/site-packages/nvidia/cu13/lib" \) 2>/dev/null)
+    done < <(find /venv/main/lib -type d \( -path "*/site-packages/nvidia/cuda_runtime/lib" -o -path "*/site-packages/nvidia/cu13/lib" -o -path "*/site-packages/nvidia/*/lib" \) 2>/dev/null)
 
     if [[ ${#cuda_runtime_paths[@]} -eq 0 ]]; then
         printf "WARN: Could not find CUDA runtime library directories under /venv/main/lib.\n"
@@ -279,6 +282,21 @@ function provisioning_install_trellis2_runtime_requirements() {
             printf "%s\n" "${runtime_path}" | ${as_root} tee "/etc/ld.so.conf.d/trellis2_${conf_name}.conf" >/dev/null || true
         done
 
+        # Persist for non-interactive shells that may start ComfyUI/agent under supervisor.
+        {
+            printf "export LD_LIBRARY_PATH=\""
+            local first=1
+            for runtime_path in "${cuda_runtime_paths[@]}"; do
+                if [[ ${first} -eq 0 ]]; then
+                    printf ":"
+                fi
+                first=0
+                printf "%s" "${runtime_path}"
+            done
+            printf ":\${LD_LIBRARY_PATH:-}\"\n"
+        } | ${as_root} tee /etc/profile.d/trellis2_cuda.sh >/dev/null || true
+        ${as_root} chmod 644 /etc/profile.d/trellis2_cuda.sh || true
+
         ${as_root} ldconfig || true
     fi
 
@@ -291,6 +309,8 @@ function provisioning_install_trellis2_runtime_requirements() {
             as_root="sudo"
         fi
         ${as_root} ln -sf "${libcudart_candidate}" /usr/local/lib/libcudart.so.12 || true
+        ${as_root} mkdir -p /usr/lib/x86_64-linux-gnu || true
+        ${as_root} ln -sf "${libcudart_candidate}" /usr/lib/x86_64-linux-gnu/libcudart.so.12 || true
         ${as_root} ldconfig || true
     else
         printf "WARN: libcudart.so.12 was not found after installing nvidia-cuda-runtime-cu12.\n"
@@ -303,6 +323,7 @@ function provisioning_install_trellis2_runtime_requirements() {
             if ! pip install --no-cache-dir --only-binary=:all: flash-attn; then
                 if [[ "${TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD,,}" == "true" ]] && command -v nvcc >/dev/null 2>&1; then
                     printf "flash-attn wheel unavailable; attempting bounded source build...\n"
+                    export MAX_JOBS="${MAX_JOBS:-8}"
                     if command -v timeout >/dev/null 2>&1; then
                         timeout "${TRELLIS2_FLASH_ATTN_SOURCE_BUILD_TIMEOUT_SECONDS}" \
                             pip install --no-cache-dir --no-build-isolation flash-attn || true
