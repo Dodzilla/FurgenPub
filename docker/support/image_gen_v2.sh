@@ -17,6 +17,8 @@ TRELLIS2_MODEL_REPO="${TRELLIS2_MODEL_REPO:-microsoft/TRELLIS.2-4B}"
 TRELLIS2_DINOV3_REPO="${TRELLIS2_DINOV3_REPO:-facebook/dinov3-vitl16-pretrain-lvd1689m}"
 TRELLIS2_DINOV3_FALLBACK_REPO="${TRELLIS2_DINOV3_FALLBACK_REPO:-camenduru/dinov3-vitl16-pretrain-lvd1689m}"
 TRELLIS2_INSTALL_DINOV3="${TRELLIS2_INSTALL_DINOV3:-true}"
+TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD="${TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD:-false}"
+TRELLIS2_FLASH_ATTN_SOURCE_BUILD_TIMEOUT_SECONDS="${TRELLIS2_FLASH_ATTN_SOURCE_BUILD_TIMEOUT_SECONDS:-900}"
 
 # If flash-attn install fails, we automatically fall back to xformers.
 TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
@@ -24,6 +26,8 @@ TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
 # Packages are installed after nodes so we can fix them...
 
 APT_PACKAGES=(
+    "sox"
+    "libgl1"
     "libopengl0"
 )
 
@@ -135,8 +139,28 @@ function provisioning_start() {
 }
 
 function provisioning_get_apt_packages() {
-    if [[ -n $APT_PACKAGES ]]; then
-            sudo $APT_INSTALL ${APT_PACKAGES[@]}
+    if [[ ${#APT_PACKAGES[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    printf "Installing apt package prerequisites: %s\n" "${APT_PACKAGES[*]}"
+    if command -v apt-get >/dev/null 2>&1; then
+        if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+        else
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+        fi
+    elif [[ -n "${APT_INSTALL:-}" ]]; then
+        # Compatibility fallback for environments that predefine APT_INSTALL.
+        if command -v sudo >/dev/null 2>&1; then
+            sudo ${APT_INSTALL} "${APT_PACKAGES[@]}"
+        else
+            ${APT_INSTALL} "${APT_PACKAGES[@]}"
+        fi
+    else
+        printf "WARN: apt-get and APT_INSTALL are both unavailable; skipping apt package installation.\n"
     fi
 }
 
@@ -216,13 +240,64 @@ function provisioning_install_trellis2_runtime_requirements() {
     printf "Installing rembg + onnxruntime-gpu for Trellis2 preprocessing...\n"
     pip install --no-cache-dir "onnxruntime-gpu==1.22.0" "rembg[gpu]==2.0.69"
 
+    # Make CUDA runtime libraries discoverable for both current shell and future service runs.
+    local cuda_runtime_paths=()
+    while IFS= read -r runtime_path; do
+        [[ -z "${runtime_path}" ]] && continue
+        cuda_runtime_paths+=("${runtime_path}")
+    done < <(find /venv/main/lib -type d \( -path "*/site-packages/nvidia/cuda_runtime/lib" -o -path "*/site-packages/nvidia/cu13/lib" \) 2>/dev/null)
+
+    if [[ ${#cuda_runtime_paths[@]} -eq 0 ]]; then
+        printf "WARN: Could not find CUDA runtime library directories under /venv/main/lib.\n"
+    else
+        local as_root=""
+        if command -v sudo >/dev/null 2>&1; then
+            as_root="sudo"
+        fi
+
+        for runtime_path in "${cuda_runtime_paths[@]}"; do
+            export LD_LIBRARY_PATH="${runtime_path}:${LD_LIBRARY_PATH:-}"
+            local conf_name
+            conf_name="$(echo "${runtime_path}" | tr '/.' '__')"
+            printf "%s\n" "${runtime_path}" | ${as_root} tee "/etc/ld.so.conf.d/trellis2_${conf_name}.conf" >/dev/null || true
+        done
+
+        ${as_root} ldconfig || true
+    fi
+
+    # Ensure libcudart.so.12 is visible through the default linker path.
+    local libcudart_candidate=""
+    libcudart_candidate="$(find /venv/main/lib -type f -name "libcudart.so.12*" 2>/dev/null | head -n 1)"
+    if [[ -n "${libcudart_candidate}" ]]; then
+        local as_root=""
+        if command -v sudo >/dev/null 2>&1; then
+            as_root="sudo"
+        fi
+        ${as_root} ln -sf "${libcudart_candidate}" /usr/local/lib/libcudart.so.12 || true
+        ${as_root} ldconfig || true
+    else
+        printf "WARN: libcudart.so.12 was not found after installing nvidia-cuda-runtime-cu12.\n"
+    fi
+
     TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
     if [[ "${TRELLIS2_RESOLVED_ATTN_BACKEND,,}" == "flash_attn" ]]; then
         if ! /venv/main/bin/python -c "import flash_attn" >/dev/null 2>&1; then
-            printf "Installing flash-attn (no build isolation)...\n"
-            if ! pip install --no-cache-dir --no-build-isolation flash-attn; then
+            printf "Installing flash-attn (binary wheel preferred)...\n"
+            if ! pip install --no-cache-dir --only-binary=:all: flash-attn; then
+                if [[ "${TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD,,}" == "true" ]] && command -v nvcc >/dev/null 2>&1; then
+                    printf "flash-attn wheel unavailable; attempting bounded source build...\n"
+                    if command -v timeout >/dev/null 2>&1; then
+                        timeout "${TRELLIS2_FLASH_ATTN_SOURCE_BUILD_TIMEOUT_SECONDS}" \
+                            pip install --no-cache-dir --no-build-isolation flash-attn || true
+                    else
+                        pip install --no-cache-dir --no-build-isolation flash-attn || true
+                    fi
+                fi
+            fi
+
+            if ! /venv/main/bin/python -c "import flash_attn" >/dev/null 2>&1; then
                 TRELLIS2_RESOLVED_ATTN_BACKEND="xformers"
-                printf "WARN: flash-attn install failed; falling back to xformers backend.\n"
+                printf "WARN: flash-attn is unavailable; falling back to xformers backend.\n"
             fi
         fi
     fi
@@ -240,21 +315,55 @@ function provisioning_configure_trellis2_runtime() {
         return 0
     fi
 
-    if ! grep -q "Trellis2 CUDA 12 wheel compatibility" "${launch_script}"; then
-        sed -i '/# Activate the venv/a\
-\
-# Trellis2 CUDA 12 wheel compatibility (cumesh/o_voxel wheels require libcudart.so.12)\
-CUDA12_LIB="/venv/main/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"\
-CUDA13_LIB="/venv/main/lib/python3.12/site-packages/nvidia/cu13/lib"\
-export LD_LIBRARY_PATH="${CUDA12_LIB}:${CUDA13_LIB}:${LD_LIBRARY_PATH:-}"\
-' "${launch_script}"
+    if ! grep -q "Trellis2 CUDA runtime compatibility block" "${launch_script}"; then
+        local tmp_launch first_line
+        tmp_launch="$(mktemp)"
+        first_line="$(head -n 1 "${launch_script}" || true)"
+
+        if [[ "${first_line}" == "#!"* ]]; then
+            {
+                printf "%s\n\n" "${first_line}"
+                cat <<'EOF'
+# Trellis2 CUDA runtime compatibility block
+for _trellis_cuda_lib in \
+    /venv/main/lib/python3.12/site-packages/nvidia/cuda_runtime/lib \
+    /venv/main/lib/python3.12/site-packages/nvidia/cu13/lib; do
+    if [[ -d "${_trellis_cuda_lib}" ]]; then
+        export LD_LIBRARY_PATH="${_trellis_cuda_lib}:${LD_LIBRARY_PATH:-}"
+    fi
+done
+unset _trellis_cuda_lib
+EOF
+                tail -n +2 "${launch_script}"
+            } > "${tmp_launch}"
+        else
+            {
+                cat <<'EOF'
+# Trellis2 CUDA runtime compatibility block
+for _trellis_cuda_lib in \
+    /venv/main/lib/python3.12/site-packages/nvidia/cuda_runtime/lib \
+    /venv/main/lib/python3.12/site-packages/nvidia/cu13/lib; do
+    if [[ -d "${_trellis_cuda_lib}" ]]; then
+        export LD_LIBRARY_PATH="${_trellis_cuda_lib}:${LD_LIBRARY_PATH:-}"
+    fi
+done
+unset _trellis_cuda_lib
+EOF
+                cat "${launch_script}"
+            } > "${tmp_launch}"
+        fi
+
+        cat "${tmp_launch}" > "${launch_script}"
+        rm -f "${tmp_launch}"
     fi
 
     if grep -q '^export ATTN_BACKEND=' "${launch_script}"; then
         sed -i "s|^export ATTN_BACKEND=.*|export ATTN_BACKEND=\"\\\${ATTN_BACKEND:-${TRELLIS2_RESOLVED_ATTN_BACKEND}}\"|" "${launch_script}"
     else
-        sed -i "/export LD_LIBRARY_PATH=.*cuda_runtime\\/lib/a export ATTN_BACKEND=\"\\\${ATTN_BACKEND:-${TRELLIS2_RESOLVED_ATTN_BACKEND}}\"" "${launch_script}"
+        printf "\nexport ATTN_BACKEND=\"\${ATTN_BACKEND:-%s}\"\n" "${TRELLIS2_RESOLVED_ATTN_BACKEND}" >> "${launch_script}"
     fi
+
+    chmod +x "${launch_script}" || true
 }
 
 function provisioning_ensure_trellis2_core_models() {
