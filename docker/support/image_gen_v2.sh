@@ -408,6 +408,8 @@ required_files = [
     "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
     "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.json",
     "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+    "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.json",
+    "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors",
     "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.json",
     "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
 ]
