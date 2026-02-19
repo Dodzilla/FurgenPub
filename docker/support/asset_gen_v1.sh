@@ -132,6 +132,7 @@ function provisioning_update_comfyui() {
 function provisioning_start() {
     provisioning_print_header
     provisioning_update_comfyui
+    provisioning_patch_comfyui_xformers_fallback
     provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes
@@ -142,6 +143,76 @@ function provisioning_start() {
     provisioning_get_pip_packages
     # models are now installed by DM agent
     provisioning_print_end
+}
+
+function provisioning_patch_comfyui_xformers_fallback() {
+    local attention_file
+    attention_file="${COMFYUI_DIR}/comfy/ldm/modules/attention.py"
+
+    if [[ ! -f "${attention_file}" ]]; then
+        printf "WARN: Comfy attention file missing, skipping xformers fallback patch: %s\n" "${attention_file}"
+        return 0
+    fi
+
+    /venv/main/bin/python - "${attention_file}" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+
+if "FCS xformers fallback patch" in source:
+    print("Comfy xformers fallback patch already applied.")
+    raise SystemExit(0)
+
+old_snapshot_anchor = "    if skip_reshape:\n        # b h k d -> b k h d\n"
+new_snapshot_block = (
+    "    # FCS xformers fallback patch: preserve original tensors for fallback.\n"
+    "    q_in, k_in, v_in, mask_in = q, k, v, mask\n\n"
+    "    if skip_reshape:\n"
+    "        # b h k d -> b k h d\n"
+)
+
+old_attention_call = "    out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask)\n"
+new_attention_block = (
+    "    try:\n"
+    "        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask)\n"
+    "    except NotImplementedError as e:\n"
+    "        logging.warning(\n"
+    "            \"FCS xformers fallback patch: unsupported xformers attention kernel; falling back to PyTorch SDPA. %s\",\n"
+    "            e,\n"
+    "        )\n"
+    "        return attention_pytorch(\n"
+    "            q_in,\n"
+    "            k_in,\n"
+    "            v_in,\n"
+    "            heads,\n"
+    "            mask_in,\n"
+    "            skip_reshape=skip_reshape,\n"
+    "            skip_output_reshape=skip_output_reshape,\n"
+    "            **kwargs,\n"
+    "        )\n"
+)
+
+changed = False
+if old_snapshot_anchor in source:
+    source = source.replace(old_snapshot_anchor, new_snapshot_block, 1)
+    changed = True
+else:
+    print("WARN: Could not locate skip_reshape anchor; xformers fallback patch not applied.", file=sys.stderr)
+
+if old_attention_call in source:
+    source = source.replace(old_attention_call, new_attention_block, 1)
+    changed = True
+else:
+    print("WARN: Could not locate xformers attention call; xformers fallback patch not applied.", file=sys.stderr)
+
+if not changed:
+    raise SystemExit(0)
+
+path.write_text(source, encoding="utf-8")
+print("Applied Comfy xformers fallback patch.")
+PY
 }
 
 function provisioning_get_apt_packages() {
