@@ -10,7 +10,9 @@ fi
 
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
-export SERVER_TYPE="image_gen_v2"
+# Keep image_gen_v2 as the default while allowing template-level override for evolved server types.
+export SERVER_TYPE="${SERVER_TYPE:-image_gen_v2}"
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-185c61dc26cdc631a1fd57b53744b67393a97fc6}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
@@ -104,7 +106,7 @@ function pin_node_if_requested() {
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
-        printf "Updating ComfyUI to pinned version (4e6a1b6)...\n"
+        printf "Updating ComfyUI to pinned version (%s)...\n" "${COMFYUI_PIN_COMMIT:0:7}"
         (
             cd "${COMFYUI_DIR}"
             git config --global --add safe.directory "$(pwd)"
@@ -112,7 +114,7 @@ function provisioning_update_comfyui() {
             echo "DEBUG: Fetching git updates..."
             git fetch
             echo "DEBUG: Checking out pinned commit..."
-            git checkout 4e6a1b66a93ef91848bc4bbf2a84e0ea98efcfc9
+            git checkout "${COMFYUI_PIN_COMMIT}"
         )
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
