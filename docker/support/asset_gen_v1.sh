@@ -47,6 +47,7 @@ TRELLIS2_RUNTIME_PIP_PACKAGES=(
 
 NODES=(
     "https://github.com/cubiq/ComfyUI_essentials"
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
     "https://github.com/scottmudge/ComfyUI-NAG"
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/visualbruno/ComfyUI-Trellis2"
