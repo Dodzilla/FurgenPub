@@ -47,6 +47,7 @@ NODES=(
     "https://github.com/cubiq/ComfyUI_essentials"
     "https://github.com/scottmudge/ComfyUI-NAG"
     "https://github.com/visualbruno/ComfyUI-Trellis2"
+    "https://github.com/Dodzilla/easy-comfy-nodes-async"
 )
 
 
