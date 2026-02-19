@@ -13,6 +13,7 @@ COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # Keep asset_gen_v1 as the default while still allowing template-level override.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v1}"
 COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-185c61dc26cdc631a1fd57b53744b67393a97fc6}"
+FURGENPUB_PIN_REF="${FURGENPUB_PIN_REF:-6444185e393660470095d75d9556dca2e5b163fc}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
@@ -93,31 +94,72 @@ function load_node_pins_from_env() {
     done
 }
 
-function pin_node_if_requested() {
+function node_dir_from_repo() {
+    local repo="$1"
+    local dir="${repo##*/}"
+    dir="${dir%.git}"
+    printf "%s" "$dir"
+}
+
+function validate_required_repo_pins() {
+    local missing=0
+    local repo dir
+
+    if [[ -z "${COMFYUI_PIN_COMMIT}" ]]; then
+        printf "ERROR: COMFYUI_PIN_COMMIT is empty; refusing unpinned ComfyUI provisioning.\n"
+        return 1
+    fi
+
+    for repo in "${NODES[@]}"; do
+        dir="$(node_dir_from_repo "$repo")"
+        if [[ -z "${NODE_PINS[$dir]:-}" ]]; then
+            printf "ERROR: Missing NODE_PINS entry for repo %s (dir %s).\n" "$repo" "$dir"
+            missing=1
+        fi
+    done
+
+    if [[ $missing -ne 0 ]]; then
+        printf "ERROR: One or more node repos are not pinned. Set COMFY_NODE_PINS or update NODE_PINS.\n"
+        return 1
+    fi
+
+    return 0
+}
+
+function pin_node_to_ref() {
     local dir="$1"; shift
     local path="$1"
-    local pin_ref="${NODE_PINS[$dir]}"
-    if [[ -n "$pin_ref" ]]; then
-        printf "Pinning %s to %s...\n" "$dir" "$pin_ref"
-        (
-            cd "$path" && git fetch --all --tags && git checkout --force "$pin_ref"
-        ) || echo "WARN: Failed to pin $dir to $pin_ref"
+    local pin_ref="${NODE_PINS[$dir]:-}"
+    if [[ -z "${pin_ref}" ]]; then
+        printf "ERROR: No pin defined for node directory %s.\n" "$dir"
+        return 1
     fi
+    printf "Pinning %s to %s...\n" "$dir" "$pin_ref"
+    (
+        cd "$path" && git fetch --all --tags && git checkout --force "$pin_ref"
+    ) || {
+        printf "ERROR: Failed to pin %s to %s.\n" "$dir" "$pin_ref"
+        return 1
+    }
+    return 0
 }
 
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
         printf "Updating ComfyUI to pinned version (%s)...\n" "${COMFYUI_PIN_COMMIT:0:7}"
-        (
+        if ! (
             cd "${COMFYUI_DIR}"
             git config --global --add safe.directory "$(pwd)"
             echo "DEBUG: Current directory: $(pwd)"
             echo "DEBUG: Fetching git updates..."
-            git fetch
+            git fetch --all --tags
             echo "DEBUG: Checking out pinned commit..."
-            git checkout "${COMFYUI_PIN_COMMIT}"
-        )
+            git checkout --force "${COMFYUI_PIN_COMMIT}"
+        ); then
+            echo "ERROR: Failed to checkout pinned ComfyUI commit ${COMFYUI_PIN_COMMIT}."
+            return 1
+        fi
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
             pip install --no-cache-dir -r "${COMFYUI_DIR}/requirements.txt"
@@ -135,6 +177,7 @@ function provisioning_start() {
     provisioning_patch_comfyui_xformers_fallback
     provisioning_get_apt_packages
     load_node_pins_from_env
+    validate_required_repo_pins
     provisioning_get_nodes
     provisioning_install_qwen3_tts_requirements
     provisioning_install_trellis2_runtime_requirements
@@ -248,24 +291,24 @@ function provisioning_get_pip_packages() {
 }
 
 function provisioning_get_nodes() {
+    local repo dir path requirements
     for repo in "${NODES[@]}"; do
-        dir="${repo##*/}"
-        dir="${dir%.git}"
+        dir="$(node_dir_from_repo "$repo")"
         path="${COMFYUI_DIR}/custom_nodes/${dir}"
         requirements="${path}/requirements.txt"
         if [[ -d $path ]]; then
-            if [[ ${AUTO_UPDATE,,} != "false" ]]; then
+            if [[ ${AUTO_UPDATE,,} != "false" && -z "${NODE_PINS[$dir]:-}" ]]; then
                 printf "Updating node: %s...\n" "${repo}"
                 ( cd "$path" && git pull )
             fi
-            pin_node_if_requested "$dir" "$path"
+            pin_node_to_ref "$dir" "$path" || return 1
             if [[ -e $requirements ]]; then
                pip install --no-cache-dir -r "$requirements"
             fi
         else
             printf "Downloading node: %s...\n" "${repo}"
             git clone "${repo}" "${path}" --recursive
-            pin_node_if_requested "$dir" "$path"
+            pin_node_to_ref "$dir" "$path" || return 1
             if [[ -e $requirements ]]; then
                 pip install --no-cache-dir -r "${requirements}"
             fi
@@ -710,7 +753,7 @@ function dependency_manager_start_agent() {
                 return 0
             }
         else
-            fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
+            fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/${FURGENPUB_PIN_REF}/docker/scripts/dependency_agent_v1.py"
             echo "Dependency manager: downloading agent from fallback URL ($fallback_url)."
             curl -fsSL "$fallback_url" -o "$agent_path" || {
                 echo "WARN: Dependency manager: failed to download agent from fallback URL"
@@ -728,7 +771,10 @@ function dependency_manager_start_agent() {
 
 # Allow user to disable provisioning if they started with a script they didn't want
 if [[ ! -f /.noprovisioning ]]; then
-    provisioning_start
+    provisioning_start || {
+        echo "ERROR: Provisioning failed."
+        exit 1
+    }
 fi
 
 # Start the dependency manager agent (best-effort; safe if required env vars are missing).
