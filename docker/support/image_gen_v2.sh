@@ -48,6 +48,7 @@ TRELLIS2_RUNTIME_PIP_PACKAGES=(
 NODES=(
     "https://github.com/cubiq/ComfyUI_essentials"
     "https://github.com/scottmudge/ComfyUI-NAG"
+    "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/visualbruno/ComfyUI-Trellis2"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/DarioFT/ComfyUI-Qwen3-TTS"
@@ -133,6 +134,7 @@ function provisioning_start() {
     provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes
+    provisioning_install_qwen3_tts_requirements
     provisioning_install_trellis2_runtime_requirements
     provisioning_configure_trellis2_runtime
     printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
