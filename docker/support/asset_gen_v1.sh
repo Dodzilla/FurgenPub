@@ -54,6 +54,7 @@ NODES=(
     "https://github.com/visualbruno/ComfyUI-Trellis2"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/DarioFT/ComfyUI-Qwen3-TTS"
+    "https://github.com/kana112233/ComfyUI-kaola-moss-ttsd"
     "https://github.com/WASasquatch/was-node-suite-comfyui"
 )
 
@@ -77,6 +78,7 @@ NODE_PINS[ComfyUI-SAM3]="978bb763cfadcad41363eba016e57686b414c27b"
 NODE_PINS[easy-comfy-nodes-async]="d4c651a65e885a05ce5ce09468a2597ab1f7925c"
 NODE_PINS[ComfyUI-Qwen3-TTS]="a2b5176d84ff101e3f2ab49876e9d9f2c38b7ee2"
 NODE_PINS[ComfyUI-Trellis2]="07574666fbe7c82939cec5f69373b8f0958caae1"
+NODE_PINS[ComfyUI-kaola-moss-ttsd]="e3bba1ac47617207d6fb4d48da4ee65e632bfe19"
 
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
@@ -180,6 +182,7 @@ function provisioning_start() {
     validate_required_repo_pins
     provisioning_get_nodes
     provisioning_install_qwen3_tts_requirements
+    provisioning_install_moss_ttsd_requirements
     provisioning_install_trellis2_runtime_requirements
     provisioning_configure_trellis2_runtime
     printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
@@ -326,6 +329,19 @@ function provisioning_install_qwen3_tts_requirements() {
         pip install --no-cache-dir -r "${requirements_path}"
     else
         printf "WARN: ComfyUI-Qwen3-TTS requirements.txt not found: %s\n" "${requirements_path}"
+    fi
+}
+
+function provisioning_install_moss_ttsd_requirements() {
+    local node_path requirements_path
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-kaola-moss-ttsd"
+    requirements_path="${node_path}/requirements.txt"
+
+    if [[ -e "${requirements_path}" ]]; then
+        printf "Installing ComfyUI-kaola-moss-ttsd requirements (explicit pass)...\n"
+        pip install --no-cache-dir -r "${requirements_path}"
+    else
+        printf "WARN: ComfyUI-kaola-moss-ttsd requirements.txt not found: %s\n" "${requirements_path}"
     fi
 }
 
