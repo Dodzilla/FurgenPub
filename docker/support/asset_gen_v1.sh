@@ -203,6 +203,7 @@ function provisioning_start() {
     provisioning_install_transformers_compat_shim || return 1
     provisioning_install_trellis2_runtime_requirements || return 1
     provisioning_configure_trellis2_runtime || return 1
+    provisioning_configure_pytorch_allocator_env || return 1
     printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
     provisioning_get_pip_packages || return 1
     if ! provisioning_verify_qwen3_tts_node; then
@@ -710,6 +711,32 @@ EOF
         sed -i "s|^export ATTN_BACKEND=.*|export ATTN_BACKEND=\"\\\${ATTN_BACKEND:-${TRELLIS2_RESOLVED_ATTN_BACKEND}}\"|" "${launch_script}"
     else
         printf "\nexport ATTN_BACKEND=\"\${ATTN_BACKEND:-%s}\"\n" "${TRELLIS2_RESOLVED_ATTN_BACKEND}" >> "${launch_script}"
+    fi
+
+    chmod +x "${launch_script}" || true
+}
+
+function provisioning_configure_pytorch_allocator_env() {
+    local launch_script
+    launch_script="/opt/supervisor-scripts/comfyui.sh"
+    if [[ ! -f "${launch_script}" ]]; then
+        printf "WARN: ComfyUI launch script not found for allocator env normalization: %s\n" "${launch_script}"
+        return 0
+    fi
+
+    if ! grep -q "FURGEN PyTorch allocator env normalization" "${launch_script}"; then
+        cat <<'EOF' >> "${launch_script}"
+# FURGEN PyTorch allocator env normalization
+# PyTorch 2.9 deprecates PYTORCH_CUDA_ALLOC_CONF in favor of PYTORCH_ALLOC_CONF.
+# Having both with different values can crash CUDA init with allocator backend mismatch.
+if [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ -z "${PYTORCH_ALLOC_CONF:-}" ]; then
+    export PYTORCH_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
+fi
+if [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_ALLOC_CONF:-}" ] && [ "${PYTORCH_CUDA_ALLOC_CONF}" != "${PYTORCH_ALLOC_CONF}" ]; then
+    echo "WARN: PYTORCH_CUDA_ALLOC_CONF and PYTORCH_ALLOC_CONF differ; using PYTORCH_ALLOC_CONF and unsetting deprecated variable."
+fi
+unset PYTORCH_CUDA_ALLOC_CONF
+EOF
     fi
 
     chmod +x "${launch_script}" || true
