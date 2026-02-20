@@ -58,6 +58,12 @@ NODES=(
     "https://github.com/WASasquatch/was-node-suite-comfyui"
 )
 
+# Some nodes pull optional heavy source-build dependencies that are not
+# required for asset_gen_v1 workflows and can stall provisioning.
+SKIP_NODE_REQUIREMENTS=(
+    "ComfyUI-Impact-Pack"
+)
+
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
@@ -126,6 +132,17 @@ function validate_required_repo_pins() {
     fi
 
     return 0
+}
+
+function should_skip_node_requirements() {
+    local dir="$1"
+    local skip_dir
+    for skip_dir in "${SKIP_NODE_REQUIREMENTS[@]}"; do
+        if [[ "$dir" == "$skip_dir" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 function pin_node_to_ref() {
@@ -343,7 +360,9 @@ function provisioning_get_nodes() {
                 ( cd "$path" && git pull )
             fi
             pin_node_to_ref "$dir" "$path" || return 1
-            if [[ -e $requirements ]]; then
+            if should_skip_node_requirements "$dir"; then
+               printf "Skipping requirements install for node %s to avoid slow source-build dependencies.\n" "$dir"
+            elif [[ -e $requirements ]]; then
                pip install --no-cache-dir -r "$requirements" || {
                    printf "ERROR: Failed to install requirements for node %s (%s)\n" "$dir" "$requirements"
                    return 1
@@ -356,7 +375,9 @@ function provisioning_get_nodes() {
                 return 1
             }
             pin_node_to_ref "$dir" "$path" || return 1
-            if [[ -e $requirements ]]; then
+            if should_skip_node_requirements "$dir"; then
+                printf "Skipping requirements install for node %s to avoid slow source-build dependencies.\n" "$dir"
+            elif [[ -e $requirements ]]; then
                 pip install --no-cache-dir -r "${requirements}" || {
                     printf "ERROR: Failed to install requirements for node %s (%s)\n" "$dir" "$requirements"
                     return 1
