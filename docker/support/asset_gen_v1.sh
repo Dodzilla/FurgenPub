@@ -725,18 +725,47 @@ function provisioning_configure_pytorch_allocator_env() {
     fi
 
     if ! grep -q "FURGEN PyTorch allocator env normalization" "${launch_script}"; then
-        cat <<'EOF' >> "${launch_script}"
+        local tmp_file
+        tmp_file="$(mktemp)"
+        {
+            local first_line=""
+            if IFS= read -r first_line < "${launch_script}"; then
+                if [[ "${first_line}" == "#!"* ]]; then
+                    printf "%s\n" "${first_line}"
+                    cat <<'EOF'
 # FURGEN PyTorch allocator env normalization
-# PyTorch 2.9 deprecates PYTORCH_CUDA_ALLOC_CONF in favor of PYTORCH_ALLOC_CONF.
-# Having both with different values can crash CUDA init with allocator backend mismatch.
-if [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ -z "${PYTORCH_ALLOC_CONF:-}" ]; then
+# PyTorch 2.9 can crash CUDA init when *_ALLOC_CONF vars disagree.
+if [ -n "${PYTORCH_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "${PYTORCH_ALLOC_CONF}" != "${PYTORCH_CUDA_ALLOC_CONF}" ]; then
+    echo "WARN: PYTORCH_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF differ; normalizing to PYTORCH_ALLOC_CONF."
+fi
+if [ -z "${PYTORCH_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ]; then
     export PYTORCH_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
 fi
-if [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_ALLOC_CONF:-}" ] && [ "${PYTORCH_CUDA_ALLOC_CONF}" != "${PYTORCH_ALLOC_CONF}" ]; then
-    echo "WARN: PYTORCH_CUDA_ALLOC_CONF and PYTORCH_ALLOC_CONF differ; using PYTORCH_ALLOC_CONF and unsetting deprecated variable."
+if [ -n "${PYTORCH_ALLOC_CONF:-}" ]; then
+    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_ALLOC_CONF}"
 fi
-unset PYTORCH_CUDA_ALLOC_CONF
 EOF
+                    tail -n +2 "${launch_script}"
+                    return
+                fi
+            fi
+
+            cat <<'EOF'
+# FURGEN PyTorch allocator env normalization
+# PyTorch 2.9 can crash CUDA init when *_ALLOC_CONF vars disagree.
+if [ -n "${PYTORCH_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "${PYTORCH_ALLOC_CONF}" != "${PYTORCH_CUDA_ALLOC_CONF}" ]; then
+    echo "WARN: PYTORCH_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF differ; normalizing to PYTORCH_ALLOC_CONF."
+fi
+if [ -z "${PYTORCH_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ]; then
+    export PYTORCH_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
+fi
+if [ -n "${PYTORCH_ALLOC_CONF:-}" ]; then
+    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_ALLOC_CONF}"
+fi
+EOF
+            cat "${launch_script}"
+        } > "${tmp_file}"
+        mv "${tmp_file}" "${launch_script}"
     fi
 
     chmod +x "${launch_script}" || true
