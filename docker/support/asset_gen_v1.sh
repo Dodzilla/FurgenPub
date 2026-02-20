@@ -194,6 +194,7 @@ function provisioning_start() {
     provisioning_print_header || return 1
     provisioning_update_comfyui || return 1
     provisioning_patch_comfyui_xformers_fallback || return 1
+    provisioning_configure_pytorch_allocator_env || true
     provisioning_get_apt_packages || return 1
     load_node_pins_from_env
     validate_required_repo_pins || return 1
@@ -203,7 +204,7 @@ function provisioning_start() {
     provisioning_install_transformers_compat_shim || return 1
     provisioning_install_trellis2_runtime_requirements || return 1
     provisioning_configure_trellis2_runtime || return 1
-    provisioning_configure_pytorch_allocator_env || return 1
+    provisioning_configure_pytorch_allocator_env || true
     printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
     provisioning_get_pip_packages || return 1
     if ! provisioning_verify_qwen3_tts_node; then
