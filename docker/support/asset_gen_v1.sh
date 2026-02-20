@@ -199,11 +199,15 @@ function provisioning_start() {
     load_node_pins_from_env
     validate_required_repo_pins || return 1
     provisioning_get_nodes || return 1
+    provisioning_patch_trellis2_allocator_override || return 1
+    provisioning_install_impact_pack_runtime_requirements || return 1
     provisioning_install_qwen3_tts_requirements || return 1
     provisioning_install_moss_ttsd_requirements || return 1
+    provisioning_patch_moss_ttsd_runtime || return 1
     provisioning_install_transformers_compat_shim || return 1
     provisioning_install_trellis2_runtime_requirements || return 1
     provisioning_configure_trellis2_runtime || return 1
+    provisioning_configure_comfyui_launch_args || true
     provisioning_configure_pytorch_allocator_env || true
     printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
     provisioning_get_pip_packages || return 1
@@ -512,6 +516,174 @@ function provisioning_install_moss_ttsd_requirements() {
     fi
 }
 
+function provisioning_install_impact_pack_runtime_requirements() {
+    local node_path
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-Impact-Pack"
+    if [[ ! -d "${node_path}" ]]; then
+        printf "WARN: ComfyUI-Impact-Pack directory missing, skipping runtime dependency fix.\n"
+        return 0
+    fi
+
+    printf "Installing ComfyUI-Impact-Pack runtime dependencies (piexif, segment-anything)...\n"
+    pip install --no-cache-dir "piexif==1.1.3" "segment-anything==1.0" || {
+        printf "ERROR: Failed to install Impact-Pack runtime dependencies.\n"
+        return 1
+    }
+}
+
+function provisioning_patch_moss_ttsd_runtime() {
+    local node_file
+    node_file="${COMFYUI_DIR}/custom_nodes/ComfyUI-kaola-moss-ttsd/nodes_voice_generator.py"
+
+    if [[ ! -f "${node_file}" ]]; then
+        printf "WARN: MOSS node file missing, skipping runtime compatibility patch: %s\n" "${node_file}"
+        return 0
+    fi
+
+    /venv/main/bin/python - "${node_file}" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+changed = False
+
+helper_anchor = "except ImportError:\n    folder_paths = None\n\n"
+helper_block = '''# FURGEN_MOSS_MODELING_COMPAT_PATCH
+def _furgen_patch_moss_modeling_files(model_path):
+    candidates = []
+    if model_path:
+        candidates.append(os.path.join(model_path, "modeling_moss_tts.py"))
+
+    hf_modules_root = os.path.join(os.path.expanduser("~"), ".hf_home", "modules", "transformers_modules")
+    if os.path.isdir(hf_modules_root):
+        for root, _, files in os.walk(hf_modules_root):
+            if "modeling_moss_tts.py" in files:
+                candidates.append(os.path.join(root, "modeling_moss_tts.py"))
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen or not os.path.isfile(candidate):
+            continue
+        seen.add(candidate)
+
+        try:
+            with open(candidate, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except Exception:
+            continue
+
+        patched = text
+        patched = patched.replace(
+            "def get_input_embeddings(self, input_ids: Optional[torch.LongTensor]) -> torch.Tensor:",
+            "def get_input_embeddings(self, input_ids: Optional[torch.LongTensor] = None) -> torch.Tensor:",
+        )
+        patched = patched.replace(
+            "def get_input_embeddings(self, input_ids: torch.LongTensor) -> torch.Tensor:",
+            "def get_input_embeddings(self, input_ids: Optional[torch.LongTensor] = None) -> torch.Tensor:",
+        )
+        if "inputs_embeds = self.language_model.get_input_embeddings()(input_ids[..., 0])" in patched and "if input_ids is None:" not in patched:
+            patched = patched.replace(
+                "        inputs_embeds = self.language_model.get_input_embeddings()(input_ids[..., 0])",
+                "        # Hugging Face tie-weights path may call get_input_embeddings() with no args.\\n"
+                "        if input_ids is None:\\n"
+                "            return self.language_model.get_input_embeddings()\\n\\n"
+                "        inputs_embeds = self.language_model.get_input_embeddings()(input_ids[..., 0])",
+            )
+        patched = patched.replace(
+            "        pre_exclude_mask0 = torch.tensor([self.config.pad_token_id, self.config.audio_assistant_gen_slot_token_id, self.config.audio_assistant_delay_slot_token_id, self.config.audio_end_token_id], device=device)",
+            "        pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else (self.config.eos_token_id if getattr(self.config, \\"eos_token_id\\", None) is not None else 0)\\n"
+            "        pre_exclude_mask0 = torch.tensor([pad_token_id, self.config.audio_assistant_gen_slot_token_id, self.config.audio_assistant_delay_slot_token_id, self.config.audio_end_token_id], device=device)",
+        )
+
+        if patched != text:
+            try:
+                with open(candidate, "w", encoding="utf-8") as fh:
+                    fh.write(patched)
+                print(f"[FURGEN_MOSS] Patched modeling file: {candidate}")
+            except Exception as exc:
+                print(f"[FURGEN_MOSS] WARN: failed to write {candidate}: {exc}")
+
+
+def _furgen_apply_moss_config_fallback(model, processor, prefix):
+    try:
+        if getattr(model.config, "pad_token_id", None) is None:
+            fallback_pad = None
+            if hasattr(processor, "tokenizer"):
+                fallback_pad = getattr(processor.tokenizer, "pad_token_id", None)
+                if fallback_pad is None:
+                    fallback_pad = getattr(processor.tokenizer, "eos_token_id", None)
+            if fallback_pad is None:
+                fallback_pad = 0
+            model.config.pad_token_id = int(fallback_pad)
+            print(f"[{prefix}] Applied fallback pad_token_id={model.config.pad_token_id}")
+
+        if hasattr(processor, "model_config") and getattr(processor.model_config, "pad_token_id", None) is None:
+            processor.model_config.pad_token_id = model.config.pad_token_id
+
+        token_fallbacks = {
+            "audio_assistant_gen_slot_token_id": "<|audio_assistant_gen_slot|>",
+            "audio_assistant_delay_slot_token_id": "<|audio_assistant_delay_slot|>",
+            "audio_end_token_id": "<|audio_end|>",
+            "audio_start_token_id": "<|audio_start|>",
+            "audio_user_slot_token_id": "<|audio_user_slot|>",
+        }
+        for attr_name, token_name in token_fallbacks.items():
+            if getattr(model.config, attr_name, None) is None:
+                recovered = None
+                if hasattr(processor, "model_config"):
+                    recovered = getattr(processor.model_config, attr_name, None)
+                if recovered is None and hasattr(processor, "tokenizer"):
+                    token_id = processor.tokenizer.convert_tokens_to_ids(token_name)
+                    if token_id is not None and token_id >= 0:
+                        recovered = int(token_id)
+                if recovered is not None:
+                    setattr(model.config, attr_name, int(recovered))
+    except Exception as exc:
+        print(f"[{prefix}] config fallback warning: {exc}")
+
+
+'''
+if "FURGEN_MOSS_MODELING_COMPAT_PATCH" not in source and helper_anchor in source:
+    source = source.replace(helper_anchor, helper_anchor + helper_block, 1)
+    changed = True
+
+for marker in (
+    '        print(f"[MOSS-VoiceGenerator] Loading model to {device} with {dtype}...")\n',
+    '        print(f"[MOSS-SoundEffect] Loading model to {device} w/ {dtype}...")\n',
+):
+    idx = source.find(marker)
+    if idx != -1:
+        line_start = source.rfind("\n", 0, idx) + 1
+        add_line = "        _furgen_patch_moss_modeling_files(model_path)\n"
+        if add_line not in source[max(0, line_start - 240):line_start + 240]:
+            source = source[:line_start] + add_line + source[line_start:]
+            changed = True
+
+for class_name, prefix in (
+    ("MossVoiceGeneratorLoadModel", "MOSS-VoiceGenerator"),
+    ("MossSoundEffectLoadModel", "MOSS-SoundEffect"),
+):
+    class_idx = source.find(f"class {class_name}:")
+    if class_idx == -1:
+        continue
+    eval_idx = source.find("            model.eval()\n", class_idx)
+    if eval_idx == -1:
+        continue
+    add_line = f'            _furgen_apply_moss_config_fallback(model, processor, "{prefix}")\n'
+    insert_at = eval_idx + len("            model.eval()\n")
+    if add_line not in source[eval_idx:eval_idx + 320]:
+        source = source[:insert_at] + add_line + source[insert_at:]
+        changed = True
+
+if changed:
+    path.write_text(source, encoding="utf-8")
+    print("Applied MOSS runtime compatibility patch.")
+else:
+    print("MOSS runtime compatibility patch already present.")
+PY
+}
+
 function provisioning_install_transformers_compat_shim() {
     local sitecustomize_path
     sitecustomize_path="$(
@@ -530,23 +702,163 @@ PY
         return 0
     }
 
-    if [[ -f "${sitecustomize_path}" ]] && grep -q "FURGEN_TRANSFORMERS_PRETRAINED_SHIM" "${sitecustomize_path}"; then
-        printf "Transformers compatibility shim already present at %s\n" "${sitecustomize_path}"
-        return 0
-    fi
+    printf "Ensuring transformers compatibility shims at %s\n" "${sitecustomize_path}"
+    /venv/main/bin/python - "${sitecustomize_path}" <<'PY'
+import pathlib
+import sys
 
-    printf "Installing transformers compatibility shim at %s\n" "${sitecustomize_path}"
-    cat >> "${sitecustomize_path}" <<'PY'
-# FURGEN_TRANSFORMERS_PRETRAINED_SHIM
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8") if path.exists() else ""
+
+blocks = [
+    (
+        "FURGEN_TRANSFORMERS_PRETRAINED_SHIM",
+        """# FURGEN_TRANSFORMERS_PRETRAINED_SHIM
 try:
     from transformers import configuration_utils as _fcs_tr_cfg
     if not hasattr(_fcs_tr_cfg, "PreTrainedConfig") and hasattr(_fcs_tr_cfg, "PretrainedConfig"):
         _fcs_tr_cfg.PreTrainedConfig = _fcs_tr_cfg.PretrainedConfig
 except Exception:
     pass
+""",
+    ),
+    (
+        "FURGEN_MOSS_PROCESSING_UTILS_SHIM",
+        """# FURGEN_MOSS_PROCESSING_UTILS_SHIM
+try:
+    from transformers import processing_utils as _fcs_pu
+    if not hasattr(_fcs_pu, "MODALITY_TO_BASE_CLASS_MAPPING"):
+        _fcs_pu.MODALITY_TO_BASE_CLASS_MAPPING = {}
+    _fcs_pu.MODALITY_TO_BASE_CLASS_MAPPING.setdefault("audio_tokenizer", "PreTrainedModel")
+except Exception:
+    pass
+""",
+    ),
+    (
+        "FURGEN_MOSS_AUDIO_TOKENIZER_CLASSCHECK_SHIM",
+        """# FURGEN_MOSS_AUDIO_TOKENIZER_CLASSCHECK_SHIM
+try:
+    from transformers import processing_utils as _fcs_pu
+    if hasattr(_fcs_pu, "ProcessorMixin"):
+        _fcs_orig_check = _fcs_pu.ProcessorMixin.check_argument_for_proper_class
+        def _fcs_patched_check(self, argument_name, argument_value):
+            if argument_name == "audio_tokenizer":
+                return None
+            return _fcs_orig_check(self, argument_name, argument_value)
+        _fcs_pu.ProcessorMixin.check_argument_for_proper_class = _fcs_patched_check
+except Exception:
+    pass
+""",
+    ),
+    (
+        "FURGEN_MOSS_PROCESSOR_INIT_SHIM",
+        """# FURGEN_MOSS_PROCESSOR_INIT_SHIM
+try:
+    from transformers import processing_utils as _fcs_pu
+    if hasattr(_fcs_pu, "ProcessorMixin"):
+        _fcs_orig_init = _fcs_pu.ProcessorMixin.__init__
+        def _fcs_patched_init(self, *args, **kwargs):
+            if "audio_tokenizer" in kwargs:
+                _tok = kwargs.get("audio_tokenizer")
+                kwargs.setdefault("tokenizer", _tok)
+                kwargs.setdefault("feature_extractor", _tok)
+            return _fcs_orig_init(self, *args, **kwargs)
+        _fcs_pu.ProcessorMixin.__init__ = _fcs_patched_init
+except Exception:
+    pass
+""",
+    ),
+    (
+        "FURGEN_MOSS_CLASSCHECK_BYPASS2",
+        """# FURGEN_MOSS_CLASSCHECK_BYPASS2
+try:
+    from transformers import processing_utils as _fcs_pu
+    if hasattr(_fcs_pu, "ProcessorMixin"):
+        _fcs_prev_check = _fcs_pu.ProcessorMixin.check_argument_for_proper_class
+        def _fcs_check_bypass2(self, argument_name, argument_value):
+            if argument_name in ("audio_tokenizer", "feature_extractor"):
+                return None
+            return _fcs_prev_check(self, argument_name, argument_value)
+        _fcs_pu.ProcessorMixin.check_argument_for_proper_class = _fcs_check_bypass2
+except Exception:
+    pass
+""",
+    ),
+    (
+        "FURGEN_MOSS_INITIALIZATION_ALIAS_SHIM",
+        """# FURGEN_MOSS_INITIALIZATION_ALIAS_SHIM
+try:
+    import transformers as _fcs_tr
+    import torch.nn.init as _fcs_torch_init
+    if not hasattr(_fcs_tr, "initialization"):
+        _fcs_tr.initialization = _fcs_torch_init
+except Exception:
+    pass
+""",
+    ),
+]
+
+changed = False
+for marker, block in blocks:
+    if marker in source:
+        continue
+    if source and not source.endswith("\n"):
+        source += "\n"
+    source += block
+    changed = True
+
+if changed:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    print(f"Updated compatibility shims at {path}")
+else:
+    print(f"Compatibility shims already present at {path}")
 PY
 
     return 0
+}
+
+function provisioning_patch_trellis2_allocator_override() {
+    if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
+        return 0
+    fi
+
+    local node_file
+    node_file="${COMFYUI_DIR}/custom_nodes/ComfyUI-Trellis2/nodes.py"
+    if [[ ! -f "${node_file}" ]]; then
+        printf "WARN: Trellis2 node file missing, skipping allocator override patch: %s\n" "${node_file}"
+        return 0
+    fi
+
+    /venv/main/bin/python - "${node_file}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+
+if "FURGEN hotfix: do not mutate allocator env" in source:
+    print("Trellis2 allocator override patch already present.")
+    raise SystemExit(0)
+
+pattern = re.compile(r'(?m)^(\s*)os\.environ\["PYTORCH_CUDA_ALLOC_CONF"\]\s*=.*$')
+
+def _repl(match):
+    indent = match.group(1)
+    return (
+        f"{indent}# FURGEN hotfix: do not mutate allocator env during node import; this can crash torch 2.9 CUDA init.\n"
+        f'{indent}# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"'
+    )
+
+patched, count = pattern.subn(_repl, source, count=1)
+if count == 0:
+    print("WARN: Could not locate Trellis2 allocator env assignment; skipping patch.")
+    raise SystemExit(0)
+
+path.write_text(patched, encoding="utf-8")
+print("Applied Trellis2 allocator override patch.")
+PY
 }
 
 function provisioning_install_trellis2_runtime_requirements() {
@@ -694,25 +1006,122 @@ function provisioning_configure_trellis2_runtime() {
         return 0
     fi
 
-    if ! grep -q "Trellis2 CUDA runtime compatibility block" "${launch_script}"; then
-        cat <<'EOF' >> "${launch_script}"
-# Trellis2 CUDA runtime compatibility block
-for _trellis_cuda_lib in \
-    /venv/main/lib/python3.12/site-packages/nvidia/cuda_runtime/lib \
-    /venv/main/lib/python3.12/site-packages/nvidia/cu13/lib; do
-    if [ -d "${_trellis_cuda_lib}" ]; then
-        export LD_LIBRARY_PATH="${_trellis_cuda_lib}:${LD_LIBRARY_PATH:-}"
-    fi
-done
-unset _trellis_cuda_lib
-EOF
+    /venv/main/bin/python - "${launch_script}" "${TRELLIS2_RESOLVED_ATTN_BACKEND}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+backend = sys.argv[2]
+source = path.read_text(encoding="utf-8")
+original = source
+
+managed_pattern = re.compile(
+    r"# FURGEN Trellis2 runtime block \(managed\)\n(?:.*\n)*?# /FURGEN Trellis2 runtime block\n",
+    re.MULTILINE,
+)
+legacy_pattern = re.compile(
+    r"# Trellis2 CUDA runtime compatibility block\n(?:.*\n)*?unset _trellis_cuda_lib\n",
+    re.MULTILINE,
+)
+
+source = managed_pattern.sub("", source)
+source = legacy_pattern.sub("", source)
+source = re.sub(r'(?m)^export ATTN_BACKEND=.*\n', "", source)
+
+block = (
+    "# FURGEN Trellis2 runtime block (managed)\n"
+    "for _trellis_cuda_lib in \\\n"
+    "    /venv/main/lib/python3.12/site-packages/nvidia/cuda_runtime/lib \\\n"
+    "    /venv/main/lib/python3.12/site-packages/nvidia/cu13/lib; do\n"
+    "    if [ -d \"${_trellis_cuda_lib}\" ]; then\n"
+    "        export LD_LIBRARY_PATH=\"${_trellis_cuda_lib}:${LD_LIBRARY_PATH:-}\"\n"
+    "    fi\n"
+    "done\n"
+    "unset _trellis_cuda_lib\n"
+    f"export ATTN_BACKEND=\"${{ATTN_BACKEND:-{backend}}}\"\n"
+    "# /FURGEN Trellis2 runtime block\n"
+)
+
+anchor = "unset PYTORCH_CUDA_ALLOC_CONF\n"
+if anchor in source:
+    insert_at = source.find(anchor) + len(anchor)
+    if insert_at < len(source) and source[insert_at] != "\n":
+        source = source[:insert_at] + "\n" + source[insert_at:]
+        insert_at += 1
+else:
+    if source.startswith("#!"):
+        insert_at = source.find("\n")
+        insert_at = insert_at + 1 if insert_at != -1 else len(source)
+    else:
+        insert_at = 0
+
+patched = source[:insert_at] + block + source[insert_at:]
+if patched != original:
+    path.write_text(patched, encoding="utf-8")
+    print("Applied Trellis2 launch runtime patch.")
+else:
+    print("Trellis2 launch runtime patch already present.")
+PY
+
+    chmod +x "${launch_script}" || true
+}
+
+function provisioning_configure_comfyui_launch_args() {
+    local launch_script
+    launch_script="/opt/supervisor-scripts/comfyui.sh"
+    if [[ ! -f "${launch_script}" ]]; then
+        printf "WARN: ComfyUI launch script not found for args normalization: %s\n" "${launch_script}"
+        return 0
     fi
 
-    if grep -q '^export ATTN_BACKEND=' "${launch_script}"; then
-        sed -i "s|^export ATTN_BACKEND=.*|export ATTN_BACKEND=\"\\\${ATTN_BACKEND:-${TRELLIS2_RESOLVED_ATTN_BACKEND}}\"|" "${launch_script}"
-    else
-        printf "\nexport ATTN_BACKEND=\"\${ATTN_BACKEND:-%s}\"\n" "${TRELLIS2_RESOLVED_ATTN_BACKEND}" >> "${launch_script}"
-    fi
+    /venv/main/bin/python - "${launch_script}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+original = source
+
+managed_pattern = re.compile(
+    r"# FURGEN ComfyUI launch args normalization\n(?:.*\n)*?# /FURGEN ComfyUI launch args normalization\n",
+    re.MULTILINE,
+)
+source = managed_pattern.sub("", source)
+legacy_args_pattern = re.compile(
+    r'COMFYUI_ARGS=\$\{COMFYUI_ARGS:---disable-auto-launch --port 18188 --enable-cors-header\}\n'
+    r'if \[\[ " \$\{COMFYUI_ARGS\} " != \*" --disable-cuda-malloc "\* \]\]; then\n'
+    r'    COMFYUI_ARGS="\$\{COMFYUI_ARGS\} --disable-cuda-malloc"\n'
+    r'fi\n',
+    re.MULTILINE,
+)
+source = legacy_args_pattern.sub("", source)
+
+block = (
+    "# FURGEN ComfyUI launch args normalization\n"
+    "COMFYUI_ARGS=${COMFYUI_ARGS:---disable-auto-launch --port 18188 --enable-cors-header}\n"
+    "if [[ \" ${COMFYUI_ARGS} \" != *\" --disable-cuda-malloc \"* ]]; then\n"
+    "    COMFYUI_ARGS=\"${COMFYUI_ARGS} --disable-cuda-malloc\"\n"
+    "fi\n"
+    "# /FURGEN ComfyUI launch args normalization\n"
+)
+
+anchor = "# Launch ComfyUI\n"
+if anchor in source:
+    insert_at = source.find(anchor)
+else:
+    launch_idx = source.find("python main.py")
+    insert_at = source.rfind("\n", 0, launch_idx) + 1 if launch_idx != -1 else len(source)
+
+patched = source[:insert_at] + block + source[insert_at:]
+
+if patched != original:
+    path.write_text(patched, encoding="utf-8")
+    print("Applied ComfyUI launch args normalization patch.")
+else:
+    print("ComfyUI launch args normalization already present.")
+PY
 
     chmod +x "${launch_script}" || true
 }
