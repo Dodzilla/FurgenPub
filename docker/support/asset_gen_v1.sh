@@ -735,16 +735,14 @@ function provisioning_configure_pytorch_allocator_env() {
                     printf "%s\n" "${first_line}"
                     cat <<'EOF'
 # FURGEN PyTorch allocator env normalization
-# PyTorch 2.9 can crash CUDA init when *_ALLOC_CONF vars disagree.
+# PyTorch 2.9 can crash CUDA init when allocator vars disagree or mutate.
 if [ -n "${PYTORCH_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "${PYTORCH_ALLOC_CONF}" != "${PYTORCH_CUDA_ALLOC_CONF}" ]; then
-    echo "WARN: PYTORCH_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF differ; normalizing to PYTORCH_ALLOC_CONF."
+    echo "WARN: PYTORCH_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF differ; using PYTORCH_ALLOC_CONF."
 fi
 if [ -z "${PYTORCH_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ]; then
     export PYTORCH_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
 fi
-if [ -n "${PYTORCH_ALLOC_CONF:-}" ]; then
-    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_ALLOC_CONF}"
-fi
+unset PYTORCH_CUDA_ALLOC_CONF
 EOF
                     tail -n +2 "${launch_script}"
                     return
@@ -753,16 +751,14 @@ EOF
 
             cat <<'EOF'
 # FURGEN PyTorch allocator env normalization
-# PyTorch 2.9 can crash CUDA init when *_ALLOC_CONF vars disagree.
+# PyTorch 2.9 can crash CUDA init when allocator vars disagree or mutate.
 if [ -n "${PYTORCH_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && [ "${PYTORCH_ALLOC_CONF}" != "${PYTORCH_CUDA_ALLOC_CONF}" ]; then
-    echo "WARN: PYTORCH_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF differ; normalizing to PYTORCH_ALLOC_CONF."
+    echo "WARN: PYTORCH_ALLOC_CONF and PYTORCH_CUDA_ALLOC_CONF differ; using PYTORCH_ALLOC_CONF."
 fi
 if [ -z "${PYTORCH_ALLOC_CONF:-}" ] && [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ]; then
     export PYTORCH_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF}"
 fi
-if [ -n "${PYTORCH_ALLOC_CONF:-}" ]; then
-    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_ALLOC_CONF}"
-fi
+unset PYTORCH_CUDA_ALLOC_CONF
 EOF
             cat "${launch_script}"
         } > "${tmp_file}"
