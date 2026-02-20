@@ -174,21 +174,26 @@ function provisioning_update_comfyui() {
 }
 
 function provisioning_start() {
-    provisioning_print_header
-    provisioning_update_comfyui
-    provisioning_patch_comfyui_xformers_fallback
-    provisioning_get_apt_packages
+    provisioning_print_header || return 1
+    provisioning_update_comfyui || return 1
+    provisioning_patch_comfyui_xformers_fallback || return 1
+    provisioning_get_apt_packages || return 1
     load_node_pins_from_env
-    validate_required_repo_pins
-    provisioning_get_nodes
-    provisioning_install_qwen3_tts_requirements
-    provisioning_install_moss_ttsd_requirements
-    provisioning_install_trellis2_runtime_requirements
-    provisioning_configure_trellis2_runtime
+    validate_required_repo_pins || return 1
+    provisioning_get_nodes || return 1
+    provisioning_install_qwen3_tts_requirements || return 1
+    provisioning_install_moss_ttsd_requirements || return 1
+    provisioning_install_trellis2_runtime_requirements || return 1
+    provisioning_configure_trellis2_runtime || return 1
     printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
-    provisioning_get_pip_packages
+    provisioning_get_pip_packages || return 1
+    if ! provisioning_verify_qwen3_tts_node; then
+        printf "Qwen3-TTS validation failed after dependency installs; retrying targeted repair...\n"
+        provisioning_repair_qwen3_tts_stack || return 1
+        provisioning_verify_qwen3_tts_node || return 1
+    fi
     # models are now installed by DM agent
-    provisioning_print_end
+    provisioning_print_end || return 1
 }
 
 function provisioning_patch_comfyui_xformers_fallback() {
@@ -221,13 +226,46 @@ new_snapshot_block = (
 
 old_attention_call = "    out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask)\n"
 new_attention_block = (
+    "    force_pytorch = False\n"
+    "    device_capability = None\n"
+    "    if torch.cuda.is_available():\n"
+    "        try:\n"
+    "            device_capability = torch.cuda.get_device_capability(q_in.device)\n"
+    "        except Exception:\n"
+    "            try:\n"
+    "                device_capability = torch.cuda.get_device_capability()\n"
+    "            except Exception:\n"
+    "                device_capability = None\n"
+    "    if device_capability and device_capability[0] >= 10:\n"
+    "        force_pytorch = True\n"
+    "\n"
+    "    if force_pytorch:\n"
+    "        if not getattr(attention_xformers, \"_fcs_sm_warning_emitted\", False):\n"
+    "            logging.info(\n"
+    "                \"FCS xformers fallback patch: skipping xformers on compute capability %s; using PyTorch SDPA.\",\n"
+    "                device_capability,\n"
+    "            )\n"
+    "            attention_xformers._fcs_sm_warning_emitted = True\n"
+    "        return attention_pytorch(\n"
+    "            q_in,\n"
+    "            k_in,\n"
+    "            v_in,\n"
+    "            heads,\n"
+    "            mask_in,\n"
+    "            skip_reshape=skip_reshape,\n"
+    "            skip_output_reshape=skip_output_reshape,\n"
+    "            **kwargs,\n"
+    "        )\n"
+    "\n"
     "    try:\n"
     "        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask)\n"
     "    except NotImplementedError as e:\n"
-    "        logging.warning(\n"
-    "            \"FCS xformers fallback patch: unsupported xformers attention kernel; falling back to PyTorch SDPA. %s\",\n"
-    "            e,\n"
-    "        )\n"
+    "        if not getattr(attention_xformers, \"_fcs_xformers_warning_emitted\", False):\n"
+    "            logging.warning(\n"
+    "                \"FCS xformers fallback patch: unsupported xformers attention kernel; falling back to PyTorch SDPA. %s\",\n"
+    "                e,\n"
+    "            )\n"
+    "            attention_xformers._fcs_xformers_warning_emitted = True\n"
     "        return attention_pytorch(\n"
     "            q_in,\n"
     "            k_in,\n"
@@ -306,14 +344,23 @@ function provisioning_get_nodes() {
             fi
             pin_node_to_ref "$dir" "$path" || return 1
             if [[ -e $requirements ]]; then
-               pip install --no-cache-dir -r "$requirements"
+               pip install --no-cache-dir -r "$requirements" || {
+                   printf "ERROR: Failed to install requirements for node %s (%s)\n" "$dir" "$requirements"
+                   return 1
+               }
             fi
         else
             printf "Downloading node: %s...\n" "${repo}"
-            git clone "${repo}" "${path}" --recursive
+            git clone "${repo}" "${path}" --recursive || {
+                printf "ERROR: Failed to clone node repo %s\n" "${repo}"
+                return 1
+            }
             pin_node_to_ref "$dir" "$path" || return 1
             if [[ -e $requirements ]]; then
-                pip install --no-cache-dir -r "${requirements}"
+                pip install --no-cache-dir -r "${requirements}" || {
+                    printf "ERROR: Failed to install requirements for node %s (%s)\n" "$dir" "$requirements"
+                    return 1
+                }
             fi
         fi
     done
@@ -326,10 +373,113 @@ function provisioning_install_qwen3_tts_requirements() {
 
     if [[ -e "${requirements_path}" ]]; then
         printf "Installing ComfyUI-Qwen3-TTS requirements (explicit pass)...\n"
-        pip install --no-cache-dir -r "${requirements_path}"
+        pip install --no-cache-dir -r "${requirements_path}" || {
+            printf "ERROR: Failed to install ComfyUI-Qwen3-TTS requirements: %s\n" "${requirements_path}"
+            return 1
+        }
+        # Enforce the known-good stack expected by qwen-tts.
+        pip install --no-cache-dir --upgrade \
+            "qwen-tts==0.1.1" \
+            "transformers==4.57.3" \
+            "accelerate==1.12.0" \
+            "modelscope" \
+            "soundfile" \
+            "safetensors" \
+            "librosa" || {
+            printf "ERROR: Failed to install pinned Qwen3-TTS runtime dependencies.\n"
+            return 1
+        }
     else
-        printf "WARN: ComfyUI-Qwen3-TTS requirements.txt not found: %s\n" "${requirements_path}"
+        printf "ERROR: ComfyUI-Qwen3-TTS requirements.txt not found: %s\n" "${requirements_path}"
+        return 1
     fi
+}
+
+function provisioning_repair_qwen3_tts_stack() {
+    local node_path requirements_path
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-Qwen3-TTS"
+    requirements_path="${node_path}/requirements.txt"
+
+    if [[ ! -d "${node_path}" ]]; then
+        printf "ERROR: ComfyUI-Qwen3-TTS node path is missing: %s\n" "${node_path}"
+        return 1
+    fi
+
+    if [[ -e "${requirements_path}" ]]; then
+        pip install --no-cache-dir --upgrade -r "${requirements_path}" || {
+            printf "ERROR: Qwen3-TTS repair install failed from requirements: %s\n" "${requirements_path}"
+            return 1
+        }
+    fi
+
+    pip install --no-cache-dir --upgrade \
+        "qwen-tts==0.1.1" \
+        "transformers==4.57.3" \
+        "accelerate==1.12.0" \
+        "modelscope" \
+        "soundfile" \
+        "safetensors" \
+        "librosa" || {
+        printf "ERROR: Qwen3-TTS repair install failed for pinned runtime dependencies.\n"
+        return 1
+    }
+
+    return 0
+}
+
+function provisioning_verify_qwen3_tts_node() {
+    local node_path
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-Qwen3-TTS"
+
+    if [[ ! -d "${node_path}" ]]; then
+        printf "ERROR: Qwen3-TTS custom node directory missing: %s\n" "${node_path}"
+        return 1
+    fi
+
+    printf "Validating ComfyUI-Qwen3-TTS node loadability...\n"
+    /venv/main/bin/python - "${node_path}" <<'PY'
+import importlib.util
+import os
+import sys
+import traceback
+
+node_path = sys.argv[1]
+init_path = os.path.join(node_path, "__init__.py")
+errors = []
+
+try:
+    import qwen_tts  # noqa: F401
+except Exception as exc:
+    errors.append(f"import qwen_tts failed: {exc}")
+
+try:
+    spec = importlib.util.spec_from_file_location(
+        "fcs_qwen3_tts_node",
+        init_path,
+        submodule_search_locations=[node_path],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to create import spec for {init_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    mappings = getattr(module, "NODE_CLASS_MAPPINGS", {})
+    required_nodes = ("Qwen3Loader", "Qwen3VoiceDesign")
+    missing_nodes = [node for node in required_nodes if node not in mappings]
+    if missing_nodes:
+        errors.append(f"missing NODE_CLASS_MAPPINGS entries: {missing_nodes}")
+except Exception as exc:
+    errors.append(f"importing ComfyUI-Qwen3-TTS failed: {exc}\n{traceback.format_exc()}")
+
+if errors:
+    print("QWEN3_TTS_VALIDATION_FAILED")
+    for err in errors:
+        print(err)
+    raise SystemExit(1)
+
+print("QWEN3_TTS_VALIDATION_OK")
+PY
 }
 
 function provisioning_install_moss_ttsd_requirements() {
