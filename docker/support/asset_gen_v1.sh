@@ -437,15 +437,20 @@ function provisioning_verify_qwen3_tts_node() {
     fi
 
     printf "Validating ComfyUI-Qwen3-TTS node loadability...\n"
-    /venv/main/bin/python - "${node_path}" <<'PY'
+    /venv/main/bin/python - "${node_path}" "${COMFYUI_DIR}" <<'PY'
 import importlib.util
 import os
 import sys
 import traceback
 
 node_path = sys.argv[1]
+comfyui_dir = sys.argv[2]
 init_path = os.path.join(node_path, "__init__.py")
 errors = []
+
+for extra_path in (comfyui_dir, os.path.join(comfyui_dir, "custom_nodes")):
+    if extra_path and extra_path not in sys.path:
+        sys.path.insert(0, extra_path)
 
 try:
     import qwen_tts  # noqa: F401
