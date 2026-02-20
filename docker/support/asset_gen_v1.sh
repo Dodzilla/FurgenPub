@@ -725,41 +725,42 @@ function provisioning_configure_pytorch_allocator_env() {
         return 0
     fi
 
-    if ! grep -q "FURGEN PyTorch allocator env normalization" "${launch_script}"; then
-        local tmp_file
-        tmp_file="$(mktemp)"
-        {
-            local first_line=""
-            if IFS= read -r first_line < "${launch_script}"; then
-                if [[ "${first_line}" == "#!"* ]]; then
-                    printf "%s\n" "${first_line}"
-                    cat <<'EOF'
-# FURGEN PyTorch allocator env normalization
-# PyTorch 2.9 can crash CUDA init when allocator vars disagree or mutate.
-if [ -n "${PYTORCH_ALLOC_CONF:-}" ] || [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ]; then
-    echo "INFO: Clearing PYTORCH allocator env overrides for CUDA init stability."
-fi
-unset PYTORCH_ALLOC_CONF
-unset PYTORCH_CUDA_ALLOC_CONF
-EOF
-                    tail -n +2 "${launch_script}"
-                    return
-                fi
-            fi
+    /venv/main/bin/python - "${launch_script}" <<'PY'
+import pathlib
+import re
+import sys
 
-            cat <<'EOF'
-# FURGEN PyTorch allocator env normalization
-# PyTorch 2.9 can crash CUDA init when allocator vars disagree or mutate.
-if [ -n "${PYTORCH_ALLOC_CONF:-}" ] || [ -n "${PYTORCH_CUDA_ALLOC_CONF:-}" ]; then
-    echo "INFO: Clearing PYTORCH allocator env overrides for CUDA init stability."
-fi
-unset PYTORCH_ALLOC_CONF
-unset PYTORCH_CUDA_ALLOC_CONF
-EOF
-            cat "${launch_script}"
-        } > "${tmp_file}"
-        mv "${tmp_file}" "${launch_script}"
-    fi
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+
+block = (
+    "# FURGEN PyTorch allocator env normalization\n"
+    "# PyTorch 2.9 can crash CUDA init when allocator vars disagree or mutate.\n"
+    "if [ -n \"${PYTORCH_ALLOC_CONF:-}\" ] || [ -n \"${PYTORCH_CUDA_ALLOC_CONF:-}\" ]; then\n"
+    "    echo \"INFO: Clearing PYTORCH allocator env overrides for CUDA init stability.\"\n"
+    "fi\n"
+    "unset PYTORCH_ALLOC_CONF\n"
+    "unset PYTORCH_CUDA_ALLOC_CONF\n"
+)
+
+pattern = re.compile(
+    r"# FURGEN PyTorch allocator env normalization\n"
+    r"# PyTorch 2\.9 can crash CUDA init when allocator vars disagree or mutate\.\n"
+    r"(?:.*\n){0,14}?unset PYTORCH_CUDA_ALLOC_CONF\n",
+    re.MULTILINE,
+)
+
+cleaned = re.sub(pattern, "", source)
+
+if cleaned.startswith("#!"):
+    first_line, rest = cleaned.split("\n", 1)
+    patched = f"{first_line}\n{block}{rest.lstrip()}"
+else:
+    patched = f"{block}{cleaned.lstrip()}"
+
+if patched != source:
+    path.write_text(patched, encoding="utf-8")
+PY
 
     chmod +x "${launch_script}" || true
 }
