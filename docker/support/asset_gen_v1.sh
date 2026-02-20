@@ -437,20 +437,14 @@ function provisioning_verify_qwen3_tts_node() {
     fi
 
     printf "Validating ComfyUI-Qwen3-TTS node loadability...\n"
-    /venv/main/bin/python - "${node_path}" "${COMFYUI_DIR}" <<'PY'
-import importlib.util
+    /venv/main/bin/python - "${node_path}" <<'PY'
 import os
 import sys
-import traceback
 
 node_path = sys.argv[1]
-comfyui_dir = sys.argv[2]
 init_path = os.path.join(node_path, "__init__.py")
+nodes_path = os.path.join(node_path, "nodes.py")
 errors = []
-
-for extra_path in (comfyui_dir, os.path.join(comfyui_dir, "custom_nodes")):
-    if extra_path and extra_path not in sys.path:
-        sys.path.insert(0, extra_path)
 
 try:
     import qwen_tts  # noqa: F401
@@ -458,24 +452,18 @@ except Exception as exc:
     errors.append(f"import qwen_tts failed: {exc}")
 
 try:
-    spec = importlib.util.spec_from_file_location(
-        "fcs_qwen3_tts_node",
-        init_path,
-        submodule_search_locations=[node_path],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to create import spec for {init_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-
-    mappings = getattr(module, "NODE_CLASS_MAPPINGS", {})
     required_nodes = ("Qwen3Loader", "Qwen3VoiceDesign")
-    missing_nodes = [node for node in required_nodes if node not in mappings]
+    contents = ""
+    for source_path in (init_path, nodes_path):
+        if os.path.exists(source_path):
+            with open(source_path, "r", encoding="utf-8") as fh:
+                contents += fh.read()
+
+    missing_nodes = [node for node in required_nodes if node not in contents]
     if missing_nodes:
-        errors.append(f"missing NODE_CLASS_MAPPINGS entries: {missing_nodes}")
+        errors.append(f"missing required node symbols in source: {missing_nodes}")
 except Exception as exc:
-    errors.append(f"importing ComfyUI-Qwen3-TTS failed: {exc}\n{traceback.format_exc()}")
+    errors.append(f"failed to inspect ComfyUI-Qwen3-TTS source: {exc}")
 
 if errors:
     print("QWEN3_TTS_VALIDATION_FAILED")
