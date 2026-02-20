@@ -200,6 +200,7 @@ function provisioning_start() {
     provisioning_get_nodes || return 1
     provisioning_install_qwen3_tts_requirements || return 1
     provisioning_install_moss_ttsd_requirements || return 1
+    provisioning_install_transformers_compat_shim || return 1
     provisioning_install_trellis2_runtime_requirements || return 1
     provisioning_configure_trellis2_runtime || return 1
     printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
@@ -507,6 +508,43 @@ function provisioning_install_moss_ttsd_requirements() {
     else
         printf "WARN: ComfyUI-kaola-moss-ttsd requirements.txt not found: %s\n" "${requirements_path}"
     fi
+}
+
+function provisioning_install_transformers_compat_shim() {
+    local sitecustomize_path
+    sitecustomize_path="$(
+        /venv/main/bin/python - <<'PY'
+import site
+import sys
+
+paths = [p for p in site.getsitepackages() if "site-packages" in p]
+target_dir = paths[0] if paths else next((p for p in sys.path if p and "site-packages" in p), "")
+if not target_dir:
+    raise SystemExit(1)
+print(f"{target_dir}/sitecustomize.py")
+PY
+    )" || {
+        printf "WARN: Unable to determine sitecustomize.py path for transformers compatibility shim.\n"
+        return 0
+    }
+
+    if [[ -f "${sitecustomize_path}" ]] && grep -q "FURGEN_TRANSFORMERS_PRETRAINED_SHIM" "${sitecustomize_path}"; then
+        printf "Transformers compatibility shim already present at %s\n" "${sitecustomize_path}"
+        return 0
+    fi
+
+    printf "Installing transformers compatibility shim at %s\n" "${sitecustomize_path}"
+    cat >> "${sitecustomize_path}" <<'PY'
+# FURGEN_TRANSFORMERS_PRETRAINED_SHIM
+try:
+    from transformers import configuration_utils as _fcs_tr_cfg
+    if not hasattr(_fcs_tr_cfg, "PreTrainedConfig") and hasattr(_fcs_tr_cfg, "PretrainedConfig"):
+        _fcs_tr_cfg.PreTrainedConfig = _fcs_tr_cfg.PretrainedConfig
+except Exception:
+    pass
+PY
+
+    return 0
 }
 
 function provisioning_install_trellis2_runtime_requirements() {
