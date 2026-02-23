@@ -52,6 +52,7 @@ NODES=(
     "https://github.com/scottmudge/ComfyUI-NAG"
     "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"
     "https://github.com/visualbruno/ComfyUI-Trellis2"
+    "https://github.com/Dodzilla/ComfyUI-TrellisMeshPostprocess"
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/DarioFT/ComfyUI-Qwen3-TTS"
     "https://github.com/kana112233/ComfyUI-kaola-moss-ttsd"
@@ -84,6 +85,7 @@ NODE_PINS[ComfyUI-SAM3]="978bb763cfadcad41363eba016e57686b414c27b"
 NODE_PINS[easy-comfy-nodes-async]="d4c651a65e885a05ce5ce09468a2597ab1f7925c"
 NODE_PINS[ComfyUI-Qwen3-TTS]="a2b5176d84ff101e3f2ab49876e9d9f2c38b7ee2"
 NODE_PINS[ComfyUI-Trellis2]="07574666fbe7c82939cec5f69373b8f0958caae1"
+NODE_PINS[ComfyUI-TrellisMeshPostprocess]="7c4b09752968ec09bc93f810773b4f9329e22c91"
 NODE_PINS[ComfyUI-kaola-moss-ttsd]="e3bba1ac47617207d6fb4d48da4ee65e632bfe19"
 
 function load_node_pins_from_env() {
