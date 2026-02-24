@@ -23,6 +23,10 @@ TRELLIS2_DINOV3_FALLBACK_REPO="${TRELLIS2_DINOV3_FALLBACK_REPO:-camenduru/dinov3
 TRELLIS2_INSTALL_DINOV3="${TRELLIS2_INSTALL_DINOV3:-true}"
 TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD="${TRELLIS2_FLASH_ATTN_ALLOW_SOURCE_BUILD:-true}"
 TRELLIS2_FLASH_ATTN_SOURCE_BUILD_TIMEOUT_SECONDS="${TRELLIS2_FLASH_ATTN_SOURCE_BUILD_TIMEOUT_SECONDS:-900}"
+TRELLIS2_FLEX_GEMM_ALGO="${TRELLIS2_FLEX_GEMM_ALGO:-masked_implicit_gemm}"
+TRELLIS2_FLEX_GEMM_USE_AUTOTUNE_CACHE="${TRELLIS2_FLEX_GEMM_USE_AUTOTUNE_CACHE:-1}"
+TRELLIS2_FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE="${TRELLIS2_FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-1}"
+TRELLIS2_FLEX_GEMM_AUTOTUNE_CACHE_PATH="${TRELLIS2_FLEX_GEMM_AUTOTUNE_CACHE_PATH:-${WORKSPACE}/.flex_gemm/autotune_cache.json}"
 
 # If flash-attn install fails, we automatically fall back to xformers.
 TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
@@ -202,6 +206,7 @@ function provisioning_start() {
     validate_required_repo_pins || return 1
     provisioning_get_nodes || return 1
     provisioning_patch_trellis2_allocator_override || return 1
+    provisioning_patch_trellis2_flex_gemm_algo || return 1
     provisioning_install_impact_pack_runtime_requirements || return 1
     provisioning_install_qwen3_tts_requirements || return 1
     provisioning_install_moss_ttsd_requirements || return 1
@@ -863,6 +868,46 @@ print("Applied Trellis2 allocator override patch.")
 PY
 }
 
+function provisioning_patch_trellis2_flex_gemm_algo() {
+    if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
+        return 0
+    fi
+
+    local config_file
+    config_file="${COMFYUI_DIR}/custom_nodes/ComfyUI-Trellis2/trellis2/modules/sparse/conv/config.py"
+
+    if [[ ! -f "${config_file}" ]]; then
+        printf "WARN: Trellis2 conv config missing, skipping FLEX_GEMM_ALGO patch: %s\n" "${config_file}"
+        return 0
+    fi
+
+    /venv/main/bin/python - "${config_file}" "${TRELLIS2_FLEX_GEMM_ALGO}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+desired_algo = sys.argv[2]
+source = path.read_text(encoding="utf-8")
+
+pattern = re.compile(r'(?m)^(FLEX_GEMM_ALGO\s*=\s*)(["\'])([^"\']+)\2\s*$')
+match = pattern.search(source)
+if not match:
+    print("WARN: Could not locate FLEX_GEMM_ALGO assignment in Trellis2 config; skipping patch.")
+    raise SystemExit(0)
+
+current_algo = match.group(3)
+if current_algo == desired_algo:
+    print(f"Trellis2 FLEX_GEMM_ALGO already set to {desired_algo}.")
+    raise SystemExit(0)
+
+replacement = f"{match.group(1)}'{desired_algo}'"
+patched = source[:match.start()] + replacement + source[match.end():]
+path.write_text(patched, encoding="utf-8")
+print(f"Updated Trellis2 FLEX_GEMM_ALGO: {current_algo} -> {desired_algo}")
+PY
+}
+
 function provisioning_install_trellis2_runtime_requirements() {
     if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
         return 0
@@ -1008,15 +1053,25 @@ function provisioning_configure_trellis2_runtime() {
         return 0
     fi
 
-    /venv/main/bin/python - "${launch_script}" "${TRELLIS2_RESOLVED_ATTN_BACKEND}" <<'PY'
+    /venv/main/bin/python - "${launch_script}" "${TRELLIS2_RESOLVED_ATTN_BACKEND}" "${TRELLIS2_FLEX_GEMM_USE_AUTOTUNE_CACHE}" "${TRELLIS2_FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE}" "${TRELLIS2_FLEX_GEMM_AUTOTUNE_CACHE_PATH}" <<'PY'
 import pathlib
 import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
 backend = sys.argv[2]
+flex_gemm_use_cache = sys.argv[3]
+flex_gemm_autosave_cache = sys.argv[4]
+flex_gemm_cache_path = sys.argv[5]
 source = path.read_text(encoding="utf-8")
 original = source
+
+def _shell_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+
+flex_gemm_use_cache = _shell_escape(flex_gemm_use_cache)
+flex_gemm_autosave_cache = _shell_escape(flex_gemm_autosave_cache)
+flex_gemm_cache_path = _shell_escape(flex_gemm_cache_path)
 
 managed_pattern = re.compile(
     r"# FURGEN Trellis2 runtime block \(managed\)\n(?:.*\n)*?# /FURGEN Trellis2 runtime block\n",
@@ -1041,6 +1096,11 @@ block = (
     "    fi\n"
     "done\n"
     "unset _trellis_cuda_lib\n"
+    "# FlexGEMM cache settings: persist autotune results to avoid repeat benchmarking.\n"
+    f"export FLEX_GEMM_USE_AUTOTUNE_CACHE=\"${{FLEX_GEMM_USE_AUTOTUNE_CACHE:-{flex_gemm_use_cache}}}\"\n"
+    f"export FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE=\"${{FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-{flex_gemm_autosave_cache}}}\"\n"
+    f"export FLEX_GEMM_AUTOTUNE_CACHE_PATH=\"${{FLEX_GEMM_AUTOTUNE_CACHE_PATH:-{flex_gemm_cache_path}}}\"\n"
+    "mkdir -p \"$(dirname \"${FLEX_GEMM_AUTOTUNE_CACHE_PATH}\")\"\n"
     f"export ATTN_BACKEND=\"${{ATTN_BACKEND:-{backend}}}\"\n"
     "# /FURGEN Trellis2 runtime block\n"
 )
