@@ -61,6 +61,7 @@ NODES=(
     # Other nodes
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/evanspearman/ComfyMath"
+    "https://github.com/kijai/ComfyUI-MelBandRoFormer"
 )
 
 # Hugging Face repo snapshots (download the whole repo into a folder).

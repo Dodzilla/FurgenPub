@@ -7,10 +7,19 @@ It polls the backend for dependency queue items and downloads missing artifacts
 into the ComfyUI workspace, reporting status + inventory back to the backend.
 
 Backend endpoints used (relative to FCS_API_BASE_URL, which should end with /api):
+  Legacy dependency channel (still supported for backwards compatibility):
   - POST   /dependencies/register
   - GET    /dependencies/queue?instanceId=...&limit=...
   - POST   /dependencies/status
   - POST   /dependencies/heartbeat
+
+  Agent control channel (v1 pull execution):
+  - POST   /agent/register
+  - GET    /agent/queue?instanceId=...&limit=...&waitSec=...
+  - POST   /agent/ack
+  - POST   /agent/event
+  - POST   /agent/heartbeat
+  - POST   /agent/url-refresh
 
 Required environment variables on the instance:
   - FCS_API_BASE_URL   e.g. https://us-central1-<projectId>.cloudfunctions.net/api
@@ -42,6 +51,14 @@ Optional knobs:
   - DM_DYNAMIC_MAX_BYTES          (override profile.dynamicPolicy.maxDynamicBytes; supports 50GB/2TiB)
   - DM_EVICTION_BATCH_MAX         (override profile.dynamicPolicy.evictionBatchMax; default: 20)
   - DM_PIN_TTL_SECONDS            (do not evict deps touched within this window; default: 1800)
+  - DM_AGENT_CONTROL_ENABLED      (enable /agent/* control channel; default: false)
+  - DM_INSTANCE_BOOTSTRAP_TOKEN   (instance bootstrap token for /agent/register when required)
+  - DM_AGENT_POLL_SECONDS         (poll cadence for /agent/queue; default: 1)
+  - DM_AGENT_HEARTBEAT_SECONDS    (heartbeat cadence for /agent/heartbeat; default: 5)
+  - DM_AGENT_QUEUE_WAIT_SEC       (long-poll waitSec for /agent/queue; default: 2)
+  - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
+  - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
+  - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
 
 Queue item expectations:
   - The backend should include a `resolved` object for download items with:
@@ -53,8 +70,11 @@ Queue item expectations:
 
 from __future__ import annotations
 
+import hashlib
+import http.client
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -62,18 +82,21 @@ import shutil
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.3.2"
+AGENT_VERSION = "dm-agent-py/0.4.1"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -156,6 +179,30 @@ def _split_csv(v: Optional[str]) -> List[str]:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _iso_to_ms(value: Optional[str]) -> Optional[int]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _sha256_hex_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
 def _sleep_with_jitter(seconds: float, jitter_ratio: float = 0.2) -> None:
@@ -692,6 +739,88 @@ def wget_download(
             )
 
 
+def http_download_to_file(
+    url: str,
+    dest_path: Path,
+    headers: Optional[Dict[str, str]] = None,
+    timeout_seconds: float = 60.0,
+    chunk_size: int = 8 * 1024 * 1024,
+) -> None:
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        with dest_path.open("wb") as f:
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
+def http_head(
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    timeout_seconds: float = 30.0,
+) -> Tuple[int, Dict[str, str]]:
+    req = urllib.request.Request(url, headers=headers or {}, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            return int(resp.status), {k.lower(): v for k, v in dict(resp.headers).items()}
+    except urllib.error.HTTPError as e:
+        return int(getattr(e, "code", 500) or 500), {k.lower(): v for k, v in dict(getattr(e, "headers", {})).items()}
+
+
+def http_put_file_stream(
+    url: str,
+    file_path: Path,
+    headers: Optional[Dict[str, str]] = None,
+    timeout_seconds: float = 300.0,
+    chunk_size: int = 8 * 1024 * 1024,
+) -> Tuple[int, str, Dict[str, str]]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported upload URL scheme: {parsed.scheme}")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("Upload URL missing hostname")
+    port = parsed.port
+    path_with_query = parsed.path or "/"
+    if parsed.query:
+        path_with_query = f"{path_with_query}?{parsed.query}"
+
+    if parsed.scheme == "https":
+        conn: Any = http.client.HTTPSConnection(host, port or 443, timeout=timeout_seconds)
+    else:
+        conn = http.client.HTTPConnection(host, port or 80, timeout=timeout_seconds)
+
+    req_headers = {"Content-Length": str(int(file_path.stat().st_size))}
+    if headers:
+        req_headers.update(headers)
+
+    try:
+        conn.putrequest("PUT", path_with_query)
+        for k, v in req_headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+
+        with file_path.open("rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                conn.send(chunk)
+
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", errors="replace")
+        out_headers = {k.lower(): v for k, v in dict(resp.headers).items()}
+        return int(resp.status), raw, out_headers
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @dataclass
 class LocalState:
     installed_static: Set[str]
@@ -707,11 +836,26 @@ class LocalState:
         return LocalState(installed_static=set(), installed_dynamic=set(), failed=set(), lru={}, retry={})
 
 
+@dataclass
+class AgentExecuteLease:
+    item_id: str
+    lease_id: str
+    job_id: str
+    execution_attempt: int
+    attempt_epoch: int
+    started_at_ms: int
+    command_id: str = ""
+    cancel_requested: bool = False
+    cancel_reason: str = ""
+    prompt_id: Optional[str] = None
+
+
 class DependencyAgent:
     def __init__(self) -> None:
         self.api_base_url = (_env_str("FCS_API_BASE_URL") or "").rstrip("/")
         self.server_type = (_env_str("SERVER_TYPE") or "").strip()
         self.shared_secret = _env_str("DEPENDENCY_MANAGER_SHARED_SECRET")
+        self.instance_bootstrap_token = _env_str("DM_INSTANCE_BOOTSTRAP_TOKEN") or _env_str("AGENT_INSTANCE_BOOTSTRAP_TOKEN")
         self.hf_token = _env_str("HF_TOKEN")
         self.civitai_token = _env_str("CIVITAI_TOKEN")
         self.instance_id = _env_str("DM_INSTANCE_ID")
@@ -731,6 +875,15 @@ class DependencyAgent:
         chunk_mib = max(1, min(32, chunk_mib))
         self.download_chunk_size = int(chunk_mib) * 1024 * 1024
 
+        # Agent control channel knobs (execute pull mode).
+        self.agent_control_enabled = _env_bool("DM_AGENT_CONTROL_ENABLED", False)
+        self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 1.0))
+        self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 5.0))
+        self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
+        self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
+        self.agent_local_readiness_file = _env_str("DM_LOCAL_READINESS_FILE", "provisioning_complete.txt") or "provisioning_complete.txt"
+        self.agent_max_execute_workers = max(1, min(8, _env_int("DM_AGENT_MAX_EXEC_WORKERS", 2)))
+
         allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.com"]
         self.allowed_domains = {d.lower() for d in allowed if d}
 
@@ -743,6 +896,16 @@ class DependencyAgent:
         self._state: LocalState = self._load_state()
         self._dynamic_bytes_used = 0
         self._last_heartbeat_ms = 0
+
+        self._agent_access_token: Optional[str] = None
+        self._agent_access_token_expires_at_ms = 0
+        self._agent_bootstrap_profile: Dict[str, Any] = {}
+        self._agent_server_time_offset_ms = 0
+        self._agent_channel_supported = self.agent_control_enabled
+        self._next_agent_register_attempt_ms = 0
+        self._last_agent_heartbeat_ms = 0
+        self._agent_max_concurrent_execute_jobs = 1
+        self._active_exec_by_item: Dict[str, AgentExecuteLease] = {}
 
         # Best-effort local reconciliation (no API calls).
         with self._lock:
@@ -757,13 +920,113 @@ class DependencyAgent:
     def stop(self) -> None:
         self._stop.set()
 
-    def _headers(self, use_token: bool = True, include_secret: bool = False) -> Dict[str, str]:
+    # Include shared secret by default to avoid token races causing 401 loops
+    # (token is still used when present; backend accepts either).
+    def _headers(self, use_token: bool = True, include_secret: bool = True) -> Dict[str, str]:
         h: Dict[str, str] = {}
         if use_token and self._token:
             h["Authorization"] = f"Bearer {self._token}"
         if include_secret and self.shared_secret:
             h["X-DM-Secret"] = self.shared_secret
         return h
+
+    def _agent_headers(self, use_token: bool = True, include_secret: bool = False) -> Dict[str, str]:
+        h: Dict[str, str] = {}
+        if use_token and self._agent_access_token:
+            h["Authorization"] = f"Bearer {self._agent_access_token}"
+        if include_secret and self.shared_secret:
+            h["X-DM-Secret"] = self.shared_secret
+        return h
+
+    def _agent_root_url(self) -> str:
+        if self.api_base_url.endswith("/api"):
+            return self.api_base_url[:-4]
+        return self.api_base_url
+
+    def _resolve_agent_endpoint_url(self, endpoint: str) -> str:
+        value = (endpoint or "").strip()
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+        if value.startswith("/api/"):
+            return f"{self._agent_root_url()}{value}"
+        if not value.startswith("/"):
+            value = "/" + value
+        return f"{self.api_base_url}{value}"
+
+    def _server_now_ms(self) -> int:
+        return _now_ms() + int(self._agent_server_time_offset_ms)
+
+    def _note_server_time(self, value: Optional[str]) -> None:
+        ms = _iso_to_ms(value)
+        if ms is None:
+            return
+        self._agent_server_time_offset_ms = int(ms - _now_ms())
+
+    def _agent_api(
+        self,
+        method: str,
+        endpoint: str,
+        body: Optional[Dict[str, Any]] = None,
+        query: Optional[Dict[str, Any]] = None,
+        timeout_seconds: float = 30.0,
+        use_token: bool = True,
+        include_secret: bool = False,
+    ) -> Dict[str, Any]:
+        url = self._resolve_agent_endpoint_url(endpoint)
+        if query:
+            query_items: List[Tuple[str, str]] = []
+            for k, v in query.items():
+                if v is None:
+                    continue
+                query_items.append((str(k), str(v)))
+            if query_items:
+                sep = "&" if "?" in url else "?"
+                url = f"{url}{sep}{urllib.parse.urlencode(query_items)}"
+
+        status, resp = api_json(
+            method,
+            url,
+            body=body,
+            headers=self._agent_headers(use_token=use_token, include_secret=include_secret),
+            timeout_seconds=timeout_seconds,
+        )
+        if status != 200 or not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected agent API response ({status}): {resp}")
+        self._note_server_time(resp.get("serverTime") if isinstance(resp.get("serverTime"), str) else None)
+        if resp.get("ok") is not True:
+            err = resp.get("error") if isinstance(resp.get("error"), dict) else {}
+            code = err.get("code") if isinstance(err.get("code"), str) else "unknown_error"
+            message = err.get("message") if isinstance(err.get("message"), str) else str(resp)
+            raise RuntimeError(f"Agent API error [{code}]: {message}")
+        return resp
+
+    def _agent_token_needs_refresh(self) -> bool:
+        if not self._agent_access_token:
+            return True
+        if self._agent_access_token_expires_at_ms <= 0:
+            return True
+        # Refresh at least two minutes before expiry.
+        return self._server_now_ms() >= (int(self._agent_access_token_expires_at_ms) - 120_000)
+
+    def _local_readiness_file_path(self) -> Path:
+        candidate = Path(self.agent_local_readiness_file)
+        if candidate.is_absolute():
+            return candidate
+        return self.comfyui_dir / "input" / self.agent_local_readiness_file
+
+    def _local_readiness_file_present(self) -> bool:
+        try:
+            return self._local_readiness_file_path().exists()
+        except Exception:
+            return False
+
+    def _local_comfy_reachable(self, timeout_seconds: float = 2.0) -> bool:
+        url = f"{self.agent_local_comfy_base_url}/queue"
+        try:
+            status, _resp = api_json("GET", url, timeout_seconds=timeout_seconds)
+            return status == 200
+        except Exception:
+            return False
 
     def _dynamic_policy(self) -> Dict[str, Any]:
         # Profile (from /dependencies/register) may include dynamicPolicy.*; env vars override.
@@ -1189,6 +1452,464 @@ class DependencyAgent:
                 out.append(it)
         return out
 
+    def _agent_effective_execute_capacity(self) -> int:
+        return max(1, min(int(self.agent_max_execute_workers), int(self._agent_max_concurrent_execute_jobs)))
+
+    def _agent_register(self) -> None:
+        if not self._resolved_instance_id:
+            raise RuntimeError("Cannot register agent control channel before dependency registration resolves instanceId")
+        body: Dict[str, Any] = {
+            "instanceId": self._resolved_instance_id,
+            "serverType": self.server_type,
+            "agentVersion": AGENT_VERSION,
+            "capabilities": {
+                "dependencyChannel": True,
+                "agentPullExecution": True,
+                "downloadTool": self.download_tool,
+            },
+        }
+        if self.instance_bootstrap_token:
+            body["instanceBootstrapToken"] = self.instance_bootstrap_token
+
+        resp = self._agent_api(
+            "POST",
+            "/agent/register",
+            body=body,
+            timeout_seconds=30.0,
+            use_token=False,
+            include_secret=True,
+        )
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        token = data.get("agentAccessToken")
+        token_exp = data.get("agentAccessTokenExpiresAt")
+        if not isinstance(token, str) or not token:
+            raise RuntimeError(f"Agent register missing agentAccessToken: {resp}")
+        token_exp_ms = _iso_to_ms(token_exp if isinstance(token_exp, str) else None)
+        if token_exp_ms is None:
+            token_exp_ms = self._server_now_ms() + 45 * 60 * 1000
+
+        profile = data.get("bootstrapProfile") if isinstance(data.get("bootstrapProfile"), dict) else {}
+        max_concurrent = profile.get("maxConcurrentExecuteJobs")
+        if isinstance(max_concurrent, (int, float)) and max_concurrent > 0:
+            self._agent_max_concurrent_execute_jobs = max(1, int(max_concurrent))
+        else:
+            self._agent_max_concurrent_execute_jobs = 1
+
+        self._agent_access_token = token
+        self._agent_access_token_expires_at_ms = int(token_exp_ms)
+        self._agent_bootstrap_profile = profile
+        self._agent_channel_supported = True
+        logging.info(
+            "Registered agent control channel: instanceId=%s maxConcurrentExecuteJobs=%d tokenExpiresAt=%s",
+            self._resolved_instance_id,
+            int(self._agent_max_concurrent_execute_jobs),
+            token_exp if isinstance(token_exp, str) else "-",
+        )
+
+    def _maybe_register_agent_control(self) -> None:
+        if not self.agent_control_enabled or not self._agent_channel_supported:
+            return
+        if not self._resolved_instance_id:
+            return
+        now = self._server_now_ms()
+        if now < int(self._next_agent_register_attempt_ms):
+            return
+        if not self._agent_token_needs_refresh():
+            return
+
+        try:
+            self._agent_register()
+        except ApiError as e:
+            if e.status in (404, 405):
+                self._agent_channel_supported = False
+                logging.warning("Agent control channel unavailable (status=%d). Continuing in legacy dependency-only mode.", e.status)
+                return
+            self._next_agent_register_attempt_ms = now + 30_000
+            if e.status == 401:
+                logging.warning("Agent register unauthorized (status=401). Check shared secret/bootstrap token.")
+            else:
+                logging.warning("Agent register failed (status=%d): %s", e.status, e)
+        except Exception as e:
+            self._next_agent_register_attempt_ms = now + 30_000
+            logging.warning("Agent register failed: %s", e)
+
+    def _agent_fetch_queue(self, limit: int, wait_sec: Optional[int] = None) -> List[Dict[str, Any]]:
+        if not self._resolved_instance_id:
+            return []
+        if not self._agent_access_token:
+            return []
+        wait_value = self.agent_queue_wait_sec if wait_sec is None else wait_sec
+        resp = self._agent_api(
+            "GET",
+            "/agent/queue",
+            query={
+                "instanceId": self._resolved_instance_id,
+                "limit": max(1, min(20, int(limit))),
+                "waitSec": max(0, min(20, int(wait_value))),
+            },
+            timeout_seconds=max(30.0, float(wait_value) + 10.0),
+            use_token=True,
+            include_secret=False,
+        )
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        items = data.get("items")
+        if not isinstance(items, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, dict):
+                out.append(item)
+        return out
+
+    def _agent_ack(
+        self,
+        item_id: str,
+        lease_id: str,
+        ack_type: str,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+        tuple_fields: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not self._resolved_instance_id:
+            raise RuntimeError("Cannot ack without resolved instanceId")
+        body: Dict[str, Any] = {
+            "schemaVersion": 1,
+            "instanceId": self._resolved_instance_id,
+            "itemId": item_id,
+            "leaseId": lease_id,
+            "ackType": ack_type,
+        }
+        if error_code:
+            body["errorCode"] = str(error_code)[:120]
+        if error_message:
+            body["errorMessage"] = str(error_message)[:500]
+        if tuple_fields:
+            for key in ("jobId", "executionAttempt", "attemptEpoch"):
+                if key in tuple_fields:
+                    body[key] = tuple_fields[key]
+        resp = self._agent_api("POST", "/agent/ack", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
+        return resp.get("data") if isinstance(resp.get("data"), dict) else {}
+
+    def _agent_event(
+        self,
+        lease: AgentExecuteLease,
+        event_version: int,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not self._resolved_instance_id:
+            raise RuntimeError("Cannot emit event without resolved instanceId")
+        body: Dict[str, Any] = {
+            "schemaVersion": 1,
+            "instanceId": self._resolved_instance_id,
+            "jobId": lease.job_id,
+            "executionAttempt": lease.execution_attempt,
+            "attemptEpoch": lease.attempt_epoch,
+            "leaseId": lease.lease_id,
+            "eventVersion": int(event_version),
+            "eventType": event_type,
+        }
+        if payload:
+            for k, v in payload.items():
+                body[k] = v
+
+        digest_body = {k: v for k, v in body.items() if k != "eventDigest"}
+        body["eventDigest"] = _sha256_hex_bytes(_canonical_json_bytes(digest_body))
+
+        resp = self._agent_api("POST", "/agent/event", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        accepted = data.get("accepted")
+        reason = data.get("reason")
+        if accepted is not True and isinstance(reason, str):
+            logging.info(
+                "Agent event not accepted: jobId=%s type=%s version=%d reason=%s",
+                lease.job_id,
+                event_type,
+                int(event_version),
+                reason,
+            )
+        return data
+
+    def _collect_active_leases(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            active = list(self._active_exec_by_item.values())
+        out: List[Dict[str, Any]] = []
+        for lease in active:
+            out.append(
+                {
+                    "itemId": lease.item_id,
+                    "leaseId": lease.lease_id,
+                    "jobId": lease.job_id,
+                    "executionAttempt": lease.execution_attempt,
+                    "attemptEpoch": lease.attempt_epoch,
+                }
+            )
+        return out
+
+    def _mark_cancel_signal(self, signal: Dict[str, Any]) -> None:
+        if not isinstance(signal, dict):
+            return
+        job_id = signal.get("jobId")
+        execution_attempt = signal.get("executionAttempt")
+        attempt_epoch = signal.get("attemptEpoch")
+        lease_id = signal.get("leaseId")
+        if not isinstance(job_id, str) or not job_id:
+            return
+        if not isinstance(execution_attempt, (int, float)) or not isinstance(attempt_epoch, (int, float)) or not isinstance(lease_id, str):
+            return
+        reason = signal.get("reason") if isinstance(signal.get("reason"), str) else "cancel_requested"
+
+        with self._lock:
+            for lease in self._active_exec_by_item.values():
+                if (
+                    lease.job_id == job_id
+                    and int(lease.execution_attempt) == int(execution_attempt)
+                    and int(lease.attempt_epoch) == int(attempt_epoch)
+                    and lease.lease_id == lease_id
+                ):
+                    if not lease.cancel_requested:
+                        logging.info(
+                            "Received cancel signal for job=%s attempt=%d epoch=%d lease=%s",
+                            lease.job_id,
+                            int(lease.execution_attempt),
+                            int(lease.attempt_epoch),
+                            lease.lease_id,
+                        )
+                    lease.cancel_requested = True
+                    lease.cancel_reason = reason
+
+    def _agent_heartbeat(self) -> Dict[str, Any]:
+        if not self._resolved_instance_id or not self._agent_access_token:
+            return {}
+
+        held_leases = self._collect_active_leases()
+        local_comfy = self._local_comfy_reachable()
+        readiness_present = self._local_readiness_file_present()
+        queue_depth = len(held_leases)
+
+        body: Dict[str, Any] = {
+            "schemaVersion": 1,
+            "instanceId": self._resolved_instance_id,
+            "localComfyReachable": bool(local_comfy),
+            "localReadinessFilePresent": bool(readiness_present),
+            "localReadinessFile": self.agent_local_readiness_file,
+            "queueDepth": int(queue_depth),
+            "heldLeases": held_leases,
+            "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
+            "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
+            "agentVersion": AGENT_VERSION,
+            "capabilities": {
+                "dependencyChannel": True,
+                "agentPullExecution": True,
+            },
+        }
+        resp = self._agent_api("POST", "/agent/heartbeat", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        self._last_agent_heartbeat_ms = _now_ms()
+
+        lease_results = data.get("leases")
+        if isinstance(lease_results, list):
+            for row in lease_results:
+                if not isinstance(row, dict):
+                    continue
+                item_id = row.get("itemId")
+                result = row.get("result")
+                if isinstance(item_id, str) and isinstance(result, str) and result == "stale":
+                    with self._lock:
+                        lease = self._active_exec_by_item.get(item_id)
+                        if lease:
+                            lease.cancel_requested = True
+                            lease.cancel_reason = "lease_stale"
+
+        cancel_signals = data.get("cancelSignals")
+        if isinstance(cancel_signals, list):
+            for signal in cancel_signals:
+                if isinstance(signal, dict):
+                    self._mark_cancel_signal(signal)
+        return data
+
+    def _register_active_lease(self, lease: AgentExecuteLease) -> None:
+        with self._lock:
+            self._active_exec_by_item[lease.item_id] = lease
+
+    def _finish_active_lease(self, item_id: str) -> None:
+        with self._lock:
+            self._active_exec_by_item.pop(item_id, None)
+
+    def _is_cancel_requested(self, lease: AgentExecuteLease) -> bool:
+        with self._lock:
+            active = self._active_exec_by_item.get(lease.item_id)
+            return bool(active.cancel_requested) if active else False
+
+    def _mark_cancel_by_item_id(self, item_id: str, reason: str = "cancel_requested") -> None:
+        with self._lock:
+            lease = self._active_exec_by_item.get(item_id)
+            if lease:
+                lease.cancel_requested = True
+                lease.cancel_reason = reason
+
+    def _current_installed_dep_ids(self) -> Set[str]:
+        with self._lock:
+            self._reconcile_lru_locked()
+            out = set(self._state.installed_static)
+            out.update(self._state.installed_dynamic)
+        return out
+
+    def _comfy_api_json(
+        self,
+        method: str,
+        endpoint: str,
+        body: Optional[Dict[str, Any]] = None,
+        timeout_seconds: float = 30.0,
+    ) -> Tuple[int, Optional[Any]]:
+        ep = endpoint if endpoint.startswith("/") else "/" + endpoint
+        return api_json(method, f"{self.agent_local_comfy_base_url}{ep}", body=body, timeout_seconds=timeout_seconds)
+
+    def _comfy_submit_prompt(self, workflow: Dict[str, Any], client_id: str) -> str:
+        status, resp = self._comfy_api_json(
+            "POST",
+            "/prompt",
+            body={"prompt": workflow, "client_id": client_id},
+            timeout_seconds=60.0,
+        )
+        if status != 200 or not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected /prompt response: {status} {resp}")
+        prompt_id = resp.get("prompt_id")
+        if not isinstance(prompt_id, str) or not prompt_id:
+            raise RuntimeError(f"/prompt did not return prompt_id: {resp}")
+        return prompt_id
+
+    def _comfy_get_history(self, prompt_id: str) -> Dict[str, Any]:
+        status, resp = self._comfy_api_json("GET", f"/history/{urllib.parse.quote(prompt_id)}", timeout_seconds=30.0)
+        if status != 200 or not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected /history response: {status} {resp}")
+        entry = resp.get(prompt_id)
+        return entry if isinstance(entry, dict) else {}
+
+    def _comfy_interrupt(self) -> None:
+        try:
+            self._comfy_api_json("POST", "/interrupt", body={}, timeout_seconds=10.0)
+        except Exception as e:
+            logging.debug("Comfy interrupt failed: %s", e)
+
+    def _parse_workflow_from_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        workflow_ref = payload.get("workflowRef")
+        if not isinstance(workflow_ref, dict):
+            raise RuntimeError("execute_job payload missing workflowRef")
+        mode = workflow_ref.get("mode")
+        if mode == "inline":
+            inline_json = workflow_ref.get("inlineJson")
+            if isinstance(inline_json, str) and inline_json.strip():
+                parsed = json.loads(inline_json)
+                if isinstance(parsed, dict):
+                    return parsed
+                raise RuntimeError("inline workflow is not a JSON object")
+            if isinstance(inline_json, dict):
+                return inline_json
+            raise RuntimeError("inline workflow missing inlineJson")
+        raise RuntimeError(f"Unsupported workflowRef.mode: {mode}")
+
+    def _copy_input_to_comfy(self, source_path: Path, desired_name: str) -> Path:
+        safe_name = os.path.basename(desired_name) or f"input_{uuid.uuid4().hex}"
+        dest = self.comfyui_dir / "input" / safe_name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(source_path), str(dest))
+        return dest
+
+    def _comfy_view_url(self, filename: str, subfolder: Optional[str], file_type: str = "output") -> str:
+        params: List[Tuple[str, str]] = [("filename", filename), ("type", file_type)]
+        if subfolder:
+            params.append(("subfolder", subfolder))
+        return f"{self.agent_local_comfy_base_url}/view?{urllib.parse.urlencode(params)}"
+
+    def _collect_history_output_refs(self, history_entry: Dict[str, Any]) -> List[Dict[str, str]]:
+        outputs = history_entry.get("outputs")
+        if not isinstance(outputs, dict):
+            return []
+
+        refs: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        preferred_keys = ("images", "gifs", "videos", "audios", "audio", "latents", "meshes", "files")
+
+        def _push(row: Dict[str, Any]) -> None:
+            filename = row.get("filename")
+            if not isinstance(filename, str) or not filename:
+                return
+            subfolder = row.get("subfolder") if isinstance(row.get("subfolder"), str) else ""
+            file_type = row.get("type") if isinstance(row.get("type"), str) and row.get("type") else "output"
+            dedupe = f"{file_type}:{subfolder}:{filename}"
+            if dedupe in seen:
+                return
+            seen.add(dedupe)
+            refs.append({"filename": filename, "subfolder": subfolder, "type": file_type})
+
+        for _node_id, node_output in sorted(outputs.items(), key=lambda kv: kv[0]):
+            if not isinstance(node_output, dict):
+                continue
+            for key in preferred_keys:
+                value = node_output.get(key)
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            _push(item)
+            for value in node_output.values():
+                if isinstance(value, dict):
+                    _push(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            _push(item)
+        return refs
+
+    def _agent_handle_cancel_command(self, item: Dict[str, Any]) -> None:
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        item_id = item.get("itemId")
+        lease_id = item.get("leaseId")
+        if not isinstance(item_id, str) or not isinstance(lease_id, str):
+            return
+
+        job_id = payload.get("jobId") if isinstance(payload.get("jobId"), str) else ""
+        execution_attempt = payload.get("executionAttempt")
+        attempt_epoch = payload.get("attemptEpoch")
+        if not job_id or not isinstance(execution_attempt, (int, float)) or not isinstance(attempt_epoch, (int, float)):
+            self._agent_ack(item_id, lease_id, "command_ignored_stale")
+            return
+
+        matched = False
+        with self._lock:
+            for lease in self._active_exec_by_item.values():
+                if (
+                    lease.job_id == job_id
+                    and int(lease.execution_attempt) == int(execution_attempt)
+                    and int(lease.attempt_epoch) == int(attempt_epoch)
+                ):
+                    lease.cancel_requested = True
+                    lease.cancel_reason = payload.get("reason") if isinstance(payload.get("reason"), str) else "cancel_requested"
+                    matched = True
+                    break
+        if matched:
+            self._agent_ack(
+                item_id,
+                lease_id,
+                "command_succeeded",
+                tuple_fields={
+                    "jobId": job_id,
+                    "executionAttempt": int(execution_attempt),
+                    "attemptEpoch": int(attempt_epoch),
+                },
+            )
+        else:
+            self._agent_ack(
+                item_id,
+                lease_id,
+                "command_ignored_stale",
+                tuple_fields={
+                    "jobId": job_id,
+                    "executionAttempt": int(execution_attempt),
+                    "attemptEpoch": int(attempt_epoch),
+                },
+            )
+
     def _resolve_auth_header(self, auth: Optional[str]) -> Optional[str]:
         a = (auth or "none").lower()
         if a == "none":
@@ -1523,6 +2244,520 @@ class DependencyAgent:
         except Exception as e:
             self._post_status(item, "failed", error=str(e))
 
+    def _seconds_until_expiry(self, value: Optional[str]) -> Optional[int]:
+        ms = _iso_to_ms(value)
+        if ms is None:
+            return None
+        return int((int(ms) - int(self._server_now_ms())) / 1000)
+
+    def _agent_refresh_urls(self, lease: AgentExecuteLease, command_state: Dict[str, Any]) -> None:
+        url_refresh = command_state.get("urlRefresh")
+        if not isinstance(url_refresh, dict):
+            return
+        refresh_token = url_refresh.get("refreshToken")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise RuntimeError("Missing refreshToken for url-refresh")
+
+        endpoint = url_refresh.get("refreshEndpoint") if isinstance(url_refresh.get("refreshEndpoint"), str) else "/agent/url-refresh"
+        body = {
+            "schemaVersion": 1,
+            "instanceId": self._resolved_instance_id,
+            "jobId": lease.job_id,
+            "executionAttempt": lease.execution_attempt,
+            "attemptEpoch": lease.attempt_epoch,
+            "leaseId": lease.lease_id,
+            "refreshToken": refresh_token,
+        }
+        resp = self._agent_api("POST", endpoint, body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        if isinstance(data.get("inputFiles"), list):
+            command_state["inputFiles"] = data.get("inputFiles")
+        if isinstance(data.get("outputTargets"), list):
+            command_state["outputTargets"] = data.get("outputTargets")
+        if isinstance(data.get("refreshToken"), str) and data.get("refreshToken"):
+            url_refresh["refreshToken"] = data.get("refreshToken")
+        if isinstance(data.get("refreshTokenExpiresAt"), str):
+            url_refresh["refreshTokenExpiresAt"] = data.get("refreshTokenExpiresAt")
+
+    def _agent_maybe_refresh_urls(self, lease: AgentExecuteLease, command_state: Dict[str, Any], force: bool = False) -> None:
+        url_refresh = command_state.get("urlRefresh")
+        if not isinstance(url_refresh, dict):
+            return
+
+        min_remaining_sec = url_refresh.get("minRemainingSec")
+        if not isinstance(min_remaining_sec, (int, float)):
+            min_remaining_sec = 180
+        threshold = max(30, int(min_remaining_sec))
+
+        expiring = force
+        if not expiring:
+            candidates: List[Optional[str]] = []
+            input_files = command_state.get("inputFiles")
+            if isinstance(input_files, list):
+                for row in input_files:
+                    if isinstance(row, dict) and isinstance(row.get("downloadUrlExpiresAt"), str):
+                        candidates.append(row.get("downloadUrlExpiresAt"))
+            output_targets = command_state.get("outputTargets")
+            if isinstance(output_targets, list):
+                for row in output_targets:
+                    if not isinstance(row, dict):
+                        continue
+                    if isinstance(row.get("uploadUrlExpiresAt"), str):
+                        candidates.append(row.get("uploadUrlExpiresAt"))
+                    if isinstance(row.get("verifyHeadUrlExpiresAt"), str):
+                        candidates.append(row.get("verifyHeadUrlExpiresAt"))
+            if isinstance(url_refresh.get("refreshTokenExpiresAt"), str):
+                candidates.append(url_refresh.get("refreshTokenExpiresAt"))
+
+            for value in candidates:
+                secs = self._seconds_until_expiry(value if isinstance(value, str) else None)
+                if secs is not None and secs < threshold:
+                    expiring = True
+                    break
+
+        if expiring:
+            self._agent_refresh_urls(lease, command_state)
+
+    def _select_output_ref(
+        self,
+        refs: List[Dict[str, str]],
+        target: Dict[str, Any],
+        used_indexes: Set[int],
+    ) -> Optional[Tuple[int, Dict[str, str]]]:
+        expected_ext = ""
+        attempt_path = target.get("attemptObjectPath")
+        if isinstance(attempt_path, str) and attempt_path:
+            expected_ext = Path(attempt_path).suffix.lower()
+
+        if expected_ext:
+            for idx, row in enumerate(refs):
+                if idx in used_indexes:
+                    continue
+                filename = row.get("filename")
+                if isinstance(filename, str) and Path(filename).suffix.lower() == expected_ext:
+                    return idx, row
+
+        for idx, row in enumerate(refs):
+            if idx in used_indexes:
+                continue
+            return idx, row
+        return None
+
+    def _process_agent_execute_item(self, item: Dict[str, Any]) -> None:
+        item_id = item.get("itemId")
+        lease_id = item.get("leaseId")
+        payload = item.get("payload")
+        if not isinstance(item_id, str) or not item_id:
+            return
+        if not isinstance(lease_id, str) or not lease_id:
+            return
+        if not isinstance(payload, dict):
+            try:
+                self._agent_ack(item_id, lease_id, "command_ignored_stale")
+            except Exception:
+                pass
+            return
+
+        job_id = payload.get("jobId")
+        execution_attempt = payload.get("executionAttempt")
+        attempt_epoch = payload.get("attemptEpoch")
+        if (
+            not isinstance(job_id, str)
+            or not job_id
+            or not isinstance(execution_attempt, (int, float))
+            or not isinstance(attempt_epoch, (int, float))
+        ):
+            try:
+                self._agent_ack(item_id, lease_id, "command_ignored_stale")
+            except Exception:
+                pass
+            return
+
+        lease = AgentExecuteLease(
+            item_id=item_id,
+            lease_id=lease_id,
+            job_id=job_id,
+            execution_attempt=int(execution_attempt),
+            attempt_epoch=int(attempt_epoch),
+            started_at_ms=_now_ms(),
+            command_id=payload.get("commandId") if isinstance(payload.get("commandId"), str) else "",
+        )
+        self._register_active_lease(lease)
+
+        event_version = 0
+        terminal_sent = False
+        tmp_root = Path(tempfile.mkdtemp(prefix=f"agent_exec_{job_id}_{lease.execution_attempt}_{lease.attempt_epoch}_"))
+
+        def emit(event_type: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            nonlocal event_version
+            event_version += 1
+            return self._agent_event(lease, event_version, event_type, payload=extra)
+
+        try:
+            try:
+                emit("job_dispatched", {"commandId": lease.command_id} if lease.command_id else None)
+            except Exception as e:
+                logging.debug("job_dispatched emit failed for %s: %s", lease.job_id, e)
+
+            required_dep_ids_raw = payload.get("requiredDepIds")
+            required_dep_ids = [d for d in required_dep_ids_raw if isinstance(d, str) and d] if isinstance(required_dep_ids_raw, list) else []
+            timeouts = payload.get("timeouts") if isinstance(payload.get("timeouts"), dict) else {}
+            dep_wait_timeout_sec = int(timeouts.get("dependencyWaitTimeoutSec")) if isinstance(timeouts.get("dependencyWaitTimeoutSec"), (int, float)) else 900
+            execution_timeout_sec = int(timeouts.get("executionTimeoutSec")) if isinstance(timeouts.get("executionTimeoutSec"), (int, float)) else 2400
+
+            if required_dep_ids:
+                dep_wait_started = _now_ms()
+                last_wait_emit_ms = 0
+                while True:
+                    if self._is_cancel_requested(lease):
+                        self._comfy_interrupt()
+                        emit("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before execution started."})
+                        terminal_sent = True
+                        return
+
+                    installed = self._current_installed_dep_ids()
+                    missing = [dep for dep in required_dep_ids if dep not in installed]
+                    if not missing:
+                        break
+
+                    now_ms = _now_ms()
+                    if now_ms - dep_wait_started > max(1, dep_wait_timeout_sec) * 1000:
+                        emit(
+                            "job_failed",
+                            {
+                                "errorCode": "dependencies_timeout",
+                                "errorMessage": f"Dependencies did not become ready in {dep_wait_timeout_sec}s.",
+                            },
+                        )
+                        terminal_sent = True
+                        return
+
+                    if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= 15_000:
+                        emit("waiting_dependencies", {"missingDepIds": missing[:200]})
+                        last_wait_emit_ms = now_ms
+                    time.sleep(2.0)
+
+            if self._is_cancel_requested(lease):
+                self._comfy_interrupt()
+                emit("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before input preparation."})
+                terminal_sent = True
+                return
+
+            command_state: Dict[str, Any] = {
+                "inputFiles": payload.get("inputFiles") if isinstance(payload.get("inputFiles"), list) else [],
+                "outputTargets": (
+                    (payload.get("outputPlan") or {}).get("targets")
+                    if isinstance(payload.get("outputPlan"), dict) and isinstance((payload.get("outputPlan") or {}).get("targets"), list)
+                    else []
+                ),
+                "urlRefresh": payload.get("urlRefresh") if isinstance(payload.get("urlRefresh"), dict) else {},
+            }
+            self._agent_maybe_refresh_urls(lease, command_state, force=False)
+
+            input_files_initial = command_state.get("inputFiles")
+            if isinstance(input_files_initial, list) and input_files_initial:
+                input_tmp_dir = tmp_root / "inputs"
+                input_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+                for idx in range(len(input_files_initial)):
+                    input_files_live = command_state.get("inputFiles")
+                    if not isinstance(input_files_live, list) or idx >= len(input_files_live):
+                        break
+                    row = input_files_live[idx]
+                    if not isinstance(row, dict):
+                        continue
+                    if self._is_cancel_requested(lease):
+                        self._comfy_interrupt()
+                        emit("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested while downloading inputs."})
+                        terminal_sent = True
+                        return
+
+                    self._agent_maybe_refresh_urls(lease, command_state, force=False)
+                    download_url = row.get("downloadUrl")
+                    if not isinstance(download_url, str) or not download_url:
+                        raise RuntimeError(f"Input file #{idx} missing downloadUrl")
+
+                    name = row.get("name") if isinstance(row.get("name"), str) and row.get("name") else f"input_{idx}"
+                    temp_name = f"{idx:02d}_{os.path.basename(name)}"
+                    local_path = input_tmp_dir / temp_name
+                    http_download_to_file(
+                        download_url,
+                        local_path,
+                        timeout_seconds=float(self.download_timeout_seconds),
+                        chunk_size=int(self.download_chunk_size),
+                    )
+                    expected_sha = row.get("sha256")
+                    if isinstance(expected_sha, str) and expected_sha:
+                        actual_sha = sha256_file(local_path)
+                        if actual_sha.lower() != expected_sha.lower():
+                            raise RuntimeError(f"input_checksum_mismatch for {name}: expected {expected_sha} got {actual_sha}")
+
+                    self._copy_input_to_comfy(local_path, name)
+
+            emit("inputs_ready", None)
+
+            if self._is_cancel_requested(lease):
+                self._comfy_interrupt()
+                emit("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before prompt submit."})
+                terminal_sent = True
+                return
+
+            workflow = self._parse_workflow_from_payload(payload)
+            prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{job_id}-{uuid.uuid4().hex[:12]}")
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                if active:
+                    active.prompt_id = prompt_id
+
+            emit("prompt_submitted", {"promptId": prompt_id})
+            emit("execution_started", {"promptId": prompt_id})
+
+            start_exec_ms = _now_ms()
+            last_progress_emit_ms = 0
+            history_entry: Dict[str, Any] = {}
+            history_errors = 0
+            while True:
+                if self._is_cancel_requested(lease):
+                    self._comfy_interrupt()
+                    emit(
+                        "job_cancelled",
+                        {
+                            "promptId": prompt_id,
+                            "errorCode": "cancel_requested",
+                            "errorMessage": "Cancellation requested during execution.",
+                        },
+                    )
+                    terminal_sent = True
+                    return
+
+                if _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
+                    emit(
+                        "job_failed",
+                        {
+                            "promptId": prompt_id,
+                            "errorCode": "execution_timeout",
+                            "errorMessage": f"Execution exceeded timeout ({execution_timeout_sec}s).",
+                        },
+                    )
+                    terminal_sent = True
+                    return
+
+                try:
+                    history_entry = self._comfy_get_history(prompt_id)
+                    history_errors = 0
+                except Exception as history_err:
+                    history_errors += 1
+                    if history_errors >= 10:
+                        raise RuntimeError(f"Repeated /history lookup failures: {history_err}")
+                    logging.debug("Transient /history lookup failure for prompt %s: %s", prompt_id, history_err)
+                    time.sleep(2.0)
+                    continue
+                status_obj = history_entry.get("status") if isinstance(history_entry.get("status"), dict) else {}
+                status_str = str(status_obj.get("status_str") or status_obj.get("status") or "").strip().lower()
+                failed = status_obj.get("failed") is True or status_str in ("failed", "error")
+                completed = status_obj.get("completed") is True or status_str in ("success", "succeeded", "completed")
+
+                if failed:
+                    emit(
+                        "job_failed",
+                        {
+                            "promptId": prompt_id,
+                            "errorCode": "comfy_execution_failed",
+                            "errorMessage": (json.dumps(status_obj)[:500] if status_obj else "ComfyUI execution failed."),
+                        },
+                    )
+                    terminal_sent = True
+                    return
+
+                if completed:
+                    break
+
+                if _now_ms() - last_progress_emit_ms >= 15_000:
+                    emit("execution_progress", {"promptId": prompt_id})
+                    last_progress_emit_ms = _now_ms()
+                time.sleep(2.0)
+
+            emit("output_commit_started", {"promptId": prompt_id})
+
+            output_targets_initial = command_state.get("outputTargets")
+            if not isinstance(output_targets_initial, list) or len(output_targets_initial) == 0:
+                raise RuntimeError("Missing output targets for execute_job command.")
+
+            refs = self._collect_history_output_refs(history_entry)
+            if not refs:
+                raise RuntimeError("No output files found in ComfyUI history.")
+
+            output_tmp_dir = tmp_root / "outputs"
+            output_tmp_dir.mkdir(parents=True, exist_ok=True)
+            used_ref_indexes: Set[int] = set()
+            uploaded_outputs: List[Dict[str, Any]] = []
+
+            for target_idx in range(len(output_targets_initial)):
+                output_targets_live = command_state.get("outputTargets")
+                if not isinstance(output_targets_live, list) or target_idx >= len(output_targets_live):
+                    break
+                target = output_targets_live[target_idx]
+                if not isinstance(target, dict):
+                    continue
+                self._agent_maybe_refresh_urls(lease, command_state, force=False)
+                output_targets_live = command_state.get("outputTargets")
+                if not isinstance(output_targets_live, list) or target_idx >= len(output_targets_live):
+                    break
+                target = output_targets_live[target_idx]
+
+                selected = self._select_output_ref(refs, target, used_ref_indexes)
+                if selected is None:
+                    continue
+                ref_idx, ref = selected
+                used_ref_indexes.add(ref_idx)
+
+                filename = ref.get("filename") if isinstance(ref.get("filename"), str) else ""
+                subfolder = ref.get("subfolder") if isinstance(ref.get("subfolder"), str) else ""
+                file_type = ref.get("type") if isinstance(ref.get("type"), str) else "output"
+                if not filename:
+                    continue
+
+                local_output = output_tmp_dir / f"{len(uploaded_outputs):02d}_{os.path.basename(filename)}"
+                http_download_to_file(
+                    self._comfy_view_url(filename=filename, subfolder=subfolder if subfolder else None, file_type=file_type),
+                    local_output,
+                    timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
+                    chunk_size=int(self.download_chunk_size),
+                )
+                bytes_written = int(local_output.stat().st_size)
+                sha256_sum = sha256_file(local_output)
+
+                upload_url = target.get("uploadUrl")
+                if not isinstance(upload_url, str) or not upload_url:
+                    raise RuntimeError("Missing uploadUrl in output target.")
+                content_type = target.get("contentType") if isinstance(target.get("contentType"), str) and target.get("contentType") else None
+                if not content_type:
+                    guessed, _enc = mimetypes.guess_type(filename)
+                    content_type = guessed or "application/octet-stream"
+
+                status, body, _resp_headers = http_put_file_stream(
+                    upload_url,
+                    local_output,
+                    headers={"Content-Type": content_type},
+                    timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                )
+                if status == 412:
+                    verify_url = target.get("verifyHeadUrl")
+                    if isinstance(verify_url, str) and verify_url:
+                        head_status, head_headers = http_head(verify_url, timeout_seconds=30.0)
+                        if head_status in (200, 204):
+                            remote_len = head_headers.get("content-length")
+                            if isinstance(remote_len, str) and remote_len.isdigit() and int(remote_len) == bytes_written:
+                                status = 200
+                if status < 200 or status >= 300:
+                    raise RuntimeError(f"Output upload failed (status={status}): {body[:200]}")
+
+                logical_key = target.get("logicalOutputKey") if isinstance(target.get("logicalOutputKey"), str) else f"output_{len(uploaded_outputs)}"
+                attempt_object_path = (
+                    target.get("attemptObjectPath")
+                    if isinstance(target.get("attemptObjectPath"), str) and target.get("attemptObjectPath")
+                    else filename
+                )
+                final_object_path = (
+                    target.get("finalObjectPath")
+                    if isinstance(target.get("finalObjectPath"), str) and target.get("finalObjectPath")
+                    else attempt_object_path
+                )
+
+                out_meta = {
+                    "logicalOutputKey": logical_key,
+                    "attemptObjectPath": attempt_object_path,
+                    "finalObjectPath": final_object_path,
+                    "bytes": bytes_written,
+                    "sha256": sha256_sum,
+                    "contentType": content_type,
+                }
+                uploaded_outputs.append(out_meta)
+                try:
+                    emit("output_uploaded", out_meta)
+                except Exception as e:
+                    logging.debug("output_uploaded emit failed for %s/%s: %s", lease.job_id, logical_key, e)
+
+            if not uploaded_outputs:
+                raise RuntimeError("No outputs were uploaded.")
+
+            emit("job_completed", {"promptId": prompt_id, "outputs": uploaded_outputs})
+            terminal_sent = True
+        except Exception as e:
+            if not terminal_sent:
+                event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
+                err_code = "cancel_requested" if event_type == "job_cancelled" else "execution_error"
+                prompt_id = None
+                with self._lock:
+                    active = self._active_exec_by_item.get(lease.item_id)
+                    if active and isinstance(active.prompt_id, str):
+                        prompt_id = active.prompt_id
+                payload: Dict[str, Any] = {
+                    "errorCode": err_code,
+                    "errorMessage": str(e)[:500],
+                }
+                if prompt_id:
+                    payload["promptId"] = prompt_id
+                try:
+                    emit(event_type, payload)
+                    terminal_sent = True
+                except Exception as event_err:
+                    logging.warning("Failed emitting terminal event for %s: %s", lease.job_id, event_err)
+            logging.error(
+                "execute_job failed: itemId=%s jobId=%s attempt=%d epoch=%d err=%s",
+                lease.item_id,
+                lease.job_id,
+                int(lease.execution_attempt),
+                int(lease.attempt_epoch),
+                e,
+            )
+        finally:
+            self._finish_active_lease(lease.item_id)
+            try:
+                shutil.rmtree(str(tmp_root), ignore_errors=True)
+            except Exception:
+                pass
+
+    def _process_agent_queue_item(
+        self,
+        item: Dict[str, Any],
+        agent_executor: ThreadPoolExecutor,
+        agent_inflight: Set[Future[None]],
+    ) -> None:
+        item_type = item.get("type") if isinstance(item.get("type"), str) else ""
+        item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
+        lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
+
+        if item_type == "execute_job":
+            if not item_id or not lease_id:
+                return
+            with self._lock:
+                if item_id in self._active_exec_by_item:
+                    # Duplicate lease delivery for an already-active item.
+                    try:
+                        self._agent_ack(item_id, lease_id, "command_ignored_stale")
+                    except Exception:
+                        pass
+                    return
+            agent_inflight.add(agent_executor.submit(self._process_agent_execute_item, item))
+            return
+
+        if item_type == "cancel_job":
+            self._agent_handle_cancel_command(item)
+            return
+
+        if item_id and lease_id:
+            try:
+                self._agent_ack(
+                    item_id,
+                    lease_id,
+                    "command_failed",
+                    error_code="unknown_command_type",
+                    error_message=f"Unsupported command type '{item_type}'",
+                )
+            except Exception as e:
+                logging.warning("Failed to ack unknown command type for item=%s: %s", item_id, e)
+
     def run_forever(self) -> None:
         self.validate_env()
 
@@ -1561,7 +2796,17 @@ class DependencyAgent:
             "yes" if self.verbose_progress else "no",
             "yes" if self.download_debug else "no",
         )
-        logging.info("Polling every %.1fs, heartbeat every %.1fs, max_parallel=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
+        logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
+        logging.info(
+            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds localComfy=%s readinessFile=%s maxExecWorkers=%d",
+            "yes" if self.agent_control_enabled else "no",
+            self.agent_poll_seconds,
+            self.agent_heartbeat_seconds,
+            int(self.agent_queue_wait_sec),
+            self.agent_local_comfy_base_url,
+            self.agent_local_readiness_file,
+            int(self.agent_max_execute_workers),
+        )
         policy = self._dynamic_policy()
         if policy.get("enabled"):
             logging.info(
@@ -1574,102 +2819,200 @@ class DependencyAgent:
         else:
             logging.info("Dynamic eviction disabled (set profile.dynamicPolicy.enabled or DM_DYNAMIC_EVICTION_ENABLED=1)")
 
-        executor = ThreadPoolExecutor(max_workers=self.max_parallel)
-        inflight: Set[Future[None]] = set()
+        dep_executor = ThreadPoolExecutor(max_workers=self.max_parallel)
+        dep_inflight: Set[Future[None]] = set()
+        agent_executor = ThreadPoolExecutor(max_workers=self.agent_max_execute_workers)
+        agent_inflight: Set[Future[None]] = set()
+
+        next_dep_poll_at_ms = 0
+        next_agent_poll_at_ms = 0
+
+        # Best-effort early register for agent control channel.
+        self._maybe_register_agent_control()
 
         while not self._stop.is_set():
             try:
-                # Heartbeat (coarse).
                 now = _now_ms()
-                if now - self._last_heartbeat_ms >= int(self.heartbeat_seconds * 1000):
-                    self._heartbeat(queue_depth=None)
 
-                # Fetch queue and dispatch work.
-                items = self._fetch_queue(limit=25)
-                queue_depth = len(items)
-                queued_dep_ids: Set[str] = set()
-                for it in items:
-                    d = it.get("depId")
-                    if isinstance(d, str) and d:
-                        queued_dep_ids.add(d)
-                if queue_depth > 0 and now - self._last_heartbeat_ms >= int(5 * 1000):
-                    # Opportunistically include queueDepth without waiting full heartbeat interval.
-                    self._heartbeat(queue_depth=queue_depth + len(inflight))
-
-                # Clean up completed futures.
-                done = {f for f in inflight if f.done()}
-                inflight -= done
-                for f in done:
+                # Keep both worker sets clean.
+                done_dep = {f for f in dep_inflight if f.done()}
+                dep_inflight -= done_dep
+                for f in done_dep:
                     try:
                         f.result()
                     except Exception as e:
-                        logging.error("Unhandled worker error: %s", e)
+                        logging.error("Unhandled dependency worker error: %s", e)
 
-                # Dispatch new work up to capacity.
-                for item in items:
-                    if self._stop.is_set():
-                        break
-                    if len(inflight) >= self.max_parallel:
-                        break
-                    inflight.add(executor.submit(self._process_item, item))
+                done_agent = {f for f in agent_inflight if f.done()}
+                agent_inflight -= done_agent
+                for f in done_agent:
+                    try:
+                        f.result()
+                    except Exception as e:
+                        logging.error("Unhandled agent worker error: %s", e)
 
-                # Also retry previously-failed downloads when their backoff expires (covers prefetch deps).
-                if len(inflight) < self.max_parallel:
+                # Heartbeats.
+                if now - self._last_heartbeat_ms >= int(self.heartbeat_seconds * 1000):
+                    try:
+                        self._heartbeat(queue_depth=None)
+                    except ApiError as e:
+                        if e.status in (401, 403):
+                            logging.warning("Dependency heartbeat unauthorized (status=%d); re-registering dependency channel.", e.status)
+                            try:
+                                self._register()
+                            except Exception as re:
+                                logging.error("Dependency re-register failed: %s", re)
+                        else:
+                            logging.error("Dependency heartbeat API error: %s", e)
+                    except Exception as e:
+                        logging.error("Dependency heartbeat failed: %s", e)
+
+                self._maybe_register_agent_control()
+                if self.agent_control_enabled and self._agent_channel_supported and self._agent_access_token:
+                    if now - self._last_agent_heartbeat_ms >= int(self.agent_heartbeat_seconds * 1000):
+                        try:
+                            self._agent_heartbeat()
+                        except ApiError as e:
+                            if e.status in (401, 403):
+                                logging.warning("Agent heartbeat unauthorized (status=%d); token refresh required.", e.status)
+                                self._agent_access_token = None
+                                self._agent_access_token_expires_at_ms = 0
+                            else:
+                                logging.warning("Agent heartbeat API error (status=%d): %s", e.status, e)
+                        except Exception as e:
+                            logging.warning("Agent heartbeat failed: %s", e)
+
+                # Dependency queue polling/dispatch.
+                if now >= next_dep_poll_at_ms:
+                    try:
+                        items = self._fetch_queue(limit=25)
+                    except ApiError as e:
+                        if e.status in (401, 403):
+                            logging.warning("Dependency queue unauthorized (status=%d); re-registering.", e.status)
+                            try:
+                                self._register()
+                            except Exception as re:
+                                logging.error("Dependency re-register failed: %s", re)
+                            items = []
+                        else:
+                            raise
+
+                    queue_depth = len(items)
+                    queued_dep_ids: Set[str] = set()
+                    for it in items:
+                        d = it.get("depId")
+                        if isinstance(d, str) and d:
+                            queued_dep_ids.add(d)
+                    if queue_depth > 0 and now - self._last_heartbeat_ms >= int(5 * 1000):
+                        try:
+                            self._heartbeat(queue_depth=queue_depth + len(dep_inflight))
+                        except Exception:
+                            pass
+
                     due_retry_items: List[Dict[str, Any]] = []
                     retry_changed = False
-                    retry_cap = max(0, int(self.max_parallel) - len(inflight))
-                    with self._lock:
-                        downloading_now = set(self._downloading)
-                        for dep_id, entry in list(self._state.retry.items()):
-                            if len(due_retry_items) >= retry_cap:
-                                break
-                            if dep_id in queued_dep_ids or dep_id in downloading_now:
-                                continue
-                            if not isinstance(entry, dict):
-                                continue
-                            next_at = entry.get("nextAttemptAtMs")
-                            if not isinstance(next_at, int) or next_at > now:
-                                continue
-                            resolved = entry.get("resolved")
-                            if not isinstance(resolved, dict):
-                                # Corrupt/incomplete retry entry; drop it.
-                                self._state.retry.pop(dep_id, None)
-                                retry_changed = True
-                                continue
-                            due_retry_items.append(
-                                {
-                                    "itemId": entry.get("itemId") if isinstance(entry.get("itemId"), str) else dep_id,
-                                    "depId": dep_id,
-                                    "op": "download",
-                                    "resolved": resolved,
-                                }
-                            )
-
-                        if retry_changed:
-                            self._save_state()
+                    retry_cap = max(0, int(self.max_parallel) - len(dep_inflight))
+                    if retry_cap > 0:
+                        with self._lock:
+                            downloading_now = set(self._downloading)
+                            for dep_id, entry in list(self._state.retry.items()):
+                                if len(due_retry_items) >= retry_cap:
+                                    break
+                                if dep_id in queued_dep_ids or dep_id in downloading_now:
+                                    continue
+                                if not isinstance(entry, dict):
+                                    continue
+                                next_at = entry.get("nextAttemptAtMs")
+                                if not isinstance(next_at, int) or next_at > now:
+                                    continue
+                                resolved = entry.get("resolved")
+                                if not isinstance(resolved, dict):
+                                    self._state.retry.pop(dep_id, None)
+                                    retry_changed = True
+                                    continue
+                                due_retry_items.append(
+                                    {
+                                        "itemId": entry.get("itemId") if isinstance(entry.get("itemId"), str) else dep_id,
+                                        "depId": dep_id,
+                                        "op": "download",
+                                        "resolved": resolved,
+                                    }
+                                )
+                            if retry_changed:
+                                self._save_state()
 
                     for it in due_retry_items:
-                        if self._stop.is_set() or len(inflight) >= self.max_parallel:
+                        if self._stop.is_set() or len(dep_inflight) >= self.max_parallel:
                             break
-                        inflight.add(executor.submit(self._process_item, it))
+                        dep_inflight.add(dep_executor.submit(self._process_item, it))
 
-                _sleep_with_jitter(self.poll_seconds)
-            except ApiError as e:
-                # Unauthorized usually means token rotated or instance doc missing; re-register.
-                if e.status in (401, 403):
-                    logging.warning("Unauthorized (status=%d); re-registering.", e.status)
+                    for item in items:
+                        if self._stop.is_set():
+                            break
+                        if len(dep_inflight) >= self.max_parallel:
+                            break
+                        dep_inflight.add(dep_executor.submit(self._process_item, item))
+
+                    next_dep_poll_at_ms = now + int(max(0.2, float(self.poll_seconds)) * 1000)
+
+                # Agent queue polling/dispatch.
+                if (
+                    self.agent_control_enabled
+                    and self._agent_channel_supported
+                    and self._agent_access_token
+                    and now >= next_agent_poll_at_ms
+                ):
+                    with self._lock:
+                        active_exec_count = len(self._active_exec_by_item)
+                    execute_capacity = self._agent_effective_execute_capacity()
+                    available_exec_slots = max(0, execute_capacity - active_exec_count)
+                    poll_limit = max(1, min(20, available_exec_slots + 3))
+
                     try:
-                        self._register()
-                    except Exception as re:
-                        logging.error("Re-register failed: %s", re)
-                else:
-                    logging.error("API error: %s", e)
-                _sleep_with_jitter(5.0)
+                        agent_items = self._agent_fetch_queue(limit=poll_limit, wait_sec=self.agent_queue_wait_sec)
+                    except ApiError as e:
+                        if e.status in (401, 403):
+                            logging.warning("Agent queue unauthorized (status=%d); forcing agent re-register.", e.status)
+                            self._agent_access_token = None
+                            self._agent_access_token_expires_at_ms = 0
+                            agent_items = []
+                        elif e.status in (404, 405):
+                            self._agent_channel_supported = False
+                            logging.warning("Agent queue endpoint unavailable (status=%d). Disabling agent control channel for this process.", e.status)
+                            agent_items = []
+                        else:
+                            raise
+
+                    for item in agent_items:
+                        if self._stop.is_set():
+                            break
+                        try:
+                            self._process_agent_queue_item(item, agent_executor, agent_inflight)
+                        except Exception as e:
+                            item_id = item.get("itemId")
+                            lease_id = item.get("leaseId")
+                            logging.warning("Failed processing agent queue item %s: %s", item_id, e)
+                            if isinstance(item_id, str) and isinstance(lease_id, str):
+                                try:
+                                    self._agent_ack(
+                                        item_id,
+                                        lease_id,
+                                        "command_failed",
+                                        error_code="agent_processing_error",
+                                        error_message=str(e),
+                                    )
+                                except Exception:
+                                    pass
+
+                    next_agent_poll_at_ms = now + int(max(0.2, float(self.agent_poll_seconds)) * 1000)
+
+                _sleep_with_jitter(0.5, jitter_ratio=0.1)
             except Exception as e:
                 logging.error("Main loop error: %s", e)
                 _sleep_with_jitter(5.0)
 
-        executor.shutdown(wait=False, cancel_futures=True)
+        dep_executor.shutdown(wait=False, cancel_futures=True)
+        agent_executor.shutdown(wait=False, cancel_futures=True)
         logging.info("Dependency agent stopped.")
 
 
