@@ -51,7 +51,7 @@ Optional knobs:
   - DM_DYNAMIC_MAX_BYTES          (override profile.dynamicPolicy.maxDynamicBytes; supports 50GB/2TiB)
   - DM_EVICTION_BATCH_MAX         (override profile.dynamicPolicy.evictionBatchMax; default: 20)
   - DM_PIN_TTL_SECONDS            (do not evict deps touched within this window; default: 1800)
-  - DM_AGENT_CONTROL_ENABLED      (enable /agent/* control channel; default: false)
+  - DM_AGENT_CONTROL_ENABLED      (enable /agent/* control channel; default: true)
   - DM_INSTANCE_BOOTSTRAP_TOKEN   (instance bootstrap token for /agent/register when required)
   - DM_AGENT_POLL_SECONDS         (poll cadence for /agent/queue; default: 1)
   - DM_AGENT_HEARTBEAT_SECONDS    (heartbeat cadence for /agent/heartbeat; default: 5)
@@ -876,7 +876,7 @@ class DependencyAgent:
         self.download_chunk_size = int(chunk_mib) * 1024 * 1024
 
         # Agent control channel knobs (execute pull mode).
-        self.agent_control_enabled = _env_bool("DM_AGENT_CONTROL_ENABLED", False)
+        self.agent_control_enabled = _env_bool("DM_AGENT_CONTROL_ENABLED", True)
         self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 1.0))
         self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 5.0))
         self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
@@ -1470,6 +1470,10 @@ class DependencyAgent:
         }
         if self.instance_bootstrap_token:
             body["instanceBootstrapToken"] = self.instance_bootstrap_token
+        elif self._token:
+            # Reuse dependency-channel token as bootstrap proof when a dedicated
+            # bootstrap token is not explicitly provided.
+            body["instanceBootstrapToken"] = self._token
 
         resp = self._agent_api(
             "POST",
