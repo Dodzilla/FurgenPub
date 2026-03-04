@@ -2772,6 +2772,7 @@ class DependencyAgent:
                 bytes_written = int(local_output.stat().st_size)
                 sha256_sum = sha256_file(local_output)
 
+                logical_key = target.get("logicalOutputKey") if isinstance(target.get("logicalOutputKey"), str) else f"output_{len(uploaded_outputs)}"
                 upload_url = target.get("uploadUrl")
                 if not isinstance(upload_url, str) or not upload_url:
                     raise RuntimeError("Missing uploadUrl in output target.")
@@ -2780,10 +2781,29 @@ class DependencyAgent:
                     guessed, _enc = mimetypes.guess_type(filename)
                     content_type = guessed or "application/octet-stream"
 
+                upload_headers: Dict[str, str] = {"Content-Type": content_type}
+                upload_headers_raw = target.get("uploadHeaders")
+                if isinstance(upload_headers_raw, dict):
+                    for hk, hv in upload_headers_raw.items():
+                        if isinstance(hk, str) and hk and isinstance(hv, str):
+                            upload_headers[hk] = hv
+
+                upload_method = target.get("uploadMethod") if isinstance(target.get("uploadMethod"), str) else ""
+                if upload_method == "agent_api_put":
+                    upload_headers["X-DM-Instance-Id"] = str(self._resolved_instance_id or "")
+                    upload_headers["X-Agent-Job-Id"] = lease.job_id
+                    upload_headers["X-Agent-Execution-Attempt"] = str(int(lease.execution_attempt))
+                    upload_headers["X-Agent-Attempt-Epoch"] = str(int(lease.attempt_epoch))
+                    upload_headers["X-Agent-Lease-Id"] = lease.lease_id
+                    upload_headers["X-Agent-Logical-Output-Key"] = logical_key
+                    upload_headers["X-Agent-Source-Filename"] = filename
+                    if self._agent_access_token:
+                        upload_headers["Authorization"] = f"Bearer {self._agent_access_token}"
+
                 status, body, _resp_headers = http_put_file_stream(
                     upload_url,
                     local_output,
-                    headers={"Content-Type": content_type},
+                    headers=upload_headers,
                     timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
                 )
                 if status == 412:
@@ -2797,17 +2817,24 @@ class DependencyAgent:
                 if status < 200 or status >= 300:
                     raise RuntimeError(f"Output upload failed (status={status}): {body[:200]}")
 
-                logical_key = target.get("logicalOutputKey") if isinstance(target.get("logicalOutputKey"), str) else f"output_{len(uploaded_outputs)}"
+                response_payload = _json_loads_or_none(body) if isinstance(body, str) and body else None
+                response_data = response_payload.get("data") if isinstance(response_payload, dict) and isinstance(response_payload.get("data"), dict) else {}
+
                 attempt_object_path = (
                     target.get("attemptObjectPath")
                     if isinstance(target.get("attemptObjectPath"), str) and target.get("attemptObjectPath")
                     else filename
                 )
                 final_object_path = (
-                    target.get("finalObjectPath")
-                    if isinstance(target.get("finalObjectPath"), str) and target.get("finalObjectPath")
-                    else attempt_object_path
+                    response_data.get("destinationPath")
+                    if isinstance(response_data.get("destinationPath"), str) and response_data.get("destinationPath")
+                    else (
+                        target.get("finalObjectPath")
+                        if isinstance(target.get("finalObjectPath"), str) and target.get("finalObjectPath")
+                        else attempt_object_path
+                    )
                 )
+                public_url = response_data.get("cdnUrl") if isinstance(response_data.get("cdnUrl"), str) and response_data.get("cdnUrl") else None
 
                 out_meta = {
                     "logicalOutputKey": logical_key,
@@ -2816,6 +2843,7 @@ class DependencyAgent:
                     "bytes": bytes_written,
                     "sha256": sha256_sum,
                     "contentType": content_type,
+                    **({"publicUrl": public_url} if public_url else {}),
                 }
                 uploaded_outputs.append(out_meta)
                 try:
