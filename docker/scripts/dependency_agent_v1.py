@@ -881,7 +881,8 @@ class DependencyAgent:
         self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 5.0))
         self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
-        self.agent_local_readiness_file = _env_str("DM_LOCAL_READINESS_FILE", "provisioning_complete.txt") or "provisioning_complete.txt"
+        self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
+        self.agent_local_readiness_file = self._agent_local_readiness_file_env or "provisioning_complete.txt"
         self.agent_max_execute_workers = max(1, min(8, _env_int("DM_AGENT_MAX_EXEC_WORKERS", 2)))
 
         allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.com"]
@@ -1020,13 +1021,16 @@ class DependencyAgent:
         except Exception:
             return False
 
-    def _local_comfy_reachable(self, timeout_seconds: float = 2.0) -> bool:
-        url = f"{self.agent_local_comfy_base_url}/queue"
-        try:
-            status, _resp = api_json("GET", url, timeout_seconds=timeout_seconds)
-            return status == 200
-        except Exception:
-            return False
+    def _local_comfy_reachable(self, timeout_seconds: float = 5.0) -> bool:
+        for endpoint in ("/queue", "/system_stats"):
+            url = f"{self.agent_local_comfy_base_url}{endpoint}"
+            try:
+                status, _resp = api_json("GET", url, timeout_seconds=timeout_seconds)
+                if status == 200 or status in (401, 403):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _dynamic_policy(self) -> Dict[str, Any]:
         # Profile (from /dependencies/register) may include dynamicPolicy.*; env vars override.
@@ -1384,6 +1388,18 @@ class DependencyAgent:
             self._profile = profile
         else:
             self._profile = {}
+
+        readiness_from_register = resp.get("readinessCheckFile")
+        if (
+            not self._agent_local_readiness_file_env
+            and isinstance(readiness_from_register, str)
+            and readiness_from_register.strip()
+        ):
+            self.agent_local_readiness_file = readiness_from_register.strip()
+            logging.info(
+                "Using readiness marker from server config: %s",
+                self.agent_local_readiness_file,
+            )
 
         self._resolved_instance_id = instance_id
         self._token = agent_token
