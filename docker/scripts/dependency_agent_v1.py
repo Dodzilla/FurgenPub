@@ -96,7 +96,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.4.1"
+AGENT_VERSION = "dm-agent-py/0.4.2"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -884,6 +884,8 @@ class DependencyAgent:
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         self.agent_local_readiness_file = self._agent_local_readiness_file_env or "provisioning_complete.txt"
         self.agent_max_execute_workers = max(1, min(8, _env_int("DM_AGENT_MAX_EXEC_WORKERS", 2)))
+        self._resolved_local_comfy_base_url = self.agent_local_comfy_base_url
+        self._last_local_comfy_discovery_ms = 0
 
         allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.com"]
         self.allowed_domains = {d.lower() for d in allowed if d}
@@ -1021,16 +1023,130 @@ class DependencyAgent:
         except Exception:
             return False
 
-    def _local_comfy_reachable(self, timeout_seconds: float = 5.0) -> bool:
-        for endpoint in ("/queue", "/system_stats"):
-            url = f"{self.agent_local_comfy_base_url}{endpoint}"
+    def _normalize_local_comfy_base_url(self, raw: Optional[str]) -> Optional[str]:
+        if not isinstance(raw, str):
+            return None
+        value = raw.strip()
+        if not value:
+            return None
+        if "://" not in value:
+            value = f"http://{value}"
+        try:
+            parsed = urllib.parse.urlparse(value)
+        except Exception:
+            return None
+        scheme = (parsed.scheme or "http").lower()
+        if scheme not in ("http", "https"):
+            return None
+        host = (parsed.hostname or "").strip()
+        if not host:
+            return None
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        port = parsed.port
+        if not isinstance(port, int) or port <= 0:
+            port = 8188
+        return f"{scheme}://{host}:{port}"
+
+    def _extract_local_comfy_base_url_from_logs(self) -> Optional[str]:
+        # Probe a small set of likely logs first to avoid expensive scans.
+        candidates = [
+            self.workspace / "comfyui.log",
+            self.workspace / "comfy.log",
+            self.workspace / "logs" / "comfyui.log",
+            self.workspace / "logs" / "comfy.log",
+            self.comfyui_dir / "comfyui.log",
+            self.comfyui_dir / "logs" / "comfyui.log",
+            self.workspace / "dependency_agent.log",
+        ]
+        gui_re = re.compile(r"To see the GUI go to:\s*(https?://[^\s]+)", re.IGNORECASE)
+        url_re = re.compile(r"(https?://(?:127\.0\.0\.1|0\.0\.0\.0):\d+)", re.IGNORECASE)
+
+        for path in candidates:
             try:
-                status, _resp = api_json("GET", url, timeout_seconds=timeout_seconds)
+                if not path.exists() or not path.is_file():
+                    continue
+                # Tail only last ~128KB to keep it cheap.
+                with path.open("rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    start = max(0, size - 131072)
+                    f.seek(start, os.SEEK_SET)
+                    text = f.read().decode("utf-8", errors="ignore")
+
+                # Prefer explicit startup message.
+                for line in reversed(text.splitlines()):
+                    m = gui_re.search(line)
+                    if m:
+                        normalized = self._normalize_local_comfy_base_url(m.group(1))
+                        if normalized:
+                            return normalized
+
+                # Fallback: any loopback URL mention.
+                for line in reversed(text.splitlines()):
+                    m = url_re.search(line)
+                    if m:
+                        normalized = self._normalize_local_comfy_base_url(m.group(1))
+                        if normalized:
+                            return normalized
+            except Exception:
+                continue
+        return None
+
+    def _local_comfy_base_url_candidates(self) -> List[str]:
+        out: List[str] = []
+
+        def _add(url: Optional[str]) -> None:
+            normalized = self._normalize_local_comfy_base_url(url)
+            if normalized and normalized not in out:
+                out.append(normalized)
+
+        # Honor explicit env var first.
+        _add(self.agent_local_comfy_base_url)
+
+        # Optionally pick up runtime-discovered GUI URL from local logs.
+        now = _now_ms()
+        if (now - int(self._last_local_comfy_discovery_ms)) >= 30_000:
+            discovered = self._extract_local_comfy_base_url_from_logs()
+            if discovered:
+                _add(discovered)
+            self._last_local_comfy_discovery_ms = now
+
+        # Known common local ports across templates.
+        _add("http://127.0.0.1:8188")
+        _add("http://127.0.0.1:18188")
+        return out
+
+    def _probe_local_comfy_base_url(self, base_url: str, timeout_seconds: float = 5.0) -> bool:
+        for endpoint in ("/queue", "/system_stats"):
+            try:
+                status, _resp = api_json("GET", f"{base_url}{endpoint}", timeout_seconds=timeout_seconds)
                 if status == 200 or status in (401, 403):
                     return True
             except Exception:
                 continue
         return False
+
+    def _resolve_local_comfy_base_url(self, force_refresh: bool = False, timeout_seconds: float = 5.0) -> str:
+        if not force_refresh and self._resolved_local_comfy_base_url:
+            return self._resolved_local_comfy_base_url
+
+        for base_url in self._local_comfy_base_url_candidates():
+            if self._probe_local_comfy_base_url(base_url, timeout_seconds=timeout_seconds):
+                if base_url != self._resolved_local_comfy_base_url:
+                    logging.info("Resolved local Comfy base URL: %s", base_url)
+                self._resolved_local_comfy_base_url = base_url
+                return base_url
+
+        # If all probes fail, keep last known URL to avoid thrashing API paths.
+        fallback = self._normalize_local_comfy_base_url(self._resolved_local_comfy_base_url) or self.agent_local_comfy_base_url
+        self._resolved_local_comfy_base_url = fallback
+        return fallback
+
+    def _local_comfy_reachable(self, timeout_seconds: float = 5.0) -> bool:
+        # Force refresh periodically so we can recover from port changes.
+        resolved = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=timeout_seconds)
+        return self._probe_local_comfy_base_url(resolved, timeout_seconds=timeout_seconds)
 
     def _dynamic_policy(self) -> Dict[str, Any]:
         # Profile (from /dependencies/register) may include dynamicPolicy.*; env vars override.
@@ -1783,7 +1899,15 @@ class DependencyAgent:
         timeout_seconds: float = 30.0,
     ) -> Tuple[int, Optional[Any]]:
         ep = endpoint if endpoint.startswith("/") else "/" + endpoint
-        return api_json(method, f"{self.agent_local_comfy_base_url}{ep}", body=body, timeout_seconds=timeout_seconds)
+        base_url = self._resolve_local_comfy_base_url(force_refresh=False, timeout_seconds=min(5.0, timeout_seconds))
+        try:
+            return api_json(method, f"{base_url}{ep}", body=body, timeout_seconds=timeout_seconds)
+        except Exception:
+            # For non-mutating calls, retry once with a forced base-url refresh.
+            if method.upper() in ("GET", "HEAD"):
+                refreshed = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=min(5.0, timeout_seconds))
+                return api_json(method, f"{refreshed}{ep}", body=body, timeout_seconds=timeout_seconds)
+            raise
 
     def _comfy_submit_prompt(self, workflow: Dict[str, Any], client_id: str) -> str:
         status, resp = self._comfy_api_json(
@@ -1840,7 +1964,8 @@ class DependencyAgent:
         params: List[Tuple[str, str]] = [("filename", filename), ("type", file_type)]
         if subfolder:
             params.append(("subfolder", subfolder))
-        return f"{self.agent_local_comfy_base_url}/view?{urllib.parse.urlencode(params)}"
+        base_url = self._resolve_local_comfy_base_url(force_refresh=False, timeout_seconds=2.0)
+        return f"{base_url}/view?{urllib.parse.urlencode(params)}"
 
     def _collect_history_output_refs(self, history_entry: Dict[str, Any]) -> List[Dict[str, str]]:
         outputs = history_entry.get("outputs")
