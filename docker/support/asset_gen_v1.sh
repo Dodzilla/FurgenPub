@@ -13,7 +13,6 @@ COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # Keep asset_gen_v1 as the default while still allowing template-level override.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v1}"
 COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-185c61dc26cdc631a1fd57b53744b67393a97fc6}"
-FURGENPUB_PIN_REF="${FURGENPUB_PIN_REF:-cb79ba9b924246c101c6a4ec69d578c016a6e0e7}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
@@ -1492,7 +1491,7 @@ function dependency_manager_start_agent() {
                 return 0
             }
         else
-            fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/${FURGENPUB_PIN_REF}/docker/scripts/dependency_agent_v1.py"
+            fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
             echo "Dependency manager: downloading agent from fallback URL ($fallback_url)."
             curl -fsSL "$fallback_url" -o "$agent_path" || {
                 echo "WARN: Dependency manager: failed to download agent from fallback URL"
