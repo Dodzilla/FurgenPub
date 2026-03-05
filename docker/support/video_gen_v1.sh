@@ -62,6 +62,7 @@ NODES=(
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/evanspearman/ComfyMath"
     "https://github.com/kijai/ComfyUI-MelBandRoFormer"
+    "https://github.com/ClownsharkBatwing/RES4LYF"
 )
 
 # Hugging Face repo snapshots (download the whole repo into a folder).
