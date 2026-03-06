@@ -12,7 +12,7 @@ fi
 
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
-COMFYUI_PIN="${COMFYUI_PIN:-bbe2c13a7075bcf4de3b6744f96d84d12c334350}"
+COMFYUI_PIN="${COMFYUI_PIN:-1c218282369a6cc80651d878fc51fa33d7bf34e2}"
 
 # NOTE:
 # - Do NOT put Hugging Face tokens in this file (or in git clone URLs).
