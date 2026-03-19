@@ -74,6 +74,10 @@ SKIP_NODE_REQUIREMENTS=(
     "ComfyUI-Impact-Pack"
 )
 
+UNPINNED_NODE_DIRS=(
+    "ComfyUI-AudioAnnotation"
+)
+
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
@@ -92,7 +96,6 @@ NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
 NODE_PINS[ComfyUI-NAG]="c6f27116a8259f5b501d498a09e51c82fa72e35f"
 NODE_PINS[ComfyUI-SAM3]="978bb763cfadcad41363eba016e57686b414c27b"
 NODE_PINS[easy-comfy-nodes-async]="d4c651a65e885a05ce5ce09468a2597ab1f7925c"
-NODE_PINS[ComfyUI-AudioAnnotation]="7c0d6fac246dae8e906fd060fc75595345cc66a3"
 NODE_PINS[ComfyUI-Qwen3-TTS]="a2b5176d84ff101e3f2ab49876e9d9f2c38b7ee2"
 NODE_PINS[ComfyUI-Trellis2]="07574666fbe7c82939cec5f69373b8f0958caae1"
 NODE_PINS[ComfyUI-TrellisMeshPostprocess]="7c4b09752968ec09bc93f810773b4f9329e22c91"
@@ -121,6 +124,17 @@ function node_dir_from_repo() {
     printf "%s" "$dir"
 }
 
+function node_allows_unpinned_ref() {
+    local dir="$1"
+    local allowed_dir
+    for allowed_dir in "${UNPINNED_NODE_DIRS[@]}"; do
+        if [[ "$dir" == "$allowed_dir" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 function validate_required_repo_pins() {
     local missing=0
     local repo dir
@@ -132,7 +146,7 @@ function validate_required_repo_pins() {
 
     for repo in "${NODES[@]}"; do
         dir="$(node_dir_from_repo "$repo")"
-        if [[ -z "${NODE_PINS[$dir]:-}" ]]; then
+        if [[ -z "${NODE_PINS[$dir]:-}" ]] && ! node_allows_unpinned_ref "$dir"; then
             printf "ERROR: Missing NODE_PINS entry for repo %s (dir %s).\n" "$repo" "$dir"
             missing=1
         fi
@@ -162,6 +176,10 @@ function pin_node_to_ref() {
     local path="$1"
     local pin_ref="${NODE_PINS[$dir]:-}"
     if [[ -z "${pin_ref}" ]]; then
+        if node_allows_unpinned_ref "$dir"; then
+            printf "Leaving %s on its current/default branch (unpinned by design).\n" "$dir"
+            return 0
+        fi
         printf "ERROR: No pin defined for node directory %s.\n" "$dir"
         return 1
     fi
