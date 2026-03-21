@@ -909,6 +909,7 @@ class DependencyAgent:
         self._last_agent_heartbeat_ms = 0
         self._agent_max_concurrent_execute_jobs = 1
         self._active_exec_by_item: Dict[str, AgentExecuteLease] = {}
+        self._agent_poll_wakeup = threading.Event()
 
         # Best-effort local reconciliation (no API calls).
         with self._lock:
@@ -1872,6 +1873,9 @@ class DependencyAgent:
         with self._lock:
             self._active_exec_by_item.pop(item_id, None)
 
+    def _request_agent_queue_poll(self) -> None:
+        self._agent_poll_wakeup.set()
+
     def _is_cancel_requested(self, lease: AgentExecuteLease) -> bool:
         with self._lock:
             active = self._active_exec_by_item.get(lease.item_id)
@@ -2695,7 +2699,7 @@ class DependencyAgent:
                     if history_errors >= 10:
                         raise RuntimeError(f"Repeated /history lookup failures: {history_err}")
                     logging.debug("Transient /history lookup failure for prompt %s: %s", prompt_id, history_err)
-                    time.sleep(2.0)
+                    time.sleep(0.5)
                     continue
                 status_obj = history_entry.get("status") if isinstance(history_entry.get("status"), dict) else {}
                 status_str = str(status_obj.get("status_str") or status_obj.get("status") or "").strip().lower()
@@ -2720,7 +2724,7 @@ class DependencyAgent:
                 if _now_ms() - last_progress_emit_ms >= 15_000:
                     emit("execution_progress", {"promptId": prompt_id})
                     last_progress_emit_ms = _now_ms()
-                time.sleep(2.0)
+                time.sleep(0.5)
 
             emit("output_commit_started", {"promptId": prompt_id})
 
@@ -2886,6 +2890,7 @@ class DependencyAgent:
             )
         finally:
             self._finish_active_lease(lease.item_id)
+            self._request_agent_queue_poll()
             try:
                 shutil.rmtree(str(tmp_root), ignore_errors=True)
             except Exception:
@@ -3006,6 +3011,9 @@ class DependencyAgent:
         while not self._stop.is_set():
             try:
                 now = _now_ms()
+                if self._agent_poll_wakeup.is_set():
+                    self._agent_poll_wakeup.clear()
+                    next_agent_poll_at_ms = 0
 
                 # Keep both worker sets clean.
                 done_dep = {f for f in dep_inflight if f.done()}
@@ -3179,7 +3187,8 @@ class DependencyAgent:
 
                     next_agent_poll_at_ms = now + int(max(0.2, float(self.agent_poll_seconds)) * 1000)
 
-                _sleep_with_jitter(0.5, jitter_ratio=0.1)
+                wait_seconds = max(0.05, 0.5 + random.uniform(-0.05, 0.05))
+                self._agent_poll_wakeup.wait(timeout=wait_seconds)
             except Exception as e:
                 logging.error("Main loop error: %s", e)
                 _sleep_with_jitter(5.0)
