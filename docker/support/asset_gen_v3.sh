@@ -12,7 +12,7 @@ source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # Keep asset_gen_v2 as the default while still allowing template-level override.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v2}"
-COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-185c61dc26cdc631a1fd57b53744b67393a97fc6}"
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-ebf6b52e322664af91fcdc8b8848d31d5fb98f66}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
@@ -26,6 +26,13 @@ TRELLIS2_FLEX_GEMM_ALGO="${TRELLIS2_FLEX_GEMM_ALGO:-masked_implicit_gemm}"
 TRELLIS2_FLEX_GEMM_USE_AUTOTUNE_CACHE="${TRELLIS2_FLEX_GEMM_USE_AUTOTUNE_CACHE:-1}"
 TRELLIS2_FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE="${TRELLIS2_FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE:-1}"
 TRELLIS2_FLEX_GEMM_AUTOTUNE_CACHE_PATH="${TRELLIS2_FLEX_GEMM_AUTOTUNE_CACHE_PATH:-${WORKSPACE}/.flex_gemm/autotune_cache.json}"
+TRELLIS2_TORCH_VERSION="${TRELLIS2_TORCH_VERSION:-2.9.1+cu128}"
+TRELLIS2_TORCHVISION_VERSION="${TRELLIS2_TORCHVISION_VERSION:-0.24.1+cu128}"
+TRELLIS2_TORCHAUDIO_VERSION="${TRELLIS2_TORCHAUDIO_VERSION:-2.9.1+cu128}"
+TRELLIS2_XFORMERS_VERSION="${TRELLIS2_XFORMERS_VERSION:-0.0.33.post2}"
+TRELLIS2_PYTORCH_INDEX_URL="${TRELLIS2_PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+TRELLIS2_PYTORCH_EXTRA_INDEX_URL="${TRELLIS2_PYTORCH_EXTRA_INDEX_URL:-https://pypi.org/simple}"
+TRELLIS2_LINUX_WHEELS_SUBDIR="${TRELLIS2_LINUX_WHEELS_SUBDIR:-Torch291}"
 AUDIO_ANNOTATION_DEFAULT_MODEL="${AUDIO_ANNOTATION_DEFAULT_MODEL:-distil-large-v3}"
 AUDIO_ANNOTATION_DEVICE="${AUDIO_ANNOTATION_DEVICE:-auto}"
 AUDIO_ANNOTATION_PREWARM="${AUDIO_ANNOTATION_PREWARM:-true}"
@@ -256,6 +263,7 @@ function provisioning_start() {
         printf "Qwen3-TTS validation failed after dependency installs; retrying targeted repair...\n"
         provisioning_repair_qwen3_tts_stack || return 1
         provisioning_verify_qwen3_tts_node || return 1
+        provisioning_install_trellis2_runtime_requirements || return 1
     fi
     # models are now installed by DM agent
     provisioning_print_end || return 1
@@ -981,6 +989,69 @@ print(f"Updated Trellis2 FLEX_GEMM_ALGO: {current_algo} -> {desired_algo}")
 PY
 }
 
+function provisioning_pin_trellis2_torch_stack() {
+    if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
+        return 0
+    fi
+
+    local current_torch current_torchvision current_torchaudio current_xformers
+    current_torch="$(/venv/main/bin/python - <<'PY'
+try:
+    import torch
+    print(getattr(torch, "__version__", "missing"))
+except Exception:
+    print("missing")
+PY
+)"
+    current_torchvision="$(/venv/main/bin/python - <<'PY'
+try:
+    import torchvision
+    print(getattr(torchvision, "__version__", "missing"))
+except Exception:
+    print("missing")
+PY
+)"
+    current_torchaudio="$(/venv/main/bin/python - <<'PY'
+try:
+    import torchaudio
+    print(getattr(torchaudio, "__version__", "missing"))
+except Exception:
+    print("missing")
+PY
+)"
+    current_xformers="$(/venv/main/bin/python - <<'PY'
+try:
+    import xformers
+    print(getattr(xformers, "__version__", "missing"))
+except Exception:
+    print("missing")
+PY
+)"
+
+    if [[ "${current_torch}" == "${TRELLIS2_TORCH_VERSION}" && \
+          "${current_torchvision}" == "${TRELLIS2_TORCHVISION_VERSION}" && \
+          "${current_torchaudio}" == "${TRELLIS2_TORCHAUDIO_VERSION}" && \
+          "${current_xformers}" == "${TRELLIS2_XFORMERS_VERSION}" ]]; then
+        printf "Trellis2 torch stack already pinned: torch=%s torchvision=%s torchaudio=%s xformers=%s\n" \
+            "${current_torch}" "${current_torchvision}" "${current_torchaudio}" "${current_xformers}"
+        return 0
+    fi
+
+    printf "Pinning Trellis2 torch runtime to torch=%s torchvision=%s torchaudio=%s xformers=%s...\n" \
+        "${TRELLIS2_TORCH_VERSION}" "${TRELLIS2_TORCHVISION_VERSION}" "${TRELLIS2_TORCHAUDIO_VERSION}" "${TRELLIS2_XFORMERS_VERSION}"
+
+    pip install --no-cache-dir --force-reinstall \
+        --index-url "${TRELLIS2_PYTORCH_INDEX_URL}" \
+        --extra-index-url "${TRELLIS2_PYTORCH_EXTRA_INDEX_URL}" \
+        "torch==${TRELLIS2_TORCH_VERSION}" \
+        "torchvision==${TRELLIS2_TORCHVISION_VERSION}" \
+        "torchaudio==${TRELLIS2_TORCHAUDIO_VERSION}" \
+        "xformers==${TRELLIS2_XFORMERS_VERSION}" || {
+        printf "ERROR: Failed to pin Trellis2 torch runtime.\n"
+        return 1
+    }
+}
+
 function provisioning_install_trellis2_runtime_requirements() {
     if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
         return 0
@@ -988,34 +1059,31 @@ function provisioning_install_trellis2_runtime_requirements() {
 
     local node_path wheels_dir
     node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-Trellis2"
-    wheels_dir="${node_path}/wheels/Linux/Torch291"
+    wheels_dir="${node_path}/wheels/Linux/${TRELLIS2_LINUX_WHEELS_SUBDIR}"
 
     if [[ ! -d "${node_path}" ]]; then
         printf "WARN: Trellis2 node directory not found: %s\n" "${node_path}"
         return 0
     fi
 
+    provisioning_pin_trellis2_torch_stack || return 1
+
     # Trellis2 Linux wheels are built against CUDA 12 runtime and require these binary wheels.
     if [[ -d "${wheels_dir}" ]]; then
         printf "Installing Trellis2 binary wheels from %s...\n" "${wheels_dir}"
-        # o_voxel wheel depends on git-sourced cumesh/flex_gemm. We install those wheels directly
-        # and install o_voxel without deps to avoid rebuilding against a mismatched local CUDA toolkit.
+        # All Trellis2 compiled wheels must be installed without dependency resolution. Their metadata
+        # only expresses broad torch/triton constraints, and a normal pip install can silently upgrade
+        # the runtime away from the ABI that these wheels were built against.
         pip install --no-cache-dir plyfile zstandard
         for wheel in "${wheels_dir}"/*.whl; do
             [[ -e "${wheel}" ]] || continue
-            local wheel_name
-            wheel_name="$(basename "${wheel}")"
-            if [[ "${wheel_name}" == o_voxel-* ]]; then
-                pip install --no-cache-dir --no-deps "${wheel}"
-            else
-                pip install --no-cache-dir "${wheel}"
-            fi
+            pip install --no-cache-dir --force-reinstall --no-deps "${wheel}"
         done
         if ! /venv/main/bin/python -c "import o_voxel" >/dev/null 2>&1; then
             local ovoxel_wheel
             ovoxel_wheel="$(find "${wheels_dir}" -maxdepth 1 -type f -name "o_voxel-*.whl" | head -n 1)"
             if [[ -n "${ovoxel_wheel}" ]]; then
-                pip install --no-cache-dir --no-deps "${ovoxel_wheel}" || true
+                pip install --no-cache-dir --force-reinstall --no-deps "${ovoxel_wheel}" || true
             fi
         fi
     else
