@@ -30,8 +30,8 @@ def _parse_video_entries(video_entries: str) -> list[str]:
         if not line or line.startswith("#"):
             continue
         entries.append(_resolve_video_entry(line))
-    if len(entries) < 2:
-        raise ValueError("at least two video entries are required")
+    if len(entries) < 1:
+        raise ValueError("at least one video entry is required")
     return entries
 
 
@@ -89,6 +89,10 @@ class FCSConcatVideos:
                     "FLOAT",
                     {"default": 60.0, "min": 1.0, "max": 120.0, "step": 1.0},
                 ),
+                "overlap_frames": (
+                    "INT",
+                    {"default": 1, "min": 0, "max": 120, "step": 1},
+                ),
                 "filename_prefix": (
                     "STRING",
                     {"default": "video_concat"},
@@ -115,6 +119,7 @@ class FCSConcatVideos:
         self,
         video_entries,
         frame_rate,
+        overlap_frames,
         filename_prefix,
         pix_fmt,
         crf,
@@ -124,6 +129,17 @@ class FCSConcatVideos:
         probes = [_probe_video(entry) for entry in entries]
         base_width = probes[0]["width"] or 1920
         base_height = probes[0]["height"] or 1088
+        overlap_frames = max(0, int(overlap_frames or 0))
+        overlap_seconds = float(overlap_frames) / float(frame_rate or 60.0) if overlap_frames > 0 else 0.0
+
+        if overlap_seconds > 0:
+            for idx, probe in enumerate(probes):
+                if idx == 0:
+                    continue
+                if probe["duration"] <= overlap_seconds:
+                    raise ValueError(
+                        f"clip {idx + 1} is too short for overlap trim: duration={probe['duration']:.3f}s overlap={overlap_seconds:.3f}s"
+                    )
 
         output_dir = (
             folder_paths.get_output_directory()
@@ -157,18 +173,40 @@ class FCSConcatVideos:
         filter_parts = []
         concat_inputs = []
         for idx, probe in enumerate(probes):
+            clip_trim_seconds = overlap_seconds if idx > 0 else 0.0
             ffmpeg_inputs.extend(["-i", probe["path"]])
-            filter_parts.append(
-                f"[{idx}:v]fps={frame_rate},scale={base_width}:{base_height}:flags=lanczos:force_original_aspect_ratio=decrease,"
-                f"pad={base_width}:{base_height}:(ow-iw)/2:(oh-ih)/2:black,format={pix_fmt},setsar=1[v{idx}]"
-            )
-            if probe["has_audio"]:
-                filter_parts.append(
-                    f"[{idx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{idx}]"
+            video_filters = [
+                f"fps={frame_rate}",
+                f"scale={base_width}:{base_height}:flags=lanczos:force_original_aspect_ratio=decrease",
+                f"pad={base_width}:{base_height}:(ow-iw)/2:(oh-ih)/2:black",
+                f"format={pix_fmt}",
+                "setsar=1",
+            ]
+            if clip_trim_seconds > 0:
+                video_filters.extend(
+                    [
+                        f"trim=start={clip_trim_seconds:.6f}",
+                        "setpts=PTS-STARTPTS",
+                    ]
                 )
+            filter_parts.append(f"[{idx}:v]{','.join(video_filters)}[v{idx}]")
+            if probe["has_audio"]:
+                audio_filters = [
+                    "aresample=48000",
+                    "aformat=sample_fmts=fltp:channel_layouts=stereo",
+                ]
+                if clip_trim_seconds > 0:
+                    audio_filters.extend(
+                        [
+                            f"atrim=start={clip_trim_seconds:.6f}",
+                            "asetpts=PTS-STARTPTS",
+                        ]
+                    )
+                filter_parts.append(f"[{idx}:a]{','.join(audio_filters)}[a{idx}]")
             else:
+                silent_duration = max(0.001, probe["duration"] - clip_trim_seconds)
                 filter_parts.append(
-                    f"anullsrc=channel_layout=stereo:sample_rate=48000:d={probe['duration']}[a{idx}]"
+                    f"anullsrc=channel_layout=stereo:sample_rate=48000:d={silent_duration:.6f}[a{idx}]"
                 )
             concat_inputs.extend([f"[v{idx}]", f"[a{idx}]"])
 
