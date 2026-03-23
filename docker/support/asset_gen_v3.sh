@@ -245,6 +245,7 @@ function provisioning_start() {
     load_node_pins_from_env
     validate_required_repo_pins || return 1
     provisioning_get_nodes || return 1
+    provisioning_install_furgen_video_tools_node || return 1
     provisioning_patch_trellis2_allocator_override || return 1
     provisioning_patch_trellis2_flex_gemm_algo || return 1
     provisioning_install_impact_pack_runtime_requirements || return 1
@@ -267,6 +268,24 @@ function provisioning_start() {
     fi
     # models are now installed by DM agent
     provisioning_print_end || return 1
+}
+
+function provisioning_install_furgen_video_tools_node() {
+    local script_dir src_dir dest_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    src_dir="${script_dir}/custom_nodes/FurgenVideoTools"
+    dest_dir="${COMFYUI_DIR}/custom_nodes/FurgenVideoTools"
+
+    if [[ ! -d "${src_dir}" ]]; then
+        printf "WARN: FurgenVideoTools source directory missing; skipping managed custom node install: %s\n" "${src_dir}"
+        return 0
+    fi
+
+    mkdir -p "${COMFYUI_DIR}/custom_nodes"
+    rm -rf "${dest_dir}"
+    mkdir -p "${dest_dir}"
+    cp -R "${src_dir}/." "${dest_dir}/"
+    printf "Installed managed custom node: FurgenVideoTools\n"
 }
 
 function provisioning_patch_comfyui_xformers_fallback() {
