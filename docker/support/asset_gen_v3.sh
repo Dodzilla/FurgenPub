@@ -37,6 +37,7 @@ AUDIO_ANNOTATION_DEFAULT_MODEL="${AUDIO_ANNOTATION_DEFAULT_MODEL:-distil-large-v
 AUDIO_ANNOTATION_DEVICE="${AUDIO_ANNOTATION_DEVICE:-auto}"
 AUDIO_ANNOTATION_PREWARM="${AUDIO_ANNOTATION_PREWARM:-true}"
 AUDIO_ANNOTATION_MODEL_CACHE="${AUDIO_ANNOTATION_MODEL_CACHE:-${WORKSPACE}/.cache/ktm_audio_annotation}"
+FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support}"
 
 # If flash-attn install fails, we automatically fall back to xformers.
 TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
@@ -271,21 +272,33 @@ function provisioning_start() {
 }
 
 function provisioning_install_furgen_video_tools_node() {
-    local script_dir src_dir dest_dir
+    local script_dir src_dir dest_dir remote_base
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     src_dir="${script_dir}/custom_nodes/FurgenVideoTools"
     dest_dir="${COMFYUI_DIR}/custom_nodes/FurgenVideoTools"
-
-    if [[ ! -d "${src_dir}" ]]; then
-        printf "WARN: FurgenVideoTools source directory missing; skipping managed custom node install: %s\n" "${src_dir}"
-        return 0
-    fi
+    remote_base="${FURGENPUB_RAW_BASE_URL%/}/custom_nodes/FurgenVideoTools"
 
     mkdir -p "${COMFYUI_DIR}/custom_nodes"
     rm -rf "${dest_dir}"
     mkdir -p "${dest_dir}"
-    cp -R "${src_dir}/." "${dest_dir}/"
-    printf "Installed managed custom node: FurgenVideoTools\n"
+
+    if [[ -d "${src_dir}" ]]; then
+        cp -R "${src_dir}/." "${dest_dir}/"
+        printf "Installed managed custom node: FurgenVideoTools (local copy)\n"
+        return 0
+    fi
+
+    printf "Local FurgenVideoTools source missing; downloading managed custom node from %s\n" "${remote_base}"
+    curl -fsSL "${remote_base}/__init__.py" -o "${dest_dir}/__init__.py" || {
+        printf "ERROR: Failed to download FurgenVideoTools __init__.py from %s\n" "${remote_base}"
+        return 1
+    }
+    curl -fsSL "${remote_base}/furgen_video_tools.py" -o "${dest_dir}/furgen_video_tools.py" || {
+        printf "ERROR: Failed to download FurgenVideoTools implementation from %s\n" "${remote_base}"
+        return 1
+    }
+
+    printf "Installed managed custom node: FurgenVideoTools (downloaded)\n"
 }
 
 function provisioning_patch_comfyui_xformers_fallback() {
