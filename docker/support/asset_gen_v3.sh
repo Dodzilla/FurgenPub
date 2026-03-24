@@ -237,9 +237,28 @@ function provisioning_update_comfyui() {
     fi
 }
 
+function provisioning_verify_comfyui_dynamic_vram_support() {
+    local cli_args_file
+    cli_args_file="${COMFYUI_DIR}/comfy/cli_args.py"
+
+    if [[ ! -f "${cli_args_file}" ]]; then
+        printf "ERROR: ComfyUI CLI args file not found while verifying dynamic VRAM support: %s\n" "${cli_args_file}"
+        return 1
+    fi
+
+    if ! grep -Fq -- '--enable-dynamic-vram' "${cli_args_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout does not support --enable-dynamic-vram.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${cli_args_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    printf "Verified ComfyUI dynamic VRAM flag support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
+}
+
 function provisioning_start() {
     provisioning_print_header || return 1
     provisioning_update_comfyui || return 1
+    provisioning_verify_comfyui_dynamic_vram_support || return 1
     provisioning_patch_comfyui_xformers_fallback || return 1
     provisioning_configure_pytorch_allocator_env || true
     provisioning_get_apt_packages || return 1
