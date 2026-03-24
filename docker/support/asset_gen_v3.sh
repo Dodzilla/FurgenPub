@@ -10,8 +10,9 @@ fi
 
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
-# Keep asset_gen_v2 as the default while still allowing template-level override.
-export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v2}"
+# asset_gen_v3 templates should default to the matching server type while still
+# allowing template/runtime override when explicitly required.
+export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v3}"
 COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-ebf6b52e322664af91fcdc8b8848d31d5fb98f66}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
@@ -79,10 +80,12 @@ NODES=(
     "https://github.com/GACLove/ComfyUI-VFI"
     "https://github.com/Lightricks/ComfyUI-LTXVideo"
     "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
+    "https://github.com/kijai/ComfyUI-MelBandRoFormer"
+    "https://github.com/kijai/ComfyUI-KJNodes"
 )
 
 # Some nodes pull optional heavy source-build dependencies that are not
-# required for asset_gen_v2 workflows and can stall provisioning.
+# required for the current asset_gen image workflows and can stall provisioning.
 SKIP_NODE_REQUIREMENTS=(
     "ComfyUI-Impact-Pack"
 )
