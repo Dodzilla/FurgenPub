@@ -1363,6 +1363,9 @@ block = (
     "if [[ \" ${COMFYUI_ARGS} \" != *\" --disable-cuda-malloc \"* ]]; then\n"
     "    COMFYUI_ARGS=\"${COMFYUI_ARGS} --disable-cuda-malloc\"\n"
     "fi\n"
+    "if [[ \" ${COMFYUI_ARGS} \" != *\" --disable-dynamic-vram \"* ]]; then\n"
+    "    COMFYUI_ARGS=\"${COMFYUI_ARGS} --disable-dynamic-vram\"\n"
+    "fi\n"
     "# /FURGEN ComfyUI launch args normalization\n"
 )
 
