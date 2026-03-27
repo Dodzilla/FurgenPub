@@ -120,6 +120,8 @@ NODE_PINS[ComfyMath]="c01177221c31b8e5fbc062778fc8254aeb541638"
 NODE_PINS[ComfyUI-VFI]="6176a430f12cd16003f4664c1e3c6af8e96cc3c6"
 NODE_PINS[ComfyUI-LTXVideo]="531512f7286963dc7aff1fd8bf5556e95eae03af"
 NODE_PINS[ComfyUI-VideoHelperSuite]="449839959f0153fb8a57211a9364c55163935ca9"
+NODE_PINS[ComfyUI-MelBandRoFormer]="92c86854e6654f4aacc97484471af95c98ea16d4"
+NODE_PINS[ComfyUI-KJNodes]="7519171dd6b6ccea43091c6b73e42443bba11f5b"
 
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
