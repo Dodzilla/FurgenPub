@@ -13,7 +13,7 @@ COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # asset_gen_v3 templates should default to the matching server type while still
 # allowing template/runtime override when explicitly required.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v3}"
-COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-ebf6b52e322664af91fcdc8b8848d31d5fb98f66}"
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
