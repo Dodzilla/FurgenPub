@@ -1388,9 +1388,9 @@ block = (
     "if [[ \" ${COMFYUI_ARGS} \" != *\" --disable-cuda-malloc \"* ]]; then\n"
     "    COMFYUI_ARGS=\"${COMFYUI_ARGS} --disable-cuda-malloc\"\n"
     "fi\n"
-    "if [[ \" ${COMFYUI_ARGS} \" != *\" --disable-dynamic-vram \"* ]]; then\n"
-    "    COMFYUI_ARGS=\"${COMFYUI_ARGS} --disable-dynamic-vram\"\n"
-    "fi\n"
+    "# asset_gen_v3 runs Klein KV-cache Flux jobs on 32 GiB GPUs; forcing\n"
+    "# --disable-dynamic-vram keeps too much model state resident between\n"
+    "# prompts and has been observed to trigger repeat CUDA OOMs.\n"
     "# /FURGEN ComfyUI launch args normalization\n"
 )
 
