@@ -260,10 +260,35 @@ function provisioning_verify_comfyui_dynamic_vram_support() {
     printf "Verified ComfyUI dynamic VRAM flag support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
 }
 
+function provisioning_verify_flux_kv_cache_support() {
+    local flux_nodes_file
+    flux_nodes_file="${COMFYUI_DIR}/comfy_extras/nodes_flux.py"
+
+    if [[ ! -f "${flux_nodes_file}" ]]; then
+        printf "ERROR: Flux nodes file not found while verifying KV cache support: %s\n" "${flux_nodes_file}"
+        return 1
+    fi
+
+    if ! grep -Fq "FluxKVCache" "${flux_nodes_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout does not expose FluxKVCache.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${flux_nodes_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    if ! grep -Fq "FluxKontextMultiReferenceLatentMethod" "${flux_nodes_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout does not expose FluxKontextMultiReferenceLatentMethod.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${flux_nodes_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    printf "Verified Flux KV cache node support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
+}
+
 function provisioning_start() {
     provisioning_print_header || return 1
     provisioning_update_comfyui || return 1
     provisioning_verify_comfyui_dynamic_vram_support || return 1
+    provisioning_verify_flux_kv_cache_support || return 1
     provisioning_patch_comfyui_xformers_fallback || return 1
     provisioning_configure_pytorch_allocator_env || true
     provisioning_get_apt_packages || return 1

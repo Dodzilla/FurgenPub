@@ -12,7 +12,7 @@ source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # Keep asset_gen_v2 as the default while still allowing template-level override.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v2}"
-COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-185c61dc26cdc631a1fd57b53744b67393a97fc6}"
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
@@ -220,9 +220,34 @@ function provisioning_update_comfyui() {
     fi
 }
 
+function provisioning_verify_flux_kv_cache_support() {
+    local flux_nodes_file
+    flux_nodes_file="${COMFYUI_DIR}/comfy_extras/nodes_flux.py"
+
+    if [[ ! -f "${flux_nodes_file}" ]]; then
+        printf "ERROR: Flux nodes file not found while verifying KV cache support: %s\n" "${flux_nodes_file}"
+        return 1
+    fi
+
+    if ! grep -Fq "FluxKVCache" "${flux_nodes_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout does not expose FluxKVCache.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${flux_nodes_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    if ! grep -Fq "FluxKontextMultiReferenceLatentMethod" "${flux_nodes_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout does not expose FluxKontextMultiReferenceLatentMethod.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${flux_nodes_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    printf "Verified Flux KV cache node support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
+}
+
 function provisioning_start() {
     provisioning_print_header || return 1
     provisioning_update_comfyui || return 1
+    provisioning_verify_flux_kv_cache_support || return 1
     provisioning_patch_comfyui_xformers_fallback || return 1
     provisioning_configure_pytorch_allocator_env || true
     provisioning_get_apt_packages || return 1

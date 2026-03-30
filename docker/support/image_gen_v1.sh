@@ -10,6 +10,8 @@ fi
 
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
+export SERVER_TYPE="${SERVER_TYPE:-image_gen_v1}"
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
 
 # Packages are installed after nodes so we can fix them...
 
@@ -86,16 +88,19 @@ function pin_node_if_requested() {
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
-        printf "Updating ComfyUI to pinned version (4e6a1b6)...\n"
-        (
+        printf "Updating ComfyUI to pinned version (%s)...\n" "${COMFYUI_PIN_COMMIT:0:7}"
+        if ! (
             cd "${COMFYUI_DIR}"
             git config --global --add safe.directory "$(pwd)"
             echo "DEBUG: Current directory: $(pwd)"
             echo "DEBUG: Fetching git updates..."
-            git fetch
+            git fetch --all --tags
             echo "DEBUG: Checking out pinned commit..."
-            git checkout 4e6a1b66a93ef91848bc4bbf2a84e0ea98efcfc9
-        )
+            git checkout --force "${COMFYUI_PIN_COMMIT}"
+        ); then
+            echo "ERROR: Failed to checkout pinned ComfyUI commit ${COMFYUI_PIN_COMMIT}."
+            return 1
+        fi
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
             pip install --no-cache-dir -r "${COMFYUI_DIR}/requirements.txt"
@@ -107,9 +112,34 @@ function provisioning_update_comfyui() {
     fi
 }
 
+function provisioning_verify_flux_kv_cache_support() {
+    local flux_nodes_file
+    flux_nodes_file="${COMFYUI_DIR}/comfy_extras/nodes_flux.py"
+
+    if [[ ! -f "${flux_nodes_file}" ]]; then
+        printf "ERROR: Flux nodes file not found while verifying KV cache support: %s\n" "${flux_nodes_file}"
+        return 1
+    fi
+
+    if ! grep -Fq "FluxKVCache" "${flux_nodes_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout does not expose FluxKVCache.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${flux_nodes_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    if ! grep -Fq "FluxKontextMultiReferenceLatentMethod" "${flux_nodes_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout does not expose FluxKontextMultiReferenceLatentMethod.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${flux_nodes_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    printf "Verified Flux KV cache node support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
+}
+
 function provisioning_start() {
     provisioning_print_header
     provisioning_update_comfyui
+    provisioning_verify_flux_kv_cache_support
     provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes
