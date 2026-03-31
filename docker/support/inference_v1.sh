@@ -11,17 +11,22 @@ MODEL_ALIAS="${MODEL_ALIAS:-inference_v1}"
 LLAMA_HOST="${LLAMA_HOST:-0.0.0.0}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
 LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-224000}"
-LLAMA_BATCH_SIZE="${LLAMA_BATCH_SIZE:-512}"
-LLAMA_UBATCH_SIZE="${LLAMA_UBATCH_SIZE:-256}"
-LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
+LLAMA_BATCH_SIZE="${LLAMA_BATCH_SIZE:-2048}"
+LLAMA_UBATCH_SIZE="${LLAMA_UBATCH_SIZE:-1024}"
+LLAMA_PARALLEL="${LLAMA_PARALLEL:-2}"
 LLAMA_GPU_LAYERS="${LLAMA_GPU_LAYERS:-999}"
 LLAMA_FLASH_ATTN="${LLAMA_FLASH_ATTN:-1}"
 LLAMA_CACHE_TYPE_K="${LLAMA_CACHE_TYPE_K:-q8_0}"
 LLAMA_CACHE_TYPE_V="${LLAMA_CACHE_TYPE_V:-q8_0}"
+LLAMA_CACHE_PROMPT="${LLAMA_CACHE_PROMPT:-1}"
+LLAMA_CACHE_RAM_MIB="${LLAMA_CACHE_RAM_MIB:-8192}"
+LLAMA_CONT_BATCHING="${LLAMA_CONT_BATCHING:-1}"
+LLAMA_KV_UNIFIED="${LLAMA_KV_UNIFIED:-1}"
 LLAMA_EXTRA_ARGS="${LLAMA_EXTRA_ARGS:-}"
 INFERENCE_INSTANCE_API_KEY="${INFERENCE_INSTANCE_API_KEY:-}"
 MODEL_DIR="${MODEL_DIR:-${WORK_ROOT}/models/inference_v1}"
 MODEL_PATH="${MODEL_DIR}/${MODEL_FILE}"
+PYTHON_VENV_DIR="${PYTHON_VENV_DIR:-${WORK_ROOT}/.venv/inference_v1}"
 HEALTH_URL="http://127.0.0.1:${LLAMA_PORT}/health"
 SERVER_LOG="${LOG_DIR}/inference_v1.log"
 SERVER_PID_FILE="${LOG_DIR}/inference_v1.pid"
@@ -76,21 +81,21 @@ install_build_deps() {
     git \
     ninja-build \
     pkg-config \
-    python3-pip
+    python3-pip \
+    python3-venv
 }
 
-ensure_pip() {
-  if python3 -m pip --version >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if python3 -m ensurepip --upgrade >/dev/null 2>&1; then
+ensure_python_venv() {
+  if [[ -x "${PYTHON_VENV_DIR}/bin/python" ]]; then
     return 0
   fi
 
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install --no-install-recommends -y python3-pip
+  apt-get install --no-install-recommends -y python3-venv
+  mkdir -p "$(dirname "${PYTHON_VENV_DIR}")"
+  python3 -m venv "${PYTHON_VENV_DIR}"
+  "${PYTHON_VENV_DIR}/bin/python" -m pip install --no-cache-dir --upgrade pip
 }
 
 build_llama_server() {
@@ -124,14 +129,21 @@ build_llama_server() {
 }
 
 install_hf_cli() {
-  if python3 -c "import huggingface_hub" >/dev/null 2>&1; then
+  local venv_python="${PYTHON_VENV_DIR}/bin/python"
+
+  ensure_python_venv
+
+  if "${venv_python}" -c "import huggingface_hub" >/dev/null 2>&1; then
     return 0
   fi
-  ensure_pip
-  python3 -m pip install --no-cache-dir --upgrade huggingface_hub
+
+  # Ubuntu 24.04 images mark the system Python as externally managed.
+  "${venv_python}" -m pip install --no-cache-dir --upgrade huggingface_hub
 }
 
 download_model() {
+  local venv_python="${PYTHON_VENV_DIR}/bin/python"
+
   if [[ -f "${MODEL_PATH}" ]]; then
     echo "Model already present at ${MODEL_PATH}"
     return 0
@@ -139,7 +151,7 @@ download_model() {
 
   install_hf_cli
 
-  MODEL_REPO="${MODEL_REPO}" MODEL_FILE="${MODEL_FILE}" MODEL_DIR="${MODEL_DIR}" HF_TOKEN="${HF_TOKEN:-}" python3 - <<'PY'
+  MODEL_REPO="${MODEL_REPO}" MODEL_FILE="${MODEL_FILE}" MODEL_DIR="${MODEL_DIR}" HF_TOKEN="${HF_TOKEN:-}" "${venv_python}" - <<'PY'
 import os
 from huggingface_hub import hf_hub_download
 
@@ -180,6 +192,28 @@ launch_server() {
 
   if [[ -n "${LLAMA_CACHE_TYPE_V}" ]]; then
     cmd+=(--cache-type-v "${LLAMA_CACHE_TYPE_V}")
+  fi
+
+  if [[ "${LLAMA_CACHE_PROMPT}" == "1" ]]; then
+    cmd+=(--cache-prompt)
+  else
+    cmd+=(--no-cache-prompt)
+  fi
+
+  if [[ -n "${LLAMA_CACHE_RAM_MIB}" ]]; then
+    cmd+=(--cache-ram "${LLAMA_CACHE_RAM_MIB}")
+  fi
+
+  if [[ "${LLAMA_CONT_BATCHING}" == "1" ]]; then
+    cmd+=(--cont-batching)
+  else
+    cmd+=(--no-cont-batching)
+  fi
+
+  if [[ "${LLAMA_KV_UNIFIED}" == "1" ]]; then
+    cmd+=(--kv-unified)
+  else
+    cmd+=(--no-kv-unified)
   fi
 
   if [[ -n "${INFERENCE_INSTANCE_API_KEY}" ]]; then
