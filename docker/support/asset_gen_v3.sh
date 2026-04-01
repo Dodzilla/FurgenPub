@@ -312,9 +312,9 @@ function provisioning_start() {
     provisioning_get_pip_packages || return 1
     if ! provisioning_verify_qwen3_tts_node; then
         printf "Qwen3-TTS validation failed after dependency installs; retrying targeted repair...\n"
+        provisioning_install_trellis2_runtime_requirements || return 1
         provisioning_repair_qwen3_tts_stack || return 1
         provisioning_verify_qwen3_tts_node || return 1
-        provisioning_install_trellis2_runtime_requirements || return 1
     fi
     # models are now installed by DM agent
     provisioning_print_end || return 1
@@ -610,7 +610,19 @@ except Exception as exc:
     errors.append(f"import qwen_tts failed: {exc}")
 
 try:
-    required_nodes = ("Qwen3Loader", "Qwen3VoiceDesign")
+    import flash_attn  # noqa: F401
+except Exception as exc:
+    errors.append(f"import flash_attn failed: {exc}")
+
+try:
+    required_nodes = (
+        "Qwen3Loader",
+        "Qwen3VoiceDesign",
+        "Qwen3VoiceClone",
+        "Qwen3PromptMaker",
+        "Qwen3SavePrompt",
+        "Qwen3LoadPrompt",
+    )
     contents = ""
     for source_path in (init_path, nodes_path):
         if os.path.exists(source_path):
