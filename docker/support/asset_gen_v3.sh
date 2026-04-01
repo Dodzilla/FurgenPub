@@ -13,7 +13,8 @@ COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # asset_gen_v3 templates should default to the matching server type while still
 # allowing template/runtime override when explicitly required.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v3}"
-COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
+# Includes ComfyUI PR #13111 (LTXVReferenceAudio / ID-LoRA reference audio).
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-7d437687c260df7772c603658111148e0e863e59}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
@@ -284,11 +285,54 @@ function provisioning_verify_flux_kv_cache_support() {
     printf "Verified Flux KV cache node support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
 }
 
+function provisioning_verify_ltx_reference_audio_support() {
+    local nodes_lt_file model_base_file av_model_file
+    nodes_lt_file="${COMFYUI_DIR}/comfy_extras/nodes_lt.py"
+    model_base_file="${COMFYUI_DIR}/comfy/model_base.py"
+    av_model_file="${COMFYUI_DIR}/comfy/ldm/lightricks/av_model.py"
+
+    if [[ ! -f "${nodes_lt_file}" ]]; then
+        printf "ERROR: ComfyUI LTX node file not found while verifying reference audio support: %s\n" "${nodes_lt_file}"
+        return 1
+    fi
+
+    if [[ ! -f "${model_base_file}" ]]; then
+        printf "ERROR: ComfyUI model base file not found while verifying reference audio support: %s\n" "${model_base_file}"
+        return 1
+    fi
+
+    if [[ ! -f "${av_model_file}" ]]; then
+        printf "ERROR: ComfyUI AV model file not found while verifying reference audio support: %s\n" "${av_model_file}"
+        return 1
+    fi
+
+    if ! grep -Fq "class LTXVReferenceAudio" "${nodes_lt_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout does not expose LTXVReferenceAudio.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${nodes_lt_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    if ! grep -Fq "out['ref_audio']" "${model_base_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout is missing ref_audio conditioning plumbing.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${model_base_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    if ! grep -Fq "ref_audio_seq_len" "${av_model_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout is missing LTX audio reference handling in av_model.py.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${av_model_file}" "${COMFYUI_PIN_COMMIT}"
+        return 1
+    fi
+
+    printf "Verified LTXVReferenceAudio support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
+}
+
 function provisioning_start() {
     provisioning_print_header || return 1
     provisioning_update_comfyui || return 1
     provisioning_verify_comfyui_dynamic_vram_support || return 1
     provisioning_verify_flux_kv_cache_support || return 1
+    provisioning_verify_ltx_reference_audio_support || return 1
     provisioning_patch_comfyui_xformers_fallback || return 1
     provisioning_configure_pytorch_allocator_env || true
     provisioning_get_apt_packages || return 1

@@ -12,7 +12,8 @@ fi
 
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
-COMFYUI_PIN="${COMFYUI_PIN:-1c218282369a6cc80651d878fc51fa33d7bf34e2}"
+# Includes ComfyUI PR #13111 (LTXVReferenceAudio / ID-LoRA reference audio).
+COMFYUI_PIN="${COMFYUI_PIN:-7d437687c260df7772c603658111148e0e863e59}"
 
 # NOTE:
 # - Do NOT put Hugging Face tokens in this file (or in git clone URLs).
@@ -128,15 +129,18 @@ function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
         printf "Updating ComfyUI to pinned version (%s)...\n" "${COMFYUI_PIN:0:7}"
-        (
+        if ! (
             cd "${COMFYUI_DIR}"
             git config --global --add safe.directory "$(pwd)"
             echo "DEBUG: Current directory: $(pwd)"
             echo "DEBUG: Fetching git updates..."
-            git fetch
+            git fetch --all --tags
             echo "DEBUG: Checking out pinned commit..."
-            git checkout "${COMFYUI_PIN}"
-        )
+            git checkout --force "${COMFYUI_PIN}"
+        ); then
+            echo "ERROR: Failed to checkout pinned ComfyUI commit ${COMFYUI_PIN}."
+            return 1
+        fi
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
             pip install --no-cache-dir -r "${COMFYUI_DIR}/requirements.txt"
@@ -148,16 +152,59 @@ function provisioning_update_comfyui() {
     fi
 }
 
+function provisioning_verify_ltx_reference_audio_support() {
+    local nodes_lt_file model_base_file av_model_file
+    nodes_lt_file="${COMFYUI_DIR}/comfy_extras/nodes_lt.py"
+    model_base_file="${COMFYUI_DIR}/comfy/model_base.py"
+    av_model_file="${COMFYUI_DIR}/comfy/ldm/lightricks/av_model.py"
+
+    if [[ ! -f "${nodes_lt_file}" ]]; then
+        printf "ERROR: ComfyUI LTX node file not found while verifying reference audio support: %s\n" "${nodes_lt_file}"
+        return 1
+    fi
+
+    if [[ ! -f "${model_base_file}" ]]; then
+        printf "ERROR: ComfyUI model base file not found while verifying reference audio support: %s\n" "${model_base_file}"
+        return 1
+    fi
+
+    if [[ ! -f "${av_model_file}" ]]; then
+        printf "ERROR: ComfyUI AV model file not found while verifying reference audio support: %s\n" "${av_model_file}"
+        return 1
+    fi
+
+    if ! grep -Fq "class LTXVReferenceAudio" "${nodes_lt_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout does not expose LTXVReferenceAudio.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${nodes_lt_file}" "${COMFYUI_PIN}"
+        return 1
+    fi
+
+    if ! grep -Fq "out['ref_audio']" "${model_base_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout is missing ref_audio conditioning plumbing.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${model_base_file}" "${COMFYUI_PIN}"
+        return 1
+    fi
+
+    if ! grep -Fq "ref_audio_seq_len" "${av_model_file}"; then
+        printf "ERROR: Pinned ComfyUI checkout is missing LTX audio reference handling in av_model.py.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${av_model_file}" "${COMFYUI_PIN}"
+        return 1
+    fi
+
+    printf "Verified LTXVReferenceAudio support at pin %s.\n" "${COMFYUI_PIN}"
+}
+
 function provisioning_start() {
-    provisioning_print_header
-    provisioning_update_comfyui
-    provisioning_get_apt_packages
+    provisioning_print_header || return 1
+    provisioning_update_comfyui || return 1
+    provisioning_verify_ltx_reference_audio_support || return 1
+    provisioning_get_apt_packages || return 1
     load_node_pins_from_env
-    provisioning_get_nodes
+    provisioning_get_nodes || return 1
     # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
     provisioning_ensure_node_requirements
-    provisioning_get_pip_packages
-    provisioning_print_end
+    provisioning_get_pip_packages || return 1
+    provisioning_print_end || return 1
 }
 
 function provisioning_get_apt_packages() {
