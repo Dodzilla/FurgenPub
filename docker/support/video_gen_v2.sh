@@ -195,16 +195,27 @@ function provisioning_verify_ltx_reference_audio_support() {
 }
 
 function provisioning_start() {
+    local soft_failures=0
+
     provisioning_print_header || return 1
     provisioning_update_comfyui || return 1
     provisioning_verify_ltx_reference_audio_support || return 1
     provisioning_get_apt_packages || return 1
     load_node_pins_from_env
-    provisioning_get_nodes || return 1
+    provisioning_get_nodes || {
+        printf "WARN: Provisioning step 'provisioning_get_nodes' failed with exit code %s; continuing.\n" "$?"
+        soft_failures=1
+    }
     # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
     provisioning_ensure_node_requirements
-    provisioning_get_pip_packages || return 1
+    provisioning_get_pip_packages || {
+        printf "WARN: Provisioning step 'provisioning_get_pip_packages' failed with exit code %s; continuing.\n" "$?"
+        soft_failures=1
+    }
     provisioning_print_end || return 1
+    if [[ "$soft_failures" -ne 0 ]]; then
+        printf "Provisioning completed with non-fatal warnings.\n"
+    fi
 }
 
 function provisioning_get_apt_packages() {
@@ -280,6 +291,7 @@ function provisioning_print_header() {
 function provisioning_print_end() {
     # Create provisioning completion marker
     echo "Creating provisioning completion marker..."
+    mkdir -p "${WORKSPACE}/ComfyUI/input"
     echo "Provisioning completed at $(date)" > "${WORKSPACE}/ComfyUI/input/provisioned_furry_all.txt"
 
     printf "\nProvisioning complete:  Application will start now\n\n"
