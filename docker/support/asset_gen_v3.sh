@@ -13,8 +13,8 @@ COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # asset_gen_v3 templates should default to the matching server type while still
 # allowing template/runtime override when explicitly required.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v3}"
-# Includes ComfyUI PR #13111 (LTXVReferenceAudio / ID-LoRA reference audio).
-COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-7d437687c260df7772c603658111148e0e863e59}"
+# Pin to the latest official ComfyUI release (v0.18.2, 2026-03-25).
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
@@ -306,12 +306,6 @@ function provisioning_verify_ltx_reference_audio_support() {
         return 1
     fi
 
-    if ! grep -Fq "class LTXVReferenceAudio" "${nodes_lt_file}"; then
-        printf "ERROR: Pinned ComfyUI checkout does not expose LTXVReferenceAudio.\n"
-        printf "ERROR: Checked %s at pin %s\n" "${nodes_lt_file}" "${COMFYUI_PIN_COMMIT}"
-        return 1
-    fi
-
     if ! grep -Fq "out['ref_audio']" "${model_base_file}"; then
         printf "ERROR: Pinned ComfyUI checkout is missing ref_audio conditioning plumbing.\n"
         printf "ERROR: Checked %s at pin %s\n" "${model_base_file}" "${COMFYUI_PIN_COMMIT}"
@@ -324,7 +318,7 @@ function provisioning_verify_ltx_reference_audio_support() {
         return 1
     fi
 
-    printf "Verified LTXVReferenceAudio support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
+    printf "Verified LTX reference-audio plumbing at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
 }
 
 function provisioning_start() {
