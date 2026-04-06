@@ -13,7 +13,7 @@ fi
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # Pin to the latest official ComfyUI release (v0.18.2, 2026-03-25).
-COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
+COMFYUI_PIN="${COMFYUI_PIN:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
 
 # NOTE:
 # - Do NOT put Hugging Face tokens in this file (or in git clone URLs).
