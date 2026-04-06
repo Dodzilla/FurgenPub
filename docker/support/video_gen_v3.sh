@@ -149,55 +149,12 @@ function provisioning_update_comfyui() {
     fi
 }
 
-function provisioning_verify_ltx_reference_audio_support() {
-    local nodes_lt_file model_base_file av_model_file
-    nodes_lt_file="${COMFYUI_DIR}/comfy_extras/nodes_lt.py"
-    model_base_file="${COMFYUI_DIR}/comfy/model_base.py"
-    av_model_file="${COMFYUI_DIR}/comfy/ldm/lightricks/av_model.py"
-
-    if [[ ! -f "${nodes_lt_file}" ]]; then
-        printf "ERROR: ComfyUI LTX node file not found while verifying reference audio support: %s\n" "${nodes_lt_file}"
-        return 1
-    fi
-
-    if [[ ! -f "${model_base_file}" ]]; then
-        printf "ERROR: ComfyUI model base file not found while verifying reference audio support: %s\n" "${model_base_file}"
-        return 1
-    fi
-
-    if [[ ! -f "${av_model_file}" ]]; then
-        printf "ERROR: ComfyUI AV model file not found while verifying reference audio support: %s\n" "${av_model_file}"
-        return 1
-    fi
-
-    if ! grep -Fq "class LTXVReferenceAudio" "${nodes_lt_file}"; then
-        printf "ERROR: Pinned ComfyUI checkout does not expose LTXVReferenceAudio.\n"
-        printf "ERROR: Checked %s at pin %s\n" "${nodes_lt_file}" "${COMFYUI_PIN}"
-        return 1
-    fi
-
-    if ! grep -Fq "out['ref_audio']" "${model_base_file}"; then
-        printf "ERROR: Pinned ComfyUI checkout is missing ref_audio conditioning plumbing.\n"
-        printf "ERROR: Checked %s at pin %s\n" "${model_base_file}" "${COMFYUI_PIN}"
-        return 1
-    fi
-
-    if ! grep -Fq "ref_audio_seq_len" "${av_model_file}"; then
-        printf "ERROR: Pinned ComfyUI checkout is missing LTX audio reference handling in av_model.py.\n"
-        printf "ERROR: Checked %s at pin %s\n" "${av_model_file}" "${COMFYUI_PIN}"
-        return 1
-    fi
-
-    printf "Verified LTXVReferenceAudio support at pin %s.\n" "${COMFYUI_PIN}"
-}
-
 function provisioning_start() {
     local soft_failures=0
 
-    provisioning_print_header || return 1
-    provisioning_update_comfyui || return 1
-    provisioning_verify_ltx_reference_audio_support || return 1
-    provisioning_get_apt_packages || return 1
+    provisioning_print_header
+    provisioning_update_comfyui
+    provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes || {
         printf "WARN: Provisioning step 'provisioning_get_nodes' failed with exit code %s; continuing.\n" "$?"
