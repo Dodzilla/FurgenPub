@@ -1512,22 +1512,20 @@ import sys
 path = pathlib.Path(sys.argv[1])
 source = path.read_text(encoding="utf-8")
 
-block = (
-    "# FURGEN PyTorch allocator env normalization\n"
-    "# PyTorch 2.9 can crash CUDA init when allocator vars disagree or mutate.\n"
-    "if [ -n \"${PYTORCH_ALLOC_CONF:-}\" ] || [ -n \"${PYTORCH_CUDA_ALLOC_CONF:-}\" ]; then\n"
-    "    echo \"INFO: Clearing PYTORCH allocator env overrides for CUDA init stability.\"\n"
-    "fi\n"
-    "unset PYTORCH_ALLOC_CONF\n"
-    "unset PYTORCH_CUDA_ALLOC_CONF\n"
-)
+    block = (
+        "# FURGEN PyTorch allocator env normalization\n"
+        "# asset_gen_v4 mixes Flux, OmniVoice, and FP8 LTX jobs on 32 GiB GPUs.\n"
+        "# Keep a single stable CUDA allocator setting to reduce fragmentation\n"
+        "# after large model swaps while avoiding conflicting allocator env vars.\n"
+        "unset PYTORCH_ALLOC_CONF\n"
+        "export PYTORCH_CUDA_ALLOC_CONF=\"${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}\"\n"
+    )
 
-pattern = re.compile(
-    r"# FURGEN PyTorch allocator env normalization\n"
-    r"# PyTorch 2\.9 can crash CUDA init when allocator vars disagree or mutate\.\n"
-    r"(?:.*\n){0,14}?unset PYTORCH_CUDA_ALLOC_CONF\n",
-    re.MULTILINE,
-)
+    pattern = re.compile(
+        r"# FURGEN PyTorch allocator env normalization\n"
+        r"(?:.*\n){0,14}?(?:unset PYTORCH_CUDA_ALLOC_CONF|export PYTORCH_CUDA_ALLOC_CONF=.*)\n",
+        re.MULTILINE,
+    )
 
 cleaned = re.sub(pattern, "", source)
 
