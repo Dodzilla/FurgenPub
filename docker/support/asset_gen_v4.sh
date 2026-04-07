@@ -14,7 +14,7 @@ COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # allowing template/runtime override when explicitly required.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v4}"
 # Pin to the latest official ComfyUI release (v0.18.2, 2026-03-25).
-COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-e87858e9743f92222cdb478f1f835135750b6a0b}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
