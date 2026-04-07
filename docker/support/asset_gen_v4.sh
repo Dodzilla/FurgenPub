@@ -650,6 +650,23 @@ else:
             )
 
 try:
+    import torch
+    import torch.nn.init as torch_init
+except Exception as exc:
+    errors.append(f"import torch failed while checking OmniVoice runtime compatibility: {exc}")
+else:
+    if not hasattr(torch_init, "copy_"):
+        errors.append("torch.nn.init.copy_ is missing; OmniVoice HiggsAudio tokenizer will fail at runtime")
+    else:
+        try:
+            tensor = torch.zeros(1)
+            torch_init.copy_(tensor, torch.ones(1))
+            if float(tensor.item()) != 1.0:
+                errors.append(f"torch.nn.init.copy_ compatibility shim returned unexpected tensor contents: {tensor.tolist()}")
+        except Exception as exc:
+            errors.append(f"torch.nn.init.copy_ compatibility shim failed when exercised: {exc}")
+
+try:
     required_nodes = (
         "OmniVoiceLongformTTS",
         "OmniVoiceVoiceCloneTTS",
@@ -1011,6 +1028,22 @@ try:
     import torch.nn.init as _fcs_torch_init
     if not hasattr(_fcs_tr, "initialization"):
         _fcs_tr.initialization = _fcs_torch_init
+except Exception:
+    pass
+""",
+    ),
+    (
+        "FURGEN_OMNIVOICE_TORCH_INIT_COPY_SHIM",
+        """# FURGEN_OMNIVOICE_TORCH_INIT_COPY_SHIM
+try:
+    import torch as _fcs_torch
+    import torch.nn.init as _fcs_torch_init
+    if not hasattr(_fcs_torch_init, "copy_"):
+        def _fcs_init_copy_(tensor, value):
+            with _fcs_torch.no_grad():
+                coerced = _fcs_torch.as_tensor(value, dtype=tensor.dtype, device=tensor.device)
+                return tensor.copy_(coerced)
+        _fcs_torch_init.copy_ = _fcs_init_copy_
 except Exception:
     pass
 """,
