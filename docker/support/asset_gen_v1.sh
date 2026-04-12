@@ -1532,6 +1532,9 @@ function dependency_manager_start_agent() {
     nohup bash -lc "source /venv/main/bin/activate && python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
 }
 
+# Start the dependency manager agent (best-effort; safe if required env vars are missing).
+dependency_manager_start_agent
+
 # Allow user to disable provisioning if they started with a script they didn't want
 if [[ ! -f /.noprovisioning ]]; then
     provisioning_start || {
@@ -1539,6 +1542,3 @@ if [[ ! -f /.noprovisioning ]]; then
         exit 1
     }
 fi
-
-# Start the dependency manager agent (best-effort; safe if required env vars are missing).
-dependency_manager_start_agent
