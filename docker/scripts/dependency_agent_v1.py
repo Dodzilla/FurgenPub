@@ -96,7 +96,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.4.3"
+AGENT_VERSION = "dm-agent-py/0.4.4"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -1932,6 +1932,11 @@ class DependencyAgent:
         if status != 200 or not isinstance(resp, dict):
             raise RuntimeError(f"Unexpected /history response: {status} {resp}")
         entry = resp.get(prompt_id)
+        if isinstance(entry, dict):
+            return entry
+        # Some ComfyUI builds return the history entry directly for /history/<prompt_id>.
+        if isinstance(resp.get("outputs"), dict):
+            return resp
         return entry if isinstance(entry, dict) else {}
 
     def _comfy_interrupt(self) -> None:
@@ -2033,6 +2038,19 @@ class DependencyAgent:
             seen.add(dedupe)
             refs.append({"filename": filename, "subfolder": subfolder, "type": file_type})
 
+        def _push_path_value(raw_value: Any) -> None:
+            if not isinstance(raw_value, str):
+                return
+            split_path = _split_path(raw_value)
+            if split_path is None:
+                return
+            filename, subfolder = split_path
+            dedupe = f"output:{subfolder}:{filename}"
+            if dedupe in seen:
+                return
+            seen.add(dedupe)
+            refs.append({"filename": filename, "subfolder": subfolder, "type": "output"})
+
         for _node_id, node_output in sorted(outputs.items(), key=lambda kv: kv[0]):
             if not isinstance(node_output, dict):
                 continue
@@ -2059,6 +2077,10 @@ class DependencyAgent:
                     for item in value:
                         if isinstance(item, dict):
                             _push(item)
+                        else:
+                            _push_path_value(item)
+                else:
+                    _push_path_value(value)
         return refs
 
     def _agent_handle_cancel_command(self, item: Dict[str, Any]) -> None:
