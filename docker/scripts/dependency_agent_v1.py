@@ -1979,12 +1979,53 @@ class DependencyAgent:
         refs: List[Dict[str, str]] = []
         seen: Set[str] = set()
         preferred_keys = ("images", "gifs", "videos", "audios", "audio", "latents", "meshes", "files")
+        path_like_keys = ("path", "file_path", "glb_path", "obj_path", "mesh_path")
+
+        def _split_path(raw_path: str) -> Optional[Tuple[str, str]]:
+            normalized = str(raw_path or "").strip().replace("\\", "/")
+            if not normalized:
+                return None
+
+            # Trellis export nodes may return an absolute path under ComfyUI's output
+            # directory. Reduce it to the relative path shape expected by /view.
+            output_marker = "/output/"
+            lower_normalized = normalized.lower()
+            marker_index = lower_normalized.rfind(output_marker)
+            if marker_index >= 0:
+                normalized = normalized[marker_index + len(output_marker):]
+
+            normalized = normalized.lstrip("/").rstrip("/")
+            if not normalized:
+                return None
+
+            filename = os.path.basename(normalized)
+            if not filename or "." not in filename:
+                return None
+
+            subfolder = os.path.dirname(normalized)
+            if subfolder in ("", "."):
+                subfolder = ""
+
+            return filename, subfolder
 
         def _push(row: Dict[str, Any]) -> None:
             filename = row.get("filename")
-            if not isinstance(filename, str) or not filename:
-                return
             subfolder = row.get("subfolder") if isinstance(row.get("subfolder"), str) else ""
+            if not isinstance(filename, str) or not filename:
+                for key in path_like_keys:
+                    raw_path = row.get(key)
+                    if not isinstance(raw_path, str) or not raw_path:
+                        continue
+                    split_path = _split_path(raw_path)
+                    if split_path is None:
+                        continue
+                    filename, derived_subfolder = split_path
+                    if not subfolder:
+                        subfolder = derived_subfolder
+                    break
+                else:
+                    return
+
             file_type = row.get("type") if isinstance(row.get("type"), str) and row.get("type") else "output"
             dedupe = f"{file_type}:{subfolder}:{filename}"
             if dedupe in seen:
@@ -2001,6 +2042,16 @@ class DependencyAgent:
                     for item in value:
                         if isinstance(item, dict):
                             _push(item)
+                elif isinstance(value, dict):
+                    _push(value)
+            for key in path_like_keys:
+                value = node_output.get(key)
+                if isinstance(value, str):
+                    _push({key: value})
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str):
+                            _push({key: item})
             for value in node_output.values():
                 if isinstance(value, dict):
                     _push(value)
