@@ -61,6 +61,8 @@ Optional knobs:
   - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
   - DM_INPUT_CACHE_DIR            (persistent remote-input cache dir; default: $WORKSPACE/.dm_input_cache)
   - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 10GiB)
+  - DM_AGENT_SELF_UPDATE_ENABLED  (allow backend-directed in-place script updates; default: true)
+  - DM_AGENT_SELF_UPDATE_RETRY_SECONDS (retry delay after failed update attempts; default: 300)
 
 Queue item expectations:
   - The backend should include a `resolved` object for download items with:
@@ -85,6 +87,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -99,7 +102,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.5.0"
+AGENT_VERSION = "dm-agent-py/0.6.0"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -318,6 +321,21 @@ def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+AGENT_VERSION_RE = re.compile(r'^\s*AGENT_VERSION\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
+
+
+def extract_agent_version_from_script(path: Path) -> Optional[str]:
+    try:
+        text = path.read_text("utf-8")
+    except Exception:
+        return None
+    match = AGENT_VERSION_RE.search(text)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return value or None
 
 
 def _safe_url_for_logs(url: str) -> str:
@@ -861,6 +879,13 @@ class AgentExecuteLease:
     tmp_root: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class AgentSelfUpdateRelease:
+    target_version: str
+    download_url: str
+    sha256: Optional[str] = None
+
+
 class DependencyAgent:
     def __init__(self) -> None:
         self.api_base_url = (_env_str("FCS_API_BASE_URL") or "").rstrip("/")
@@ -900,6 +925,9 @@ class DependencyAgent:
         self._last_local_comfy_discovery_ms = 0
         self.input_cache_dir = Path(_env_str("DM_INPUT_CACHE_DIR") or str(self.workspace / ".dm_input_cache"))
         self.input_cache_max_bytes = max(0, int(_parse_bytes(_env_str("DM_INPUT_CACHE_MAX_BYTES")) or 10 * 1024 * 1024 * 1024))
+        self.self_update_enabled = _env_bool("DM_AGENT_SELF_UPDATE_ENABLED", True)
+        self.self_update_retry_seconds = max(30.0, _env_float("DM_AGENT_SELF_UPDATE_RETRY_SECONDS", 300.0))
+        self.self_script_path = Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__))
 
         allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.com"]
         self.allowed_domains = {d.lower() for d in allowed if d}
@@ -934,6 +962,9 @@ class DependencyAgent:
         self._agent_prefetch_inflight: Set[Future[None]] = set()
         self._agent_execute_inflight: Set[Future[None]] = set()
         self._agent_upload_inflight: Set[Future[None]] = set()
+        self._pending_self_update: Optional[AgentSelfUpdateRelease] = None
+        self._pending_self_update_source = ""
+        self._self_update_retry_at_ms = 0
 
         # Best-effort local reconciliation (no API calls).
         with self._lock:
@@ -1597,6 +1628,148 @@ class DependencyAgent:
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True), "utf-8")
         os.replace(str(tmp), str(self.state_path))
 
+    def _normalize_agent_update_release(self, raw: Any) -> Optional[AgentSelfUpdateRelease]:
+        if not isinstance(raw, dict):
+            return None
+
+        target = raw.get("targetVersion")
+        download_url = raw.get("downloadUrl")
+        if not isinstance(target, str) or not target.strip():
+            return None
+        if not isinstance(download_url, str) or not download_url.strip():
+            return None
+
+        sha256 = raw.get("sha256")
+        sha256_norm = sha256.strip().lower() if isinstance(sha256, str) and re.match(r"^[0-9a-fA-F]{64}$", sha256.strip()) else None
+        return AgentSelfUpdateRelease(
+            target_version=target.strip(),
+            download_url=download_url.strip(),
+            sha256=sha256_norm,
+        )
+
+    def _current_script_sha256(self) -> Optional[str]:
+        try:
+            return sha256_file(self.self_script_path).lower()
+        except Exception:
+            return None
+
+    def _self_update_required(self, release: AgentSelfUpdateRelease) -> bool:
+        if release.target_version != AGENT_VERSION:
+            return True
+        if release.sha256:
+            current_sha = self._current_script_sha256()
+            return current_sha is None or current_sha != release.sha256
+        return False
+
+    def _maybe_queue_self_update(self, raw: Any, source: str) -> None:
+        if not self.self_update_enabled:
+            return
+
+        release = self._normalize_agent_update_release(raw)
+        if release is None:
+            return
+
+        if not self._self_update_required(release):
+            if self._pending_self_update == release:
+                self._pending_self_update = None
+                self._pending_self_update_source = ""
+                self._self_update_retry_at_ms = 0
+            return
+
+        if self._pending_self_update == release:
+            return
+
+        self._pending_self_update = release
+        self._pending_self_update_source = source
+        self._self_update_retry_at_ms = 0
+        logging.info(
+            "Queued dependency agent self-update: current=%s target=%s source=%s url=%s",
+            AGENT_VERSION,
+            release.target_version,
+            source,
+            release.download_url,
+        )
+
+    def _perform_pending_self_update(self) -> None:
+        release = self._pending_self_update
+        if release is None or self._stop.is_set():
+            return
+
+        now_ms = _now_ms()
+        if now_ms < int(self._self_update_retry_at_ms):
+            return
+
+        tmp_path = self.self_script_path.parent / f".{self.self_script_path.name}.{uuid.uuid4().hex}.tmp"
+        current_sha = self._current_script_sha256()
+
+        try:
+            self.self_script_path.parent.mkdir(parents=True, exist_ok=True)
+            http_download_to_file(
+                release.download_url,
+                tmp_path,
+                timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
+                chunk_size=int(self.download_chunk_size),
+                user_agent=f"dm-agent-self-update/{AGENT_VERSION}",
+            )
+
+            downloaded_sha = sha256_file(tmp_path).lower()
+            if release.sha256 and downloaded_sha != release.sha256:
+                raise RuntimeError(
+                    f"self-update checksum mismatch: expected {release.sha256} got {downloaded_sha}"
+                )
+
+            downloaded_version = extract_agent_version_from_script(tmp_path)
+            if downloaded_version != release.target_version:
+                raise RuntimeError(
+                    "self-update version mismatch: "
+                    f"expected {release.target_version} got {downloaded_version or 'missing'}"
+                )
+
+            if current_sha and downloaded_sha == current_sha and release.target_version == AGENT_VERSION:
+                logging.info(
+                    "Dependency agent self-update target already installed: version=%s path=%s",
+                    release.target_version,
+                    self.self_script_path,
+                )
+                self._pending_self_update = None
+                self._pending_self_update_source = ""
+                self._self_update_retry_at_ms = 0
+                return
+
+            try:
+                if self.self_script_path.exists():
+                    mode = self.self_script_path.stat().st_mode & 0o777
+                    os.chmod(tmp_path, mode or 0o755)
+                else:
+                    os.chmod(tmp_path, 0o755)
+            except Exception:
+                pass
+
+            os.replace(str(tmp_path), str(self.self_script_path))
+            logging.info(
+                "Restarting dependency agent into updated script: old=%s new=%s path=%s",
+                AGENT_VERSION,
+                release.target_version,
+                self.self_script_path,
+            )
+            os.execv(sys.executable, [sys.executable, str(self.self_script_path), *sys.argv[1:]])
+        except Exception as e:
+            self._self_update_retry_at_ms = _now_ms() + int(self.self_update_retry_seconds * 1000)
+            logging.warning(
+                "Dependency agent self-update failed: current=%s target=%s source=%s retryIn=%.0fs err=%s",
+                AGENT_VERSION,
+                release.target_version,
+                self._pending_self_update_source or "-",
+                float(self.self_update_retry_seconds),
+                e,
+            )
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
     def _register(self) -> None:
         instance_ip = self.instance_ip
         if not self.instance_id and not instance_ip:
@@ -1657,6 +1830,7 @@ class DependencyAgent:
                 self.agent_local_readiness_file,
             )
 
+        self._maybe_queue_self_update(resp.get("agentUpdate"), "dependencies/register")
         self._resolved_instance_id = instance_id
         self._token = agent_token
         logging.info("Registered dependency agent: instanceId=%s", instance_id)
@@ -1704,7 +1878,10 @@ class DependencyAgent:
         if queue_depth is not None:
             body["queueDepth"] = int(queue_depth)
 
-        api_json("POST", url, body=body, headers=self._headers(use_token=True, include_secret=False), timeout_seconds=30.0)
+        status, resp = api_json("POST", url, body=body, headers=self._headers(use_token=True, include_secret=False), timeout_seconds=30.0)
+        if status != 200 or not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected heartbeat response: {status} {resp}")
+        self._maybe_queue_self_update(resp.get("agentUpdate"), "dependencies/heartbeat")
         self._last_heartbeat_ms = _now_ms()
 
     def _fetch_queue(self, limit: int = 20) -> List[Dict[str, Any]]:
@@ -1783,6 +1960,7 @@ class DependencyAgent:
         self._agent_access_token_expires_at_ms = int(token_exp_ms)
         self._agent_bootstrap_profile = profile
         self._agent_channel_supported = True
+        self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/register")
         logging.info(
             "Registered agent control channel: instanceId=%s maxConcurrentExecuteJobs=%d maxPrefetchJobs=%d tokenExpiresAt=%s",
             self._resolved_instance_id,
@@ -2002,6 +2180,7 @@ class DependencyAgent:
         }
         resp = self._agent_api("POST", "/agent/heartbeat", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/heartbeat")
         self._last_agent_heartbeat_ms = _now_ms()
 
         lease_results = data.get("leases")
@@ -4046,6 +4225,12 @@ class DependencyAgent:
             self.agent_local_readiness_file,
             int(self.agent_max_execute_workers),
         )
+        logging.info(
+            "Self-update: enabled=%s scriptPath=%s retrySeconds=%.0f",
+            "yes" if self.self_update_enabled else "no",
+            str(self.self_script_path),
+            float(self.self_update_retry_seconds),
+        )
         policy = self._dynamic_policy()
         if policy.get("enabled"):
             logging.info(
@@ -4147,8 +4332,22 @@ class DependencyAgent:
                         self._submit_agent_execute(ready_lease)
                         active_execute_count += 1
 
+                with self._lock:
+                    active_leases = list(self._active_exec_by_item.values())
+                    downloading_count = len(self._downloading)
+                active_job_ids = {lease.job_id for lease in active_leases if lease.job_id}
+                pending_self_update = self._pending_self_update is not None
+                needs_dep_queue_for_active_work = any(
+                    lease.stage in ("leased", "prefetching", "ready", "waiting_dependencies")
+                    for lease in active_leases
+                )
+
+                if pending_self_update and not active_leases and len(dep_inflight) == 0 and downloading_count == 0:
+                    self._perform_pending_self_update()
+                    continue
+
                 # Dependency queue polling/dispatch.
-                if now >= next_dep_poll_at_ms:
+                if now >= next_dep_poll_at_ms and (not pending_self_update or needs_dep_queue_for_active_work):
                     try:
                         items = self._fetch_queue(limit=25)
                     except ApiError as e:
@@ -4161,6 +4360,12 @@ class DependencyAgent:
                             items = []
                         else:
                             raise
+
+                    if pending_self_update and active_job_ids:
+                        items = [
+                            item for item in items
+                            if isinstance(item.get("requestedByJobId"), str) and item.get("requestedByJobId") in active_job_ids
+                        ]
 
                     queue_depth = len(items)
                     queued_dep_ids: Set[str] = set()
@@ -4225,6 +4430,7 @@ class DependencyAgent:
                     self.agent_control_enabled
                     and self._agent_channel_supported
                     and self._agent_access_token
+                    and not pending_self_update
                     and now >= next_agent_poll_at_ms
                 ):
                     with self._lock:

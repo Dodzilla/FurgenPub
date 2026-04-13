@@ -14,6 +14,26 @@ This runbook installs and runs the single-file dependency agent (`scripts/depend
 - (Recommended) `comfyUIServerTypes/{serverType}.modelManagement.mode = "dependency_manager_v1"`.
 - (Recommended) `serverTypeDependencyProfiles/{profileId}` exists and `prefetchOnBoot=true` so core/warm static deps are queued at agent registration.
 
+## Live agent updates
+
+Running instances can now self-update the dependency agent in place. The backend advertises the desired release during dependency/agent register + heartbeat calls, and the agent drains active work, downloads the replacement script, and `exec`s into it without requiring a full Vast instance replacement.
+
+Backend release knobs:
+- `DEPENDENCY_AGENT_TARGET_VERSION`  
+  Example: `dm-agent-py/0.6.0`
+- `DEPENDENCY_AGENT_UPDATE_URL`  
+  Optional. Defaults to the public `FurgenPub` raw URL for `docker/scripts/dependency_agent_v1.py`.
+- `DEPENDENCY_AGENT_UPDATE_SHA256`  
+  Optional but recommended for integrity checking.
+
+Agent-side knob:
+- `DM_AGENT_SELF_UPDATE_ENABLED` (default `true`)
+
+Recommended rollout:
+1. Publish the new `dependency_agent_v1.py` to your public host / `FurgenPub`.
+2. Deploy Functions with the new target version and, optionally, URL + SHA256.
+3. Let running agents drain and restart themselves onto the new script.
+
 ## Instance environment variables
 
 Required:
