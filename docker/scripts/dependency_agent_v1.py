@@ -59,6 +59,8 @@ Optional knobs:
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
   - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
+  - DM_INPUT_CACHE_DIR            (persistent remote-input cache dir; default: $WORKSPACE/.dm_input_cache)
+  - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 10GiB)
 
 Queue item expectations:
   - The backend should include a `resolved` object for download items with:
@@ -70,6 +72,7 @@ Queue item expectations:
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import http.client
 import json
@@ -90,13 +93,13 @@ import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.4.4"
+AGENT_VERSION = "dm-agent-py/0.5.0"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -844,10 +847,18 @@ class AgentExecuteLease:
     execution_attempt: int
     attempt_epoch: int
     started_at_ms: int
+    stage: str = "leased"
+    lease_order: int = 0
+    event_version: int = 0
     command_id: str = ""
     cancel_requested: bool = False
     cancel_reason: str = ""
     prompt_id: Optional[str] = None
+    payload: Dict[str, Any] = field(default_factory=dict)
+    command_state: Dict[str, Any] = field(default_factory=dict)
+    prefetched_inputs: List[Dict[str, Any]] = field(default_factory=list)
+    history_entry: Dict[str, Any] = field(default_factory=dict)
+    tmp_root: Optional[str] = None
 
 
 class DependencyAgent:
@@ -884,8 +895,11 @@ class DependencyAgent:
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         self.agent_local_readiness_file = self._agent_local_readiness_file_env or "provisioning_complete.txt"
         self.agent_max_execute_workers = max(1, min(8, _env_int("DM_AGENT_MAX_EXEC_WORKERS", 2)))
+        self.asset_gen_v5_script = _env_str("DM_ASSET_GEN_V5_SCRIPT")
         self._resolved_local_comfy_base_url = self.agent_local_comfy_base_url
         self._last_local_comfy_discovery_ms = 0
+        self.input_cache_dir = Path(_env_str("DM_INPUT_CACHE_DIR") or str(self.workspace / ".dm_input_cache"))
+        self.input_cache_max_bytes = max(0, int(_parse_bytes(_env_str("DM_INPUT_CACHE_MAX_BYTES")) or 10 * 1024 * 1024 * 1024))
 
         allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.com"]
         self.allowed_domains = {d.lower() for d in allowed if d}
@@ -908,12 +922,24 @@ class DependencyAgent:
         self._next_agent_register_attempt_ms = 0
         self._last_agent_heartbeat_ms = 0
         self._agent_max_concurrent_execute_jobs = 1
+        self._agent_max_prefetch_jobs = 0
         self._active_exec_by_item: Dict[str, AgentExecuteLease] = {}
+        self._ready_agent_item_ids: deque[str] = deque()
+        self._agent_lease_order = 0
+        self._input_cache_downloading: Set[str] = set()
         self._agent_poll_wakeup = threading.Event()
+        self._agent_prefetch_executor: Optional[ThreadPoolExecutor] = None
+        self._agent_execute_executor: Optional[ThreadPoolExecutor] = None
+        self._agent_upload_executor: Optional[ThreadPoolExecutor] = None
+        self._agent_prefetch_inflight: Set[Future[None]] = set()
+        self._agent_execute_inflight: Set[Future[None]] = set()
+        self._agent_upload_inflight: Set[Future[None]] = set()
 
         # Best-effort local reconciliation (no API calls).
         with self._lock:
             self._reconcile_lru_locked()
+
+        self.input_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def validate_env(self) -> None:
         if not self.api_base_url:
@@ -1017,6 +1043,19 @@ class DependencyAgent:
         if candidate.is_absolute():
             return candidate
         return self.comfyui_dir / "input" / self.agent_local_readiness_file
+
+    def _remove_local_readiness_file(self) -> None:
+        try:
+            path = self._local_readiness_file_path()
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    def _write_local_readiness_file(self) -> None:
+        path = self._local_readiness_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"Provisioning completed at {_now_iso()}\n", encoding="utf-8")
 
     def _local_readiness_file_present(self) -> bool:
         try:
@@ -1148,6 +1187,106 @@ class DependencyAgent:
         # Force refresh periodically so we can recover from port changes.
         resolved = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=timeout_seconds)
         return self._probe_local_comfy_base_url(resolved, timeout_seconds=timeout_seconds)
+
+    def _resolve_asset_gen_v5_script(self) -> Optional[Path]:
+        candidates: List[Path] = []
+        if self.asset_gen_v5_script:
+            candidates.append(Path(self.asset_gen_v5_script))
+        candidates.extend([
+            self.workspace / "asset_gen_v5.sh",
+            Path("/workspace/asset_gen_v5.sh"),
+            Path("/opt/FurgenPub/docker/support/asset_gen_v5.sh"),
+            Path("/workspace/FurgenPub/docker/support/asset_gen_v5.sh"),
+        ])
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    def _restart_local_comfy(self) -> None:
+        restart_endpoints = [
+            "/manager/reboot",
+            "/api/manager/reboot",
+            "/restart",
+            "/system/restart",
+            "/reboot",
+        ]
+        for endpoint in restart_endpoints:
+            try:
+                self._comfy_api_json("GET", endpoint, timeout_seconds=10.0)
+                return
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "connection reset" in msg or "ecconnreset" in msg or "timeout" in msg:
+                    return
+        raise RuntimeError("All local ComfyUI restart endpoints failed or are unavailable.")
+
+    def _local_comfy_has_class_type(self, class_type: str, timeout_seconds: float = 10.0) -> bool:
+        if not isinstance(class_type, str) or not class_type.strip():
+            return False
+        normalized = class_type.strip()
+        quoted = urllib.parse.quote(normalized, safe="")
+        try:
+            status, resp = self._comfy_api_json("GET", f"/object_info/{quoted}", timeout_seconds=timeout_seconds)
+            if status == 200 and isinstance(resp, dict):
+                if normalized in resp and isinstance(resp.get(normalized), dict):
+                    return True
+                if any(key in resp for key in ("input", "output", "name")):
+                    return True
+        except Exception:
+            pass
+
+        try:
+            status, resp = self._comfy_api_json("GET", "/object_info", timeout_seconds=timeout_seconds)
+            return status == 200 and isinstance(resp, dict) and normalized in resp
+        except Exception:
+            return False
+
+    def _wait_for_local_comfy_ready(self, timeout_seconds: float = 300.0) -> None:
+        deadline = time.time() + max(30.0, timeout_seconds)
+        while time.time() < deadline:
+            if self._local_comfy_reachable(timeout_seconds=5.0) and self._local_readiness_file_present():
+                return
+            time.sleep(2.0)
+        raise RuntimeError("Local ComfyUI did not become ready after restart.")
+
+    def _wait_for_local_comfy_restart(self, verify_class_types: List[str], timeout_seconds: float = 300.0) -> None:
+        deadline = time.time() + max(30.0, timeout_seconds)
+        saw_down = not self._local_comfy_reachable(timeout_seconds=5.0)
+        normalized_verify = list(dict.fromkeys(
+            class_type.strip()
+            for class_type in verify_class_types
+            if isinstance(class_type, str) and class_type.strip()
+        ))
+        last_missing = normalized_verify
+
+        while time.time() < deadline:
+            reachable = self._local_comfy_reachable(timeout_seconds=5.0)
+            if not reachable:
+                saw_down = True
+                time.sleep(2.0)
+                continue
+
+            missing = [
+                class_type
+                for class_type in normalized_verify
+                if not self._local_comfy_has_class_type(class_type, timeout_seconds=5.0)
+            ]
+            if not missing and (saw_down or normalized_verify):
+                return
+            if not normalized_verify and saw_down and reachable:
+                return
+
+            last_missing = missing
+            time.sleep(2.0)
+
+        detail = ""
+        if last_missing:
+            detail = f" Missing classes: {', '.join(last_missing[:10])}"
+        raise RuntimeError(f"Local ComfyUI did not finish restarting after bundle installation.{detail}")
 
     def _dynamic_policy(self) -> Dict[str, Any]:
         # Profile (from /dependencies/register) may include dynamicPolicy.*; env vars override.
@@ -1588,6 +1727,9 @@ class DependencyAgent:
     def _agent_effective_execute_capacity(self) -> int:
         return max(1, min(int(self.agent_max_execute_workers), int(self._agent_max_concurrent_execute_jobs)))
 
+    def _agent_effective_prefetch_capacity(self) -> int:
+        return max(0, int(self._agent_max_prefetch_jobs))
+
     def _agent_register(self) -> None:
         if not self._resolved_instance_id:
             raise RuntimeError("Cannot register agent control channel before dependency registration resolves instanceId")
@@ -1627,19 +1769,25 @@ class DependencyAgent:
 
         profile = data.get("bootstrapProfile") if isinstance(data.get("bootstrapProfile"), dict) else {}
         max_concurrent = profile.get("maxConcurrentExecuteJobs")
+        max_prefetch = profile.get("maxPrefetchJobs")
         if isinstance(max_concurrent, (int, float)) and max_concurrent > 0:
             self._agent_max_concurrent_execute_jobs = max(1, int(max_concurrent))
         else:
             self._agent_max_concurrent_execute_jobs = 1
+        if isinstance(max_prefetch, (int, float)) and max_prefetch >= 0:
+            self._agent_max_prefetch_jobs = max(0, int(max_prefetch))
+        else:
+            self._agent_max_prefetch_jobs = 0
 
         self._agent_access_token = token
         self._agent_access_token_expires_at_ms = int(token_exp_ms)
         self._agent_bootstrap_profile = profile
         self._agent_channel_supported = True
         logging.info(
-            "Registered agent control channel: instanceId=%s maxConcurrentExecuteJobs=%d tokenExpiresAt=%s",
+            "Registered agent control channel: instanceId=%s maxConcurrentExecuteJobs=%d maxPrefetchJobs=%d tokenExpiresAt=%s",
             self._resolved_instance_id,
             int(self._agent_max_concurrent_execute_jobs),
+            int(self._agent_max_prefetch_jobs),
             token_exp if isinstance(token_exp, str) else "-",
         )
 
@@ -1767,6 +1915,17 @@ class DependencyAgent:
             )
         return data
 
+    def _emit_agent_event(self, lease: AgentExecuteLease, event_type: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        with self._lock:
+            active = self._active_exec_by_item.get(lease.item_id)
+            if active:
+                active.event_version += 1
+                event_version = int(active.event_version)
+            else:
+                lease.event_version += 1
+                event_version = int(lease.event_version)
+        return self._agent_event(lease, event_version, event_type, payload=payload)
+
     def _collect_active_leases(self) -> List[Dict[str, Any]]:
         with self._lock:
             active = list(self._active_exec_by_item.values())
@@ -1834,6 +1993,7 @@ class DependencyAgent:
             "heldLeases": held_leases,
             "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
             "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
+            "maxPrefetchJobs": int(self._agent_effective_prefetch_capacity()),
             "agentVersion": AGENT_VERSION,
             "capabilities": {
                 "dependencyChannel": True,
@@ -1872,9 +2032,58 @@ class DependencyAgent:
     def _finish_active_lease(self, item_id: str) -> None:
         with self._lock:
             self._active_exec_by_item.pop(item_id, None)
+            try:
+                self._ready_agent_item_ids.remove(item_id)
+            except ValueError:
+                pass
 
     def _request_agent_queue_poll(self) -> None:
         self._agent_poll_wakeup.set()
+
+    def _agent_stage_counts_locked(self) -> Tuple[int, int, int]:
+        execute_count = 0
+        prefetch_count = 0
+        upload_count = 0
+        for lease in self._active_exec_by_item.values():
+            if lease.stage in ("leased", "prefetching", "ready"):
+                prefetch_count += 1
+            elif lease.stage in ("waiting_dependencies", "executing"):
+                execute_count += 1
+            elif lease.stage == "uploading":
+                upload_count += 1
+        return execute_count, prefetch_count, upload_count
+
+    def _next_agent_lease_order(self) -> int:
+        with self._lock:
+            self._agent_lease_order += 1
+            return int(self._agent_lease_order)
+
+    def _enqueue_ready_locked(self, lease: AgentExecuteLease) -> None:
+        try:
+            self._ready_agent_item_ids.remove(lease.item_id)
+        except ValueError:
+            pass
+        inserted = False
+        for idx, item_id in enumerate(self._ready_agent_item_ids):
+            other = self._active_exec_by_item.get(item_id)
+            other_order = int(other.lease_order) if other else 0
+            if other is None or other.stage != "ready" or int(lease.lease_order) < other_order:
+                self._ready_agent_item_ids.insert(idx, lease.item_id)
+                inserted = True
+                break
+        if not inserted:
+            self._ready_agent_item_ids.append(lease.item_id)
+
+    def _pop_next_ready_lease(self) -> Optional[AgentExecuteLease]:
+        with self._lock:
+            while self._ready_agent_item_ids:
+                item_id = self._ready_agent_item_ids.popleft()
+                lease = self._active_exec_by_item.get(item_id)
+                if not lease or lease.stage != "ready":
+                    continue
+                lease.stage = "executing"
+                return lease
+        return None
 
     def _is_cancel_requested(self, lease: AgentExecuteLease) -> bool:
         with self._lock:
@@ -1887,6 +2096,16 @@ class DependencyAgent:
             if lease:
                 lease.cancel_requested = True
                 lease.cancel_reason = reason
+
+    def _cleanup_agent_lease(self, lease: AgentExecuteLease) -> None:
+        tmp_root = Path(lease.tmp_root) if isinstance(lease.tmp_root, str) and lease.tmp_root else None
+        self._finish_active_lease(lease.item_id)
+        self._request_agent_queue_poll()
+        if tmp_root is not None:
+            try:
+                shutil.rmtree(str(tmp_root), ignore_errors=True)
+            except Exception:
+                pass
 
     def _current_installed_dep_ids(self) -> Set[str]:
         with self._lock:
@@ -1962,11 +2181,211 @@ class DependencyAgent:
             raise RuntimeError("inline workflow missing inlineJson")
         raise RuntimeError(f"Unsupported workflowRef.mode: {mode}")
 
+    def _input_cache_expected_size_bytes(self, row: Dict[str, Any]) -> int:
+        for key in ("expectedSizeBytes", "sizeBytes", "bytes"):
+            value = row.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+        return 0
+
+    def _canonical_input_source(self, row: Dict[str, Any], name: str) -> str:
+        bucket = row.get("sourceBucket")
+        object_path = row.get("sourceObjectPath")
+        if isinstance(bucket, str) and bucket and isinstance(object_path, str) and object_path:
+            return f"gs://{bucket}/{object_path}"
+
+        raw_url = row.get("downloadUrl")
+        if isinstance(raw_url, str) and raw_url:
+            try:
+                parsed = urllib.parse.urlparse(raw_url)
+                return urllib.parse.urlunparse(
+                    (
+                        parsed.scheme.lower(),
+                        parsed.netloc.lower(),
+                        parsed.path,
+                        "",
+                        "",
+                        "",
+                    )
+                )
+            except Exception:
+                return raw_url
+        return name
+
+    def _input_cache_key(self, row: Dict[str, Any], name: str) -> str:
+        expected_sha = row.get("sha256")
+        if isinstance(expected_sha, str) and expected_sha:
+            return f"sha256_{expected_sha.strip().lower()}"
+        stable_source = self._canonical_input_source(row, name)
+        digest = _sha256_hex_bytes(_canonical_json_bytes({"source": stable_source, "name": name}))
+        return f"url_{digest}"
+
+    def _input_cache_path(self, cache_key: str, desired_name: str) -> Path:
+        safe_name = os.path.basename(desired_name) or "input.bin"
+        return self.input_cache_dir / cache_key[:2] / f"{cache_key}_{safe_name}"
+
+    def _touch_input_cache_path(self, path: Path) -> None:
+        now = time.time()
+        try:
+            os.utime(path, (now, now))
+        except Exception:
+            pass
+
+    def _is_cached_input_valid(self, cache_path: Path, row: Dict[str, Any]) -> bool:
+        if not cache_path.exists() or not cache_path.is_file():
+            return False
+        expected_size = self._input_cache_expected_size_bytes(row)
+        if expected_size > 0:
+            try:
+                if int(cache_path.stat().st_size) != expected_size:
+                    return False
+            except Exception:
+                return False
+        expected_sha = row.get("sha256")
+        if isinstance(expected_sha, str) and expected_sha:
+            try:
+                actual_sha = sha256_file(cache_path)
+            except Exception:
+                return False
+            if actual_sha.lower() != expected_sha.lower():
+                return False
+        return True
+
+    def _protected_input_cache_paths_locked(self) -> Set[str]:
+        protected: Set[str] = set()
+        for lease in self._active_exec_by_item.values():
+            for entry in lease.prefetched_inputs:
+                cache_path = entry.get("cache_path")
+                if isinstance(cache_path, str) and cache_path:
+                    protected.add(os.path.abspath(cache_path))
+        return protected
+
+    def _iter_input_cache_files(self) -> List[Path]:
+        out: List[Path] = []
+        tmp_dir = (self.input_cache_dir / ".tmp").resolve()
+        if not self.input_cache_dir.exists():
+            return out
+        for path in self.input_cache_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                resolved = path.resolve()
+            except Exception:
+                resolved = path
+            if tmp_dir in resolved.parents:
+                continue
+            out.append(path)
+        return out
+
+    def _prune_input_cache(self, incoming_bytes: int = 0) -> None:
+        if int(self.input_cache_max_bytes) <= 0:
+            return
+        with self._lock:
+            protected = self._protected_input_cache_paths_locked()
+
+        candidates: List[Tuple[float, int, Path]] = []
+        total_bytes = 0
+        for path in self._iter_input_cache_files():
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            total_bytes += int(stat.st_size)
+            candidates.append((float(stat.st_mtime), int(stat.st_size), path))
+
+        candidates.sort(key=lambda row: (row[0], str(row[2])))
+        while total_bytes + max(0, int(incoming_bytes)) > int(self.input_cache_max_bytes) and candidates:
+            _mtime, size_bytes, path = candidates.pop(0)
+            abs_path = os.path.abspath(str(path))
+            if abs_path in protected:
+                continue
+            try:
+                path.unlink()
+                total_bytes = max(0, total_bytes - int(size_bytes))
+            except Exception:
+                continue
+
+    def _ensure_cached_input(self, lease: AgentExecuteLease, row: Dict[str, Any], idx: int) -> Dict[str, Any]:
+        name = row.get("name") if isinstance(row.get("name"), str) and row.get("name") else f"input_{idx}"
+        cache_key = self._input_cache_key(row, name)
+        cache_path = self._input_cache_path(cache_key, name)
+        tmp_dir = self.input_cache_dir / ".tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        while True:
+            if self._is_cached_input_valid(cache_path, row):
+                self._touch_input_cache_path(cache_path)
+                return {
+                    "name": name,
+                    "cache_key": cache_key,
+                    "cache_path": str(cache_path),
+                }
+
+            try:
+                if cache_path.exists():
+                    cache_path.unlink()
+            except Exception:
+                pass
+
+            should_download = False
+            with self._lock:
+                if cache_key not in self._input_cache_downloading:
+                    self._input_cache_downloading.add(cache_key)
+                    should_download = True
+            if should_download:
+                break
+            time.sleep(0.2)
+
+        try:
+            self._agent_maybe_refresh_urls(lease, lease.command_state, force=False)
+            download_url = row.get("downloadUrl")
+            if not isinstance(download_url, str) or not download_url:
+                raise RuntimeError(f"Input file #{idx} missing downloadUrl")
+
+            self._prune_input_cache(self._input_cache_expected_size_bytes(row))
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            partial = tmp_dir / f"{cache_key}.{uuid.uuid4().hex}.partial"
+            try:
+                http_download_to_file(
+                    download_url,
+                    partial,
+                    timeout_seconds=float(self.download_timeout_seconds),
+                    chunk_size=int(self.download_chunk_size),
+                )
+                if not self._is_cached_input_valid(partial, row):
+                    raise RuntimeError(f"input_cache_validation_failed for {name}")
+                os.replace(str(partial), str(cache_path))
+            finally:
+                try:
+                    if partial.exists():
+                        partial.unlink()
+                except Exception:
+                    pass
+            self._touch_input_cache_path(cache_path)
+            return {
+                "name": name,
+                "cache_key": cache_key,
+                "cache_path": str(cache_path),
+            }
+        finally:
+            with self._lock:
+                self._input_cache_downloading.discard(cache_key)
+
     def _copy_input_to_comfy(self, source_path: Path, desired_name: str) -> Path:
         safe_name = os.path.basename(desired_name) or f"input_{uuid.uuid4().hex}"
         dest = self.comfyui_dir / "input" / safe_name
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(source_path), str(dest))
+        temp_dest = dest.parent / f".{safe_name}.{uuid.uuid4().hex}.tmp"
+        try:
+            if temp_dest.exists():
+                temp_dest.unlink()
+        except Exception:
+            pass
+        try:
+            os.link(str(source_path), str(temp_dest))
+        except Exception:
+            shutil.copy2(str(source_path), str(temp_dest))
+        os.replace(str(temp_dest), str(dest))
         return dest
 
     def _comfy_view_url(self, filename: str, subfolder: Optional[str], file_type: str = "output") -> str:
@@ -2082,6 +2501,68 @@ class DependencyAgent:
                 else:
                     _push_path_value(value)
         return refs
+
+    def _process_install_node_bundles_item(self, item: Dict[str, Any]) -> None:
+        item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
+        lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        if not item_id or not lease_id:
+            return
+
+        bundle_ids = [bundle_id for bundle_id in payload.get("bundleIds", []) if isinstance(bundle_id, str) and bundle_id]
+        verify_class_types = [class_type for class_type in payload.get("verifyClassTypes", []) if isinstance(class_type, str) and class_type]
+        if not bundle_ids:
+            self._agent_ack(item_id, lease_id, "command_ignored_stale")
+            return
+
+        if (self.server_type or "").strip() != "asset_gen_v5":
+            self._agent_ack(
+                item_id,
+                lease_id,
+                "command_failed",
+                error_code="unsupported_server_type",
+                error_message=f"install_node_bundles is only supported on asset_gen_v5 (server_type={self.server_type})",
+            )
+            return
+
+        script_path = self._resolve_asset_gen_v5_script()
+        if script_path is None:
+            self._agent_ack(
+                item_id,
+                lease_id,
+                "command_failed",
+                error_code="asset_gen_v5_script_missing",
+                error_message="Unable to locate asset_gen_v5.sh on this instance.",
+            )
+            return
+
+        self._remove_local_readiness_file()
+
+        try:
+            subprocess.run(
+                ["bash", str(script_path), "install-bundles", *bundle_ids],
+                cwd=str(self.workspace),
+                env=os.environ.copy(),
+                check=True,
+                timeout=max(1800, 300 * max(1, len(bundle_ids))),
+            )
+            self._remove_local_readiness_file()
+            self._restart_local_comfy()
+            self._wait_for_local_comfy_restart(
+                verify_class_types,
+                timeout_seconds=max(300.0, 120.0 * max(1, len(bundle_ids))),
+            )
+            self._write_local_readiness_file()
+            self._agent_ack(item_id, lease_id, "command_succeeded")
+        except Exception as exc:
+            self._remove_local_readiness_file()
+            self._agent_ack(
+                item_id,
+                lease_id,
+                "command_failed",
+                error_code="install_node_bundles_failed",
+                error_message=str(exc)[:500],
+            )
 
     def _agent_handle_cancel_command(self, item: Dict[str, Any]) -> None:
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
@@ -2969,18 +3450,499 @@ class DependencyAgent:
             except Exception:
                 pass
 
-    def _process_agent_queue_item(
-        self,
-        item: Dict[str, Any],
-        agent_executor: ThreadPoolExecutor,
-        agent_inflight: Set[Future[None]],
-    ) -> None:
+    def _submit_agent_prefetch(self, lease: AgentExecuteLease) -> None:
+        if self._agent_prefetch_executor is None:
+            raise RuntimeError("Agent prefetch executor is not initialized")
+        future = self._agent_prefetch_executor.submit(self._prefetch_agent_execute_lease, lease)
+        with self._lock:
+            self._agent_prefetch_inflight.add(future)
+
+    def _submit_agent_execute(self, lease: AgentExecuteLease) -> None:
+        if self._agent_execute_executor is None:
+            raise RuntimeError("Agent execute executor is not initialized")
+        future = self._agent_execute_executor.submit(self._execute_agent_ready_lease, lease)
+        with self._lock:
+            self._agent_execute_inflight.add(future)
+
+    def _submit_agent_upload(self, lease: AgentExecuteLease) -> None:
+        if self._agent_upload_executor is None:
+            raise RuntimeError("Agent upload executor is not initialized")
+        future = self._agent_upload_executor.submit(self._upload_agent_outputs, lease)
+        with self._lock:
+            self._agent_upload_inflight.add(future)
+
+    def _prefetch_agent_execute_lease(self, lease: AgentExecuteLease) -> None:
+        retain_lease = False
+        terminal_sent = False
+        try:
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                if not active:
+                    return
+                active.stage = "prefetching"
+
+            try:
+                self._emit_agent_event(lease, "job_dispatched", {"commandId": lease.command_id} if lease.command_id else None)
+            except Exception as e:
+                logging.debug("job_dispatched emit failed for %s: %s", lease.job_id, e)
+
+            if self._is_cancel_requested(lease):
+                self._emit_agent_event(
+                    lease,
+                    "job_cancelled",
+                    {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before input prefetch."},
+                )
+                terminal_sent = True
+                return
+
+            prefetched_inputs: List[Dict[str, Any]] = []
+            input_files_initial = lease.command_state.get("inputFiles")
+            if isinstance(input_files_initial, list) and input_files_initial:
+                for idx in range(len(input_files_initial)):
+                    input_files_live = lease.command_state.get("inputFiles")
+                    if not isinstance(input_files_live, list) or idx >= len(input_files_live):
+                        break
+                    row = input_files_live[idx]
+                    if not isinstance(row, dict):
+                        continue
+                    if self._is_cancel_requested(lease):
+                        self._emit_agent_event(
+                            lease,
+                            "job_cancelled",
+                            {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested while prefetching inputs."},
+                        )
+                        terminal_sent = True
+                        return
+                    prefetched_inputs.append(self._ensure_cached_input(lease, row, idx))
+
+            self._emit_agent_event(lease, "inputs_ready", None)
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                if not active:
+                    return
+                active.prefetched_inputs = prefetched_inputs
+                active.stage = "ready"
+                self._enqueue_ready_locked(active)
+            retain_lease = True
+            self._request_agent_queue_poll()
+        except Exception as e:
+            if not terminal_sent:
+                event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
+                err_code = "cancel_requested" if event_type == "job_cancelled" else "prefetch_error"
+                try:
+                    self._emit_agent_event(
+                        lease,
+                        event_type,
+                        {"errorCode": err_code, "errorMessage": str(e)[:500]},
+                    )
+                    terminal_sent = True
+                except Exception as event_err:
+                    logging.warning("Failed emitting prefetch terminal event for %s: %s", lease.job_id, event_err)
+            logging.error(
+                "execute_job prefetch failed: itemId=%s jobId=%s attempt=%d epoch=%d err=%s",
+                lease.item_id,
+                lease.job_id,
+                int(lease.execution_attempt),
+                int(lease.attempt_epoch),
+                e,
+            )
+        finally:
+            if not retain_lease:
+                self._cleanup_agent_lease(lease)
+
+    def _execute_agent_ready_lease(self, lease: AgentExecuteLease) -> None:
+        retain_lease = False
+        terminal_sent = False
+        try:
+            required_dep_ids_raw = lease.payload.get("requiredDepIds")
+            required_dep_ids = [d for d in required_dep_ids_raw if isinstance(d, str) and d] if isinstance(required_dep_ids_raw, list) else []
+            timeouts = lease.payload.get("timeouts") if isinstance(lease.payload.get("timeouts"), dict) else {}
+            dep_wait_timeout_sec = int(timeouts.get("dependencyWaitTimeoutSec")) if isinstance(timeouts.get("dependencyWaitTimeoutSec"), (int, float)) else 900
+            execution_timeout_sec = int(timeouts.get("executionTimeoutSec")) if isinstance(timeouts.get("executionTimeoutSec"), (int, float)) else 2400
+
+            if required_dep_ids:
+                dep_wait_started = _now_ms()
+                last_wait_emit_ms = 0
+                with self._lock:
+                    active = self._active_exec_by_item.get(lease.item_id)
+                    if active:
+                        active.stage = "waiting_dependencies"
+                while True:
+                    if self._is_cancel_requested(lease):
+                        self._comfy_interrupt()
+                        self._emit_agent_event(
+                            lease,
+                            "job_cancelled",
+                            {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before execution started."},
+                        )
+                        terminal_sent = True
+                        return
+
+                    installed = self._current_installed_dep_ids()
+                    missing = [dep for dep in required_dep_ids if dep not in installed]
+                    if not missing:
+                        break
+
+                    now_ms = _now_ms()
+                    if now_ms - dep_wait_started > max(1, dep_wait_timeout_sec) * 1000:
+                        self._emit_agent_event(
+                            lease,
+                            "job_failed",
+                            {
+                                "errorCode": "dependencies_timeout",
+                                "errorMessage": f"Dependencies did not become ready in {dep_wait_timeout_sec}s.",
+                            },
+                        )
+                        terminal_sent = True
+                        return
+
+                    if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= 15_000:
+                        self._emit_agent_event(lease, "waiting_dependencies", {"missingDepIds": missing[:200]})
+                        last_wait_emit_ms = now_ms
+                    time.sleep(2.0)
+
+            if self._is_cancel_requested(lease):
+                self._comfy_interrupt()
+                self._emit_agent_event(
+                    lease,
+                    "job_cancelled",
+                    {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before prompt submit."},
+                )
+                terminal_sent = True
+                return
+
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                prefetched_inputs = list(active.prefetched_inputs) if active else list(lease.prefetched_inputs)
+                if active:
+                    active.stage = "executing"
+
+            for entry in prefetched_inputs:
+                cache_path = entry.get("cache_path")
+                input_name = entry.get("name")
+                if not isinstance(cache_path, str) or not cache_path:
+                    continue
+                if not isinstance(input_name, str) or not input_name:
+                    input_name = f"input_{uuid.uuid4().hex}"
+                self._copy_input_to_comfy(Path(cache_path), input_name)
+
+            workflow = self._parse_workflow_from_payload(lease.payload)
+            prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{lease.job_id}-{uuid.uuid4().hex[:12]}")
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                if active:
+                    active.prompt_id = prompt_id
+
+            self._emit_agent_event(lease, "prompt_submitted", {"promptId": prompt_id})
+            self._emit_agent_event(lease, "execution_started", {"promptId": prompt_id})
+
+            start_exec_ms = _now_ms()
+            last_progress_emit_ms = 0
+            history_entry: Dict[str, Any] = {}
+            history_errors = 0
+            while True:
+                if self._is_cancel_requested(lease):
+                    self._comfy_interrupt()
+                    self._emit_agent_event(
+                        lease,
+                        "job_cancelled",
+                        {
+                            "promptId": prompt_id,
+                            "errorCode": "cancel_requested",
+                            "errorMessage": "Cancellation requested during execution.",
+                        },
+                    )
+                    terminal_sent = True
+                    return
+
+                if _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
+                    self._emit_agent_event(
+                        lease,
+                        "job_failed",
+                        {
+                            "promptId": prompt_id,
+                            "errorCode": "execution_timeout",
+                            "errorMessage": f"Execution exceeded timeout ({execution_timeout_sec}s).",
+                        },
+                    )
+                    terminal_sent = True
+                    return
+
+                try:
+                    history_entry = self._comfy_get_history(prompt_id)
+                    history_errors = 0
+                except Exception as history_err:
+                    history_errors += 1
+                    if history_errors >= 10:
+                        raise RuntimeError(f"Repeated /history lookup failures: {history_err}")
+                    logging.debug("Transient /history lookup failure for prompt %s: %s", prompt_id, history_err)
+                    time.sleep(0.5)
+                    continue
+                status_obj = history_entry.get("status") if isinstance(history_entry.get("status"), dict) else {}
+                status_str = str(status_obj.get("status_str") or status_obj.get("status") or "").strip().lower()
+                failed = status_obj.get("failed") is True or status_str in ("failed", "error")
+                completed = status_obj.get("completed") is True or status_str in ("success", "succeeded", "completed")
+
+                if failed:
+                    self._emit_agent_event(
+                        lease,
+                        "job_failed",
+                        {
+                            "promptId": prompt_id,
+                            "errorCode": "comfy_execution_failed",
+                            "errorMessage": (json.dumps(status_obj)[:500] if status_obj else "ComfyUI execution failed."),
+                        },
+                    )
+                    terminal_sent = True
+                    return
+
+                if completed:
+                    break
+
+                if _now_ms() - last_progress_emit_ms >= 15_000:
+                    self._emit_agent_event(lease, "execution_progress", {"promptId": prompt_id})
+                    last_progress_emit_ms = _now_ms()
+                time.sleep(0.5)
+
+            self._emit_agent_event(lease, "output_commit_started", {"promptId": prompt_id})
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                if active:
+                    active.stage = "uploading"
+                    active.history_entry = history_entry
+                    active.prompt_id = prompt_id
+
+            self._submit_agent_upload(lease)
+            retain_lease = True
+            self._request_agent_queue_poll()
+        except Exception as e:
+            if not terminal_sent:
+                event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
+                err_code = "cancel_requested" if event_type == "job_cancelled" else "execution_error"
+                prompt_id = None
+                with self._lock:
+                    active = self._active_exec_by_item.get(lease.item_id)
+                    if active and isinstance(active.prompt_id, str):
+                        prompt_id = active.prompt_id
+                payload: Dict[str, Any] = {
+                    "errorCode": err_code,
+                    "errorMessage": str(e)[:500],
+                }
+                if prompt_id:
+                    payload["promptId"] = prompt_id
+                try:
+                    self._emit_agent_event(lease, event_type, payload)
+                    terminal_sent = True
+                except Exception as event_err:
+                    logging.warning("Failed emitting execute terminal event for %s: %s", lease.job_id, event_err)
+            logging.error(
+                "execute_job execute failed: itemId=%s jobId=%s attempt=%d epoch=%d err=%s",
+                lease.item_id,
+                lease.job_id,
+                int(lease.execution_attempt),
+                int(lease.attempt_epoch),
+                e,
+            )
+        finally:
+            if not retain_lease:
+                self._cleanup_agent_lease(lease)
+
+    def _upload_agent_outputs(self, lease: AgentExecuteLease) -> None:
+        terminal_sent = False
+        try:
+            output_targets_initial = lease.command_state.get("outputTargets")
+            if not isinstance(output_targets_initial, list) or len(output_targets_initial) == 0:
+                raise RuntimeError("Missing output targets for execute_job command.")
+
+            history_entry = lease.history_entry if isinstance(lease.history_entry, dict) else {}
+            refs = self._collect_history_output_refs(history_entry)
+            if not refs:
+                raise RuntimeError("No output files found in ComfyUI history.")
+
+            tmp_root = Path(lease.tmp_root) if isinstance(lease.tmp_root, str) and lease.tmp_root else Path(tempfile.mkdtemp(prefix=f"agent_exec_{lease.job_id}_upload_"))
+            output_tmp_dir = tmp_root / "outputs"
+            output_tmp_dir.mkdir(parents=True, exist_ok=True)
+            used_ref_indexes: Set[int] = set()
+            uploaded_outputs: List[Dict[str, Any]] = []
+
+            for target_idx in range(len(output_targets_initial)):
+                if self._is_cancel_requested(lease):
+                    raise RuntimeError(lease.cancel_reason or "lease_stale_during_upload")
+
+                output_targets_live = lease.command_state.get("outputTargets")
+                if not isinstance(output_targets_live, list) or target_idx >= len(output_targets_live):
+                    break
+                target = output_targets_live[target_idx]
+                if not isinstance(target, dict):
+                    continue
+                self._agent_maybe_refresh_urls(lease, lease.command_state, force=False)
+                output_targets_live = lease.command_state.get("outputTargets")
+                if not isinstance(output_targets_live, list) or target_idx >= len(output_targets_live):
+                    break
+                target = output_targets_live[target_idx]
+
+                selected = self._select_output_ref(refs, target, used_ref_indexes)
+                if selected is None:
+                    continue
+                ref_idx, ref = selected
+                used_ref_indexes.add(ref_idx)
+
+                filename = ref.get("filename") if isinstance(ref.get("filename"), str) else ""
+                subfolder = ref.get("subfolder") if isinstance(ref.get("subfolder"), str) else ""
+                file_type = ref.get("type") if isinstance(ref.get("type"), str) else "output"
+                if not filename:
+                    continue
+
+                local_output = output_tmp_dir / f"{len(uploaded_outputs):02d}_{os.path.basename(filename)}"
+                http_download_to_file(
+                    self._comfy_view_url(filename=filename, subfolder=subfolder if subfolder else None, file_type=file_type),
+                    local_output,
+                    timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
+                    chunk_size=int(self.download_chunk_size),
+                )
+                bytes_written = int(local_output.stat().st_size)
+                sha256_sum = sha256_file(local_output)
+
+                logical_key = target.get("logicalOutputKey") if isinstance(target.get("logicalOutputKey"), str) else f"output_{len(uploaded_outputs)}"
+                upload_url = target.get("uploadUrl")
+                if not isinstance(upload_url, str) or not upload_url:
+                    raise RuntimeError("Missing uploadUrl in output target.")
+                content_type = target.get("contentType") if isinstance(target.get("contentType"), str) and target.get("contentType") else None
+                if not content_type:
+                    guessed, _enc = mimetypes.guess_type(filename)
+                    content_type = guessed or "application/octet-stream"
+
+                upload_headers: Dict[str, str] = {"Content-Type": content_type}
+                upload_headers_raw = target.get("uploadHeaders")
+                if isinstance(upload_headers_raw, dict):
+                    for hk, hv in upload_headers_raw.items():
+                        if isinstance(hk, str) and hk and isinstance(hv, str):
+                            upload_headers[hk] = hv
+
+                upload_method = target.get("uploadMethod") if isinstance(target.get("uploadMethod"), str) else ""
+                if upload_method == "agent_api_put":
+                    upload_headers["X-DM-Instance-Id"] = str(self._resolved_instance_id or "")
+                    upload_headers["X-Agent-Job-Id"] = lease.job_id
+                    upload_headers["X-Agent-Execution-Attempt"] = str(int(lease.execution_attempt))
+                    upload_headers["X-Agent-Attempt-Epoch"] = str(int(lease.attempt_epoch))
+                    upload_headers["X-Agent-Lease-Id"] = lease.lease_id
+                    upload_headers["X-Agent-Logical-Output-Key"] = logical_key
+                    upload_headers["X-Agent-Source-Filename"] = filename
+                    if self._agent_access_token:
+                        upload_headers["Authorization"] = f"Bearer {self._agent_access_token}"
+
+                status, body, _resp_headers = http_put_file_stream(
+                    upload_url,
+                    local_output,
+                    headers=upload_headers,
+                    timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                )
+                if status == 412:
+                    verify_url = target.get("verifyHeadUrl")
+                    if isinstance(verify_url, str) and verify_url:
+                        head_status, head_headers = http_head(verify_url, timeout_seconds=30.0)
+                        if head_status in (200, 204):
+                            remote_len = head_headers.get("content-length")
+                            if isinstance(remote_len, str) and remote_len.isdigit() and int(remote_len) == bytes_written:
+                                status = 200
+                if status < 200 or status >= 300:
+                    raise RuntimeError(f"Output upload failed (status={status}): {body[:200]}")
+
+                response_payload = _json_loads_or_none(body) if isinstance(body, str) and body else None
+                response_data = response_payload.get("data") if isinstance(response_payload, dict) and isinstance(response_payload.get("data"), dict) else {}
+
+                attempt_object_path = (
+                    target.get("attemptObjectPath")
+                    if isinstance(target.get("attemptObjectPath"), str) and target.get("attemptObjectPath")
+                    else filename
+                )
+                final_object_path = (
+                    response_data.get("destinationPath")
+                    if isinstance(response_data.get("destinationPath"), str) and response_data.get("destinationPath")
+                    else (
+                        target.get("finalObjectPath")
+                        if isinstance(target.get("finalObjectPath"), str) and target.get("finalObjectPath")
+                        else attempt_object_path
+                    )
+                )
+                public_url = response_data.get("cdnUrl") if isinstance(response_data.get("cdnUrl"), str) and response_data.get("cdnUrl") else None
+
+                out_meta = {
+                    "logicalOutputKey": logical_key,
+                    "attemptObjectPath": attempt_object_path,
+                    "finalObjectPath": final_object_path,
+                    "bytes": bytes_written,
+                    "sha256": sha256_sum,
+                    "contentType": content_type,
+                    **({"publicUrl": public_url} if public_url else {}),
+                }
+                uploaded_outputs.append(out_meta)
+                try:
+                    self._emit_agent_event(lease, "output_uploaded", out_meta)
+                except Exception as e:
+                    logging.debug("output_uploaded emit failed for %s/%s: %s", lease.job_id, logical_key, e)
+
+            if not uploaded_outputs:
+                raise RuntimeError("No outputs were uploaded.")
+
+            completion_payload: Dict[str, Any] = {"outputs": uploaded_outputs}
+            if isinstance(lease.prompt_id, str) and lease.prompt_id:
+                completion_payload["promptId"] = lease.prompt_id
+            self._emit_agent_event(lease, "job_completed", completion_payload)
+            terminal_sent = True
+        except Exception as e:
+            if not terminal_sent:
+                payload: Dict[str, Any] = {
+                    "errorCode": "upload_error",
+                    "errorMessage": str(e)[:500],
+                }
+                if isinstance(lease.prompt_id, str) and lease.prompt_id:
+                    payload["promptId"] = lease.prompt_id
+                try:
+                    self._emit_agent_event(lease, "job_failed", payload)
+                    terminal_sent = True
+                except Exception as event_err:
+                    logging.warning("Failed emitting upload terminal event for %s: %s", lease.job_id, event_err)
+            logging.error(
+                "execute_job upload failed: itemId=%s jobId=%s attempt=%d epoch=%d err=%s",
+                lease.item_id,
+                lease.job_id,
+                int(lease.execution_attempt),
+                int(lease.attempt_epoch),
+                e,
+            )
+        finally:
+            self._cleanup_agent_lease(lease)
+
+    def _process_agent_queue_item(self, item: Dict[str, Any]) -> None:
         item_type = item.get("type") if isinstance(item.get("type"), str) else ""
         item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
         lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
 
         if item_type == "execute_job":
             if not item_id or not lease_id:
+                return
+            payload = item.get("payload")
+            if not isinstance(payload, dict):
+                try:
+                    self._agent_ack(item_id, lease_id, "command_ignored_stale")
+                except Exception:
+                    pass
+                return
+
+            job_id = payload.get("jobId")
+            execution_attempt = payload.get("executionAttempt")
+            attempt_epoch = payload.get("attemptEpoch")
+            if (
+                not isinstance(job_id, str)
+                or not job_id
+                or not isinstance(execution_attempt, (int, float))
+                or not isinstance(attempt_epoch, (int, float))
+            ):
+                try:
+                    self._agent_ack(item_id, lease_id, "command_ignored_stale")
+                except Exception:
+                    pass
                 return
             with self._lock:
                 if item_id in self._active_exec_by_item:
@@ -2990,11 +3952,37 @@ class DependencyAgent:
                     except Exception:
                         pass
                     return
-            agent_inflight.add(agent_executor.submit(self._process_agent_execute_item, item))
+            lease = AgentExecuteLease(
+                item_id=item_id,
+                lease_id=lease_id,
+                job_id=job_id,
+                execution_attempt=int(execution_attempt),
+                attempt_epoch=int(attempt_epoch),
+                started_at_ms=_now_ms(),
+                lease_order=self._next_agent_lease_order(),
+                command_id=payload.get("commandId") if isinstance(payload.get("commandId"), str) else "",
+                payload=payload,
+                command_state={
+                    "inputFiles": payload.get("inputFiles") if isinstance(payload.get("inputFiles"), list) else [],
+                    "outputTargets": (
+                        (payload.get("outputPlan") or {}).get("targets")
+                        if isinstance(payload.get("outputPlan"), dict) and isinstance((payload.get("outputPlan") or {}).get("targets"), list)
+                        else []
+                    ),
+                    "urlRefresh": payload.get("urlRefresh") if isinstance(payload.get("urlRefresh"), dict) else {},
+                },
+                tmp_root=str(tempfile.mkdtemp(prefix=f"agent_exec_{job_id}_{int(execution_attempt)}_{int(attempt_epoch)}_")),
+            )
+            self._register_active_lease(lease)
+            self._submit_agent_prefetch(lease)
             return
 
         if item_type == "cancel_job":
             self._agent_handle_cancel_command(item)
+            return
+
+        if item_type == "install_node_bundles":
+            self._process_install_node_bundles_item(item)
             return
 
         if item_id and lease_id:
@@ -3072,8 +4060,14 @@ class DependencyAgent:
 
         dep_executor = ThreadPoolExecutor(max_workers=self.max_parallel)
         dep_inflight: Set[Future[None]] = set()
-        agent_executor = ThreadPoolExecutor(max_workers=self.agent_max_execute_workers)
-        agent_inflight: Set[Future[None]] = set()
+        agent_aux_workers = max(2, int(self.agent_max_execute_workers))
+        self._agent_prefetch_executor = ThreadPoolExecutor(max_workers=agent_aux_workers)
+        self._agent_execute_executor = ThreadPoolExecutor(max_workers=max(1, int(self.agent_max_execute_workers)))
+        self._agent_upload_executor = ThreadPoolExecutor(max_workers=agent_aux_workers)
+        with self._lock:
+            self._agent_prefetch_inflight.clear()
+            self._agent_execute_inflight.clear()
+            self._agent_upload_inflight.clear()
 
         next_dep_poll_at_ms = 0
         next_agent_poll_at_ms = 0
@@ -3097,13 +4091,20 @@ class DependencyAgent:
                     except Exception as e:
                         logging.error("Unhandled dependency worker error: %s", e)
 
-                done_agent = {f for f in agent_inflight if f.done()}
-                agent_inflight -= done_agent
-                for f in done_agent:
-                    try:
-                        f.result()
-                    except Exception as e:
-                        logging.error("Unhandled agent worker error: %s", e)
+                for inflight_name, label in (
+                    ("_agent_prefetch_inflight", "prefetch"),
+                    ("_agent_execute_inflight", "execute"),
+                    ("_agent_upload_inflight", "upload"),
+                ):
+                    with self._lock:
+                        inflight = getattr(self, inflight_name)
+                        done = {f for f in inflight if f.done()}
+                        inflight -= done
+                    for f in done:
+                        try:
+                            f.result()
+                        except Exception as e:
+                            logging.error("Unhandled agent %s worker error: %s", label, e)
 
                 # Heartbeats.
                 if now - self._last_heartbeat_ms >= int(self.heartbeat_seconds * 1000):
@@ -3135,6 +4136,16 @@ class DependencyAgent:
                                 logging.warning("Agent heartbeat API error (status=%d): %s", e.status, e)
                         except Exception as e:
                             logging.warning("Agent heartbeat failed: %s", e)
+
+                    execute_capacity = self._agent_effective_execute_capacity()
+                    with self._lock:
+                        active_execute_count, _prefetch_count_unused, _upload_count_unused = self._agent_stage_counts_locked()
+                    while active_execute_count < execute_capacity:
+                        ready_lease = self._pop_next_ready_lease()
+                        if ready_lease is None:
+                            break
+                        self._submit_agent_execute(ready_lease)
+                        active_execute_count += 1
 
                 # Dependency queue polling/dispatch.
                 if now >= next_dep_poll_at_ms:
@@ -3217,10 +4228,15 @@ class DependencyAgent:
                     and now >= next_agent_poll_at_ms
                 ):
                     with self._lock:
-                        active_exec_count = len(self._active_exec_by_item)
+                        active_execute_count, active_prefetch_count, active_upload_count = self._agent_stage_counts_locked()
                     execute_capacity = self._agent_effective_execute_capacity()
-                    available_exec_slots = max(0, execute_capacity - active_exec_count)
-                    poll_limit = max(1, min(20, available_exec_slots + 3))
+                    prefetch_capacity = self._agent_effective_prefetch_capacity()
+                    execute_and_prefetch_budget = max(
+                        0,
+                        (execute_capacity + prefetch_capacity) -
+                        (active_execute_count + active_prefetch_count + active_upload_count),
+                    )
+                    poll_limit = max(1, min(20, execute_and_prefetch_budget + 2))
 
                     try:
                         agent_items = self._agent_fetch_queue(limit=poll_limit, wait_sec=self.agent_queue_wait_sec)
@@ -3241,7 +4257,7 @@ class DependencyAgent:
                         if self._stop.is_set():
                             break
                         try:
-                            self._process_agent_queue_item(item, agent_executor, agent_inflight)
+                            self._process_agent_queue_item(item)
                         except Exception as e:
                             item_id = item.get("itemId")
                             lease_id = item.get("leaseId")
@@ -3267,7 +4283,12 @@ class DependencyAgent:
                 _sleep_with_jitter(5.0)
 
         dep_executor.shutdown(wait=False, cancel_futures=True)
-        agent_executor.shutdown(wait=False, cancel_futures=True)
+        if self._agent_prefetch_executor is not None:
+            self._agent_prefetch_executor.shutdown(wait=False, cancel_futures=True)
+        if self._agent_execute_executor is not None:
+            self._agent_execute_executor.shutdown(wait=False, cancel_futures=True)
+        if self._agent_upload_executor is not None:
+            self._agent_upload_executor.shutdown(wait=False, cancel_futures=True)
         logging.info("Dependency agent stopped.")
 
 
