@@ -103,7 +103,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.7.4"
+AGENT_VERSION = "dm-agent-py/0.7.5"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
