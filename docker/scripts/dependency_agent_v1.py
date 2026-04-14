@@ -41,7 +41,8 @@ Optional knobs:
   - DM_HEARTBEAT_SECONDS    (default: 30)
   - MAX_PARALLEL_DOWNLOADS  (default: 1)
   - DM_STATE_PATH           (default: $WORKSPACE/dependency_agent_state.json)
-  - DM_ALLOWED_DOMAINS      (comma-separated allowlist; default: huggingface.co,hf.co,civitai.com)
+  - DM_ALLOWED_DOMAINS      (comma-separated allowlist for dependency/model downloads; default: huggingface.co,hf.co,civitai.com)
+  - DM_INPUT_ALLOWED_DOMAINS (optional comma-separated allowlist for job input/prefetch downloads; default: allow all)
   - DM_DOWNLOAD_TOOL             (default: wget; options: wget, python)
   - DM_DOWNLOAD_TIMEOUT_SECONDS (socket timeout for downloads; default: 300)
   - DM_DOWNLOAD_CHUNK_MIB        (download read chunk size in MiB; default: 1)
@@ -102,7 +103,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.7.2"
+AGENT_VERSION = "dm-agent-py/0.7.4"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -766,8 +767,12 @@ def http_download_to_file(
     headers: Optional[Dict[str, str]] = None,
     timeout_seconds: float = 60.0,
     chunk_size: int = 8 * 1024 * 1024,
+    user_agent: Optional[str] = None,
 ) -> None:
-    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    req_headers = dict(headers or {})
+    if user_agent and "User-Agent" not in req_headers and "user-agent" not in req_headers:
+        req_headers["User-Agent"] = user_agent
+    req = urllib.request.Request(url, headers=req_headers, method="GET")
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
         with dest_path.open("wb") as f:
@@ -932,6 +937,12 @@ class DependencyAgent:
 
         allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.com"]
         self.allowed_domains = {d.lower() for d in allowed if d}
+        input_allowed = (
+            _split_csv(_env_str("DM_INPUT_ALLOWED_DOMAINS"))
+            or _split_csv(_env_str("PREFETCH_ALLOWED_DOMAINS"))
+            or _split_csv(_env_str("INPUT_PREFETCH_ALLOWED_DOMAINS"))
+        )
+        self.input_allowed_domains = {d.lower() for d in input_allowed if d}
 
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -978,6 +989,23 @@ class DependencyAgent:
             raise SystemExit("Missing required env var: FCS_API_BASE_URL")
         if not self.server_type:
             raise SystemExit("Missing required env var: SERVER_TYPE")
+
+    def _download_allowed_domains_for_item(
+        self,
+        item: Dict[str, Any],
+        resolved: Dict[str, Any],
+    ) -> Optional[Set[str]]:
+        dep_id = item.get("depId")
+        if isinstance(dep_id, str) and dep_id.startswith("jobfile_"):
+            return self.input_allowed_domains or None
+
+        dest_rel = resolved.get("destRelativePath")
+        if isinstance(dest_rel, str):
+            normalized_dest = dest_rel.strip().lstrip("/").replace("\\", "/")
+            if normalized_dest.startswith("input/"):
+                return self.input_allowed_domains or None
+
+        return self.allowed_domains
 
     def stop(self) -> None:
         self._stop.set()
@@ -2961,6 +2989,7 @@ class DependencyAgent:
 
         auth = resolved.get("auth")
         auth_header = self._resolve_auth_header(auth if isinstance(auth, str) else None)
+        allowed_domains = self._download_allowed_domains_for_item(item, resolved)
 
         # Fast path: if the file already exists (e.g., legacy provisioning), treat as installed.
         if dest_abs.exists():
@@ -3045,7 +3074,7 @@ class DependencyAgent:
                     auth_header=auth_header,
                     expected_size_bytes=int(expected_size_bytes),
                     timeout_seconds=float(self.download_timeout_seconds),
-                    allowed_domains=self.allowed_domains,
+                    allowed_domains=allowed_domains,
                     debug=self.download_debug,
                 )
             elif self.download_tool == "python":
@@ -3056,7 +3085,7 @@ class DependencyAgent:
                     expected_size_bytes=int(expected_size_bytes),
                     timeout_seconds=float(self.download_timeout_seconds),
                     chunk_size=int(self.download_chunk_size),
-                    allowed_domains=self.allowed_domains,
+                    allowed_domains=allowed_domains,
                     verbose=self.verbose_progress,
                     debug=self.download_debug,
                 )
@@ -4286,7 +4315,11 @@ class DependencyAgent:
 
         logging.info("ComfyUI dir: %s", str(self.comfyui_dir))
         logging.info("State file: %s", str(self.state_path))
-        logging.info("Allowed download domains: %s", ",".join(sorted(self.allowed_domains)))
+        logging.info("Allowed dependency download domains: %s", ",".join(sorted(self.allowed_domains)))
+        if self.input_allowed_domains:
+            logging.info("Allowed input prefetch download domains: %s", ",".join(sorted(self.input_allowed_domains)))
+        else:
+            logging.info("Allowed input prefetch download domains: unrestricted")
         logging.info(
             "Download settings: tool=%s timeout=%.1fs chunkMiB=%d verbose=%s debug=%s",
             self.download_tool,
