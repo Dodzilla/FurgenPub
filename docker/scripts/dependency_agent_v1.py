@@ -60,7 +60,7 @@ Optional knobs:
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
   - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
   - DM_INPUT_CACHE_DIR            (persistent remote-input cache dir; default: $WORKSPACE/.dm_input_cache)
-  - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 10GiB)
+  - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 20GiB)
   - DM_AGENT_SELF_UPDATE_ENABLED  (allow backend-directed in-place script updates; default: true)
   - DM_AGENT_SELF_UPDATE_RETRY_SECONDS (retry delay after failed update attempts; default: 300)
 
@@ -102,7 +102,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.6.0"
+AGENT_VERSION = "dm-agent-py/0.7.0"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -924,7 +924,8 @@ class DependencyAgent:
         self._resolved_local_comfy_base_url = self.agent_local_comfy_base_url
         self._last_local_comfy_discovery_ms = 0
         self.input_cache_dir = Path(_env_str("DM_INPUT_CACHE_DIR") or str(self.workspace / ".dm_input_cache"))
-        self.input_cache_max_bytes = max(0, int(_parse_bytes(_env_str("DM_INPUT_CACHE_MAX_BYTES")) or 10 * 1024 * 1024 * 1024))
+        self.input_cache_max_bytes = max(0, int(_parse_bytes(_env_str("DM_INPUT_CACHE_MAX_BYTES")) or 20 * 1024 * 1024 * 1024))
+        self.input_cache_heartbeat_max_keys = max(0, min(1000, _env_int("DM_INPUT_CACHE_HEARTBEAT_MAX_KEYS", 200)))
         self.self_update_enabled = _env_bool("DM_AGENT_SELF_UPDATE_ENABLED", True)
         self.self_update_retry_seconds = max(30.0, _env_float("DM_AGENT_SELF_UPDATE_RETRY_SECONDS", 300.0))
         self.self_script_path = Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__))
@@ -2160,6 +2161,7 @@ class DependencyAgent:
         local_comfy = self._local_comfy_reachable()
         readiness_present = self._local_readiness_file_present()
         queue_depth = len(held_leases)
+        input_cache_inventory = self._collect_input_cache_inventory()
 
         body: Dict[str, Any] = {
             "schemaVersion": 1,
@@ -2172,6 +2174,11 @@ class DependencyAgent:
             "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
             "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
             "maxPrefetchJobs": int(self._agent_effective_prefetch_capacity()),
+            "inputCacheKeys": input_cache_inventory.get("keys", []),
+            "inputCacheKeyCount": int(input_cache_inventory.get("keyCount", 0)),
+            "inputCacheBytesUsed": int(input_cache_inventory.get("bytesUsed", 0)),
+            "inputCacheMaxBytes": int(input_cache_inventory.get("maxBytes", 0)),
+            "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
             "agentVersion": AGENT_VERSION,
             "capabilities": {
                 "dependencyChannel": True,
@@ -2392,12 +2399,63 @@ class DependencyAgent:
         return name
 
     def _input_cache_key(self, row: Dict[str, Any], name: str) -> str:
+        provided_cache_key = row.get("cacheKey")
+        if isinstance(provided_cache_key, str) and provided_cache_key.strip():
+            normalized = provided_cache_key.strip().lower()
+            if re.fullmatch(r"(?:url|sha256|key)_[0-9a-f]{64}", normalized):
+                return normalized
+            digest = _sha256_hex_bytes(_canonical_json_bytes({"cacheKey": provided_cache_key.strip(), "name": name}))
+            return f"key_{digest}"
         expected_sha = row.get("sha256")
         if isinstance(expected_sha, str) and expected_sha:
             return f"sha256_{expected_sha.strip().lower()}"
         stable_source = self._canonical_input_source(row, name)
         digest = _sha256_hex_bytes(_canonical_json_bytes({"source": stable_source, "name": name}))
         return f"url_{digest}"
+
+    def _extract_input_cache_key_from_path(self, path: Path) -> Optional[str]:
+        match = re.match(r"^((?:url|sha256|key)_[0-9a-f]{64})(?:_|$)", path.name.lower())
+        if not match:
+            return None
+        return match.group(1)
+
+    def _collect_input_cache_inventory(self) -> Dict[str, Any]:
+        cache_key_mtime: Dict[str, float] = {}
+        total_bytes = 0
+        for path in self._iter_input_cache_files():
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            total_bytes += int(stat.st_size)
+            cache_key = self._extract_input_cache_key_from_path(path)
+            if not cache_key:
+                continue
+            prev_mtime = cache_key_mtime.get(cache_key)
+            if prev_mtime is None or float(stat.st_mtime) > prev_mtime:
+                cache_key_mtime[cache_key] = float(stat.st_mtime)
+
+        ordered_keys = [
+            key for key, _mtime in sorted(
+                cache_key_mtime.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ]
+        max_keys = max(0, int(self.input_cache_heartbeat_max_keys))
+        if max_keys <= 0:
+            selected_keys: List[str] = []
+            truncated = len(ordered_keys) > 0
+        else:
+            selected_keys = ordered_keys[:max_keys]
+            truncated = len(ordered_keys) > len(selected_keys)
+
+        return {
+            "keys": selected_keys,
+            "keyCount": len(ordered_keys),
+            "bytesUsed": int(total_bytes),
+            "maxBytes": int(self.input_cache_max_bytes),
+            "inventoryTruncated": truncated,
+        }
 
     def _input_cache_path(self, cache_key: str, desired_name: str) -> Path:
         safe_name = os.path.basename(desired_name) or "input.bin"
@@ -2906,6 +2964,12 @@ class DependencyAgent:
 
         # Fast path: if the file already exists (e.g., legacy provisioning), treat as installed.
         if dest_abs.exists():
+            size_matches = True
+            if expected_size_bytes > 0:
+                try:
+                    size_matches = int(dest_abs.stat().st_size) == int(expected_size_bytes)
+                except Exception:
+                    size_matches = False
             if isinstance(sha256_expected, str) and sha256_expected:
                 actual_existing = sha256_file(dest_abs)
                 if actual_existing.lower() != sha256_expected.lower():
@@ -2914,6 +2978,14 @@ class DependencyAgent:
                         dep_id,
                         sha256_expected,
                         actual_existing,
+                        str(dest_abs),
+                    )
+                elif not size_matches:
+                    logging.warning(
+                        "Existing file size mismatch for %s; re-downloading. expected=%s got=%s path=%s",
+                        dep_id,
+                        int(expected_size_bytes),
+                        int(dest_abs.stat().st_size),
                         str(dest_abs),
                     )
                 else:
@@ -2933,20 +3005,29 @@ class DependencyAgent:
                         self._save_state()
                     return
             else:
-                with self._lock:
-                    if isinstance(kind, str) and kind.lower() == "dynamic":
-                        self._touch_dynamic_locked(dep_id, dest_rel)
-                    else:
-                        prev = self._state.lru.pop(dep_id, None) or {}
-                        prev_size = prev.get("sizeBytes") if isinstance(prev.get("sizeBytes"), int) else 0
-                        self._dynamic_bytes_used = max(0, int(self._dynamic_bytes_used) - int(prev_size))
-                        self._state.installed_dynamic.discard(dep_id)
-                        self._state.installed_static.add(dep_id)
-                    self._state.failed.discard(dep_id)
-                    self._state.retry.pop(dep_id, None)
-                    self._downloading.discard(dep_id)
-                    self._save_state()
-                return
+                if not size_matches:
+                    logging.warning(
+                        "Existing file size mismatch for %s; re-downloading. expected=%s got=%s path=%s",
+                        dep_id,
+                        int(expected_size_bytes),
+                        int(dest_abs.stat().st_size),
+                        str(dest_abs),
+                    )
+                else:
+                    with self._lock:
+                        if isinstance(kind, str) and kind.lower() == "dynamic":
+                            self._touch_dynamic_locked(dep_id, dest_rel)
+                        else:
+                            prev = self._state.lru.pop(dep_id, None) or {}
+                            prev_size = prev.get("sizeBytes") if isinstance(prev.get("sizeBytes"), int) else 0
+                            self._dynamic_bytes_used = max(0, int(self._dynamic_bytes_used) - int(prev_size))
+                            self._state.installed_dynamic.discard(dep_id)
+                            self._state.installed_static.add(dep_id)
+                        self._state.failed.discard(dep_id)
+                        self._state.retry.pop(dep_id, None)
+                        self._downloading.discard(dep_id)
+                        self._save_state()
+                    return
 
         did_evict = self._ensure_space_for_download(expected_size_bytes, dep_id)
         if did_evict and _now_ms() - int(self._last_heartbeat_ms) >= 2000:
