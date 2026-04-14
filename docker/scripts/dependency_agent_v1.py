@@ -4542,6 +4542,13 @@ class DependencyAgent:
                 ):
                     with self._lock:
                         active_execute_count, active_prefetch_count, active_upload_count = self._agent_stage_counts_locked()
+                        has_ready_items = any(
+                            (
+                                (lease := self._active_exec_by_item.get(item_id)) is not None and
+                                lease.stage == "ready"
+                            )
+                            for item_id in self._ready_agent_item_ids
+                        )
                     execute_capacity = self._agent_effective_execute_capacity()
                     prefetch_capacity = self._agent_effective_prefetch_capacity()
                     execute_and_prefetch_budget = max(
@@ -4551,8 +4558,19 @@ class DependencyAgent:
                     )
                     poll_limit = max(1, min(20, execute_and_prefetch_budget + 2))
 
+                    queue_wait_sec = self.agent_queue_wait_sec
+                    if (
+                        has_ready_items
+                        or active_execute_count > 0
+                        or active_prefetch_count > 0
+                        or active_upload_count > 0
+                    ):
+                        # Once an instance is hot, keep queue fetches non-blocking so the
+                        # main loop can react immediately when execution capacity opens up.
+                        queue_wait_sec = 0
+
                     try:
-                        agent_items = self._agent_fetch_queue(limit=poll_limit, wait_sec=self.agent_queue_wait_sec)
+                        agent_items = self._agent_fetch_queue(limit=poll_limit, wait_sec=queue_wait_sec)
                     except ApiError as e:
                         if e.status in (401, 403):
                             logging.warning("Agent queue unauthorized (status=%d); forcing agent re-register.", e.status)
