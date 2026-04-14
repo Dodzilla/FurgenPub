@@ -102,7 +102,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.7.1"
+AGENT_VERSION = "dm-agent-py/0.7.2"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -4419,8 +4419,10 @@ class DependencyAgent:
                 pending_self_update = self._pending_self_update is not None
 
                 if pending_self_update and not active_leases and len(dep_inflight) == 0 and downloading_count == 0:
+                    # A failed or backoff-delayed self-update must not stall queue intake.
+                    # Keep the process working unless _perform_pending_self_update() actually
+                    # execs into the new script.
                     self._perform_pending_self_update()
-                    continue
 
                 # A pending self-update must not drain the instance or pause queue intake.
                 # Otherwise a failed or deferred update can leave the process heartbeating
