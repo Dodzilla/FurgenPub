@@ -102,7 +102,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.7.0"
+AGENT_VERSION = "dm-agent-py/0.7.1"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -4416,19 +4416,17 @@ class DependencyAgent:
                 with self._lock:
                     active_leases = list(self._active_exec_by_item.values())
                     downloading_count = len(self._downloading)
-                active_job_ids = {lease.job_id for lease in active_leases if lease.job_id}
                 pending_self_update = self._pending_self_update is not None
-                needs_dep_queue_for_active_work = any(
-                    lease.stage in ("leased", "prefetching", "ready", "waiting_dependencies")
-                    for lease in active_leases
-                )
 
                 if pending_self_update and not active_leases and len(dep_inflight) == 0 and downloading_count == 0:
                     self._perform_pending_self_update()
                     continue
 
-                # Dependency queue polling/dispatch.
-                if now >= next_dep_poll_at_ms and (not pending_self_update or needs_dep_queue_for_active_work):
+                # A pending self-update must not drain the instance or pause queue intake.
+                # Otherwise a failed or deferred update can leave the process heartbeating
+                # but refusing both dependency work and agent jobs indefinitely.
+                # Only perform the restart when the process is actually idle.
+                if now >= next_dep_poll_at_ms:
                     try:
                         items = self._fetch_queue(limit=25)
                     except ApiError as e:
@@ -4441,12 +4439,6 @@ class DependencyAgent:
                             items = []
                         else:
                             raise
-
-                    if pending_self_update and active_job_ids:
-                        items = [
-                            item for item in items
-                            if isinstance(item.get("requestedByJobId"), str) and item.get("requestedByJobId") in active_job_ids
-                        ]
 
                     queue_depth = len(items)
                     queued_dep_ids: Set[str] = set()
@@ -4511,7 +4503,6 @@ class DependencyAgent:
                     self.agent_control_enabled
                     and self._agent_channel_supported
                     and self._agent_access_token
-                    and not pending_self_update
                     and now >= next_agent_poll_at_ms
                 ):
                     with self._lock:
