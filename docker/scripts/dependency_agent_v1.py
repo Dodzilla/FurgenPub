@@ -64,6 +64,7 @@ Optional knobs:
   - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 20GiB)
   - DM_AGENT_SELF_UPDATE_ENABLED  (allow backend-directed in-place script updates; default: true)
   - DM_AGENT_SELF_UPDATE_RETRY_SECONDS (retry delay after failed update attempts; default: 300)
+  - DM_EXISTING_FILE_STABLE_SECONDS (minimum age before existing files without size/hash metadata are trusted; default: 120)
 
 Queue item expectations:
   - The backend should include a `resolved` object for download items with:
@@ -103,7 +104,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.7.5"
+AGENT_VERSION = "dm-agent-py/0.7.7"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -139,6 +140,9 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if v is None:
         return default
     return v.lower() in ("1", "true", "yes", "y", "on")
+
+
+EXISTING_FILE_STABLE_SECONDS = max(0, _env_int("DM_EXISTING_FILE_STABLE_SECONDS", 120))
 
 
 def _parse_bytes(v: Optional[str]) -> Optional[int]:
@@ -292,6 +296,39 @@ def api_json(
         payload = json.dumps(body).encode("utf-8")
         req_headers["Content-Type"] = "application/json"
 
+    req = urllib.request.Request(url, data=payload, method=method.upper(), headers=req_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            if not raw:
+                return resp.status, None
+            parsed = _json_loads_or_none(raw)
+            return resp.status, parsed if parsed is not None else raw
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        raise ApiError(int(getattr(e, "code", 500) or 500), raw) from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error calling {url}: {e}") from None
+
+
+def api_form_json(
+    method: str,
+    url: str,
+    body: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+    timeout_seconds: float = 30.0,
+) -> Tuple[int, Optional[Any]]:
+    req_headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    if headers:
+        req_headers.update(headers)
+    payload = urllib.parse.urlencode({k: str(v) for k, v in body.items()}).encode("utf-8")
     req = urllib.request.Request(url, data=payload, method=method.upper(), headers=req_headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
@@ -953,6 +990,7 @@ class DependencyAgent:
         self._state: LocalState = self._load_state()
         self._dynamic_bytes_used = 0
         self._last_heartbeat_ms = 0
+        self._last_dependency_queue_depth = 0
 
         self._agent_access_token: Optional[str] = None
         self._agent_access_token_expires_at_ms = 0
@@ -967,6 +1005,8 @@ class DependencyAgent:
         self._ready_agent_item_ids: deque[str] = deque()
         self._agent_lease_order = 0
         self._input_cache_downloading: Set[str] = set()
+        self._loop_wakeup = threading.Event()
+        self._dependency_poll_wakeup = threading.Event()
         self._agent_poll_wakeup = threading.Event()
         self._agent_prefetch_executor: Optional[ThreadPoolExecutor] = None
         self._agent_execute_executor: Optional[ThreadPoolExecutor] = None
@@ -977,6 +1017,14 @@ class DependencyAgent:
         self._pending_self_update: Optional[AgentSelfUpdateRelease] = None
         self._pending_self_update_source = ""
         self._self_update_retry_at_ms = 0
+        self._coordination: Optional[Dict[str, Any]] = None
+        self._coordination_id_token: Optional[str] = None
+        self._coordination_refresh_token: Optional[str] = None
+        self._coordination_id_token_expires_at_ms = 0
+        self._coordination_stream_thread: Optional[threading.Thread] = None
+        self._coordination_stream_stop = threading.Event()
+        self._coordination_stream_healthy = False
+        self._coordination_http_checkpoint_due_ms = 0
 
         # Best-effort local reconciliation (no API calls).
         with self._lock:
@@ -1009,6 +1057,10 @@ class DependencyAgent:
 
     def stop(self) -> None:
         self._stop.set()
+        self._coordination_stream_stop.set()
+        self._dependency_poll_wakeup.set()
+        self._agent_poll_wakeup.set()
+        self._loop_wakeup.set()
 
     # Include shared secret by default to avoid token races causing 401 loops
     # (token is still used when present; backend accepts either).
@@ -1097,6 +1149,536 @@ class DependencyAgent:
             return True
         # Refresh at least two minutes before expiry.
         return self._server_now_ms() >= (int(self._agent_access_token_expires_at_ms) - 120_000)
+
+    def _normalize_coordination_path(self, value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        out = value.strip()
+        if not out:
+            return None
+        if not out.startswith("/"):
+            out = "/" + out
+        if len(out) > 1:
+            out = out.rstrip("/")
+        return out
+
+    def _normalize_coordination_payload(self, raw: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict) or raw.get("enabled") is not True:
+            return None
+        mode = raw.get("mode")
+        database_url = raw.get("databaseUrl")
+        api_key = raw.get("apiKey")
+        auth = raw.get("auth") if isinstance(raw.get("auth"), dict) else {}
+        custom_token = auth.get("customToken")
+        paths = raw.get("paths") if isinstance(raw.get("paths"), dict) else {}
+        signals = paths.get("signals") if isinstance(paths.get("signals"), dict) else {}
+        runtime = paths.get("runtime") if isinstance(paths.get("runtime"), dict) else {}
+        instance_root = self._normalize_coordination_path(paths.get("instanceRoot"))
+        signals_root = self._normalize_coordination_path(signals.get("root"))
+        agent_signal = self._normalize_coordination_path(signals.get("agentQueue"))
+        dependency_signal = self._normalize_coordination_path(signals.get("dependencyQueue"))
+        runtime_root = self._normalize_coordination_path(runtime.get("root"))
+        agent_runtime = self._normalize_coordination_path(runtime.get("agentControl"))
+        dependency_runtime = self._normalize_coordination_path(runtime.get("dependencyManager"))
+        if mode != "rtdb_v1":
+            return None
+        if not isinstance(database_url, str) or not database_url.strip():
+            return None
+        if not isinstance(api_key, str) or not api_key.strip():
+            return None
+        if not isinstance(custom_token, str) or not custom_token.strip():
+            return None
+        if not all((instance_root, signals_root, agent_signal, dependency_signal, runtime_root, agent_runtime, dependency_runtime)):
+            return None
+
+        safety = raw.get("safetyPollSeconds") if isinstance(raw.get("safetyPollSeconds"), dict) else {}
+        agent_safety = safety.get("agent")
+        dep_safety = safety.get("dependencies")
+        checkpoint = raw.get("firestoreCheckpointSeconds")
+        try:
+            agent_safety_sec = max(1.0, float(agent_safety if isinstance(agent_safety, (int, float)) else 15.0))
+        except Exception:
+            agent_safety_sec = 15.0
+        try:
+            dep_safety_sec = max(1.0, float(dep_safety if isinstance(dep_safety, (int, float)) else 30.0))
+        except Exception:
+            dep_safety_sec = 30.0
+        try:
+            checkpoint_sec = max(5.0, float(checkpoint if isinstance(checkpoint, (int, float)) else 60.0))
+        except Exception:
+            checkpoint_sec = 60.0
+
+        normalized = {
+            "enabled": True,
+            "mode": "rtdb_v1",
+            "databaseUrl": database_url.strip(),
+            "apiKey": api_key.strip(),
+            "customToken": custom_token.strip(),
+            "paths": {
+                "instanceRoot": instance_root,
+                "signalsRoot": signals_root,
+                "agentQueueSignal": agent_signal,
+                "dependencyQueueSignal": dependency_signal,
+                "runtimeRoot": runtime_root,
+                "agentControlRuntime": agent_runtime,
+                "dependencyManagerRuntime": dependency_runtime,
+            },
+            "safetyPollSeconds": {
+                "agent": agent_safety_sec,
+                "dependencies": dep_safety_sec,
+            },
+            "firestoreCheckpointSeconds": checkpoint_sec,
+            "legacyHttpFallback": raw.get("legacyHttpFallback") is not False,
+        }
+        normalized["configKey"] = json.dumps(
+            {
+                "databaseUrl": normalized["databaseUrl"],
+                "paths": normalized["paths"],
+                "safetyPollSeconds": normalized["safetyPollSeconds"],
+                "firestoreCheckpointSeconds": normalized["firestoreCheckpointSeconds"],
+            },
+            sort_keys=True,
+        )
+        return normalized
+
+    def _coordination_identity_toolkit_url(self, api_key: str) -> str:
+        auth_emulator = _env_str("FIREBASE_AUTH_EMULATOR_HOST")
+        if auth_emulator:
+            return f"http://{auth_emulator}/identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={urllib.parse.quote(api_key)}"
+        return f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={urllib.parse.quote(api_key)}"
+
+    def _coordination_secure_token_url(self, api_key: str) -> str:
+        auth_emulator = _env_str("FIREBASE_AUTH_EMULATOR_HOST")
+        if auth_emulator:
+            return f"http://{auth_emulator}/securetoken.googleapis.com/v1/token?key={urllib.parse.quote(api_key)}"
+        return f"https://securetoken.googleapis.com/v1/token?key={urllib.parse.quote(api_key)}"
+
+    def _coordination_token_needs_refresh(self) -> bool:
+        if not self._coordination_id_token:
+            return True
+        if self._coordination_id_token_expires_at_ms <= 0:
+            return True
+        return _now_ms() >= (int(self._coordination_id_token_expires_at_ms) - 60_000)
+
+    def _refresh_coordination_id_token(self) -> str:
+        coord = self._coordination
+        if not coord:
+            raise RuntimeError("RTDB coordination is not configured")
+
+        refresh_token = self._coordination_refresh_token
+        api_key = coord.get("apiKey")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise RuntimeError("RTDB coordination refresh token is unavailable")
+        if not isinstance(api_key, str) or not api_key:
+            raise RuntimeError("RTDB coordination API key is unavailable")
+
+        status, resp = api_form_json(
+            "POST",
+            self._coordination_secure_token_url(api_key),
+            body={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            timeout_seconds=30.0,
+        )
+        if status != 200 or not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected RTDB token refresh response: {status} {resp}")
+
+        id_token = resp.get("id_token")
+        next_refresh_token = resp.get("refresh_token")
+        expires_in = resp.get("expires_in")
+        if not isinstance(id_token, str) or not id_token:
+            raise RuntimeError(f"RTDB token refresh missing id_token: {resp}")
+        try:
+            expires_in_sec = max(60, int(expires_in if isinstance(expires_in, (int, float, str)) else 3600))
+        except Exception:
+            expires_in_sec = 3600
+
+        self._coordination_id_token = id_token
+        if isinstance(next_refresh_token, str) and next_refresh_token:
+            self._coordination_refresh_token = next_refresh_token
+        self._coordination_id_token_expires_at_ms = _now_ms() + (expires_in_sec * 1000)
+        return id_token
+
+    def _exchange_coordination_custom_token(self) -> str:
+        coord = self._coordination
+        if not coord:
+            raise RuntimeError("RTDB coordination is not configured")
+
+        api_key = coord.get("apiKey")
+        custom_token = coord.get("customToken")
+        if not isinstance(api_key, str) or not api_key:
+            raise RuntimeError("RTDB coordination API key is unavailable")
+        if not isinstance(custom_token, str) or not custom_token:
+            raise RuntimeError("RTDB coordination custom token is unavailable")
+
+        status, resp = api_json(
+            "POST",
+            self._coordination_identity_toolkit_url(api_key),
+            body={
+                "token": custom_token,
+                "returnSecureToken": True,
+            },
+            timeout_seconds=30.0,
+        )
+        if status != 200 or not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected RTDB custom-token exchange response: {status} {resp}")
+
+        id_token = resp.get("idToken")
+        refresh_token = resp.get("refreshToken")
+        expires_in = resp.get("expiresIn")
+        if not isinstance(id_token, str) or not id_token:
+            raise RuntimeError(f"RTDB custom-token exchange missing idToken: {resp}")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise RuntimeError(f"RTDB custom-token exchange missing refreshToken: {resp}")
+        try:
+            expires_in_sec = max(60, int(expires_in if isinstance(expires_in, (int, float, str)) else 3600))
+        except Exception:
+            expires_in_sec = 3600
+
+        self._coordination_id_token = id_token
+        self._coordination_refresh_token = refresh_token
+        self._coordination_id_token_expires_at_ms = _now_ms() + (expires_in_sec * 1000)
+        return id_token
+
+    def _ensure_coordination_id_token(self, force_refresh: bool = False) -> str:
+        if force_refresh:
+            self._coordination_id_token = None
+            self._coordination_id_token_expires_at_ms = 0
+
+        if not self._coordination_token_needs_refresh():
+            if not self._coordination_id_token:
+                raise RuntimeError("RTDB coordination ID token is unexpectedly empty")
+            return self._coordination_id_token
+
+        try:
+            return self._refresh_coordination_id_token()
+        except Exception:
+            return self._exchange_coordination_custom_token()
+
+    def _coordination_rtdb_url(self, node_path: str, id_token: Optional[str] = None) -> str:
+        coord = self._coordination
+        if not coord:
+            raise RuntimeError("RTDB coordination is not configured")
+        database_url = coord.get("databaseUrl")
+        if not isinstance(database_url, str) or not database_url:
+            raise RuntimeError("RTDB coordination database URL is unavailable")
+
+        parsed = urllib.parse.urlparse(database_url)
+        base_path = parsed.path.rstrip("/")
+        clean_node = self._normalize_coordination_path(node_path) or "/"
+        target_path = f"{base_path}{clean_node}.json"
+        query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if id_token:
+            query_items.append(("auth", id_token))
+        return urllib.parse.urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                target_path,
+                "",
+                urllib.parse.urlencode(query_items),
+                "",
+            )
+        )
+
+    def _coordination_set_stream_health(self, healthy: bool) -> None:
+        was_healthy = bool(self._coordination_stream_healthy)
+        self._coordination_stream_healthy = bool(healthy)
+        if was_healthy and not healthy:
+            self._request_agent_queue_poll()
+            self._request_dependency_queue_poll()
+
+    def _coordination_restart_stream(self) -> None:
+        old_thread = self._coordination_stream_thread
+        old_stop = self._coordination_stream_stop
+        old_stop.set()
+        self._coordination_set_stream_health(False)
+        if old_thread and old_thread.is_alive():
+            old_thread.join(timeout=2.0)
+
+        if not self._coordination or self._stop.is_set():
+            self._coordination_stream_thread = None
+            return
+
+        self._coordination_stream_stop = threading.Event()
+        thread = threading.Thread(
+            target=self._coordination_stream_loop,
+            name="dm-rtdb-coordination",
+            daemon=True,
+        )
+        self._coordination_stream_thread = thread
+        thread.start()
+
+    def _clear_coordination(self, source: str) -> None:
+        had_coordination = bool(self._coordination)
+        had_stream_healthy = bool(self._coordination_stream_healthy)
+        if had_coordination:
+            logging.info("RTDB coordination disabled from %s; reverting to legacy polling.", source)
+        self._coordination = None
+        self._coordination_id_token = None
+        self._coordination_refresh_token = None
+        self._coordination_id_token_expires_at_ms = 0
+        self._coordination_http_checkpoint_due_ms = 0
+        self._coordination_restart_stream()
+        if had_coordination and not had_stream_healthy:
+            self._request_agent_queue_poll()
+            self._request_dependency_queue_poll()
+
+    def _set_coordination_from_response(self, response: Any, source: str) -> None:
+        raw = response.get("coordination") if isinstance(response, dict) else None
+        normalized = self._normalize_coordination_payload(raw)
+        if normalized is None:
+            self._clear_coordination(source)
+            return
+
+        current_key = self._coordination.get("configKey") if isinstance(self._coordination, dict) else None
+        if current_key == normalized.get("configKey"):
+            self._coordination = normalized
+            return
+
+        self._coordination = normalized
+        self._coordination_id_token = None
+        self._coordination_refresh_token = None
+        self._coordination_id_token_expires_at_ms = 0
+        self._coordination_http_checkpoint_due_ms = 0
+        logging.info(
+            "RTDB coordination enabled from %s: db=%s dependencySafetyPoll=%.1fs agentSafetyPoll=%.1fs checkpoint=%.0fs",
+            source,
+            _safe_url_for_logs(str(normalized.get("databaseUrl") or "")),
+            float(normalized["safetyPollSeconds"]["dependencies"]),
+            float(normalized["safetyPollSeconds"]["agent"]),
+            float(normalized["firestoreCheckpointSeconds"]),
+        )
+        self._coordination_restart_stream()
+
+    def _coordination_should_use_safety_polls(self) -> bool:
+        return bool(self._coordination and self._coordination_stream_healthy)
+
+    def _coordination_dependency_poll_seconds(self) -> float:
+        if self._coordination_should_use_safety_polls():
+            return float(self._coordination["safetyPollSeconds"]["dependencies"])
+        return float(self.poll_seconds)
+
+    def _coordination_agent_poll_seconds(self) -> float:
+        if self._coordination_should_use_safety_polls():
+            return float(self._coordination["safetyPollSeconds"]["agent"])
+        return float(self.agent_poll_seconds)
+
+    def _coordination_http_checkpoint_due(self, now_ms: Optional[int] = None) -> bool:
+        if not self._coordination:
+            return True
+        if self._coordination.get("legacyHttpFallback") is not True:
+            return False
+        at_ms = int(now_ms if isinstance(now_ms, int) else _now_ms())
+        return at_ms >= int(self._coordination_http_checkpoint_due_ms)
+
+    def _coordination_note_http_checkpoint(self, now_ms: Optional[int] = None) -> None:
+        at_ms = int(now_ms if isinstance(now_ms, int) else _now_ms())
+        if not self._coordination:
+            self._coordination_http_checkpoint_due_ms = at_ms
+            return
+        interval_sec = float(self._coordination.get("firestoreCheckpointSeconds") or 60.0)
+        self._coordination_http_checkpoint_due_ms = at_ms + int(max(5.0, interval_sec) * 1000)
+
+    def _coordination_patch_runtime(self, patch: Dict[str, Any], timeout_seconds: float = 15.0) -> bool:
+        if not self._coordination:
+            return False
+
+        def _attempt(id_token: str) -> bool:
+            url = self._coordination_rtdb_url(self._coordination["paths"]["runtimeRoot"], id_token=id_token)
+            status, resp = api_json("PATCH", url, body=patch, timeout_seconds=timeout_seconds)
+            if status not in (200, 204):
+                raise RuntimeError(f"Unexpected RTDB runtime patch response: {status} {resp}")
+            return True
+
+        try:
+            return _attempt(self._ensure_coordination_id_token())
+        except ApiError as e:
+            if e.status not in (401, 403):
+                logging.warning("RTDB runtime patch API error: %s", e)
+                return False
+        except Exception as e:
+            logging.warning("RTDB runtime patch failed: %s", e)
+            return False
+
+        try:
+            return _attempt(self._ensure_coordination_id_token(force_refresh=True))
+        except Exception as e:
+            logging.warning("RTDB runtime patch retry failed: %s", e)
+            return False
+
+    def _collect_dependency_runtime_payload(self, queue_depth: Optional[int] = None) -> Dict[str, Any]:
+        with self._lock:
+            self._reconcile_lru_locked()
+            installed_static = sorted(self._state.installed_static)
+            installed_dynamic = sorted(self._state.installed_dynamic)
+            failed = sorted(self._state.failed)
+            downloading = sorted(self._downloading)
+            dynamic_bytes_used = int(self._dynamic_bytes_used)
+            if isinstance(queue_depth, int):
+                self._last_dependency_queue_depth = max(0, int(queue_depth))
+            queue_depth_value = int(self._last_dependency_queue_depth)
+
+        now_ms = _now_ms()
+        stats = disk_stats(self.comfyui_dir)
+        return {
+            "dependencyManager": {
+                "installedDepIdsStatic": installed_static,
+                "installedDepIdsDynamic": installed_dynamic,
+                "downloadingDepIds": downloading,
+                "failedDepIds": failed,
+                "inventoryTruncated": False,
+                "queueDepth": queue_depth_value,
+                "dynamicBytesUsed": dynamic_bytes_used,
+                "disk": {
+                    "totalBytes": int(stats.get("totalBytes", 0)),
+                    "freeBytes": int(stats.get("freeBytes", 0)),
+                    "usedBytes": int(stats.get("usedBytes", 0)),
+                    "measuredAtMs": now_ms,
+                },
+                "lastHeartbeatAtMs": now_ms,
+            },
+            "updatedAtMs": now_ms,
+        }
+
+    def _write_dependency_runtime_mirror(self, queue_depth: Optional[int] = None) -> bool:
+        return self._coordination_patch_runtime(self._collect_dependency_runtime_payload(queue_depth=queue_depth))
+
+    def _collect_agent_runtime_payload(self) -> Dict[str, Any]:
+        held_leases = self._collect_active_leases()
+        local_comfy = self._local_comfy_reachable()
+        readiness_present = self._local_readiness_file_present()
+        input_cache_inventory = self._collect_input_cache_inventory()
+        now_ms = _now_ms()
+        return {
+            "agentControl": {
+                "lastHeartbeatAtMs": now_ms,
+                "localComfyReachable": bool(local_comfy),
+                "localReadinessFilePresent": bool(readiness_present),
+                "localReadinessFile": self.agent_local_readiness_file,
+                "queueDepth": int(len(held_leases)),
+                "heldLeases": held_leases,
+                "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
+                "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
+                "maxPrefetchJobs": int(self._agent_effective_prefetch_capacity()),
+                "inputCacheKeys": input_cache_inventory.get("keys", []),
+                "inputCacheKeyCount": int(input_cache_inventory.get("keyCount", 0)),
+                "inputCacheBytesUsed": int(input_cache_inventory.get("bytesUsed", 0)),
+                "inputCacheMaxBytes": int(input_cache_inventory.get("maxBytes", 0)),
+                "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
+                "agentVersion": AGENT_VERSION,
+                "capabilities": {
+                    "dependencyChannel": True,
+                    "agentPullExecution": True,
+                },
+            },
+            "updatedAtMs": now_ms,
+        }
+
+    def _write_agent_runtime_mirror(self) -> bool:
+        return self._coordination_patch_runtime(self._collect_agent_runtime_payload(), timeout_seconds=10.0)
+
+    def _coordination_handle_stream_event(self, event_name: str, raw_data: str) -> None:
+        event = (event_name or "").strip().lower()
+        if not event or event in ("keep-alive", "keepalive"):
+            return
+        if event in ("cancel", "auth_revoked"):
+            raise RuntimeError(f"RTDB signal stream closed by server event={event}")
+        if event not in ("put", "patch"):
+            return
+        payload = _json_loads_or_none(raw_data)
+        if not isinstance(payload, dict):
+            return
+        path = payload.get("path")
+        if not isinstance(path, str):
+            path = "/"
+        if path == "/" or path.startswith("/agentQueue"):
+            self._request_agent_queue_poll()
+        if path == "/" or path.startswith("/dependencyQueue"):
+            self._request_dependency_queue_poll()
+
+    def _coordination_stream_loop(self) -> None:
+        backoff_seconds = 1.0
+        while not self._stop.is_set() and not self._coordination_stream_stop.is_set():
+            conn: Optional[Any] = None
+            try:
+                if not self._coordination:
+                    return
+                id_token = self._ensure_coordination_id_token()
+                url = self._coordination_rtdb_url(self._coordination["paths"]["signalsRoot"], id_token=id_token)
+                parsed = urllib.parse.urlparse(url)
+                path_with_query = parsed.path or "/"
+                if parsed.query:
+                    path_with_query = f"{path_with_query}?{parsed.query}"
+                if parsed.scheme == "https":
+                    conn = http.client.HTTPSConnection(parsed.hostname or "", parsed.port or 443, timeout=90.0)
+                else:
+                    conn = http.client.HTTPConnection(parsed.hostname or "", parsed.port or 80, timeout=90.0)
+                conn.putrequest("GET", path_with_query)
+                conn.putheader("Accept", "text/event-stream")
+                conn.putheader("Cache-Control", "no-cache")
+                conn.endheaders()
+                resp = conn.getresponse()
+                if int(resp.status) not in (200, 204):
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    if int(resp.status) in (401, 403):
+                        raise ApiError(int(resp.status), raw)
+                    raise RuntimeError(f"Unexpected RTDB stream response: {resp.status} {raw}")
+
+                logging.info("RTDB coordination signal stream connected: %s", _safe_url_for_logs(url))
+                self._coordination_set_stream_health(True)
+                self._request_agent_queue_poll()
+                self._request_dependency_queue_poll()
+                backoff_seconds = 1.0
+
+                current_event = ""
+                data_lines: List[str] = []
+                while not self._stop.is_set() and not self._coordination_stream_stop.is_set():
+                    raw_line = resp.fp.readline()
+                    if not raw_line:
+                        raise RuntimeError("RTDB signal stream ended")
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line:
+                        if data_lines:
+                            self._coordination_handle_stream_event(current_event, "\n".join(data_lines))
+                        current_event = ""
+                        data_lines = []
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if line.startswith("event:"):
+                        current_event = line[6:].strip()
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                return
+            except ApiError as e:
+                if e.status in (401, 403):
+                    self._coordination_id_token = None
+                    self._coordination_id_token_expires_at_ms = 0
+                    logging.warning("RTDB coordination signal stream unauthorized; refreshing token.")
+                else:
+                    logging.warning("RTDB coordination signal stream API error: %s", e)
+            except Exception as e:
+                if not self._stop.is_set() and not self._coordination_stream_stop.is_set():
+                    logging.warning("RTDB coordination signal stream failed: %s", e)
+            finally:
+                self._coordination_set_stream_health(False)
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            if self._stop.is_set() or self._coordination_stream_stop.is_set():
+                return
+            _sleep_with_jitter(backoff_seconds, jitter_ratio=0.1)
+            backoff_seconds = min(30.0, backoff_seconds * 1.5)
+
+    def _request_dependency_queue_poll(self) -> None:
+        self._dependency_poll_wakeup.set()
+        self._loop_wakeup.set()
 
     def _local_readiness_file_path(self) -> Path:
         candidate = Path(self.agent_local_readiness_file)
@@ -1859,6 +2441,7 @@ class DependencyAgent:
                 self.agent_local_readiness_file,
             )
 
+        self._set_coordination_from_response(resp, "dependencies/register")
         self._maybe_queue_self_update(resp.get("agentUpdate"), "dependencies/register")
         self._resolved_instance_id = instance_id
         self._token = agent_token
@@ -1886,6 +2469,14 @@ class DependencyAgent:
     def _heartbeat(self, queue_depth: Optional[int] = None) -> None:
         if not self._resolved_instance_id:
             return
+        now_ms = _now_ms()
+        rtdb_ok = True
+        if self._coordination:
+            rtdb_ok = self._write_dependency_runtime_mirror(queue_depth=queue_depth)
+        if self._coordination and rtdb_ok and not self._coordination_http_checkpoint_due(now_ms):
+            self._last_heartbeat_ms = now_ms
+            return
+
         url = f"{self.api_base_url}/dependencies/heartbeat"
         with self._lock:
             self._reconcile_lru_locked()
@@ -1911,7 +2502,8 @@ class DependencyAgent:
         if status != 200 or not isinstance(resp, dict):
             raise RuntimeError(f"Unexpected heartbeat response: {status} {resp}")
         self._maybe_queue_self_update(resp.get("agentUpdate"), "dependencies/heartbeat")
-        self._last_heartbeat_ms = _now_ms()
+        self._coordination_note_http_checkpoint(now_ms)
+        self._last_heartbeat_ms = now_ms
 
     def _fetch_queue(self, limit: int = 20) -> List[Dict[str, Any]]:
         if not self._resolved_instance_id:
@@ -1923,11 +2515,13 @@ class DependencyAgent:
             raise RuntimeError(f"Unexpected queue response: {status} {resp}")
         items = resp.get("items", [])
         if not isinstance(items, list):
+            self._last_dependency_queue_depth = 0
             return []
         out: List[Dict[str, Any]] = []
         for it in items:
             if isinstance(it, dict):
                 out.append(it)
+        self._last_dependency_queue_depth = len(out)
         return out
 
     def _agent_effective_execute_capacity(self) -> int:
@@ -1989,6 +2583,7 @@ class DependencyAgent:
         self._agent_access_token_expires_at_ms = int(token_exp_ms)
         self._agent_bootstrap_profile = profile
         self._agent_channel_supported = True
+        self._set_coordination_from_response(data, "/agent/register")
         self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/register")
         logging.info(
             "Registered agent control channel: instanceId=%s maxConcurrentExecuteJobs=%d maxPrefetchJobs=%d tokenExpiresAt=%s",
@@ -2213,6 +2808,8 @@ class DependencyAgent:
                 "agentPullExecution": True,
             },
         }
+        if self._coordination:
+            self._write_agent_runtime_mirror()
         resp = self._agent_api("POST", "/agent/heartbeat", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/heartbeat")
@@ -2253,6 +2850,7 @@ class DependencyAgent:
 
     def _request_agent_queue_poll(self) -> None:
         self._agent_poll_wakeup.set()
+        self._loop_wakeup.set()
 
     def _agent_stage_counts_locked(self) -> Tuple[int, int, int]:
         execute_count = 0
@@ -2916,6 +3514,8 @@ class DependencyAgent:
         delay = min(cap, base * (2 ** max(0, int(attempts) - 1)))
 
         le = (last_error or "").lower()
+        if "existing file appears in progress" in le:
+            return 15.0
         if "429" in le or "too many requests" in le:
             delay = max(delay, 5.0 * 60.0)
         if "timed out" in le or "timeout" in le:
@@ -2994,9 +3594,18 @@ class DependencyAgent:
         # Fast path: if the file already exists (e.g., legacy provisioning), treat as installed.
         if dest_abs.exists():
             size_matches = True
+            existing_stat: Optional[os.stat_result] = None
+            modified_age_seconds: Optional[float] = None
+            try:
+                existing_stat = dest_abs.stat()
+                modified_age_seconds = max(0.0, time.time() - float(existing_stat.st_mtime))
+            except Exception:
+                existing_stat = None
+                modified_age_seconds = None
             if expected_size_bytes > 0:
                 try:
-                    size_matches = int(dest_abs.stat().st_size) == int(expected_size_bytes)
+                    stat_ref = existing_stat if existing_stat is not None else dest_abs.stat()
+                    size_matches = int(stat_ref.st_size) == int(expected_size_bytes)
                 except Exception:
                     size_matches = False
             if isinstance(sha256_expected, str) and sha256_expected:
@@ -3034,6 +3643,14 @@ class DependencyAgent:
                         self._save_state()
                     return
             else:
+                if (
+                    modified_age_seconds is not None
+                    and modified_age_seconds < float(EXISTING_FILE_STABLE_SECONDS)
+                ):
+                    raise RuntimeError(
+                        "Existing file appears in progress for "
+                        f"{dep_id}; modified {modified_age_seconds:.1f}s ago."
+                    )
                 if not size_matches:
                     logging.warning(
                         "Existing file size mismatch for %s; re-downloading. expected=%s got=%s path=%s",
@@ -4377,6 +4994,9 @@ class DependencyAgent:
         while not self._stop.is_set():
             try:
                 now = _now_ms()
+                if self._dependency_poll_wakeup.is_set():
+                    self._dependency_poll_wakeup.clear()
+                    next_dep_poll_at_ms = 0
                 if self._agent_poll_wakeup.is_set():
                     self._agent_poll_wakeup.clear()
                     next_agent_poll_at_ms = 0
@@ -4531,7 +5151,7 @@ class DependencyAgent:
                             break
                         dep_inflight.add(dep_executor.submit(self._process_item, item))
 
-                    next_dep_poll_at_ms = now + int(max(0.2, float(self.poll_seconds)) * 1000)
+                    next_dep_poll_at_ms = now + int(max(0.2, float(self._coordination_dependency_poll_seconds())) * 1000)
 
                 # Agent queue polling/dispatch.
                 if (
@@ -4567,6 +5187,10 @@ class DependencyAgent:
                     ):
                         # Once an instance is hot, keep queue fetches non-blocking so the
                         # main loop can react immediately when execution capacity opens up.
+                        queue_wait_sec = 0
+                    elif self._coordination_should_use_safety_polls():
+                        # RTDB wakeups already signal new queue work; safety polls should
+                        # avoid adding their own long-poll tail.
                         queue_wait_sec = 0
 
                     try:
@@ -4605,10 +5229,11 @@ class DependencyAgent:
                                 except Exception:
                                     pass
 
-                    next_agent_poll_at_ms = now + int(max(0.2, float(self.agent_poll_seconds)) * 1000)
+                    next_agent_poll_at_ms = now + int(max(0.2, float(self._coordination_agent_poll_seconds())) * 1000)
 
                 wait_seconds = max(0.05, 0.5 + random.uniform(-0.05, 0.05))
-                self._agent_poll_wakeup.wait(timeout=wait_seconds)
+                self._loop_wakeup.wait(timeout=wait_seconds)
+                self._loop_wakeup.clear()
             except Exception as e:
                 logging.error("Main loop error: %s", e)
                 _sleep_with_jitter(5.0)
