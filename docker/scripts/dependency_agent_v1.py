@@ -104,7 +104,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.7.7"
+AGENT_VERSION = "dm-agent-py/0.7.8"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -4421,7 +4421,6 @@ class DependencyAgent:
                         return
                     prefetched_inputs.append(self._ensure_cached_input(lease, row, idx))
 
-            self._emit_agent_event(lease, "inputs_ready", None)
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 if not active:
@@ -4431,6 +4430,10 @@ class DependencyAgent:
                 self._enqueue_ready_locked(active)
             retain_lease = True
             self._request_agent_queue_poll()
+            try:
+                self._emit_agent_event(lease, "inputs_ready", None)
+            except Exception as e:
+                logging.debug("inputs_ready emit failed for %s: %s", lease.job_id, e)
         except Exception as e:
             if not terminal_sent:
                 event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
@@ -4539,7 +4542,6 @@ class DependencyAgent:
                 if active:
                     active.prompt_id = prompt_id
 
-            self._emit_agent_event(lease, "prompt_submitted", {"promptId": prompt_id})
             self._emit_agent_event(lease, "execution_started", {"promptId": prompt_id})
 
             start_exec_ms = _now_ms()
@@ -4610,17 +4612,17 @@ class DependencyAgent:
                     last_progress_emit_ms = _now_ms()
                 time.sleep(0.5)
 
-            self._emit_agent_event(lease, "output_commit_started", {"promptId": prompt_id})
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 if active:
                     active.stage = "uploading"
                     active.history_entry = history_entry
                     active.prompt_id = prompt_id
+            self._request_agent_queue_poll()
+            self._emit_agent_event(lease, "output_commit_started", {"promptId": prompt_id})
 
             self._submit_agent_upload(lease)
             retain_lease = True
-            self._request_agent_queue_poll()
         except Exception as e:
             if not terminal_sent:
                 event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
