@@ -39,7 +39,7 @@ Optional knobs:
   - WORKSPACE               (default: /workspace)
   - DM_POLL_SECONDS         (default: 5)
   - DM_HEARTBEAT_SECONDS    (default: 30)
-  - MAX_PARALLEL_DOWNLOADS  (default: 1)
+  - MAX_PARALLEL_DOWNLOADS  (default: 3)
   - DM_STATE_PATH           (default: $WORKSPACE/dependency_agent_state.json)
   - DM_ALLOWED_DOMAINS      (comma-separated allowlist for dependency/model downloads; default: huggingface.co,hf.co,civitai.com)
   - DM_INPUT_ALLOWED_DOMAINS (optional comma-separated allowlist for job input/prefetch downloads; default: allow all)
@@ -101,10 +101,10 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.7.8"
+AGENT_VERSION = "dm-agent-py/0.7.9"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -348,16 +348,36 @@ def api_form_json(
         raise RuntimeError(f"Network error calling {url}: {e}") from None
 
 
-def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+def sha256_file(
+    path: Path,
+    chunk_size: int = 8 * 1024 * 1024,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> str:
     import hashlib
 
     h = hashlib.sha256()
+    total_size = 0
+    try:
+        total_size = int(path.stat().st_size)
+    except Exception:
+        total_size = 0
+    processed = 0
+    last_progress_at = 0.0
     with path.open("rb") as f:
         while True:
             chunk = f.read(chunk_size)
             if not chunk:
                 break
             h.update(chunk)
+            processed += len(chunk)
+            if progress_cb:
+                now = time.time()
+                if processed == total_size or now - last_progress_at >= 2.0:
+                    try:
+                        progress_cb(int(processed), int(total_size))
+                    except Exception:
+                        pass
+                    last_progress_at = now
     return h.hexdigest()
 
 
@@ -407,6 +427,7 @@ def http_download(
     allowed_domains: Optional[Set[str]] = None,
     verbose: bool = False,
     debug: bool = False,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> None:
     parsed = urllib.parse.urlparse(url)
     host = (parsed.hostname or "").lower()
@@ -574,6 +595,11 @@ def http_download(
                         break
                     f.write(chunk)
                     downloaded += len(chunk)
+                    if progress_cb:
+                        try:
+                            progress_cb(int(downloaded), int(expected_total or expected_size_bytes or 0))
+                        except Exception:
+                            pass
                     if verbose:
                         now = time.time()
                         if now - last_log >= 10:
@@ -670,6 +696,7 @@ def wget_download(
     allowed_domains: Optional[Set[str]] = None,
     debug: bool = False,
     user_agent: str = "dm-agent-wget/1.0",
+    progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> None:
     if not _command_exists("wget"):
         raise RuntimeError("wget not found on PATH (install wget or set DM_DOWNLOAD_TOOL=python).")
@@ -746,9 +773,53 @@ def wget_download(
             float(timeout_seconds),
         )
 
-    proc = subprocess.run(cmd + [url], capture_output=True, text=True)
+    proc = subprocess.Popen(
+        cmd + [url],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stderr_lines: List[str] = []
 
-    stderr = proc.stderr or ""
+    def _drain_stderr() -> None:
+        stream = proc.stderr
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                stderr_lines.append(line)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    last_progress_at = 0.0
+    while True:
+        ret = proc.poll()
+        now = time.time()
+        if progress_cb and (ret is not None or now - last_progress_at >= 2.0):
+            current_bytes = 0
+            try:
+                if dest_partial.exists():
+                    current_bytes = int(dest_partial.stat().st_size)
+            except Exception:
+                current_bytes = 0
+            try:
+                progress_cb(int(current_bytes), int(expected_size_bytes or 0))
+            except Exception:
+                pass
+            last_progress_at = now
+        if ret is not None:
+            break
+        time.sleep(1.0)
+
+    stderr_thread.join(timeout=5.0)
+    stderr = "".join(stderr_lines)
     locations: List[str] = []
     statuses: List[int] = []
     retry_after: Optional[str] = None
@@ -900,6 +971,21 @@ class LocalState:
 
 
 @dataclass
+class DownloadActivity:
+    dep_id: str
+    dest_relative_path: str = ""
+    expected_bytes: int = 0
+    downloaded_bytes: int = 0
+    started_at_ms: int = field(default_factory=_now_ms)
+    updated_at_ms: int = field(default_factory=_now_ms)
+    stage: str = "starting"
+    tool: str = ""
+    throughput_bytes_per_sec: int = 0
+    last_sample_at_ms: int = 0
+    last_sample_bytes: int = 0
+
+
+@dataclass
 class AgentExecuteLease:
     item_id: str
     lease_id: str
@@ -943,7 +1029,7 @@ class DependencyAgent:
         self.state_path = Path(_env_str("DM_STATE_PATH") or str(self.workspace / "dependency_agent_state.json"))
         self.poll_seconds = _env_float("DM_POLL_SECONDS", 5.0)
         self.heartbeat_seconds = _env_float("DM_HEARTBEAT_SECONDS", 30.0)
-        self.max_parallel = max(1, min(4, _env_int("MAX_PARALLEL_DOWNLOADS", 1)))
+        self.max_parallel = max(1, min(4, _env_int("MAX_PARALLEL_DOWNLOADS", 3)))
         self.verbose_progress = (_env_str("DM_VERBOSE_PROGRESS") or "").lower() in ("1", "true", "yes", "on")
         self.download_debug = _env_bool("DM_DOWNLOAD_DEBUG", False)
         self.download_tool = (_env_str("DM_DOWNLOAD_TOOL") or "wget").strip().lower()
@@ -987,6 +1073,7 @@ class DependencyAgent:
         self._resolved_instance_id: Optional[str] = None
         self._profile: Dict[str, Any] = {}
         self._downloading: Set[str] = set()
+        self._download_activity: Dict[str, DownloadActivity] = {}
         self._state: LocalState = self._load_state()
         self._dynamic_bytes_used = 0
         self._last_heartbeat_ms = 0
@@ -1054,6 +1141,82 @@ class DependencyAgent:
                 return self.input_allowed_domains or None
 
         return self.allowed_domains
+
+    def _update_download_activity(
+        self,
+        dep_id: str,
+        dest_relative_path: Optional[str] = None,
+        expected_bytes: Optional[int] = None,
+        downloaded_bytes: Optional[int] = None,
+        stage: Optional[str] = None,
+        tool: Optional[str] = None,
+    ) -> None:
+        if not dep_id:
+            return
+        now_ms = _now_ms()
+        with self._lock:
+            row = self._download_activity.get(dep_id)
+            if row is None:
+                row = DownloadActivity(dep_id=dep_id, started_at_ms=now_ms, updated_at_ms=now_ms)
+                self._download_activity[dep_id] = row
+
+            if isinstance(dest_relative_path, str) and dest_relative_path:
+                row.dest_relative_path = dest_relative_path
+            if isinstance(expected_bytes, int) and expected_bytes >= 0:
+                row.expected_bytes = int(expected_bytes)
+
+            stage_changed = isinstance(stage, str) and stage and stage != row.stage
+            if stage_changed:
+                row.stage = stage
+                row.throughput_bytes_per_sec = 0
+                row.last_sample_at_ms = 0
+                row.last_sample_bytes = int(downloaded_bytes) if isinstance(downloaded_bytes, int) and downloaded_bytes >= 0 else row.downloaded_bytes
+
+            if isinstance(tool, str) and tool:
+                row.tool = tool
+
+            if isinstance(downloaded_bytes, int) and downloaded_bytes >= 0:
+                current_bytes = int(downloaded_bytes)
+                if row.last_sample_at_ms > 0 and now_ms > row.last_sample_at_ms and current_bytes >= row.last_sample_bytes:
+                    delta_ms = now_ms - row.last_sample_at_ms
+                    delta_bytes = current_bytes - row.last_sample_bytes
+                    if delta_ms >= 500:
+                        row.throughput_bytes_per_sec = int(delta_bytes / max(0.001, delta_ms / 1000.0))
+                row.downloaded_bytes = current_bytes
+                row.last_sample_at_ms = now_ms
+                row.last_sample_bytes = current_bytes
+
+            row.updated_at_ms = now_ms
+
+    def _clear_download_activity(self, dep_id: str) -> None:
+        if not dep_id:
+            return
+        with self._lock:
+            self._download_activity.pop(dep_id, None)
+
+    def _serialize_download_activity_locked(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for dep_id in sorted(self._download_activity.keys()):
+            row = self._download_activity.get(dep_id)
+            if row is None:
+                continue
+            item: Dict[str, Any] = {
+                "depId": dep_id,
+                "stage": row.stage,
+                "downloadedBytes": int(max(0, row.downloaded_bytes)),
+                "startedAtMs": int(max(0, row.started_at_ms)),
+                "updatedAtMs": int(max(0, row.updated_at_ms)),
+            }
+            if row.dest_relative_path:
+                item["destRelativePath"] = row.dest_relative_path
+            if row.expected_bytes > 0:
+                item["expectedBytes"] = int(row.expected_bytes)
+            if row.throughput_bytes_per_sec > 0:
+                item["throughputBytesPerSec"] = int(row.throughput_bytes_per_sec)
+            if row.tool:
+                item["tool"] = row.tool
+            out.append(item)
+        return out
 
     def stop(self) -> None:
         self._stop.set()
@@ -1515,6 +1678,7 @@ class DependencyAgent:
             installed_dynamic = sorted(self._state.installed_dynamic)
             failed = sorted(self._state.failed)
             downloading = sorted(self._downloading)
+            active_downloads = self._serialize_download_activity_locked()
             dynamic_bytes_used = int(self._dynamic_bytes_used)
             if isinstance(queue_depth, int):
                 self._last_dependency_queue_depth = max(0, int(queue_depth))
@@ -1527,6 +1691,7 @@ class DependencyAgent:
                 "installedDepIdsStatic": installed_static,
                 "installedDepIdsDynamic": installed_dynamic,
                 "downloadingDepIds": downloading,
+                "activeDownloads": active_downloads,
                 "failedDepIds": failed,
                 "inventoryTruncated": False,
                 "queueDepth": queue_depth_value,
@@ -2453,12 +2618,14 @@ class DependencyAgent:
         url = f"{self.api_base_url}/dependencies/status"
         with self._lock:
             dynamic_bytes_used = int(self._dynamic_bytes_used)
+            active_downloads = self._serialize_download_activity_locked()
         body: Dict[str, Any] = {
             "instanceId": self._resolved_instance_id,
             "itemId": item.get("itemId") or item.get("depId"),
             "depId": item.get("depId"),
             "op": item.get("op"),
             "state": state,
+            "activeDownloads": active_downloads,
             "diskStats": disk_stats(self.comfyui_dir),
             "dynamicBytesUsed": dynamic_bytes_used,
         }
@@ -2470,10 +2637,12 @@ class DependencyAgent:
         if not self._resolved_instance_id:
             return
         now_ms = _now_ms()
+        with self._lock:
+            active_downloads = self._serialize_download_activity_locked()
         rtdb_ok = True
         if self._coordination:
             rtdb_ok = self._write_dependency_runtime_mirror(queue_depth=queue_depth)
-        if self._coordination and rtdb_ok and not self._coordination_http_checkpoint_due(now_ms):
+        if self._coordination and rtdb_ok and not active_downloads and not self._coordination_http_checkpoint_due(now_ms):
             self._last_heartbeat_ms = now_ms
             return
 
@@ -2484,6 +2653,7 @@ class DependencyAgent:
             installed_dynamic = sorted(self._state.installed_dynamic)
             failed = sorted(self._state.failed)
             downloading = sorted(self._downloading)
+            active_downloads = self._serialize_download_activity_locked()
             dynamic_bytes_used = int(self._dynamic_bytes_used)
 
         body: Dict[str, Any] = {
@@ -2491,6 +2661,7 @@ class DependencyAgent:
             "installedStaticDepIds": installed_static,
             "installedDynamicDepIds": installed_dynamic,
             "downloadingDepIds": downloading,
+            "activeDownloads": active_downloads,
             "failedDepIds": failed,
             "diskStats": disk_stats(self.comfyui_dir),
             "dynamicBytesUsed": dynamic_bytes_used,
@@ -3590,6 +3761,26 @@ class DependencyAgent:
         auth = resolved.get("auth")
         auth_header = self._resolve_auth_header(auth if isinstance(auth, str) else None)
         allowed_domains = self._download_allowed_domains_for_item(item, resolved)
+        self._update_download_activity(
+            dep_id,
+            dest_relative_path=dest_rel,
+            expected_bytes=int(expected_size_bytes),
+            downloaded_bytes=0,
+            stage="preparing",
+            tool=self.download_tool,
+        )
+
+        def _progress_cb(stage_name: str, tool_name: str) -> Callable[[int, int], None]:
+            def _cb(processed_bytes: int, total_bytes: int) -> None:
+                self._update_download_activity(
+                    dep_id,
+                    dest_relative_path=dest_rel,
+                    expected_bytes=int(total_bytes or expected_size_bytes or 0),
+                    downloaded_bytes=int(processed_bytes),
+                    stage=stage_name,
+                    tool=tool_name,
+                )
+            return _cb
 
         # Fast path: if the file already exists (e.g., legacy provisioning), treat as installed.
         if dest_abs.exists():
@@ -3609,7 +3800,10 @@ class DependencyAgent:
                 except Exception:
                     size_matches = False
             if isinstance(sha256_expected, str) and sha256_expected:
-                actual_existing = sha256_file(dest_abs)
+                actual_existing = sha256_file(
+                    dest_abs,
+                    progress_cb=_progress_cb("verifying_existing", "local"),
+                )
                 if actual_existing.lower() != sha256_expected.lower():
                     logging.warning(
                         "Existing file sha256 mismatch for %s; re-downloading. expected=%s got=%s path=%s",
@@ -3641,6 +3835,7 @@ class DependencyAgent:
                         self._state.retry.pop(dep_id, None)
                         self._downloading.discard(dep_id)
                         self._save_state()
+                    self._clear_download_activity(dep_id)
                     return
             else:
                 if (
@@ -3673,6 +3868,7 @@ class DependencyAgent:
                         self._state.retry.pop(dep_id, None)
                         self._downloading.discard(dep_id)
                         self._save_state()
+                    self._clear_download_activity(dep_id)
                     return
 
         did_evict = self._ensure_space_for_download(expected_size_bytes, dep_id)
@@ -3693,6 +3889,7 @@ class DependencyAgent:
                     timeout_seconds=float(self.download_timeout_seconds),
                     allowed_domains=allowed_domains,
                     debug=self.download_debug,
+                    progress_cb=_progress_cb("downloading", "wget"),
                 )
             elif self.download_tool == "python":
                 http_download(
@@ -3705,12 +3902,16 @@ class DependencyAgent:
                     allowed_domains=allowed_domains,
                     verbose=self.verbose_progress,
                     debug=self.download_debug,
+                    progress_cb=_progress_cb("downloading", "python"),
                 )
             else:
                 raise RuntimeError(f"Unsupported DM_DOWNLOAD_TOOL: {self.download_tool}")
 
             if isinstance(sha256_expected, str) and sha256_expected:
-                actual = sha256_file(partial)
+                actual = sha256_file(
+                    partial,
+                    progress_cb=_progress_cb("verifying_download", "local"),
+                )
                 if actual.lower() != sha256_expected.lower():
                     try:
                         if partial.exists():
@@ -3727,6 +3928,7 @@ class DependencyAgent:
                         partial.unlink()
                 except Exception:
                     pass
+            self._clear_download_activity(dep_id)
             raise
 
         os.replace(str(partial), str(dest_abs))
@@ -3752,6 +3954,7 @@ class DependencyAgent:
 
             self._save_state()
 
+        self._clear_download_activity(dep_id)
         if should_heartbeat and _now_ms() - int(self._last_heartbeat_ms) >= 2000:
             # This will update installedDynamicDepIds after eviction.
             try:
@@ -3808,6 +4011,18 @@ class DependencyAgent:
             if dep_id:
                 with self._lock:
                     self._downloading.add(dep_id)
+                resolved = item.get("resolved") if isinstance(item.get("resolved"), dict) else {}
+                expected_size_raw = resolved.get("expectedSizeBytes") if isinstance(resolved, dict) else None
+                expected_size_bytes = int(expected_size_raw) if isinstance(expected_size_raw, (int, float)) and expected_size_raw > 0 else 0
+                dest_rel = resolved.get("destRelativePath") if isinstance(resolved, dict) and isinstance(resolved.get("destRelativePath"), str) else None
+                self._update_download_activity(
+                    dep_id,
+                    dest_relative_path=dest_rel,
+                    expected_bytes=expected_size_bytes,
+                    downloaded_bytes=0,
+                    stage="starting",
+                    tool=self.download_tool,
+                )
             self._post_status(item, "running")
 
             try:
@@ -3823,6 +4038,8 @@ class DependencyAgent:
             except Exception as e:
                 err_msg = str(e)
                 retryable = self._is_retryable_download_error(e)
+                if dep_id:
+                    self._clear_download_activity(dep_id)
                 if retryable:
                     next_at = self._schedule_download_retry(item, e)
                     if dep_id:
