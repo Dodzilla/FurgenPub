@@ -20,7 +20,7 @@ Running instances can now self-update the dependency agent in place. The backend
 
 Backend release knobs:
 - `DEPENDENCY_AGENT_TARGET_VERSION`  
-  Example: `dm-agent-py/0.6.0`
+  Example: `dm-agent-py/0.9.0`
 - `DEPENDENCY_AGENT_UPDATE_URL`  
   Optional. Defaults to the public `FurgenPub` raw URL for `docker/scripts/dependency_agent_v1.py`.
 - `DEPENDENCY_AGENT_UPDATE_SHA256`  
@@ -33,6 +33,12 @@ Recommended rollout:
 1. Publish the new `dependency_agent_v1.py` to your public host / `FurgenPub`.
 2. Deploy Functions with the new target version and, optionally, URL + SHA256.
 3. Let running agents drain and restart themselves onto the new script.
+
+As of `dm-agent-py/0.9.0`, the agent supports hybrid output completion:
+- outputs up to `8 MiB` stay on the low-latency direct Bunny upload path
+- larger outputs use resumable GCS staging and are promoted to Bunny asynchronously by the backend
+
+That means newly provisioned servers must fetch the public `docker/scripts/dependency_agent_v1.py` copy from FurgenPub, not a stale private copy, or large output completion will fall back to the legacy direct-upload path and hit platform request-size limits again.
 
 ## Instance environment variables
 

@@ -104,7 +104,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.8.0"
+AGENT_VERSION = "dm-agent-py/0.9.0"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -904,12 +904,11 @@ def http_head(
         return int(getattr(e, "code", 500) or 500), {k.lower(): v for k, v in dict(getattr(e, "headers", {})).items()}
 
 
-def http_put_file_stream(
+def http_put_bytes(
     url: str,
-    file_path: Path,
+    body: bytes = b"",
     headers: Optional[Dict[str, str]] = None,
     timeout_seconds: float = 300.0,
-    chunk_size: int = 8 * 1024 * 1024,
 ) -> Tuple[int, str, Dict[str, str]]:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -927,7 +926,7 @@ def http_put_file_stream(
     else:
         conn = http.client.HTTPConnection(host, port or 80, timeout=timeout_seconds)
 
-    req_headers = {"Content-Length": str(int(file_path.stat().st_size))}
+    req_headers = {"Content-Length": str(len(body))}
     if headers:
         req_headers.update(headers)
 
@@ -936,13 +935,8 @@ def http_put_file_stream(
         for k, v in req_headers.items():
             conn.putheader(k, v)
         conn.endheaders()
-
-        with file_path.open("rb") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                conn.send(chunk)
+        if body:
+            conn.send(body)
 
         resp = conn.getresponse()
         raw = resp.read().decode("utf-8", errors="replace")
@@ -953,6 +947,208 @@ def http_put_file_stream(
             conn.close()
         except Exception:
             pass
+
+
+def http_put_file_stream(
+    url: str,
+    file_path: Path,
+    headers: Optional[Dict[str, str]] = None,
+    timeout_seconds: float = 300.0,
+    chunk_size: int = 8 * 1024 * 1024,
+    start_offset: int = 0,
+    length: Optional[int] = None,
+) -> Tuple[int, str, Dict[str, str]]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported upload URL scheme: {parsed.scheme}")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("Upload URL missing hostname")
+    port = parsed.port
+    path_with_query = parsed.path or "/"
+    if parsed.query:
+        path_with_query = f"{path_with_query}?{parsed.query}"
+
+    if parsed.scheme == "https":
+        conn: Any = http.client.HTTPSConnection(host, port or 443, timeout=timeout_seconds)
+    else:
+        conn = http.client.HTTPConnection(host, port or 80, timeout=timeout_seconds)
+
+    total_size = int(file_path.stat().st_size)
+    if start_offset < 0:
+        raise ValueError("start_offset must be >= 0")
+    if start_offset > total_size:
+        raise ValueError("start_offset exceeds file size")
+    if length is None:
+        length = total_size - start_offset
+    if length < 0:
+        raise ValueError("length must be >= 0")
+
+    req_headers = {"Content-Length": str(int(length))}
+    if headers:
+        req_headers.update(headers)
+
+    try:
+        conn.putrequest("PUT", path_with_query)
+        for k, v in req_headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+
+        with file_path.open("rb") as f:
+            if start_offset:
+                f.seek(start_offset)
+            remaining = int(length)
+            while remaining > 0:
+                chunk = f.read(min(int(chunk_size), remaining))
+                if not chunk:
+                    break
+                conn.send(chunk)
+                remaining -= len(chunk)
+
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", errors="replace")
+        out_headers = {k.lower(): v for k, v in dict(resp.headers).items()}
+        return int(resp.status), raw, out_headers
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _parse_gcs_resume_offset(headers: Dict[str, str]) -> int:
+    range_header = headers.get("range") or headers.get("Range")
+    if isinstance(range_header, str):
+        match = re.match(r"^bytes=0-(\d+)$", range_header.strip())
+        if match:
+            return int(match.group(1)) + 1
+    return 0
+
+
+def gcs_resumable_query_offset(
+    session_url: str,
+    total_size: int,
+    content_type: str,
+    timeout_seconds: float = 60.0,
+) -> int:
+    headers = {
+        "Content-Type": content_type,
+        "Content-Range": f"bytes */{int(total_size)}",
+    }
+    status, body, resp_headers = http_put_bytes(
+        session_url,
+        body=b"",
+        headers=headers,
+        timeout_seconds=timeout_seconds,
+    )
+    if status in (200, 201):
+        return int(total_size)
+    if status == 308:
+        return _parse_gcs_resume_offset(resp_headers)
+    raise RuntimeError(f"GCS resumable status query failed (status={status}): {body[:200]}")
+
+
+def gcs_resumable_upload_file(
+    session_url: str,
+    file_path: Path,
+    content_type: str,
+    timeout_seconds: float = 300.0,
+    chunk_size: int = 8 * 1024 * 1024,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> None:
+    total_size = int(file_path.stat().st_size)
+    if total_size <= 0:
+        raise RuntimeError("Cannot resumable-upload an empty file.")
+
+    chunk_size = max(256 * 1024, int(chunk_size))
+    if chunk_size % (256 * 1024) != 0:
+        chunk_size = ((chunk_size // (256 * 1024)) + 1) * (256 * 1024)
+
+    offset = 0
+    consecutive_failures = 0
+
+    while offset < total_size:
+        chunk_end = min(offset + chunk_size, total_size) - 1
+        chunk_length = (chunk_end - offset) + 1
+        headers = {
+            "Content-Type": content_type,
+            "Content-Range": f"bytes {int(offset)}-{int(chunk_end)}/{int(total_size)}",
+        }
+
+        try:
+            status, body, resp_headers = http_put_file_stream(
+                session_url,
+                file_path,
+                headers=headers,
+                timeout_seconds=timeout_seconds,
+                chunk_size=chunk_size,
+                start_offset=offset,
+                length=chunk_length,
+            )
+            consecutive_failures = 0
+        except Exception:
+            consecutive_failures += 1
+            offset = gcs_resumable_query_offset(
+                session_url,
+                total_size,
+                content_type,
+                timeout_seconds=min(60.0, timeout_seconds),
+            )
+            if progress_cb:
+                try:
+                    progress_cb(int(offset), int(total_size))
+                except Exception:
+                    pass
+            if consecutive_failures >= 5:
+                raise
+            _sleep_with_jitter(min(5.0, float(consecutive_failures)))
+            continue
+
+        if status in (200, 201):
+            offset = total_size
+            if progress_cb:
+                try:
+                    progress_cb(int(total_size), int(total_size))
+                except Exception:
+                    pass
+            return
+
+        if status == 308:
+            next_offset = _parse_gcs_resume_offset(resp_headers)
+            if next_offset <= offset:
+                next_offset = gcs_resumable_query_offset(
+                    session_url,
+                    total_size,
+                    content_type,
+                    timeout_seconds=min(60.0, timeout_seconds),
+                )
+            offset = max(offset, next_offset)
+            if progress_cb:
+                try:
+                    progress_cb(int(offset), int(total_size))
+                except Exception:
+                    pass
+            continue
+
+        if status in (408, 429) or 500 <= status <= 599:
+            consecutive_failures += 1
+            offset = gcs_resumable_query_offset(
+                session_url,
+                total_size,
+                content_type,
+                timeout_seconds=min(60.0, timeout_seconds),
+            )
+            if progress_cb:
+                try:
+                    progress_cb(int(offset), int(total_size))
+                except Exception:
+                    pass
+            if consecutive_failures >= 5:
+                raise RuntimeError(f"GCS resumable upload failed after retries (status={status}): {body[:200]}")
+            _sleep_with_jitter(min(5.0, float(consecutive_failures)))
+            continue
+
+        raise RuntimeError(f"GCS resumable upload failed (status={status}): {body[:200]}")
 
 
 @dataclass
@@ -1741,6 +1937,7 @@ class DependencyAgent:
                 "capabilities": {
                     "dependencyChannel": True,
                     "agentPullExecution": True,
+                    "hybridOutputUploadsV1": True,
                 },
             },
             "updatedAtMs": now_ms,
@@ -4171,6 +4368,8 @@ class DependencyAgent:
                         continue
                     if isinstance(row.get("uploadUrlExpiresAt"), str):
                         candidates.append(row.get("uploadUrlExpiresAt"))
+                    if isinstance(row.get("stagedUploadUrlExpiresAt"), str):
+                        candidates.append(row.get("stagedUploadUrlExpiresAt"))
                     if isinstance(row.get("verifyHeadUrlExpiresAt"), str):
                         candidates.append(row.get("verifyHeadUrlExpiresAt"))
             if isinstance(url_refresh.get("refreshTokenExpiresAt"), str):
@@ -4209,6 +4408,134 @@ class DependencyAgent:
                 continue
             return idx, row
         return None
+
+    def _upload_output_artifact(
+        self,
+        lease: AgentExecuteLease,
+        target: Dict[str, Any],
+        filename: str,
+        local_output: Path,
+        bytes_written: int,
+        sha256_sum: str,
+    ) -> Dict[str, Any]:
+        logical_key = target.get("logicalOutputKey") if isinstance(target.get("logicalOutputKey"), str) else ""
+        if not logical_key:
+            logical_key = f"output_{Path(filename).stem}"
+
+        content_type = target.get("contentType") if isinstance(target.get("contentType"), str) and target.get("contentType") else None
+        if not content_type:
+            guessed, _enc = mimetypes.guess_type(filename)
+            content_type = guessed or "application/octet-stream"
+
+        fast_path_max_bytes = target.get("fastPathMaxBytes")
+        fast_path_threshold = int(fast_path_max_bytes) if isinstance(fast_path_max_bytes, (int, float)) else None
+        staged_upload_url = target.get("stagedUploadUrl") if isinstance(target.get("stagedUploadUrl"), str) and target.get("stagedUploadUrl") else None
+        staged_upload_method = target.get("stagedUploadMethod") if isinstance(target.get("stagedUploadMethod"), str) else ""
+        should_stage = (
+            fast_path_threshold is not None and
+            int(bytes_written) > int(fast_path_threshold) and
+            staged_upload_url is not None and
+            staged_upload_method == "gcs_resumable_session_put"
+        )
+
+        attempt_object_path = (
+            target.get("attemptObjectPath")
+            if isinstance(target.get("attemptObjectPath"), str) and target.get("attemptObjectPath")
+            else filename
+        )
+        final_object_path = (
+            target.get("finalObjectPath")
+            if isinstance(target.get("finalObjectPath"), str) and target.get("finalObjectPath")
+            else attempt_object_path
+        )
+
+        if should_stage:
+            gcs_resumable_upload_file(
+                staged_upload_url,
+                local_output,
+                content_type,
+                timeout_seconds=max(300.0, float(self.download_timeout_seconds)),
+                chunk_size=8 * 1024 * 1024,
+            )
+            out_meta: Dict[str, Any] = {
+                "logicalOutputKey": logical_key,
+                "attemptObjectPath": attempt_object_path,
+                "finalObjectPath": final_object_path,
+                "bytes": bytes_written,
+                "sha256": sha256_sum,
+                "contentType": content_type,
+                "deliveryPath": "gcs_staged",
+            }
+            bucket = target.get("bucket") if isinstance(target.get("bucket"), str) and target.get("bucket") else None
+            if bucket:
+                out_meta["bucket"] = bucket
+            source_filename = target.get("sourceFilename") if isinstance(target.get("sourceFilename"), str) and target.get("sourceFilename") else filename
+            if source_filename:
+                out_meta["sourceFilename"] = source_filename
+            return out_meta
+
+        upload_url = target.get("uploadUrl")
+        if not isinstance(upload_url, str) or not upload_url:
+            raise RuntimeError("Missing uploadUrl in output target.")
+
+        upload_headers: Dict[str, str] = {"Content-Type": content_type}
+        upload_headers_raw = target.get("uploadHeaders")
+        if isinstance(upload_headers_raw, dict):
+            for hk, hv in upload_headers_raw.items():
+                if isinstance(hk, str) and hk and isinstance(hv, str):
+                    upload_headers[hk] = hv
+
+        upload_method = target.get("uploadMethod") if isinstance(target.get("uploadMethod"), str) else ""
+        if upload_method == "agent_api_put":
+            upload_headers["X-DM-Instance-Id"] = str(self._resolved_instance_id or "")
+            upload_headers["X-Agent-Job-Id"] = lease.job_id
+            upload_headers["X-Agent-Execution-Attempt"] = str(int(lease.execution_attempt))
+            upload_headers["X-Agent-Attempt-Epoch"] = str(int(lease.attempt_epoch))
+            upload_headers["X-Agent-Lease-Id"] = lease.lease_id
+            upload_headers["X-Agent-Logical-Output-Key"] = logical_key
+            upload_headers["X-Agent-Source-Filename"] = filename
+            if self._agent_access_token:
+                upload_headers["Authorization"] = f"Bearer {self._agent_access_token}"
+
+        status, body, _resp_headers = http_put_file_stream(
+            upload_url,
+            local_output,
+            headers=upload_headers,
+            timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+        )
+        if status == 412:
+            verify_url = target.get("verifyHeadUrl")
+            if isinstance(verify_url, str) and verify_url:
+                head_status, head_headers = http_head(verify_url, timeout_seconds=30.0)
+                if head_status in (200, 204):
+                    remote_len = head_headers.get("content-length")
+                    if isinstance(remote_len, str) and remote_len.isdigit() and int(remote_len) == bytes_written:
+                        status = 200
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"Output upload failed (status={status}): {body[:200]}")
+
+        response_payload = _json_loads_or_none(body) if isinstance(body, str) and body else None
+        response_data = response_payload.get("data") if isinstance(response_payload, dict) and isinstance(response_payload.get("data"), dict) else {}
+        public_url = response_data.get("cdnUrl") if isinstance(response_data.get("cdnUrl"), str) and response_data.get("cdnUrl") else None
+
+        out_meta = {
+            "logicalOutputKey": logical_key,
+            "attemptObjectPath": attempt_object_path,
+            "finalObjectPath": (
+                response_data.get("destinationPath")
+                if isinstance(response_data.get("destinationPath"), str) and response_data.get("destinationPath")
+                else final_object_path
+            ),
+            "bytes": bytes_written,
+            "sha256": sha256_sum,
+            "contentType": content_type,
+            "deliveryPath": "direct_bunny",
+            **({"publicUrl": public_url} if public_url else {}),
+        }
+        source_filename = target.get("sourceFilename") if isinstance(target.get("sourceFilename"), str) and target.get("sourceFilename") else filename
+        if source_filename:
+            out_meta["sourceFilename"] = source_filename
+        return out_meta
 
     def _process_agent_execute_item(self, item: Dict[str, Any]) -> None:
         item_id = item.get("itemId")
@@ -4493,85 +4820,24 @@ class DependencyAgent:
                 )
                 bytes_written = int(local_output.stat().st_size)
                 sha256_sum = sha256_file(local_output)
-
-                logical_key = target.get("logicalOutputKey") if isinstance(target.get("logicalOutputKey"), str) else f"output_{len(uploaded_outputs)}"
-                upload_url = target.get("uploadUrl")
-                if not isinstance(upload_url, str) or not upload_url:
-                    raise RuntimeError("Missing uploadUrl in output target.")
-                content_type = target.get("contentType") if isinstance(target.get("contentType"), str) and target.get("contentType") else None
-                if not content_type:
-                    guessed, _enc = mimetypes.guess_type(filename)
-                    content_type = guessed or "application/octet-stream"
-
-                upload_headers: Dict[str, str] = {"Content-Type": content_type}
-                upload_headers_raw = target.get("uploadHeaders")
-                if isinstance(upload_headers_raw, dict):
-                    for hk, hv in upload_headers_raw.items():
-                        if isinstance(hk, str) and hk and isinstance(hv, str):
-                            upload_headers[hk] = hv
-
-                upload_method = target.get("uploadMethod") if isinstance(target.get("uploadMethod"), str) else ""
-                if upload_method == "agent_api_put":
-                    upload_headers["X-DM-Instance-Id"] = str(self._resolved_instance_id or "")
-                    upload_headers["X-Agent-Job-Id"] = lease.job_id
-                    upload_headers["X-Agent-Execution-Attempt"] = str(int(lease.execution_attempt))
-                    upload_headers["X-Agent-Attempt-Epoch"] = str(int(lease.attempt_epoch))
-                    upload_headers["X-Agent-Lease-Id"] = lease.lease_id
-                    upload_headers["X-Agent-Logical-Output-Key"] = logical_key
-                    upload_headers["X-Agent-Source-Filename"] = filename
-                    if self._agent_access_token:
-                        upload_headers["Authorization"] = f"Bearer {self._agent_access_token}"
-
-                status, body, _resp_headers = http_put_file_stream(
-                    upload_url,
+                out_meta = self._upload_output_artifact(
+                    lease,
+                    target,
+                    filename,
                     local_output,
-                    headers=upload_headers,
-                    timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                    bytes_written,
+                    sha256_sum,
                 )
-                if status == 412:
-                    verify_url = target.get("verifyHeadUrl")
-                    if isinstance(verify_url, str) and verify_url:
-                        head_status, head_headers = http_head(verify_url, timeout_seconds=30.0)
-                        if head_status in (200, 204):
-                            remote_len = head_headers.get("content-length")
-                            if isinstance(remote_len, str) and remote_len.isdigit() and int(remote_len) == bytes_written:
-                                status = 200
-                if status < 200 or status >= 300:
-                    raise RuntimeError(f"Output upload failed (status={status}): {body[:200]}")
-
-                response_payload = _json_loads_or_none(body) if isinstance(body, str) and body else None
-                response_data = response_payload.get("data") if isinstance(response_payload, dict) and isinstance(response_payload.get("data"), dict) else {}
-
-                attempt_object_path = (
-                    target.get("attemptObjectPath")
-                    if isinstance(target.get("attemptObjectPath"), str) and target.get("attemptObjectPath")
-                    else filename
-                )
-                final_object_path = (
-                    response_data.get("destinationPath")
-                    if isinstance(response_data.get("destinationPath"), str) and response_data.get("destinationPath")
-                    else (
-                        target.get("finalObjectPath")
-                        if isinstance(target.get("finalObjectPath"), str) and target.get("finalObjectPath")
-                        else attempt_object_path
-                    )
-                )
-                public_url = response_data.get("cdnUrl") if isinstance(response_data.get("cdnUrl"), str) and response_data.get("cdnUrl") else None
-
-                out_meta = {
-                    "logicalOutputKey": logical_key,
-                    "attemptObjectPath": attempt_object_path,
-                    "finalObjectPath": final_object_path,
-                    "bytes": bytes_written,
-                    "sha256": sha256_sum,
-                    "contentType": content_type,
-                    **({"publicUrl": public_url} if public_url else {}),
-                }
                 uploaded_outputs.append(out_meta)
                 try:
                     emit("output_uploaded", out_meta)
                 except Exception as e:
-                    logging.debug("output_uploaded emit failed for %s/%s: %s", lease.job_id, logical_key, e)
+                    logging.debug(
+                        "output_uploaded emit failed for %s/%s: %s",
+                        lease.job_id,
+                        out_meta.get("logicalOutputKey"),
+                        e,
+                    )
 
             if not uploaded_outputs:
                 raise RuntimeError("No outputs were uploaded.")
@@ -4968,85 +5234,24 @@ class DependencyAgent:
                 )
                 bytes_written = int(local_output.stat().st_size)
                 sha256_sum = sha256_file(local_output)
-
-                logical_key = target.get("logicalOutputKey") if isinstance(target.get("logicalOutputKey"), str) else f"output_{len(uploaded_outputs)}"
-                upload_url = target.get("uploadUrl")
-                if not isinstance(upload_url, str) or not upload_url:
-                    raise RuntimeError("Missing uploadUrl in output target.")
-                content_type = target.get("contentType") if isinstance(target.get("contentType"), str) and target.get("contentType") else None
-                if not content_type:
-                    guessed, _enc = mimetypes.guess_type(filename)
-                    content_type = guessed or "application/octet-stream"
-
-                upload_headers: Dict[str, str] = {"Content-Type": content_type}
-                upload_headers_raw = target.get("uploadHeaders")
-                if isinstance(upload_headers_raw, dict):
-                    for hk, hv in upload_headers_raw.items():
-                        if isinstance(hk, str) and hk and isinstance(hv, str):
-                            upload_headers[hk] = hv
-
-                upload_method = target.get("uploadMethod") if isinstance(target.get("uploadMethod"), str) else ""
-                if upload_method == "agent_api_put":
-                    upload_headers["X-DM-Instance-Id"] = str(self._resolved_instance_id or "")
-                    upload_headers["X-Agent-Job-Id"] = lease.job_id
-                    upload_headers["X-Agent-Execution-Attempt"] = str(int(lease.execution_attempt))
-                    upload_headers["X-Agent-Attempt-Epoch"] = str(int(lease.attempt_epoch))
-                    upload_headers["X-Agent-Lease-Id"] = lease.lease_id
-                    upload_headers["X-Agent-Logical-Output-Key"] = logical_key
-                    upload_headers["X-Agent-Source-Filename"] = filename
-                    if self._agent_access_token:
-                        upload_headers["Authorization"] = f"Bearer {self._agent_access_token}"
-
-                status, body, _resp_headers = http_put_file_stream(
-                    upload_url,
+                out_meta = self._upload_output_artifact(
+                    lease,
+                    target,
+                    filename,
                     local_output,
-                    headers=upload_headers,
-                    timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                    bytes_written,
+                    sha256_sum,
                 )
-                if status == 412:
-                    verify_url = target.get("verifyHeadUrl")
-                    if isinstance(verify_url, str) and verify_url:
-                        head_status, head_headers = http_head(verify_url, timeout_seconds=30.0)
-                        if head_status in (200, 204):
-                            remote_len = head_headers.get("content-length")
-                            if isinstance(remote_len, str) and remote_len.isdigit() and int(remote_len) == bytes_written:
-                                status = 200
-                if status < 200 or status >= 300:
-                    raise RuntimeError(f"Output upload failed (status={status}): {body[:200]}")
-
-                response_payload = _json_loads_or_none(body) if isinstance(body, str) and body else None
-                response_data = response_payload.get("data") if isinstance(response_payload, dict) and isinstance(response_payload.get("data"), dict) else {}
-
-                attempt_object_path = (
-                    target.get("attemptObjectPath")
-                    if isinstance(target.get("attemptObjectPath"), str) and target.get("attemptObjectPath")
-                    else filename
-                )
-                final_object_path = (
-                    response_data.get("destinationPath")
-                    if isinstance(response_data.get("destinationPath"), str) and response_data.get("destinationPath")
-                    else (
-                        target.get("finalObjectPath")
-                        if isinstance(target.get("finalObjectPath"), str) and target.get("finalObjectPath")
-                        else attempt_object_path
-                    )
-                )
-                public_url = response_data.get("cdnUrl") if isinstance(response_data.get("cdnUrl"), str) and response_data.get("cdnUrl") else None
-
-                out_meta = {
-                    "logicalOutputKey": logical_key,
-                    "attemptObjectPath": attempt_object_path,
-                    "finalObjectPath": final_object_path,
-                    "bytes": bytes_written,
-                    "sha256": sha256_sum,
-                    "contentType": content_type,
-                    **({"publicUrl": public_url} if public_url else {}),
-                }
                 uploaded_outputs.append(out_meta)
                 try:
                     self._emit_agent_event(lease, "output_uploaded", out_meta)
                 except Exception as e:
-                    logging.debug("output_uploaded emit failed for %s/%s: %s", lease.job_id, logical_key, e)
+                    logging.debug(
+                        "output_uploaded emit failed for %s/%s: %s",
+                        lease.job_id,
+                        out_meta.get("logicalOutputKey"),
+                        e,
+                    )
 
             if not uploaded_outputs:
                 raise RuntimeError("No outputs were uploaded.")
