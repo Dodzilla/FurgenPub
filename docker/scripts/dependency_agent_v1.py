@@ -104,7 +104,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.7.9"
+AGENT_VERSION = "dm-agent-py/0.8.0"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -1051,6 +1051,9 @@ class DependencyAgent:
         self.asset_gen_v5_script = _env_str("DM_ASSET_GEN_V5_SCRIPT")
         self._resolved_local_comfy_base_url = self.agent_local_comfy_base_url
         self._last_local_comfy_discovery_ms = 0
+        self._comfy_queue_summary_ttl_ms = max(1000, min(10000, int(_env_float("DM_COMFY_QUEUE_SUMMARY_TTL_SECONDS", 2.0) * 1000)))
+        self._last_comfy_queue_summary: Dict[str, Any] = {}
+        self._last_comfy_queue_summary_at_ms = 0
         self.input_cache_dir = Path(_env_str("DM_INPUT_CACHE_DIR") or str(self.workspace / ".dm_input_cache"))
         self.input_cache_max_bytes = max(0, int(_parse_bytes(_env_str("DM_INPUT_CACHE_MAX_BYTES")) or 20 * 1024 * 1024 * 1024))
         self.input_cache_heartbeat_max_keys = max(0, min(1000, _env_int("DM_INPUT_CACHE_HEARTBEAT_MAX_KEYS", 200)))
@@ -1714,6 +1717,7 @@ class DependencyAgent:
         held_leases = self._collect_active_leases()
         local_comfy = self._local_comfy_reachable()
         readiness_present = self._local_readiness_file_present()
+        queue_summary = self._local_comfy_queue_summary(timeout_seconds=5.0)
         input_cache_inventory = self._collect_input_cache_inventory()
         now_ms = _now_ms()
         return {
@@ -1723,6 +1727,7 @@ class DependencyAgent:
                 "localReadinessFilePresent": bool(readiness_present),
                 "localReadinessFile": self.agent_local_readiness_file,
                 "queueDepth": int(len(held_leases)),
+                **({"queueSummary": queue_summary} if queue_summary else {}),
                 "heldLeases": held_leases,
                 "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
                 "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
@@ -1994,6 +1999,40 @@ class DependencyAgent:
         # Force refresh periodically so we can recover from port changes.
         resolved = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=timeout_seconds)
         return self._probe_local_comfy_base_url(resolved, timeout_seconds=timeout_seconds)
+
+    def _local_comfy_queue_summary(
+        self,
+        timeout_seconds: float = 5.0,
+        max_age_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        ttl_ms = int(max_age_ms if isinstance(max_age_ms, int) and max_age_ms > 0 else self._comfy_queue_summary_ttl_ms)
+        now_ms = _now_ms()
+        cached = self._last_comfy_queue_summary if isinstance(self._last_comfy_queue_summary, dict) else {}
+        cached_at_ms = int(self._last_comfy_queue_summary_at_ms or 0)
+        if cached and cached_at_ms > 0 and (now_ms - cached_at_ms) <= ttl_ms:
+            return dict(cached)
+
+        try:
+            status, resp = self._comfy_api_json("GET", "/queue", timeout_seconds=timeout_seconds)
+            if status != 200 or not isinstance(resp, dict):
+                raise RuntimeError(f"Unexpected /queue response: {status} {resp}")
+            running = resp.get("queue_running") if isinstance(resp.get("queue_running"), list) else []
+            pending = resp.get("queue_pending") if isinstance(resp.get("queue_pending"), list) else []
+            summary = {
+                "runningCount": int(len(running)),
+                "pendingCount": int(len(pending)),
+                "totalCount": int(len(running) + len(pending)),
+                "checkedAtMs": int(now_ms),
+                "source": "agent_heartbeat",
+            }
+            self._last_comfy_queue_summary = dict(summary)
+            self._last_comfy_queue_summary_at_ms = now_ms
+            return summary
+        except Exception as exc:
+            logging.debug("Local Comfy queue summary failed: %s", exc)
+            if cached and cached_at_ms > 0:
+                return dict(cached)
+            return {}
 
     def _resolve_asset_gen_v5_script(self) -> Optional[Path]:
         candidates: List[Path] = []
@@ -2955,6 +2994,7 @@ class DependencyAgent:
         local_comfy = self._local_comfy_reachable()
         readiness_present = self._local_readiness_file_present()
         queue_depth = len(held_leases)
+        queue_summary = self._local_comfy_queue_summary(timeout_seconds=5.0)
         input_cache_inventory = self._collect_input_cache_inventory()
 
         body: Dict[str, Any] = {
@@ -2964,6 +3004,7 @@ class DependencyAgent:
             "localReadinessFilePresent": bool(readiness_present),
             "localReadinessFile": self.agent_local_readiness_file,
             "queueDepth": int(queue_depth),
+            **({"queueSummary": queue_summary} if queue_summary else {}),
             "heldLeases": held_leases,
             "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
             "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
