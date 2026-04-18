@@ -44,6 +44,16 @@ OMNIVOICE_PACKAGE_VERSION="${OMNIVOICE_PACKAGE_VERSION:-0.1.3}"
 OMNIVOICE_TRANSFORMERS_VERSION="${OMNIVOICE_TRANSFORMERS_VERSION:-5.3.0}"
 OMNIVOICE_SOXR_VERSION="${OMNIVOICE_SOXR_VERSION:-1.0.0}"
 OMNIVOICE_PYDUB_VERSION="${OMNIVOICE_PYDUB_VERSION:-0.25.1}"
+FISHAUDIO_TRANSFORMERS_MIN_VERSION="${FISHAUDIO_TRANSFORMERS_MIN_VERSION:-4.45.2}"
+FISHAUDIO_PYDANTIC_MIN_VERSION="${FISHAUDIO_PYDANTIC_MIN_VERSION:-2.9.2}"
+FISHAUDIO_AUDIO_TOOLS_VERSION="${FISHAUDIO_AUDIO_TOOLS_VERSION:-0.7.2}"
+FISHAUDIO_ZSTANDARD_MIN_VERSION="${FISHAUDIO_ZSTANDARD_MIN_VERSION:-0.22.0}"
+FISHAUDIO_RESAMPY_MIN_VERSION="${FISHAUDIO_RESAMPY_MIN_VERSION:-0.4.3}"
+FISHAUDIO_SAFETENSORS_MIN_VERSION="${FISHAUDIO_SAFETENSORS_MIN_VERSION:-0.4.0}"
+FISHAUDIO_PYROOTUTILS_MIN_VERSION="${FISHAUDIO_PYROOTUTILS_MIN_VERSION:-1.0.4}"
+FISHAUDIO_NATSORT_MIN_VERSION="${FISHAUDIO_NATSORT_MIN_VERSION:-8.4.0}"
+FISHAUDIO_LORALIB_MIN_VERSION="${FISHAUDIO_LORALIB_MIN_VERSION:-0.1.2}"
+FISHAUDIO_HYDRA_CORE_MIN_VERSION="${FISHAUDIO_HYDRA_CORE_MIN_VERSION:-1.3.2}"
 
 # If flash-attn install fails, we automatically fall back to xformers.
 TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
@@ -78,6 +88,7 @@ NODES=(
     "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Dodzilla/ComfyUI-AudioAnnotation"
     "https://github.com/Saganaki22/ComfyUI-OmniVoice-TTS"
+    "https://github.com/Saganaki22/ComfyUI-FishAudioS2"
     "https://github.com/kana112233/ComfyUI-kaola-moss-ttsd"
     "https://github.com/WASasquatch/was-node-suite-comfyui"
 
@@ -118,6 +129,7 @@ NODE_PINS[ComfyUI-NAG]="c6f27116a8259f5b501d498a09e51c82fa72e35f"
 NODE_PINS[ComfyUI-SAM3]="978bb763cfadcad41363eba016e57686b414c27b"
 NODE_PINS[easy-comfy-nodes-async]="d4c651a65e885a05ce5ce09468a2597ab1f7925c"
 NODE_PINS[ComfyUI-OmniVoice-TTS]="30ecd70e5543ca8b0c5b2bf6e8fdffa8f611ef25"
+NODE_PINS[ComfyUI-FishAudioS2]="0d15094399c2c95e9197145641727315082cddc6"
 NODE_PINS[ComfyUI-Trellis2]="07574666fbe7c82939cec5f69373b8f0958caae1"
 NODE_PINS[ComfyUI-TrellisMeshPostprocess]="7c4b09752968ec09bc93f810773b4f9329e22c91"
 NODE_PINS[ComfyUI-kaola-moss-ttsd]="e3bba1ac47617207d6fb4d48da4ee65e632bfe19"
@@ -342,6 +354,7 @@ function provisioning_start() {
     provisioning_patch_trellis2_flex_gemm_algo || return 1
     provisioning_install_impact_pack_runtime_requirements || return 1
     provisioning_install_omnivoice_requirements || return 1
+    provisioning_install_fishaudio_requirements || return 1
     provisioning_install_moss_ttsd_requirements || return 1
     provisioning_patch_moss_ttsd_runtime || return 1
     provisioning_install_transformers_compat_shim || return 1
@@ -353,6 +366,7 @@ function provisioning_start() {
     printf "Skipping Trellis2 model downloads in provisioning (managed by dependency manager static deps)...\n"
     provisioning_get_pip_packages || return 1
     provisioning_verify_omnivoice_node || return 1
+    provisioning_verify_fishaudio_node || return 1
     # models are now installed by DM agent
     provisioning_print_end || return 1
 }
@@ -697,6 +711,220 @@ if errors:
     raise SystemExit(1)
 
 print("OMNIVOICE_TTS_VALIDATION_OK")
+PY
+}
+
+function provisioning_install_fishaudio_requirements() {
+    local node_path install_script_path
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-FishAudioS2"
+    install_script_path="${node_path}/install.py"
+
+    if [[ ! -d "${node_path}" ]]; then
+        printf "ERROR: FishAudioS2 custom node directory missing: %s\n" "${node_path}"
+        return 1
+    fi
+
+    if [[ -f "${install_script_path}" ]]; then
+        printf "Running FishAudioS2 install.py bootstrap...\n"
+        /venv/main/bin/python "${install_script_path}" || {
+            printf "ERROR: FishAudioS2 install.py failed: %s\n" "${install_script_path}"
+            return 1
+        }
+    else
+        printf "WARN: FishAudioS2 install.py not found, continuing with explicit package installs: %s\n" "${install_script_path}"
+    fi
+
+    printf "Installing FishAudioS2 shared-runtime dependencies...\n"
+    pip install --no-cache-dir --upgrade \
+        "transformers>=${FISHAUDIO_TRANSFORMERS_MIN_VERSION}" \
+        "huggingface_hub>=0.34.0" \
+        "numpy" \
+        "tqdm" \
+        "soundfile" \
+        "loguru" \
+        "einops>=0.7.0" \
+        "librosa>=0.10.1" \
+        "rich>=13.5.3" \
+        "ormsgpack" \
+        "pydantic>=${FISHAUDIO_PYDANTIC_MIN_VERSION}" \
+        "tiktoken>=0.8.0" \
+        "cachetools" \
+        "zstandard>=${FISHAUDIO_ZSTANDARD_MIN_VERSION}" \
+        "resampy>=${FISHAUDIO_RESAMPY_MIN_VERSION}" \
+        "safetensors>=${FISHAUDIO_SAFETENSORS_MIN_VERSION}" \
+        "pyrootutils>=${FISHAUDIO_PYROOTUTILS_MIN_VERSION}" \
+        "natsort>=${FISHAUDIO_NATSORT_MIN_VERSION}" \
+        "loralib>=${FISHAUDIO_LORALIB_MIN_VERSION}" \
+        "hydra-core>=${FISHAUDIO_HYDRA_CORE_MIN_VERSION}" \
+        "flatten-dict" \
+        "importlib-resources" \
+        "julius" \
+        "randomname" \
+        "ffmpy" \
+        "argbind" \
+        "tensorboard" \
+        "bitsandbytes" || {
+        printf "ERROR: Failed to install FishAudioS2 shared-runtime dependencies.\n"
+        return 1
+    }
+
+    printf "Installing FishAudioS2 DAC runtime packages with --no-deps to preserve shared protobuf compatibility...\n"
+    pip install --no-cache-dir --upgrade --no-deps \
+        "descript-audiotools>=${FISHAUDIO_AUDIO_TOOLS_VERSION}" \
+        "descript-audio-codec" || {
+        printf "ERROR: Failed to install FishAudioS2 DAC runtime packages.\n"
+        return 1
+    }
+}
+
+function provisioning_verify_fishaudio_node() {
+    local node_path
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-FishAudioS2"
+
+    if [[ ! -d "${node_path}" ]]; then
+        printf "ERROR: FishAudioS2 custom node directory missing: %s\n" "${node_path}"
+        return 1
+    fi
+
+    printf "Validating ComfyUI-FishAudioS2 node loadability...\n"
+    /venv/main/bin/python - "${node_path}" "${FISHAUDIO_TRANSFORMERS_MIN_VERSION}" "${FISHAUDIO_PYDANTIC_MIN_VERSION}" <<'PY'
+import importlib.util
+import os
+import sys
+
+node_path = sys.argv[1]
+minimum_transformers = tuple(int(part) for part in sys.argv[2].split(".")[:3])
+minimum_pydantic = tuple(int(part) for part in sys.argv[3].split(".")[:3])
+errors = []
+
+for dependency_name in (
+    "audiotools",
+    "bitsandbytes",
+    "cachetools",
+    "dac",
+    "einops",
+    "ffmpy",
+    "flatten_dict",
+    "hydra",
+    "huggingface_hub",
+    "importlib_resources",
+    "julius",
+    "librosa",
+    "loguru",
+    "natsort",
+    "numpy",
+    "ormsgpack",
+    "pyrootutils",
+    "randomname",
+    "resampy",
+    "rich",
+    "safetensors",
+    "soundfile",
+    "tensorboard",
+    "tiktoken",
+    "tqdm",
+    "zstandard",
+):
+    try:
+        __import__(dependency_name)
+    except Exception as exc:
+        errors.append(f"import {dependency_name} failed: {exc}")
+
+try:
+    import transformers
+except Exception as exc:
+    errors.append(f"import transformers failed: {exc}")
+else:
+    try:
+        current = tuple(int(part) for part in transformers.__version__.split(".")[:3])
+    except Exception as exc:
+        errors.append(f"failed to parse transformers version '{transformers.__version__}': {exc}")
+    else:
+        if current < minimum_transformers:
+            errors.append(
+                f"transformers version too old: installed {transformers.__version__}, need >= {sys.argv[2]}"
+            )
+
+try:
+    import pydantic
+except Exception as exc:
+    errors.append(f"import pydantic failed: {exc}")
+else:
+    try:
+        current = tuple(int(part) for part in pydantic.__version__.split(".")[:3])
+    except Exception as exc:
+        errors.append(f"failed to parse pydantic version '{pydantic.__version__}': {exc}")
+    else:
+        if current < minimum_pydantic:
+            errors.append(
+                f"pydantic version too old: installed {pydantic.__version__}, need >= {sys.argv[3]}"
+            )
+
+try:
+    import torch
+except Exception as exc:
+    errors.append(f"import torch failed while checking FishAudioS2 runtime compatibility: {exc}")
+else:
+    if not torch.cuda.is_available():
+        errors.append("torch.cuda.is_available() is false; Fish Audio S2 BF16 research path expects CUDA")
+
+try:
+    package_name = "ComfyUI_FishAudioS2"
+    init_path = os.path.join(node_path, "__init__.py")
+    spec = importlib.util.spec_from_file_location(
+        package_name,
+        init_path,
+        submodule_search_locations=[node_path],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to create import spec for {init_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[package_name] = module
+    spec.loader.exec_module(module)
+except Exception as exc:
+    errors.append(f"import ComfyUI-FishAudioS2 package failed: {exc}")
+else:
+    mappings = getattr(module, "NODE_CLASS_MAPPINGS", {})
+    if not isinstance(mappings, dict):
+        errors.append("NODE_CLASS_MAPPINGS is missing or not a dict")
+    else:
+        for required in ("FishS2TTS", "FishS2VoiceCloneTTS"):
+            if required not in mappings:
+                errors.append(f"missing required registered node class: {required}")
+
+    try:
+        import fish_speech
+    except Exception as exc:
+        errors.append(f"import fish_speech failed after package load: {exc}")
+    else:
+        fish_file = getattr(fish_speech, "__file__", None)
+        if not isinstance(fish_file, str) or "fish_speech_src" not in fish_file:
+            errors.append(f"fish_speech resolved from unexpected location: {fish_file}")
+
+    try:
+        contents = ""
+        source_paths = (
+            os.path.join(node_path, "__init__.py"),
+            os.path.join(node_path, "nodes", "tts_node.py"),
+            os.path.join(node_path, "nodes", "voice_clone_node.py"),
+        )
+        for source_path in source_paths:
+            if os.path.exists(source_path):
+                with open(source_path, "r", encoding="utf-8") as fh:
+                    contents += fh.read()
+        missing_nodes = [node for node in ("FishS2TTS", "FishS2VoiceCloneTTS") if node not in contents]
+        if missing_nodes:
+            errors.append(f"missing required FishAudioS2 node symbols in source: {missing_nodes}")
+    except Exception as exc:
+        errors.append(f"failed to inspect ComfyUI-FishAudioS2 source: {exc}")
+
+if errors:
+    print("FISHAUDIO_S2_VALIDATION_FAILED")
+    for err in errors:
+        print(err)
+    raise SystemExit(1)
+
+print("FISHAUDIO_S2_VALIDATION_OK")
 PY
 }
 
