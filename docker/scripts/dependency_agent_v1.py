@@ -104,7 +104,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.0"
+AGENT_VERSION = "dm-agent-py/0.9.1"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -904,6 +904,40 @@ def http_head(
         return int(getattr(e, "code", 500) or 500), {k.lower(): v for k, v in dict(getattr(e, "headers", {})).items()}
 
 
+def _best_effort_expected_size_from_headers(headers: Optional[Dict[str, str]]) -> int:
+    if not isinstance(headers, dict):
+        return 0
+
+    candidates = [
+        headers.get("x-linked-size"),
+        headers.get("x-file-size"),
+        headers.get("content-length"),
+    ]
+    for value in candidates:
+        if isinstance(value, str):
+            raw = value.strip()
+            if raw.isdigit():
+                try:
+                    parsed = int(raw)
+                except Exception:
+                    parsed = 0
+                if parsed > 0:
+                    return parsed
+
+    content_range = headers.get("content-range")
+    if isinstance(content_range, str):
+        match = re.search(r"/(\d+)\s*$", content_range.strip())
+        if match:
+            try:
+                parsed = int(match.group(1))
+            except Exception:
+                parsed = 0
+            if parsed > 0:
+                return parsed
+
+    return 0
+
+
 def http_put_bytes(
     url: str,
     body: bytes = b"",
@@ -1340,6 +1374,40 @@ class DependencyAgent:
                 return self.input_allowed_domains or None
 
         return self.allowed_domains
+
+    def _resolve_remote_expected_size_bytes(
+        self,
+        url: str,
+        auth_header: Optional[str],
+    ) -> int:
+        headers: Dict[str, str] = {
+            "User-Agent": "dm-agent-head/1.0",
+        }
+        if auth_header:
+            headers["Authorization"] = auth_header
+
+        try:
+            status, resp_headers = http_head(
+                url,
+                headers=headers,
+                timeout_seconds=min(60.0, float(self.download_timeout_seconds)),
+            )
+        except Exception as e:
+            logging.info("remote size HEAD failed for %s: %s", _safe_url_for_logs(url), e)
+            return 0
+
+        if status >= 400:
+            logging.info("remote size HEAD returned %s for %s", status, _safe_url_for_logs(url))
+            return 0
+
+        size_bytes = _best_effort_expected_size_from_headers(resp_headers)
+        if size_bytes <= 0 and self.download_debug:
+            logging.info(
+                "remote size HEAD returned no usable size for %s (headers=%s)",
+                _safe_url_for_logs(url),
+                json.dumps(resp_headers, sort_keys=True)[:800],
+            )
+        return max(0, int(size_bytes))
 
     def _update_download_activity(
         self,
@@ -3999,6 +4067,15 @@ class DependencyAgent:
         auth = resolved.get("auth")
         auth_header = self._resolve_auth_header(auth if isinstance(auth, str) else None)
         allowed_domains = self._download_allowed_domains_for_item(item, resolved)
+        if expected_size_bytes <= 0:
+            inferred_remote_size = self._resolve_remote_expected_size_bytes(url, auth_header)
+            if inferred_remote_size > 0:
+                expected_size_bytes = inferred_remote_size
+                logging.info(
+                    "Using remote HEAD size for %s: %d bytes",
+                    dep_id,
+                    int(expected_size_bytes),
+                )
         self._update_download_activity(
             dep_id,
             dest_relative_path=dest_rel,
