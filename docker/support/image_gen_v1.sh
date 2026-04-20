@@ -274,9 +274,15 @@ function provisioning_download() {
     fi
 }
 
+function dependency_manager_is_disabled() {
+    local dm_agent_disable
+    dm_agent_disable="$(printf '%s' "${DM_AGENT_DISABLE:-}" | tr '[:upper:]' '[:lower:]')"
+    [[ "$dm_agent_disable" == "1" || "$dm_agent_disable" == "true" ]]
+}
+
 function dependency_manager_start_agent() {
     # Allow opt-out.
-    if [[ "${DM_AGENT_DISABLE,,}" == "1" || "${DM_AGENT_DISABLE,,}" == "true" ]]; then
+    if dependency_manager_is_disabled; then
         echo "Dependency manager: DM_AGENT_DISABLE set; skipping agent start."
         return 0
     fi
@@ -388,6 +394,12 @@ watchdog_pid_path="${DM_AGENT_WATCHDOG_PID_PATH:-${WORKSPACE}/dependency_agent_w
 agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
 fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
 
+dependency_manager_is_disabled() {
+    local dm_agent_disable
+    dm_agent_disable="$(printf '%s' "${DM_AGENT_DISABLE:-}" | tr '[:upper:]' '[:lower:]')"
+    [[ "$dm_agent_disable" == "1" || "$dm_agent_disable" == "true" ]]
+}
+
 dependency_manager_agent_running() {
     if command -v pgrep >/dev/null 2>&1 && pgrep -f "$agent_path" >/dev/null 2>&1; then
         return 0
@@ -442,7 +454,7 @@ dependency_manager_start_agent_once() {
     echo $! > "$pid_path"
 }
 
-if [[ "${DM_AGENT_DISABLE,,}" == "1" || "${DM_AGENT_DISABLE,,}" == "true" ]]; then
+if dependency_manager_is_disabled; then
     exit 0
 fi
 
@@ -500,7 +512,8 @@ source = path.read_text(encoding="utf-8")
 
 block = (
     "# FURGEN dependency agent watchdog bootstrap\n"
-    "if [[ \"${DM_AGENT_DISABLE,,}\" != \"1\" && \"${DM_AGENT_DISABLE,,}\" != \"true\" ]]; then\n"
+    "dm_agent_disable=\"$(printf '%s' \"${DM_AGENT_DISABLE:-}\" | tr '[:upper:]' '[:lower:]')\"\n"
+    "if [[ \"${dm_agent_disable}\" != \"1\" && \"${dm_agent_disable}\" != \"true\" ]]; then\n"
     "    watchdog_path=\"${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.sh}\"\n"
     "    watchdog_log_path=\"${DM_AGENT_WATCHDOG_LOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.log}\"\n"
     "    if [[ -x \"${watchdog_path}\" ]]; then\n"
@@ -540,7 +553,7 @@ PY
 function dependency_manager_start_agent() {
     local watchdog_path watchdog_log_path
 
-    if [[ "${DM_AGENT_DISABLE,,}" == "1" || "${DM_AGENT_DISABLE,,}" == "true" ]]; then
+    if dependency_manager_is_disabled; then
         echo "Dependency manager: DM_AGENT_DISABLE set; skipping agent start."
         return 0
     fi
