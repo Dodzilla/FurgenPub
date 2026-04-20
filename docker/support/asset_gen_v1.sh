@@ -1532,6 +1532,237 @@ function dependency_manager_start_agent() {
     nohup bash -lc "source /venv/main/bin/activate && python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
 }
 
+function dependency_manager_install_agent_artifact() {
+    local agent_path agent_url script_dir bundled_path fallback_url
+    agent_path="${DM_AGENT_PATH:-${WORKSPACE}/dependency_agent_v1.py}"
+    agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
+
+    mkdir -p "$(dirname "$agent_path")" || true
+    mkdir -p "${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}" || true
+
+    if [[ -n "$agent_url" ]]; then
+        echo "Dependency manager: downloading agent from DM_AGENT_URL/AGENT_URL."
+        curl -fsSL "$agent_url" -o "$agent_path" || {
+            echo "WARN: Dependency manager: failed to download agent from $agent_url"
+            return 1
+        }
+    else
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        bundled_path="${script_dir}/../scripts/dependency_agent_v1.py"
+        if [[ -f "$bundled_path" ]]; then
+            echo "Dependency manager: installing bundled agent from $bundled_path."
+            cp -f "$bundled_path" "$agent_path" || {
+                echo "WARN: Dependency manager: failed to copy bundled agent from $bundled_path"
+                return 1
+            }
+        else
+            fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
+            echo "Dependency manager: downloading agent from fallback URL ($fallback_url)."
+            curl -fsSL "$fallback_url" -o "$agent_path" || {
+                echo "WARN: Dependency manager: failed to download agent from fallback URL"
+                return 1
+            }
+        fi
+    fi
+
+    chmod +x "$agent_path" || true
+}
+
+function dependency_manager_render_watchdog() {
+    local watchdog_path
+    watchdog_path="${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE}/dependency_agent_watchdog.sh}"
+
+    mkdir -p "$(dirname "$watchdog_path")" || true
+
+    cat > "$watchdog_path" <<'EOF'
+#!/bin/bash
+
+set -u
+
+WORKSPACE="${WORKSPACE:-/workspace}"
+DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
+agent_path="${DM_AGENT_PATH:-${WORKSPACE}/dependency_agent_v1.py}"
+log_path="${DM_AGENT_LOG_PATH:-${WORKSPACE}/dependency_agent.log}"
+pid_path="${DM_AGENT_PID_PATH:-${WORKSPACE}/dependency_agent.pid}"
+watchdog_pid_path="${DM_AGENT_WATCHDOG_PID_PATH:-${WORKSPACE}/dependency_agent_watchdog.pid}"
+agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
+fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
+
+dependency_manager_agent_running() {
+    if command -v pgrep >/dev/null 2>&1 && pgrep -f "$agent_path" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ -f "$pid_path" ]]; then
+        local pid
+        pid="$(cat "$pid_path" 2>/dev/null || true)"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+dependency_manager_install_agent_if_missing() {
+    mkdir -p "$(dirname "$agent_path")" || true
+    mkdir -p "${DM_COMFYUI_DIR}" || true
+
+    if [[ -s "$agent_path" ]]; then
+        chmod +x "$agent_path" || true
+        return 0
+    fi
+
+    if [[ -n "$agent_url" ]]; then
+        echo "Dependency manager: watchdog downloading agent from DM_AGENT_URL/AGENT_URL."
+        curl -fsSL "$agent_url" -o "$agent_path" || {
+            echo "WARN: Dependency manager: watchdog failed to download agent from $agent_url"
+            return 1
+        }
+    else
+        echo "Dependency manager: watchdog downloading agent from fallback URL ($fallback_url)."
+        curl -fsSL "$fallback_url" -o "$agent_path" || {
+            echo "WARN: Dependency manager: watchdog failed to download agent from fallback URL"
+            return 1
+        }
+    fi
+
+    chmod +x "$agent_path" || true
+}
+
+dependency_manager_start_agent_once() {
+    if dependency_manager_agent_running; then
+        return 0
+    fi
+
+    dependency_manager_install_agent_if_missing || return 0
+
+    echo "Dependency manager: watchdog starting agent; log=$log_path"
+    nohup bash -lc "if [[ -f /venv/main/bin/activate ]]; then source /venv/main/bin/activate; fi; python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
+    echo $! > "$pid_path"
+}
+
+if [[ "${DM_AGENT_DISABLE,,}" == "1" || "${DM_AGENT_DISABLE,,}" == "true" ]]; then
+    exit 0
+fi
+
+mkdir -p "$(dirname "$watchdog_pid_path")" || true
+if [[ -f "$watchdog_pid_path" ]]; then
+    existing_pid="$(cat "$watchdog_pid_path" 2>/dev/null || true)"
+    if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" 2>/dev/null; then
+        echo "Dependency manager: watchdog already running with pid=$existing_pid."
+        exit 0
+    fi
+fi
+
+echo $$ > "$watchdog_pid_path"
+cleanup() {
+    if [[ -f "$watchdog_pid_path" ]] && [[ "$(cat "$watchdog_pid_path" 2>/dev/null || true)" == "$$" ]]; then
+        rm -f "$watchdog_pid_path"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+dependency_manager_start_agent_once
+while true; do
+    sleep "${DM_AGENT_WATCHDOG_SECONDS:-15}"
+    dependency_manager_start_agent_once
+done
+EOF
+
+    chmod +x "$watchdog_path" || true
+}
+
+function dependency_manager_configure_supervisor_watchdog() {
+    local launch_script python_bin
+    launch_script="/opt/supervisor-scripts/comfyui.sh"
+
+    if [[ ! -f "$launch_script" ]]; then
+        return 0
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        python_bin="$(command -v python)"
+    elif command -v python3 >/dev/null 2>&1; then
+        python_bin="$(command -v python3)"
+    else
+        echo "WARN: Dependency manager: no python interpreter available to patch $launch_script"
+        return 0
+    fi
+
+    "$python_bin" - "$launch_script" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+
+block = (
+    "# FURGEN dependency agent watchdog bootstrap\n"
+    "if [[ \"${DM_AGENT_DISABLE,,}\" != \"1\" && \"${DM_AGENT_DISABLE,,}\" != \"true\" ]]; then\n"
+    "    watchdog_path=\"${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.sh}\"\n"
+    "    watchdog_log_path=\"${DM_AGENT_WATCHDOG_LOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.log}\"\n"
+    "    if [[ -x \"${watchdog_path}\" ]]; then\n"
+    "        if ! command -v pgrep >/dev/null 2>&1 || ! pgrep -f \"${watchdog_path}\" >/dev/null 2>&1; then\n"
+    "            nohup \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+    "        fi\n"
+    "    fi\n"
+    "fi\n"
+    "# /FURGEN dependency agent watchdog bootstrap\n"
+)
+
+pattern = re.compile(
+    r"# FURGEN dependency agent watchdog bootstrap\n.*?# /FURGEN dependency agent watchdog bootstrap\n",
+    re.DOTALL,
+)
+source = pattern.sub("", source)
+
+anchor = "# Launch ComfyUI\n"
+if anchor in source:
+    insert_at = source.find(anchor)
+else:
+    launch_idx = source.find("python main.py")
+    insert_at = source.rfind("\n", 0, launch_idx) + 1 if launch_idx != -1 else len(source)
+
+patched = source[:insert_at] + block + source[insert_at:]
+
+if patched != path.read_text(encoding="utf-8"):
+    path.write_text(patched, encoding="utf-8")
+    print("Applied dependency agent watchdog bootstrap patch.")
+else:
+    print("Dependency agent watchdog bootstrap already present.")
+PY
+
+    chmod +x "$launch_script" || true
+}
+
+function dependency_manager_start_agent() {
+    local watchdog_path watchdog_log_path
+
+    if [[ "${DM_AGENT_DISABLE,,}" == "1" || "${DM_AGENT_DISABLE,,}" == "true" ]]; then
+        echo "Dependency manager: DM_AGENT_DISABLE set; skipping agent start."
+        return 0
+    fi
+
+    dependency_manager_install_agent_artifact || true
+    dependency_manager_render_watchdog
+    dependency_manager_configure_supervisor_watchdog
+
+    watchdog_path="${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE}/dependency_agent_watchdog.sh}"
+    watchdog_log_path="${DM_AGENT_WATCHDOG_LOG_PATH:-${WORKSPACE}/dependency_agent_watchdog.log}"
+
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -f "$watchdog_path" >/dev/null 2>&1; then
+            echo "Dependency manager: watchdog already running ($watchdog_path)."
+            return 0
+        fi
+    fi
+
+    echo "Dependency manager: starting agent watchdog; log=$watchdog_log_path"
+    nohup "$watchdog_path" >> "$watchdog_log_path" 2>&1 &
+}
+
 # Start the dependency manager agent (best-effort; safe if required env vars are missing).
 dependency_manager_start_agent
 

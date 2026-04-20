@@ -79,7 +79,7 @@ Optional behavior knobs:
 
 1) Ensure the env vars above are set in the Vast template.
 
-2) Add this snippet to your startup script (replace `AGENT_URL`):
+2) Add this snippet to your startup script (replace `AGENT_URL`). Use a watchdog or supervisor, not a one-shot `nohup python ... &`, so the agent comes back after crashes and instance reboots:
 
 ```bash
 set -euo pipefail
@@ -90,15 +90,32 @@ export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$WORKSPACE/ComfyUI}"
 AGENT_URL="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
 AGENT_PATH="$WORKSPACE/dependency_agent_v1.py"
 LOG_PATH="$WORKSPACE/dependency_agent.log"
+WATCHDOG_PATH="$WORKSPACE/dependency_agent_watchdog.sh"
+WATCHDOG_LOG_PATH="$WORKSPACE/dependency_agent_watchdog.log"
 
 curl -fsSL "$AGENT_URL" -o "$AGENT_PATH"
-chmod +x "$AGENT_PATH" || true
+cat > "$WATCHDOG_PATH" <<'EOF'
+#!/bin/bash
+set -u
 
-# Start in background. Use bash -lc so env vars from the template are visible.
-nohup bash -lc "python3 '$AGENT_PATH' >> '$LOG_PATH' 2>&1" >/dev/null 2>&1 &
+WORKSPACE="${WORKSPACE:-/workspace}"
+AGENT_PATH="${AGENT_PATH:-$WORKSPACE/dependency_agent_v1.py}"
+LOG_PATH="${LOG_PATH:-$WORKSPACE/dependency_agent.log}"
+
+while true; do
+  if ! pgrep -f "$AGENT_PATH" >/dev/null 2>&1; then
+    nohup bash -lc "if [[ -f /venv/main/bin/activate ]]; then source /venv/main/bin/activate; fi; python3 '$AGENT_PATH' >> '$LOG_PATH' 2>&1" >/dev/null 2>&1 &
+  fi
+  sleep 15
+done
+EOF
+
+chmod +x "$AGENT_PATH" "$WATCHDOG_PATH" || true
+nohup "$WATCHDOG_PATH" >> "$WATCHDOG_LOG_PATH" 2>&1 &
 ```
 
 Notes:
+- The checked-in `FurgenPub/docker/support/*.sh` provisioning scripts now render a watchdog like this automatically and, when `/opt/supervisor-scripts/comfyui.sh` exists, patch that supervised boot path to relaunch the watchdog on reboot.
 - If your template starts ComfyUI separately, keep doing that; the agent only needs the ComfyUI workspace path, not the ComfyUI process itself.
 - If you use a “core-ready” marker file, keep that logic in your provisioning script; the agent is independent of readiness gating.
 
@@ -111,7 +128,24 @@ export SERVER_TYPE="furry-standard-v8"
 export DEPENDENCY_MANAGER_SHARED_SECRET="..."
 
 curl -fsSL "https://<your-public-host>/dependency_agent_v1.py" -o "$WORKSPACE/dependency_agent_v1.py"
-nohup python3 "$WORKSPACE/dependency_agent_v1.py" > "$WORKSPACE/dependency_agent.log" 2>&1 &
+cat > "$WORKSPACE/dependency_agent_watchdog.sh" <<'EOF'
+#!/bin/bash
+set -u
+
+WORKSPACE="${WORKSPACE:-/workspace}"
+AGENT_PATH="${AGENT_PATH:-$WORKSPACE/dependency_agent_v1.py}"
+LOG_PATH="${LOG_PATH:-$WORKSPACE/dependency_agent.log}"
+
+while true; do
+  if ! pgrep -f "$AGENT_PATH" >/dev/null 2>&1; then
+    nohup python3 "$AGENT_PATH" >> "$LOG_PATH" 2>&1 &
+  fi
+  sleep 15
+done
+EOF
+
+chmod +x "$WORKSPACE/dependency_agent_v1.py" "$WORKSPACE/dependency_agent_watchdog.sh"
+nohup "$WORKSPACE/dependency_agent_watchdog.sh" > "$WORKSPACE/dependency_agent_watchdog.log" 2>&1 &
 ```
 
 ## Verification checklist
