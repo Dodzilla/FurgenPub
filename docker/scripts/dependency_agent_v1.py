@@ -63,6 +63,7 @@ Optional knobs:
   - DM_INPUT_CACHE_DIR            (persistent remote-input cache dir; default: $WORKSPACE/.dm_input_cache)
   - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 20GiB)
   - DM_AGENT_SELF_UPDATE_ENABLED  (allow backend-directed in-place script updates; default: true)
+  - DM_AGENT_SELF_UPDATE_ALLOW_DOWNGRADE (allow backend-directed downgrades/rollbacks; default: false)
   - DM_AGENT_SELF_UPDATE_RETRY_SECONDS (retry delay after failed update attempts; default: 300)
   - DM_EXISTING_FILE_STABLE_SECONDS (minimum age before existing files without size/hash metadata are trusted; default: 120)
 
@@ -104,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.1"
+AGENT_VERSION = "dm-agent-py/0.9.2"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -382,6 +383,7 @@ def sha256_file(
 
 
 AGENT_VERSION_RE = re.compile(r'^\s*AGENT_VERSION\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
+AGENT_VERSION_TAG_RE = re.compile(r"^dm-agent-py/(\d+)\.(\d+)\.(\d+)$", re.IGNORECASE)
 
 
 def extract_agent_version_from_script(path: Path) -> Optional[str]:
@@ -394,6 +396,31 @@ def extract_agent_version_from_script(path: Path) -> Optional[str]:
         return None
     value = match.group(1).strip()
     return value or None
+
+
+def parse_agent_version_tuple(agent_version: str) -> Optional[Tuple[int, int, int]]:
+    value = str(agent_version or "").strip()
+    if not value:
+        return None
+    match = AGENT_VERSION_TAG_RE.fullmatch(value)
+    if not match:
+        return None
+    try:
+        return tuple(int(part) for part in match.groups())
+    except Exception:
+        return None
+
+
+def compare_agent_versions(left: str, right: str) -> Optional[int]:
+    left_tuple = parse_agent_version_tuple(left)
+    right_tuple = parse_agent_version_tuple(right)
+    if left_tuple is None or right_tuple is None:
+        return None
+    if left_tuple < right_tuple:
+        return -1
+    if left_tuple > right_tuple:
+        return 1
+    return 0
 
 
 def _safe_url_for_logs(url: str) -> str:
@@ -1288,6 +1315,7 @@ class DependencyAgent:
         self.input_cache_max_bytes = max(0, int(_parse_bytes(_env_str("DM_INPUT_CACHE_MAX_BYTES")) or 20 * 1024 * 1024 * 1024))
         self.input_cache_heartbeat_max_keys = max(0, min(1000, _env_int("DM_INPUT_CACHE_HEARTBEAT_MAX_KEYS", 200)))
         self.self_update_enabled = _env_bool("DM_AGENT_SELF_UPDATE_ENABLED", True)
+        self.self_update_allow_downgrade = _env_bool("DM_AGENT_SELF_UPDATE_ALLOW_DOWNGRADE", False)
         self.self_update_retry_seconds = max(30.0, _env_float("DM_AGENT_SELF_UPDATE_RETRY_SECONDS", 300.0))
         self.self_script_path = Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__))
 
@@ -2733,6 +2761,17 @@ class DependencyAgent:
         except Exception:
             return None
 
+    def _clear_pending_self_update(self) -> None:
+        self._pending_self_update = None
+        self._pending_self_update_source = ""
+        self._self_update_retry_at_ms = 0
+
+    def _is_blocked_self_update_downgrade(self, release: AgentSelfUpdateRelease) -> bool:
+        if self.self_update_allow_downgrade:
+            return False
+        comparison = compare_agent_versions(release.target_version, AGENT_VERSION)
+        return comparison is not None and comparison < 0
+
     def _self_update_required(self, release: AgentSelfUpdateRelease) -> bool:
         if release.target_version != AGENT_VERSION:
             return True
@@ -2749,11 +2788,20 @@ class DependencyAgent:
         if release is None:
             return
 
+        if self._is_blocked_self_update_downgrade(release):
+            if self._pending_self_update == release:
+                self._clear_pending_self_update()
+            logging.warning(
+                "Ignoring dependency agent self-update downgrade: current=%s target=%s source=%s",
+                AGENT_VERSION,
+                release.target_version,
+                source,
+            )
+            return
+
         if not self._self_update_required(release):
             if self._pending_self_update == release:
-                self._pending_self_update = None
-                self._pending_self_update_source = ""
-                self._self_update_retry_at_ms = 0
+                self._clear_pending_self_update()
             return
 
         if self._pending_self_update == release:
@@ -2777,6 +2825,16 @@ class DependencyAgent:
 
         now_ms = _now_ms()
         if now_ms < int(self._self_update_retry_at_ms):
+            return
+
+        if self._is_blocked_self_update_downgrade(release):
+            logging.warning(
+                "Skipping queued dependency agent self-update downgrade: current=%s target=%s source=%s",
+                AGENT_VERSION,
+                release.target_version,
+                self._pending_self_update_source or "-",
+            )
+            self._clear_pending_self_update()
             return
 
         tmp_path = self.self_script_path.parent / f".{self.self_script_path.name}.{uuid.uuid4().hex}.tmp"
@@ -2811,9 +2869,7 @@ class DependencyAgent:
                     release.target_version,
                     self.self_script_path,
                 )
-                self._pending_self_update = None
-                self._pending_self_update_source = ""
-                self._self_update_retry_at_ms = 0
+                self._clear_pending_self_update()
                 return
 
             try:
@@ -5499,8 +5555,9 @@ class DependencyAgent:
             int(self.agent_max_execute_workers),
         )
         logging.info(
-            "Self-update: enabled=%s scriptPath=%s retrySeconds=%.0f",
+            "Self-update: enabled=%s allowDowngrade=%s scriptPath=%s retrySeconds=%.0f",
             "yes" if self.self_update_enabled else "no",
+            "yes" if self.self_update_allow_downgrade else "no",
             str(self.self_script_path),
             float(self.self_update_retry_seconds),
         )
