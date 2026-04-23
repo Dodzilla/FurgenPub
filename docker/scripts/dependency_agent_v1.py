@@ -54,8 +54,8 @@ Optional knobs:
   - DM_PIN_TTL_SECONDS            (do not evict deps touched within this window; default: 1800)
   - DM_AGENT_CONTROL_ENABLED      (enable /agent/* control channel; default: true)
   - DM_INSTANCE_BOOTSTRAP_TOKEN   (instance bootstrap token for /agent/register when required)
-  - DM_AGENT_POLL_SECONDS         (poll cadence for /agent/queue; default: 1)
-  - DM_AGENT_HEARTBEAT_SECONDS    (heartbeat cadence for /agent/heartbeat; default: 5)
+  - DM_AGENT_POLL_SECONDS         (poll cadence for /agent/queue; default: 2)
+  - DM_AGENT_HEARTBEAT_SECONDS    (heartbeat cadence for /agent/heartbeat; default: 8)
   - DM_AGENT_QUEUE_WAIT_SEC       (long-poll waitSec for /agent/queue; default: 2)
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.3"
+AGENT_VERSION = "dm-agent-py/0.9.4"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -1305,8 +1305,10 @@ class DependencyAgent:
 
         # Agent control channel knobs (execute pull mode).
         self.agent_control_enabled = _env_bool("DM_AGENT_CONTROL_ENABLED", True)
-        self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 1.0))
-        self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 5.0))
+        self._agent_poll_seconds_env = _env_str("DM_AGENT_POLL_SECONDS") is not None
+        self._agent_heartbeat_seconds_env = _env_str("DM_AGENT_HEARTBEAT_SECONDS") is not None
+        self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 2.0))
+        self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 8.0))
         self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
@@ -1916,6 +1918,35 @@ class DependencyAgent:
             float(normalized["firestoreCheckpointSeconds"]),
         )
         self._coordination_restart_stream()
+
+    def _runtime_config_seconds(self, value: Any, minimum: float, maximum: float) -> Optional[float]:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed != parsed or parsed <= 0:
+            return None
+        return max(float(minimum), min(float(maximum), parsed))
+
+    def _apply_agent_runtime_config(self, raw: Any, source: str) -> None:
+        if not isinstance(raw, dict):
+            return
+
+        changes: List[str] = []
+        heartbeat_seconds = self._runtime_config_seconds(raw.get("agentHeartbeatSec"), 2.0, 30.0)
+        if heartbeat_seconds is not None and not self._agent_heartbeat_seconds_env:
+            if abs(float(self.agent_heartbeat_seconds) - heartbeat_seconds) >= 0.1:
+                self.agent_heartbeat_seconds = heartbeat_seconds
+                changes.append(f"heartbeat={heartbeat_seconds:.1f}s")
+
+        poll_seconds = self._runtime_config_seconds(raw.get("agentPollSec"), 0.5, 30.0)
+        if poll_seconds is not None and not self._agent_poll_seconds_env:
+            if abs(float(self.agent_poll_seconds) - poll_seconds) >= 0.1:
+                self.agent_poll_seconds = poll_seconds
+                changes.append(f"poll={poll_seconds:.1f}s")
+
+        if changes:
+            logging.info("Applied agent runtime config from %s: %s", source, ", ".join(changes))
 
     def _coordination_should_use_safety_polls(self) -> bool:
         return bool(self._coordination and self._coordination_stream_healthy)
@@ -3152,6 +3183,7 @@ class DependencyAgent:
         self._agent_bootstrap_profile = profile
         self._agent_channel_supported = True
         self._set_coordination_from_response(data, "/agent/register")
+        self._apply_agent_runtime_config(data.get("agentRuntimeConfig"), "/agent/register")
         self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/register")
         logging.info(
             "Registered agent control channel: instanceId=%s maxConcurrentExecuteJobs=%d maxPrefetchJobs=%d tokenExpiresAt=%s",
@@ -3382,6 +3414,7 @@ class DependencyAgent:
             self._write_agent_runtime_mirror()
         resp = self._agent_api("POST", "/agent/heartbeat", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        self._apply_agent_runtime_config(data.get("agentRuntimeConfig"), "/agent/heartbeat")
         self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/heartbeat")
         self._last_agent_heartbeat_ms = _now_ms()
 
