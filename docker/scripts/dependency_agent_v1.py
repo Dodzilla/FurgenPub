@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.2"
+AGENT_VERSION = "dm-agent-py/0.9.3"
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -275,6 +275,13 @@ class ApiError(RuntimeError):
         self.body = body
 
 
+class NetworkError(RuntimeError):
+    def __init__(self, url: str, reason: Any):
+        self.url = _safe_url_for_logs(url)
+        self.reason = reason
+        super().__init__(f"Network error calling {self.url}: {reason}")
+
+
 def _json_loads_or_none(text: str) -> Optional[Any]:
     try:
         return json.loads(text)
@@ -312,8 +319,8 @@ def api_json(
         except Exception:
             raw = ""
         raise ApiError(int(getattr(e, "code", 500) or 500), raw) from None
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Network error calling {url}: {e}") from None
+    except (urllib.error.URLError, socket.timeout, TimeoutError, http.client.HTTPException) as e:
+        raise NetworkError(url, e) from None
 
 
 def api_form_json(
@@ -345,8 +352,8 @@ def api_form_json(
         except Exception:
             raw = ""
         raise ApiError(int(getattr(e, "code", 500) or 500), raw) from None
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Network error calling {url}: {e}") from None
+    except (urllib.error.URLError, socket.timeout, TimeoutError, http.client.HTTPException) as e:
+        raise NetworkError(url, e) from None
 
 
 def sha256_file(
@@ -1939,6 +1946,12 @@ class DependencyAgent:
         interval_sec = float(self._coordination.get("firestoreCheckpointSeconds") or 60.0)
         self._coordination_http_checkpoint_due_ms = at_ms + int(max(5.0, interval_sec) * 1000)
 
+    def _coordination_runtime_retry_delay_seconds(self, attempt: int) -> float:
+        return min(2.0, 0.5 * (2 ** max(0, int(attempt))))
+
+    def _is_coordination_runtime_retryable_api_status(self, status: int) -> bool:
+        return int(status) in (408, 409, 429, 500, 502, 503, 504)
+
     def _coordination_patch_runtime(self, patch: Dict[str, Any], timeout_seconds: float = 15.0) -> bool:
         if not self._coordination:
             return False
@@ -1950,8 +1963,32 @@ class DependencyAgent:
                 raise RuntimeError(f"Unexpected RTDB runtime patch response: {status} {resp}")
             return True
 
+        def _attempt_with_transient_retry(id_token: str) -> bool:
+            for attempt in range(2):
+                try:
+                    return _attempt(id_token)
+                except ApiError as e:
+                    if e.status in (401, 403):
+                        raise
+                    if attempt == 0 and self._is_coordination_runtime_retryable_api_status(e.status):
+                        _sleep_with_jitter(
+                            self._coordination_runtime_retry_delay_seconds(attempt),
+                            jitter_ratio=0.1,
+                        )
+                        continue
+                    raise
+                except NetworkError:
+                    if attempt == 0:
+                        _sleep_with_jitter(
+                            self._coordination_runtime_retry_delay_seconds(attempt),
+                            jitter_ratio=0.1,
+                        )
+                        continue
+                    raise
+            return False
+
         try:
-            return _attempt(self._ensure_coordination_id_token())
+            return _attempt_with_transient_retry(self._ensure_coordination_id_token())
         except ApiError as e:
             if e.status not in (401, 403):
                 logging.warning("RTDB runtime patch API error: %s", e)
@@ -1961,7 +1998,7 @@ class DependencyAgent:
             return False
 
         try:
-            return _attempt(self._ensure_coordination_id_token(force_refresh=True))
+            return _attempt_with_transient_retry(self._ensure_coordination_id_token(force_refresh=True))
         except Exception as e:
             logging.warning("RTDB runtime patch retry failed: %s", e)
             return False
