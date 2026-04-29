@@ -347,6 +347,7 @@ function provisioning_install_selected_node_bundles() {
 
     if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_trellis"; then
         provisioning_patch_trellis2_allocator_override || return 1
+        provisioning_patch_trellis2_dinov3_forward || return 1
         provisioning_patch_trellis2_flex_gemm_algo || return 1
         provisioning_install_trellis2_runtime_requirements || return 1
         provisioning_configure_trellis2_runtime || return 1
@@ -364,6 +365,7 @@ function provisioning_install_selected_node_bundles() {
     if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_moss"; then
         provisioning_install_moss_ttsd_requirements || return 1
         provisioning_patch_moss_ttsd_runtime || return 1
+        provisioning_patch_moss_audio_tokenizer_config || return 1
         provisioning_install_transformers_compat_shim || return 1
     fi
 
@@ -1101,6 +1103,94 @@ if changed:
 else:
     print("MOSS runtime compatibility patch already present.")
 PY
+
+    /venv/main/bin/python - "${COMFYUI_DIR}/custom_nodes/ComfyUI-kaola-moss-ttsd/nodes.py" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    print(f"WARN: MOSS nodes.py missing, skipping audio tokenizer runtime patch: {path}")
+    raise SystemExit(0)
+
+source = path.read_text(encoding="utf-8")
+if "FURGEN_MOSS_AUDIO_TOKENIZER_CONFIG_RUNTIME_PATCH" in source:
+    print("MOSS audio tokenizer runtime config patch already present.")
+    raise SystemExit(0)
+
+helper = '''
+
+def _furgen_patch_moss_audio_tokenizer_config(codec_path):
+    # FURGEN_MOSS_AUDIO_TOKENIZER_CONFIG_RUNTIME_PATCH
+    try:
+        from pathlib import Path as _FurgenPath
+        config_file = _FurgenPath(codec_path) / "configuration_moss_audio_tokenizer.py"
+        if not config_file.exists():
+            return
+        source = config_file.read_text(encoding="utf-8")
+        replacements = {
+            "    sampling_rate: int\\n": "    sampling_rate: int = 24000\\n",
+            "    downsample_rate: int\\n": "    downsample_rate: int = 1920\\n",
+            "    causal_transformer_context_duration: float\\n": "    causal_transformer_context_duration: float = 10.0\\n",
+            "    encoder_kwargs: list[dict[str, Any]]\\n": "    encoder_kwargs: list[dict[str, Any]] | None = None\\n",
+            "    decoder_kwargs: list[dict[str, Any]]\\n": "    decoder_kwargs: list[dict[str, Any]] | None = None\\n",
+            "    quantizer_type: str\\n": "    quantizer_type: str = \\"rlfq\\"\\n",
+            "    quantizer_kwargs: dict[str, Any]\\n": "    quantizer_kwargs: dict[str, Any] | None = None\\n",
+        }
+        patched = source
+        for old, new in replacements.items():
+            patched = patched.replace(old, new)
+        if patched != source:
+            config_file.write_text(patched, encoding="utf-8")
+    except Exception as exc:
+        print(f"WARN: failed to patch MOSS audio tokenizer config: {exc}")
+'''
+
+source = helper + "\n" + source
+call = "        # Load directly as AutoModel\n        try:\n             audio_tokenizer = AutoModel.from_pretrained(codec_path, trust_remote_code=True)\n"
+replacement = "        # Load directly as AutoModel\n        _furgen_patch_moss_audio_tokenizer_config(codec_path)\n        try:\n             audio_tokenizer = AutoModel.from_pretrained(codec_path, trust_remote_code=True)\n"
+if call not in source:
+    print("WARN: Could not locate MOSS Audio Tokenizer load call; helper installed but not wired.")
+else:
+    source = source.replace(call, replacement, 1)
+
+path.write_text(source, encoding="utf-8")
+print("Applied MOSS audio tokenizer runtime config patch.")
+PY
+}
+
+function provisioning_patch_moss_audio_tokenizer_config() {
+    local config_file
+    config_file="${COMFYUI_DIR}/models/moss_ttsd/MOSS-Audio-Tokenizer/configuration_moss_audio_tokenizer.py"
+    if [[ ! -f "${config_file}" ]]; then
+        printf "WARN: MOSS audio tokenizer config missing, skipping dataclass annotation patch: %s\n" "${config_file}"
+        return 0
+    fi
+
+    /venv/main/bin/python - "${config_file}" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+replacements = {
+    "    sampling_rate: int\n": "    sampling_rate: int = 24000\n",
+    "    downsample_rate: int\n": "    downsample_rate: int = 1920\n",
+    "    causal_transformer_context_duration: float\n": "    causal_transformer_context_duration: float = 10.0\n",
+    "    encoder_kwargs: list[dict[str, Any]]\n": "    encoder_kwargs: list[dict[str, Any]] | None = None\n",
+    "    decoder_kwargs: list[dict[str, Any]]\n": "    decoder_kwargs: list[dict[str, Any]] | None = None\n",
+    "    quantizer_type: str\n": "    quantizer_type: str = \"rlfq\"\n",
+    "    quantizer_kwargs: dict[str, Any]\n": "    quantizer_kwargs: dict[str, Any] | None = None\n",
+}
+patched = source
+for old, new in replacements.items():
+    patched = patched.replace(old, new)
+if patched != source:
+    path.write_text(patched, encoding="utf-8")
+    print("Applied MOSS audio tokenizer dataclass annotation patch.")
+else:
+    print("MOSS audio tokenizer dataclass annotation patch already present or not needed.")
+PY
 }
 
 function provisioning_install_transformers_compat_shim() {
@@ -1153,6 +1243,17 @@ for marker in managed_markers:
         cleaned.append(lines[i])
         i += 1
     source = "".join(cleaned)
+
+if source.strip():
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    print(f"Removed Furgen startup compatibility shims from {path}")
+elif path.exists():
+    path.unlink()
+    print(f"Removed empty Furgen startup compatibility shim file {path}")
+else:
+    print(f"No startup compatibility shims present at {path}")
+raise SystemExit(0)
 
 blocks = [
     (
@@ -1352,6 +1453,57 @@ replacement = f"{match.group(1)}'{desired_algo}'"
 patched = source[:match.start()] + replacement + source[match.end():]
 path.write_text(patched, encoding="utf-8")
 print(f"Updated Trellis2 FLEX_GEMM_ALGO: {current_algo} -> {desired_algo}")
+PY
+}
+
+function provisioning_patch_trellis2_dinov3_forward() {
+    if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
+        return 0
+    fi
+
+    local extractor_file
+    extractor_file="${COMFYUI_DIR}/custom_nodes/ComfyUI-Trellis2/trellis2/modules/image_feature_extractor.py"
+    if [[ ! -f "${extractor_file}" ]]; then
+        printf "WARN: Trellis2 image feature extractor missing, skipping DINOv3 forward patch: %s\n" "${extractor_file}"
+        return 0
+    fi
+
+    /venv/main/bin/python - "${extractor_file}" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+if "FURGEN hotfix: newer transformers exposes DINOv3 blocks under encoder" in source:
+    print("Trellis2 DINOv3 forward patch already present.")
+    raise SystemExit(0)
+
+old = '''    def extract_features(self, image: torch.Tensor) -> torch.Tensor:
+        image = image.to(self.model.embeddings.patch_embeddings.weight.dtype)
+        hidden_states = self.model.embeddings(image, bool_masked_pos=None)
+        position_embeddings = self.model.rope_embeddings(image)
+
+        for i, layer_module in enumerate(self.model.layer):
+            hidden_states = layer_module(
+                hidden_states,
+                position_embeddings=position_embeddings,
+            )
+
+        return F.layer_norm(hidden_states, hidden_states.shape[-1:])
+'''
+new = '''    def extract_features(self, image: torch.Tensor) -> torch.Tensor:
+        image = image.to(self.model.embeddings.patch_embeddings.weight.dtype)
+        # FURGEN hotfix: newer transformers exposes DINOv3 blocks under encoder
+        # and the public forward path is stable across both layouts.
+        outputs = self.model(pixel_values=image, output_hidden_states=False)
+        hidden_states = outputs.last_hidden_state
+        return F.layer_norm(hidden_states, hidden_states.shape[-1:])
+'''
+if old not in source:
+    print("WARN: Could not locate Trellis2 DINOv3 manual layer loop; skipping patch.")
+    raise SystemExit(0)
+path.write_text(source.replace(old, new), encoding="utf-8")
+print("Applied Trellis2 DINOv3 forward patch.")
 PY
 }
 
