@@ -1129,6 +1129,31 @@ import sys
 path = pathlib.Path(sys.argv[1])
 source = path.read_text(encoding="utf-8") if path.exists() else ""
 
+managed_markers = [
+    "FURGEN_TRANSFORMERS_PRETRAINED_SHIM",
+    "FURGEN_MOSS_PROCESSING_UTILS_SHIM",
+    "FURGEN_MOSS_AUDIO_TOKENIZER_CLASSCHECK_SHIM",
+    "FURGEN_MOSS_PROCESSOR_INIT_SHIM",
+    "FURGEN_MOSS_CLASSCHECK_BYPASS2",
+    "FURGEN_MOSS_INITIALIZATION_ALIAS_SHIM",
+    "FURGEN_OMNIVOICE_TORCH_INIT_COPY_SHIM",
+]
+for marker in managed_markers:
+    lines = source.splitlines(keepends=True)
+    cleaned = []
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == f"# {marker}":
+            i += 1
+            while i < len(lines):
+                if lines[i].startswith("# FURGEN_"):
+                    break
+                i += 1
+            continue
+        cleaned.append(lines[i])
+        i += 1
+    source = "".join(cleaned)
+
 blocks = [
     (
         "FURGEN_TRANSFORMERS_PRETRAINED_SHIM",
@@ -1207,26 +1232,20 @@ except Exception:
         "FURGEN_MOSS_INITIALIZATION_ALIAS_SHIM",
         """# FURGEN_MOSS_INITIALIZATION_ALIAS_SHIM
 try:
-    import transformers as _fcs_tr
-    import torch.nn.init as _fcs_torch_init
-    if not hasattr(_fcs_tr, "initialization"):
-        _fcs_tr.initialization = _fcs_torch_init
-except Exception:
-    pass
-""",
-    ),
-    (
-        "FURGEN_OMNIVOICE_TORCH_INIT_COPY_SHIM",
-        """# FURGEN_OMNIVOICE_TORCH_INIT_COPY_SHIM
-try:
-    import torch as _fcs_torch
-    import torch.nn.init as _fcs_torch_init
-    if not hasattr(_fcs_torch_init, "copy_"):
-        def _fcs_init_copy_(tensor, value):
-            with _fcs_torch.no_grad():
-                coerced = _fcs_torch.as_tensor(value, dtype=tensor.dtype, device=tensor.device)
-                return tensor.copy_(coerced)
-        _fcs_torch_init.copy_ = _fcs_init_copy_
+    import sys as _fcs_sys
+    import types as _fcs_types
+    class _FurgenTorchInitAlias(_fcs_types.ModuleType):
+        def __getattr__(self, name):
+            import torch.nn.init as _fcs_torch_init
+            return getattr(_fcs_torch_init, name)
+    _fcs_init_alias = _FurgenTorchInitAlias("transformers.initialization")
+    _fcs_sys.modules.setdefault("transformers.initialization", _fcs_init_alias)
+    try:
+        import transformers as _fcs_tr
+        if not hasattr(_fcs_tr, "initialization"):
+            _fcs_tr.initialization = _fcs_sys.modules["transformers.initialization"]
+    except Exception:
+        pass
 except Exception:
     pass
 """,
