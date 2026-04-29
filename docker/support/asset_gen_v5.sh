@@ -20,6 +20,8 @@ ASSET_GEN_V5_INSTALL_MODE="${ASSET_GEN_V5_INSTALL_MODE:-bundle_manager_v1}"
 ASSET_GEN_V5_BOOTSTRAP_ENDPOINT="${ASSET_GEN_V5_BOOTSTRAP_ENDPOINT:-/provisioning/bootstrap-plan}"
 ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE="${ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE:-}"
 ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLES="${ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLES:-${ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE:-asset_gen_v5_runtime_helpers,asset_gen_v5_flux_image}}"
+ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC="${ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC:-false}"
+ASSET_GEN_V5_PYTORCH_CUDA_ALLOC_CONF="${ASSET_GEN_V5_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
 TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
@@ -1649,12 +1651,16 @@ source = legacy_args_pattern.sub("", source)
 block = (
     "# FURGEN ComfyUI launch args normalization\n"
     "COMFYUI_ARGS=${COMFYUI_ARGS:---disable-auto-launch --port 18188 --enable-cors-header}\n"
-    "if [[ \" ${COMFYUI_ARGS} \" != *\" --disable-cuda-malloc \"* ]]; then\n"
+    "COMFYUI_ARGS=\"${COMFYUI_ARGS// --disable-cuda-malloc/}\"\n"
+    "COMFYUI_ARGS=\"${COMFYUI_ARGS//--disable-cuda-malloc/}\"\n"
+    "asset_gen_v5_disable_cuda_malloc=\"$(printf '%s' \"${ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC:-false}\" | tr '[:upper:]' '[:lower:]')\"\n"
+    "if [[ \"${asset_gen_v5_disable_cuda_malloc}\" == \"1\" || \"${asset_gen_v5_disable_cuda_malloc}\" == \"true\" ]]; then\n"
     "    COMFYUI_ARGS=\"${COMFYUI_ARGS} --disable-cuda-malloc\"\n"
     "fi\n"
-    "# asset_gen_v4 runs Klein KV-cache Flux jobs on 32 GiB GPUs; forcing\n"
-    "# --disable-dynamic-vram keeps too much model state resident between\n"
-    "# prompts and has been observed to trigger repeat CUDA OOMs.\n"
+    "unset asset_gen_v5_disable_cuda_malloc\n"
+    "# asset_gen_v5 defaults to ComfyUI's CUDA malloc path for Flux/Klein\n"
+    "# reliability. Use ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC=true only for\n"
+    "# targeted experiments that need the legacy allocator behavior.\n"
     "# /FURGEN ComfyUI launch args normalization\n"
 )
 
@@ -1693,20 +1699,22 @@ import sys
 path = pathlib.Path(sys.argv[1])
 source = path.read_text(encoding="utf-8")
 
-    block = (
-        "# FURGEN PyTorch allocator env normalization\n"
-        "# asset_gen_v4 mixes Flux, OmniVoice, and FP8 LTX jobs on 32 GiB GPUs.\n"
-        "# Keep a single stable CUDA allocator setting to reduce fragmentation\n"
-        "# after large model swaps while avoiding conflicting allocator env vars.\n"
-        "unset PYTORCH_ALLOC_CONF\n"
-        "export PYTORCH_CUDA_ALLOC_CONF=\"${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}\"\n"
-    )
+block = (
+    "# FURGEN PyTorch allocator env normalization\n"
+    "# asset_gen_v5 mixes Flux, OmniVoice, Trellis, and FP8 LTX jobs on 32 GiB GPUs.\n"
+    "# Keep one allocator setting to reduce fragmentation after large model swaps\n"
+    "# while avoiding legacy/conflicting allocator env vars.\n"
+    "unset PYTORCH_ALLOC_CONF\n"
+    "if [[ -z \"${PYTORCH_CUDA_ALLOC_CONF:-}\" ]]; then\n"
+    "    export PYTORCH_CUDA_ALLOC_CONF=\"${ASSET_GEN_V5_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}\"\n"
+    "fi\n"
+)
 
-    pattern = re.compile(
-        r"# FURGEN PyTorch allocator env normalization\n"
-        r"(?:.*\n){0,14}?(?:unset PYTORCH_CUDA_ALLOC_CONF|export PYTORCH_CUDA_ALLOC_CONF=.*)\n",
-        re.MULTILINE,
-    )
+pattern = re.compile(
+    r"# FURGEN PyTorch allocator env normalization\n"
+    r"(?:.*\n){0,18}?(?:unset PYTORCH_CUDA_ALLOC_CONF|export PYTORCH_CUDA_ALLOC_CONF=.*)\n",
+    re.MULTILINE,
+)
 
 cleaned = re.sub(pattern, "", source)
 

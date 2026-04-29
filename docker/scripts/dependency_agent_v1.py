@@ -105,7 +105,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.4"
+AGENT_VERSION = "dm-agent-py/0.9.5"
+MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -3058,7 +3059,7 @@ class DependencyAgent:
             "dynamicBytesUsed": dynamic_bytes_used,
         }
         if error:
-            body["error"] = error[:500]
+            body["error"] = error[:MAX_AGENT_ERROR_MESSAGE_CHARS]
         api_json("POST", url, body=body, headers=self._headers(use_token=True, include_secret=False), timeout_seconds=30.0)
 
     def _heartbeat(self, queue_depth: Optional[int] = None) -> None:
@@ -3269,7 +3270,7 @@ class DependencyAgent:
         if error_code:
             body["errorCode"] = str(error_code)[:120]
         if error_message:
-            body["errorMessage"] = str(error_message)[:500]
+            body["errorMessage"] = str(error_message)[:MAX_AGENT_ERROR_MESSAGE_CHARS]
         if tuple_fields:
             for key in ("jobId", "executionAttempt", "attemptEpoch"):
                 if key in tuple_fields:
@@ -4027,7 +4028,7 @@ class DependencyAgent:
                 lease_id,
                 "command_failed",
                 error_code="install_node_bundles_failed",
-                error_message=str(exc)[:500],
+                error_message=str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
             )
 
     def _agent_handle_cancel_command(self, item: Dict[str, Any]) -> None:
@@ -4144,7 +4145,7 @@ class DependencyAgent:
             # We can't retry without resolved info; keep it as a hard failure.
             return _now_ms() + 60_000
 
-        err_msg = str(err)[:500]
+        err_msg = str(err)[:MAX_AGENT_ERROR_MESSAGE_CHARS]
         now = _now_ms()
         with self._lock:
             prev = self._state.retry.get(dep_id) if isinstance(self._state.retry.get(dep_id), dict) else {}
@@ -4960,7 +4961,7 @@ class DependencyAgent:
                         {
                             "promptId": prompt_id,
                             "errorCode": "comfy_execution_failed",
-                            "errorMessage": (json.dumps(status_obj)[:500] if status_obj else "ComfyUI execution failed."),
+                            "errorMessage": (json.dumps(status_obj)[:MAX_AGENT_ERROR_MESSAGE_CHARS] if status_obj else "ComfyUI execution failed."),
                         },
                     )
                     terminal_sent = True
@@ -5058,7 +5059,7 @@ class DependencyAgent:
                         prompt_id = active.prompt_id
                 payload: Dict[str, Any] = {
                     "errorCode": err_code,
-                    "errorMessage": str(e)[:500],
+                    "errorMessage": str(e)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
                 }
                 if prompt_id:
                     payload["promptId"] = prompt_id
@@ -5169,7 +5170,7 @@ class DependencyAgent:
                     self._emit_agent_event(
                         lease,
                         event_type,
-                        {"errorCode": err_code, "errorMessage": str(e)[:500]},
+                        {"errorCode": err_code, "errorMessage": str(e)[:MAX_AGENT_ERROR_MESSAGE_CHARS]},
                     )
                     terminal_sent = True
                 except Exception as event_err:
@@ -5325,7 +5326,7 @@ class DependencyAgent:
                         {
                             "promptId": prompt_id,
                             "errorCode": "comfy_execution_failed",
-                            "errorMessage": (json.dumps(status_obj)[:500] if status_obj else "ComfyUI execution failed."),
+                            "errorMessage": (json.dumps(status_obj)[:MAX_AGENT_ERROR_MESSAGE_CHARS] if status_obj else "ComfyUI execution failed."),
                         },
                     )
                     terminal_sent = True
@@ -5361,7 +5362,7 @@ class DependencyAgent:
                         prompt_id = active.prompt_id
                 payload: Dict[str, Any] = {
                     "errorCode": err_code,
-                    "errorMessage": str(e)[:500],
+                    "errorMessage": str(e)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
                 }
                 if prompt_id:
                     payload["promptId"] = prompt_id
@@ -5468,7 +5469,7 @@ class DependencyAgent:
             if not terminal_sent:
                 payload: Dict[str, Any] = {
                     "errorCode": "upload_error",
-                    "errorMessage": str(e)[:500],
+                    "errorMessage": str(e)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
                 }
                 if isinstance(lease.prompt_id, str) and lease.prompt_id:
                     payload["promptId"] = lease.prompt_id
