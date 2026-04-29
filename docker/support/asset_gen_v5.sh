@@ -840,20 +840,20 @@ else:
 
 try:
     import torch
-    import torch.nn.init as torch_init
+    import transformers.initialization as transformers_init
 except Exception as exc:
-    errors.append(f"import torch failed while checking OmniVoice runtime compatibility: {exc}")
+    errors.append(f"import torch/transformers initialization failed while checking OmniVoice runtime compatibility: {exc}")
 else:
-    if not hasattr(torch_init, "copy_"):
-        errors.append("torch.nn.init.copy_ is missing; OmniVoice HiggsAudio tokenizer will fail at runtime")
+    if not hasattr(transformers_init, "copy_"):
+        errors.append("transformers.initialization.copy_ is missing; OmniVoice HiggsAudio tokenizer will fail at runtime")
     else:
         try:
             tensor = torch.zeros(1)
-            torch_init.copy_(tensor, torch.ones(1))
+            transformers_init.copy_(tensor, torch.ones(1))
             if float(tensor.item()) != 1.0:
-                errors.append(f"torch.nn.init.copy_ compatibility shim returned unexpected tensor contents: {tensor.tolist()}")
+                errors.append(f"transformers.initialization.copy_ returned unexpected tensor contents: {tensor.tolist()}")
         except Exception as exc:
-            errors.append(f"torch.nn.init.copy_ compatibility shim failed when exercised: {exc}")
+            errors.append(f"transformers.initialization.copy_ failed when exercised: {exc}")
 
 try:
     required_nodes = (
@@ -949,8 +949,8 @@ function provisioning_install_impact_pack_runtime_requirements() {
         return 0
     fi
 
-    printf "Installing ComfyUI-Impact-Pack runtime dependencies (piexif, segment-anything)...\n"
-    pip install --no-cache-dir "piexif==1.1.3" "segment-anything==1.0" || {
+    printf "Installing ComfyUI-Impact-Pack runtime dependencies (opencv-python-headless, piexif, segment-anything)...\n"
+    pip install --no-cache-dir "opencv-python-headless==4.11.0.86" "piexif==1.1.3" "segment-anything==1.0" || {
         printf "ERROR: Failed to install Impact-Pack runtime dependencies.\n"
         return 1
     }
