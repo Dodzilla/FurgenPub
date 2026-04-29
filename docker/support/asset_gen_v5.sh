@@ -24,7 +24,10 @@ ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC="${ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC
 ASSET_GEN_V5_PYTORCH_CUDA_ALLOC_CONF="${ASSET_GEN_V5_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 TRELLIS2_ENABLE="${TRELLIS2_ENABLE:-true}"
-TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-flash_attn}"
+# Default Trellis2 to xformers on asset_gen_v5. flash_attn imports cleanly on
+# the RTX 5090 image, but the 1024 cascade path repeatedly aborts with a CUDA
+# illegal memory access in torch nonzero_cuda when sparse attention is flash_attn.
+TRELLIS2_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND:-xformers}"
 TRELLIS2_MODEL_REPO="${TRELLIS2_MODEL_REPO:-microsoft/TRELLIS.2-4B}"
 TRELLIS2_DINOV3_REPO="${TRELLIS2_DINOV3_REPO:-camenduru/dinov3-vitl16-pretrain-lvd1689m}"
 TRELLIS2_DINOV3_FALLBACK_REPO="${TRELLIS2_DINOV3_FALLBACK_REPO:-camenduru/dinov3-vitl16-pretrain-lvd1689m}"
