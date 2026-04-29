@@ -1716,6 +1716,9 @@ cleaned_lines = []
 i = 0
 while i < len(lines):
     line = lines[i]
+    if line == "# FURGEN PyTorch allocator env normalization end\n":
+        i += 1
+        continue
     if line == "# FURGEN PyTorch allocator env normalization\n":
         j = i + 1
         saw_if = False
