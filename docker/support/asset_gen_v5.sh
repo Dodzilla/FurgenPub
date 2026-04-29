@@ -1832,6 +1832,10 @@ block = (
     "# asset_gen_v5 defaults to ComfyUI's CUDA malloc path for Flux/Klein\n"
     "# reliability. Use ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC=true only for\n"
     "# targeted experiments that need the legacy allocator behavior.\n"
+    "# Bypass Vast's unbuffer-based pty wrapper for Comfy. The wrapper can exit\n"
+    "# cleanly while long GPU jobs are still running, causing supervisor to\n"
+    "# restart Comfy and strand queued_on_comfy jobs.\n"
+    "export DISABLE_PTY=\"${DISABLE_PTY:-true}\"\n"
     "# /FURGEN ComfyUI launch args normalization\n"
 )
 
