@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.5"
+AGENT_VERSION = "dm-agent-py/0.9.6"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 
 
@@ -2430,6 +2430,21 @@ class DependencyAgent:
                 msg = str(exc).lower()
                 if "connection reset" in msg or "ecconnreset" in msg or "timeout" in msg:
                     return
+
+        supervisorctl = shutil.which("supervisorctl")
+        if supervisorctl:
+            proc = subprocess.run(
+                [supervisorctl, "restart", "comfyui"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+            combined = f"{proc.stdout}\n{proc.stderr}".lower()
+            if proc.returncode == 0 or "started" in combined or "startsecs" in combined:
+                return
+            raise RuntimeError(f"Local ComfyUI restart endpoints failed and supervisor restart failed: {proc.stdout} {proc.stderr}".strip())
+
         raise RuntimeError("All local ComfyUI restart endpoints failed or are unavailable.")
 
     def _local_comfy_has_class_type(self, class_type: str, timeout_seconds: float = 10.0) -> bool:

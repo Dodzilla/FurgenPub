@@ -1708,15 +1708,33 @@ block = (
     "if [[ -z \"${PYTORCH_CUDA_ALLOC_CONF:-}\" ]]; then\n"
     "    export PYTORCH_CUDA_ALLOC_CONF=\"${ASSET_GEN_V5_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}\"\n"
     "fi\n"
+    "# FURGEN PyTorch allocator env normalization end\n"
 )
 
-pattern = re.compile(
-    r"# FURGEN PyTorch allocator env normalization\n"
-    r"(?:.*\n){0,18}?(?:unset PYTORCH_CUDA_ALLOC_CONF|export PYTORCH_CUDA_ALLOC_CONF=.*)\n",
-    re.MULTILINE,
-)
+lines = source.splitlines(keepends=True)
+cleaned_lines = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if line == "# FURGEN PyTorch allocator env normalization\n":
+        j = i + 1
+        saw_if = False
+        while j < len(lines) and j < i + 40:
+            if lines[j] == "# FURGEN PyTorch allocator env normalization end\n":
+                j += 1
+                break
+            if lines[j].strip().startswith("if [[ -z \"${PYTORCH_CUDA_ALLOC_CONF:-}\""):
+                saw_if = True
+            if saw_if and lines[j].strip() == "fi":
+                j += 1
+                break
+            j += 1
+        i = j
+        continue
+    cleaned_lines.append(line)
+    i += 1
 
-cleaned = re.sub(pattern, "", source)
+cleaned = "".join(cleaned_lines)
 
 if cleaned.startswith("#!"):
     first_line, rest = cleaned.split("\n", 1)
