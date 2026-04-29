@@ -351,6 +351,7 @@ function provisioning_install_selected_node_bundles() {
     if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_trellis"; then
         provisioning_patch_trellis2_allocator_override || return 1
         provisioning_patch_trellis2_dinov3_forward || return 1
+        provisioning_patch_trellis2_sparse_nonzero || return 1
         provisioning_patch_trellis2_flex_gemm_algo || return 1
         provisioning_install_trellis2_runtime_requirements || return 1
         provisioning_configure_trellis2_runtime || return 1
@@ -1507,6 +1508,61 @@ if old not in source:
     raise SystemExit(0)
 path.write_text(source.replace(old, new), encoding="utf-8")
 print("Applied Trellis2 DINOv3 forward patch.")
+PY
+}
+
+function provisioning_patch_trellis2_sparse_nonzero() {
+    if [[ "${TRELLIS2_ENABLE,,}" != "true" ]]; then
+        return 0
+    fi
+
+    local spatial_file
+    spatial_file="${COMFYUI_DIR}/custom_nodes/ComfyUI-Trellis2/trellis2/modules/sparse/spatial/spatial2channel.py"
+    if [[ ! -f "${spatial_file}" ]]; then
+        printf "WARN: Trellis2 spatial2channel module missing, skipping sparse nonzero patch: %s\n" "${spatial_file}"
+        return 0
+    fi
+
+    /venv/main/bin/python - "${spatial_file}" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+if "FURGEN hotfix: avoid CUDA nonzero illegal-address aborts" in source:
+    print("Trellis2 sparse nonzero patch already present.")
+    raise SystemExit(0)
+
+old = '''                sub = subdivision.feats         # [N, self.factor ** DIM]
+                N_leaf = sub.sum(dim=-1)        # [N]
+                subidx = sub.nonzero()[:, -1]
+                new_coords = x.coords.clone().detach()
+                new_coords[:, 1:] *= self.factor
+                new_coords = torch.repeat_interleave(new_coords, N_leaf, dim=0, output_size=subidx.shape[0])
+                for i in range(DIM):
+                    new_coords[:, i+1] += subidx // self.factor ** i % self.factor
+                idx = torch.repeat_interleave(torch.arange(x.coords.shape[0], device=x.device), N_leaf, dim=0, output_size=subidx.shape[0])
+'''
+new = '''                sub = subdivision.feats         # [N, self.factor ** DIM]
+                # FURGEN hotfix: avoid CUDA nonzero illegal-address aborts on
+                # RTX 5090 / torch 2.9.1 while decoding Trellis 1024 cascade.
+                sub_cpu = sub.detach().to(device="cpu", dtype=torch.bool)
+                N_leaf_cpu = sub_cpu.sum(dim=-1).to(dtype=torch.long)
+                subidx = sub_cpu.nonzero()[:, -1].to(device=x.device)
+                N_leaf = N_leaf_cpu.to(device=x.device)
+                output_size = int(subidx.shape[0])
+                new_coords = x.coords.clone().detach()
+                new_coords[:, 1:] *= self.factor
+                new_coords = torch.repeat_interleave(new_coords, N_leaf, dim=0, output_size=output_size)
+                for i in range(DIM):
+                    new_coords[:, i+1] += subidx // self.factor ** i % self.factor
+                idx = torch.repeat_interleave(torch.arange(x.coords.shape[0], device=x.device), N_leaf, dim=0, output_size=output_size)
+'''
+if old not in source:
+    print("WARN: Could not locate Trellis2 SparseChannel2Spatial nonzero block; skipping patch.")
+    raise SystemExit(0)
+path.write_text(source.replace(old, new), encoding="utf-8")
+print("Applied Trellis2 sparse nonzero patch.")
 PY
 }
 
