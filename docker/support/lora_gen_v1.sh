@@ -168,10 +168,12 @@ function provisioning_install_training_backends() {
             cd "${musubi_dir}"
             git fetch --all --tags
             git checkout --force "${LORA_GEN_V1_MUSUBI_REF}"
-            if [[ -f requirements.txt ]]; then
+            if [[ -f pyproject.toml ]]; then
+                pip install --no-cache-dir -e .
+            elif [[ -f requirements.txt ]]; then
                 pip install --no-cache-dir -r requirements.txt
+                pip install --no-cache-dir "accelerate>=1.6.0"
             fi
-            pip install --no-cache-dir "accelerate>=1.12.0"
         )
     fi
 }
