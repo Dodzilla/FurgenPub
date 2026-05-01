@@ -231,7 +231,8 @@ class FCSFluxKleinLoraTrain:
         except Exception as exc:
             status = "failed"
             error = str(exc)
-            log_path.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"\n{type(exc).__name__}: {exc}\n")
 
         report = {
             "status": status,

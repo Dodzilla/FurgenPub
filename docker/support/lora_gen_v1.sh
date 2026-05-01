@@ -171,6 +171,7 @@ function provisioning_install_training_backends() {
             if [[ -f requirements.txt ]]; then
                 pip install --no-cache-dir -r requirements.txt
             fi
+            pip install --no-cache-dir "accelerate>=1.12.0"
         )
     fi
 }

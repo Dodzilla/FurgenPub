@@ -20,18 +20,18 @@ def quote(value: object) -> str:
     return shlex.quote(str(value))
 
 
-def find_existing(paths: list[Path], label: str) -> Path:
+def find_existing(paths, label: str) -> Path:
     for path in paths:
-        if not str(path):
+        if path is None:
             continue
-        if path.exists():
+        if path.is_file():
             return path
     fail(f"Missing {label}. Checked: {', '.join(str(path) for path in paths)}")
 
 
-def env_path(name: str) -> Path:
+def env_path(name: str):
     value = os.environ.get(name, "").strip()
-    return Path(value) if value else Path("")
+    return Path(value) if value else None
 
 
 def write_dataset_toml(path: Path, manifest: dict, train: dict) -> None:
