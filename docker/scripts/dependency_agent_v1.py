@@ -1976,7 +1976,7 @@ class DependencyAgent:
             self._coordination_http_checkpoint_due_ms = at_ms
             return
         interval_sec = float(self._coordination.get("firestoreCheckpointSeconds") or 60.0)
-        self._coordination_http_checkpoint_due_ms = at_ms + int(max(5.0, interval_sec) * 1000)
+        self._coordination_http_checkpoint_due_ms = at_ms + int(max(300.0, interval_sec) * 1000)
 
     def _coordination_runtime_retry_delay_seconds(self, attempt: int) -> float:
         return min(2.0, 0.5 * (2 ** max(0, int(attempt))))
