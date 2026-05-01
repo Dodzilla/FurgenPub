@@ -88,10 +88,9 @@ def build_command(config_path: Path) -> list[str]:
     dit = find_existing(
         [
             env_path("LORA_GEN_V1_DIT_PATH"),
-            comfy_dir / "models" / "diffusion_models" / "flux2-klein-base-9b.safetensors",
-            comfy_dir / "models" / "diffusion_models" / "flux-2-klein-base-9b.safetensors",
+            comfy_dir / "models" / "diffusion_models" / "flux-2-klein-9b-kv.safetensors",
         ],
-        "FLUX.2 Klein Base 9B DiT checkpoint for training",
+        "FLUX.2 Klein 9B KV DiT checkpoint for training",
     )
     vae = find_existing(
         [
@@ -117,7 +116,7 @@ def build_command(config_path: Path) -> list[str]:
     dataset_toml = config_path.parent / "musubi_dataset.toml"
     write_dataset_toml(dataset_toml, manifest, train)
 
-    model_version = os.environ.get("LORA_GEN_V1_MODEL_VERSION") or "klein-base-9b"
+    model_version = os.environ.get("LORA_GEN_V1_MODEL_VERSION") or "klein-9b"
     steps = int(train.get("steps") or 0)
     save_every_steps = max(1, int(train.get("save_every_steps") or steps or 1))
     rank = int(network.get("rank") or 32)
