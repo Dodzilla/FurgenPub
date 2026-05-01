@@ -111,8 +111,9 @@ def build_commands(config_path: Path) -> list[list[str]]:
     text_encoder = find_existing(
         [
             env_path("LORA_GEN_V1_TEXT_ENCODER_PATH"),
-            comfy_dir / "models" / "text_encoders" / "00001-of-00004.safetensors",
-            comfy_dir / "models" / "text_encoders" / "qwen_3_8b_fp8mixed.safetensors",
+            comfy_dir / "models" / "text_encoders" / "flux2-klein-9b-kv" / "model-00001-of-00004.safetensors",
+            comfy_dir / "models" / "text_encoders" / "model-00001-of-00004.safetensors",
+            comfy_dir / "models" / "text_encoders" / "qwen_3_8b.safetensors",
         ],
         "Qwen3 8B text encoder checkpoint",
     )
