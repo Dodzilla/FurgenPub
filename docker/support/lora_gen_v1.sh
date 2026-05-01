@@ -17,10 +17,11 @@ fi
 COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-e87858e9743f92222cdb478f1f835135750b6a0b}"
 FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support}"
 FCS_LORA_FACTORY_DIR="${FCS_LORA_FACTORY_DIR:-/data/lora_factory}"
-FCS_LORA_TRAIN_COMMAND="${FCS_LORA_TRAIN_COMMAND:-}"
-LORA_GEN_V1_INSTALL_TOOLKIT="${LORA_GEN_V1_INSTALL_TOOLKIT:-true}"
+FCS_LORA_TRAIN_COMMAND="${FCS_LORA_TRAIN_COMMAND:-python3 /workspace/lora_gen_v1_train.py --config {config}}"
+LORA_GEN_V1_INSTALL_TOOLKIT="${LORA_GEN_V1_INSTALL_TOOLKIT:-false}"
 LORA_GEN_V1_TOOLKIT_REPO="${LORA_GEN_V1_TOOLKIT_REPO:-https://github.com/ostris/ai-toolkit.git}"
 LORA_GEN_V1_TOOLKIT_REF="${LORA_GEN_V1_TOOLKIT_REF:-main}"
+LORA_GEN_V1_INSTALL_MUSUBI="${LORA_GEN_V1_INSTALL_MUSUBI:-true}"
 LORA_GEN_V1_MUSUBI_REPO="${LORA_GEN_V1_MUSUBI_REPO:-https://github.com/kohya-ss/musubi-tuner.git}"
 LORA_GEN_V1_MUSUBI_REF="${LORA_GEN_V1_MUSUBI_REF:-main}"
 export FCS_LORA_FACTORY_DIR FCS_LORA_TRAIN_COMMAND
@@ -126,6 +127,21 @@ function provisioning_install_furgen_lora_factory_node() {
     fi
 }
 
+function provisioning_install_lora_train_runner() {
+    local script_dir src_path dest_path remote_url
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    src_path="${script_dir}/lora_gen_v1_train.py"
+    dest_path="${WORKSPACE}/lora_gen_v1_train.py"
+    remote_url="${FURGENPUB_RAW_BASE_URL%/}/lora_gen_v1_train.py"
+
+    if [[ -f "${src_path}" ]]; then
+        cp "${src_path}" "${dest_path}"
+    else
+        curl -fsSL "${remote_url}" -o "${dest_path}"
+    fi
+    chmod +x "${dest_path}" || true
+}
+
 function provisioning_install_training_backends() {
     mkdir -p "${WORKSPACE}/training_backends" "${FCS_LORA_FACTORY_DIR}"
     if [[ "${LORA_GEN_V1_INSTALL_TOOLKIT,,}" == "true" ]]; then
@@ -212,6 +228,7 @@ function provisioning_start() {
     provisioning_get_apt_packages
     provisioning_get_nodes
     provisioning_install_furgen_lora_factory_node
+    provisioning_install_lora_train_runner
     provisioning_install_training_backends
     provisioning_configure_environment
     provisioning_print_end

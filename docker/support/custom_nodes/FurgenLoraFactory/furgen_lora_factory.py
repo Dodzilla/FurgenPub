@@ -135,7 +135,7 @@ class FCSFluxKleinLoraTrain:
         return {
             "required": {
                 "dataset_manifest": ("STRING", {"default": ""}),
-                "backend": (["ai-toolkit", "musubi"], {"default": "ai-toolkit"}),
+                "backend": (["musubi", "ai-toolkit"], {"default": "musubi"}),
                 "base_model": ("STRING", {"default": "FLUX.2 Klein Base 9B"}),
                 "output_name": ("STRING", {"default": "character_flux2_klein9b"}),
                 "rank": ("INT", {"default": 32, "min": 1, "max": 256}),
