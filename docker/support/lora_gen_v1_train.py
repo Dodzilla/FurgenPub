@@ -68,7 +68,7 @@ def write_dataset_toml(path: Path, manifest: dict, train: dict) -> None:
     )
 
 
-def build_command(config_path: Path) -> list[str]:
+def build_commands(config_path: Path) -> list[list[str]]:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     manifest_path = Path(config.get("dataset_manifest") or "")
     if not manifest_path.exists():
@@ -84,6 +84,14 @@ def build_command(config_path: Path) -> list[str]:
     train_script = find_existing(
         [musubi_dir / "src" / "musubi_tuner" / "flux_2_train_network.py"],
         "Musubi FLUX.2 train script",
+    )
+    cache_latents_script = find_existing(
+        [musubi_dir / "src" / "musubi_tuner" / "flux_2_cache_latents.py"],
+        "Musubi FLUX.2 latent cache script",
+    )
+    cache_text_script = find_existing(
+        [musubi_dir / "src" / "musubi_tuner" / "flux_2_cache_text_encoder_outputs.py"],
+        "Musubi FLUX.2 text encoder cache script",
     )
     dit = find_existing(
         [
@@ -123,7 +131,34 @@ def build_command(config_path: Path) -> list[str]:
     alpha = int(network.get("alpha") or rank)
     learning_rate = float(train.get("learning_rate") or 5e-5)
 
-    command = [
+    latent_cache_command = [
+        sys.executable,
+        str(cache_latents_script),
+        "--dataset_config",
+        str(dataset_toml),
+        "--vae",
+        str(vae),
+        "--model_version",
+        model_version,
+        "--vae_dtype",
+        "bfloat16",
+    ]
+    text_cache_command = [
+        sys.executable,
+        str(cache_text_script),
+        "--dataset_config",
+        str(dataset_toml),
+        "--text_encoder",
+        str(text_encoder),
+        "--batch_size",
+        str(int(os.environ.get("LORA_GEN_V1_TEXT_CACHE_BATCH_SIZE", "8"))),
+        "--model_version",
+        model_version,
+    ]
+    if train.get("fp8_text_encoder", True):
+        text_cache_command.append("--fp8_text_encoder")
+
+    train_command = [
         "accelerate",
         "launch",
         "--num_cpu_threads_per_process",
@@ -173,16 +208,16 @@ def build_command(config_path: Path) -> list[str]:
     ]
 
     if train.get("gradient_checkpointing", True):
-        command.append("--gradient_checkpointing")
+        train_command.append("--gradient_checkpointing")
     if train.get("fp8_base", True):
-        command.extend(["--fp8_base", "--fp8_scaled"])
+        train_command.extend(["--fp8_base", "--fp8_scaled"])
     if train.get("fp8_text_encoder", True):
-        command.append("--fp8_text_encoder")
+        train_command.append("--fp8_text_encoder")
     blocks_to_swap = os.environ.get("LORA_GEN_V1_BLOCKS_TO_SWAP", "").strip()
     if blocks_to_swap:
-        command.extend(["--blocks_to_swap", blocks_to_swap])
+        train_command.extend(["--blocks_to_swap", blocks_to_swap])
 
-    return command
+    return [latent_cache_command, text_cache_command, train_command]
 
 
 def main() -> None:
@@ -190,10 +225,11 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="Path to FCSFluxKleinLoraTrain train_config.json.")
     args = parser.parse_args()
 
-    command = build_command(Path(args.config))
-    print("Running LoRA train command:")
-    print(" ".join(quote(part) for part in command), flush=True)
-    subprocess.run(command, check=True)
+    commands = build_commands(Path(args.config))
+    for command in commands:
+        print("Running LoRA command:")
+        print(" ".join(quote(part) for part in command), flush=True)
+        subprocess.run(command, check=True)
 
 
 if __name__ == "__main__":
