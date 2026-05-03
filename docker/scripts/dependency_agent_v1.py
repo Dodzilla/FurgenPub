@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.6"
+AGENT_VERSION = "dm-agent-py/0.9.7"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 
 
@@ -2414,6 +2414,60 @@ class DependencyAgent:
                 continue
         return None
 
+    def _install_git_custom_node(self, repo_url: str, verify_dir_name: Optional[str] = None) -> None:
+        if not repo_url.startswith("https://github.com/"):
+            raise RuntimeError(f"Unsupported custom node repository: {repo_url}")
+        git = shutil.which("git")
+        if not git:
+            raise RuntimeError("git not found; cannot install custom node repository")
+        pip = shutil.which("pip")
+        node_dir = (verify_dir_name or os.path.basename(repo_url.rstrip("/"))).removesuffix(".git")
+        target = self.comfyui_dir / "custom_nodes" / node_dir
+        requirements = target / "requirements.txt"
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            subprocess.run(
+                [git, "-C", str(target), "config", "--global", "--add", "safe.directory", str(target)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+            subprocess.run(
+                [git, "-C", str(target), "pull", "--ff-only"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=180,
+            )
+        else:
+            subprocess.run(
+                [git, "clone", repo_url, str(target), "--recursive"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=300,
+            )
+
+        if pip and requirements.exists():
+            subprocess.run(
+                [pip, "install", "--no-cache-dir", "-r", str(requirements)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=600,
+            )
+
+    def _install_video_gen_v2_node_bundle(self, bundle_id: str) -> None:
+        if bundle_id == "video_gen_v2_10s_ltx_nodes":
+            self._install_git_custom_node(
+                "https://github.com/TenStrip/10S-Comfy-nodes",
+                verify_dir_name="10S-Comfy-nodes",
+            )
+            return
+        raise RuntimeError(f"Unsupported video_gen_v2 node bundle: {bundle_id}")
+
     def _restart_local_comfy(self) -> None:
         restart_endpoints = [
             "/manager/reboot",
@@ -3997,37 +4051,25 @@ class DependencyAgent:
             self._agent_ack(item_id, lease_id, "command_ignored_stale")
             return
 
-        if (self.server_type or "").strip() != "asset_gen_v5":
-            self._agent_ack(
-                item_id,
-                lease_id,
-                "command_failed",
-                error_code="unsupported_server_type",
-                error_message=f"install_node_bundles is only supported on asset_gen_v5 (server_type={self.server_type})",
-            )
-            return
-
-        script_path = self._resolve_asset_gen_v5_script()
-        if script_path is None:
-            self._agent_ack(
-                item_id,
-                lease_id,
-                "command_failed",
-                error_code="asset_gen_v5_script_missing",
-                error_message="Unable to locate asset_gen_v5.sh on this instance.",
-            )
-            return
-
         self._remove_local_readiness_file()
 
         try:
-            subprocess.run(
-                ["bash", str(script_path), "install-bundles", *bundle_ids],
-                cwd=str(self.workspace),
-                env=os.environ.copy(),
-                check=True,
-                timeout=max(1800, 300 * max(1, len(bundle_ids))),
-            )
+            if (self.server_type or "").strip() == "asset_gen_v5":
+                script_path = self._resolve_asset_gen_v5_script()
+                if script_path is None:
+                    raise RuntimeError("Unable to locate asset_gen_v5.sh on this instance.")
+                subprocess.run(
+                    ["bash", str(script_path), "install-bundles", *bundle_ids],
+                    cwd=str(self.workspace),
+                    env=os.environ.copy(),
+                    check=True,
+                    timeout=max(1800, 300 * max(1, len(bundle_ids))),
+                )
+            elif (self.server_type or "").strip() == "video_gen_v2":
+                for bundle_id in bundle_ids:
+                    self._install_video_gen_v2_node_bundle(bundle_id)
+            else:
+                raise RuntimeError(f"install_node_bundles is not supported on server_type={self.server_type}")
             self._remove_local_readiness_file()
             self._restart_local_comfy()
             self._wait_for_local_comfy_restart(
