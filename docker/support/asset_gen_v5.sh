@@ -14,8 +14,8 @@ export DM_ASSET_GEN_V5_SCRIPT="${DM_ASSET_GEN_V5_SCRIPT:-$(readlink -f "${BASH_S
 # asset_gen_v5 templates should default to the matching server type while still
 # allowing template/runtime override when explicitly required.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v5}"
-# Pin to the latest official ComfyUI release (v0.18.2, 2026-03-25).
-COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-e87858e9743f92222cdb478f1f835135750b6a0b}"
+# Pin to ComfyUI v0.21.1 plus the ACE-Step XL Turbo support needed by asset_gen_v5.
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-7a063e83a7fd2c9d8770bb20e0a7547af7ec080b}"
 ASSET_GEN_V5_INSTALL_MODE="${ASSET_GEN_V5_INSTALL_MODE:-bundle_manager_v1}"
 ASSET_GEN_V5_BOOTSTRAP_ENDPOINT="${ASSET_GEN_V5_BOOTSTRAP_ENDPOINT:-/provisioning/bootstrap-plan}"
 ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE="${ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE:-}"
@@ -347,6 +347,9 @@ function provisioning_install_selected_node_bundles() {
     fi
 
     provisioning_install_furgen_video_tools_node || return 1
+    if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_runtime_helpers"; then
+        provisioning_install_furgen_ace_step_runtime_node || return 1
+    fi
 
     if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_trellis"; then
         provisioning_patch_trellis2_allocator_override || return 1
@@ -574,6 +577,36 @@ function provisioning_install_furgen_video_tools_node() {
     }
 
     printf "Installed managed custom node: FurgenVideoTools (downloaded)\n"
+}
+
+function provisioning_install_furgen_ace_step_runtime_node() {
+    local script_dir src_dir dest_dir remote_base
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    src_dir="${script_dir}/custom_nodes/FurgenAceStepRuntime"
+    dest_dir="${COMFYUI_DIR}/custom_nodes/FurgenAceStepRuntime"
+    remote_base="${FURGENPUB_RAW_BASE_URL%/}/custom_nodes/FurgenAceStepRuntime"
+
+    mkdir -p "${COMFYUI_DIR}/custom_nodes"
+    rm -rf "${dest_dir}"
+    mkdir -p "${dest_dir}"
+
+    if [[ -d "${src_dir}" ]]; then
+        cp -R "${src_dir}/." "${dest_dir}/"
+        printf "Installed managed custom node: FurgenAceStepRuntime (local copy)\n"
+        return 0
+    fi
+
+    printf "Local FurgenAceStepRuntime source missing; downloading managed custom node from %s\n" "${remote_base}"
+    curl -fsSL "${remote_base}/__init__.py" -o "${dest_dir}/__init__.py" || {
+        printf "ERROR: Failed to download FurgenAceStepRuntime __init__.py from %s\n" "${remote_base}"
+        return 1
+    }
+    curl -fsSL "${remote_base}/furgen_ace_step15_sdpa_patch.py" -o "${dest_dir}/furgen_ace_step15_sdpa_patch.py" || {
+        printf "ERROR: Failed to download FurgenAceStepRuntime implementation from %s\n" "${remote_base}"
+        return 1
+    }
+
+    printf "Installed managed custom node: FurgenAceStepRuntime (downloaded)\n"
 }
 
 function provisioning_patch_comfyui_xformers_fallback() {
