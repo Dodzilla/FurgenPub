@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.8"
+AGENT_VERSION = "dm-agent-py/0.9.9"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 
 
@@ -2430,7 +2430,7 @@ class DependencyAgent:
         git = shutil.which("git")
         if not git:
             raise RuntimeError("git not found; cannot install custom node repository")
-        pip = shutil.which("pip")
+        pip_cmd = [sys.executable, "-m", "pip"]
         node_dir = (verify_dir_name or os.path.basename(repo_url.rstrip("/"))).removesuffix(".git")
         if not re.match(r"^[A-Za-z0-9_.-]{1,128}$", node_dir):
             raise RuntimeError(f"Unsupported custom node directory name: {node_dir}")
@@ -2471,9 +2471,9 @@ class DependencyAgent:
                 timeout=180,
             )
 
-        if install_requirements and pip and requirements.exists():
+        if install_requirements and requirements.exists():
             subprocess.run(
-                [pip, "install", "--no-cache-dir", "-r", str(requirements)],
+                [*pip_cmd, "install", "--no-cache-dir", "-r", str(requirements)],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -2514,7 +2514,7 @@ class DependencyAgent:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
             self._install_git_custom_node(
                 "https://github.com/TenStrip/10S-Comfy-nodes",
-                verify_dir_name="10S-Comfy-nodes",
+                verify_dir_name="10S_Nodes",
             )
             return
         raise RuntimeError(f"Unsupported video_gen_v2 node bundle: {bundle_id}")
