@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.10"
+AGENT_VERSION = "dm-agent-py/0.9.11"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 
 
@@ -2487,9 +2487,11 @@ class DependencyAgent:
         if spec_type == "comfy_core_update":
             git_ref = spec.get("ref")
             install_requirements = spec.get("installRequirements")
+            force_reset = spec.get("forceReset")
             self._update_comfyui_core(
                 git_ref=git_ref if isinstance(git_ref, str) and git_ref else None,
                 install_requirements=install_requirements if isinstance(install_requirements, bool) else True,
+                force_reset=force_reset if isinstance(force_reset, bool) else False,
             )
             return True
         if spec_type == "git_custom_node":
@@ -2522,6 +2524,7 @@ class DependencyAgent:
         self,
         git_ref: Optional[str] = None,
         install_requirements: bool = True,
+        force_reset: bool = False,
     ) -> None:
         if git_ref and not re.match(r"^[A-Za-z0-9._/@+-]{1,128}$", git_ref):
             raise RuntimeError(f"Unsupported ComfyUI git ref: {git_ref}")
@@ -2538,13 +2541,38 @@ class DependencyAgent:
             stderr=subprocess.PIPE,
             timeout=30,
         )
-        subprocess.run(
-            [git, "-C", str(self.comfyui_dir), "pull", "--ff-only"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=300,
-        )
+        if force_reset:
+            subprocess.run(
+                [git, "-C", str(self.comfyui_dir), "fetch", "--all", "--prune"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=300,
+            )
+            current_branch = subprocess.run(
+                [git, "-C", str(self.comfyui_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            ).stdout.strip()
+            reset_target = git_ref or (f"origin/{current_branch}" if current_branch and current_branch != "HEAD" else "origin/master")
+            subprocess.run(
+                [git, "-C", str(self.comfyui_dir), "reset", "--hard", reset_target],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=300,
+            )
+        else:
+            subprocess.run(
+                [git, "-C", str(self.comfyui_dir), "pull", "--ff-only"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=300,
+            )
         if git_ref:
             subprocess.run(
                 [git, "-C", str(self.comfyui_dir), "checkout", git_ref],
