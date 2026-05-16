@@ -41,7 +41,7 @@ Optional knobs:
   - DM_HEARTBEAT_SECONDS    (default: 30)
   - MAX_PARALLEL_DOWNLOADS  (default: 3)
   - DM_STATE_PATH           (default: $WORKSPACE/dependency_agent_state.json)
-  - DM_ALLOWED_DOMAINS      (comma-separated allowlist for dependency/model downloads; default: huggingface.co,hf.co,civitai.com)
+  - DM_ALLOWED_DOMAINS      (comma-separated allowlist for dependency/model downloads; default: huggingface.co,hf.co,civitai.red,civitai.com)
   - DM_INPUT_ALLOWED_DOMAINS (optional comma-separated allowlist for job input/prefetch downloads; default: allow all)
   - DM_DOWNLOAD_TOOL             (default: wget; options: wget, python)
   - DM_DOWNLOAD_TIMEOUT_SECONDS (socket timeout for downloads; default: 300)
@@ -1329,7 +1329,7 @@ class DependencyAgent:
         self.self_update_retry_seconds = max(30.0, _env_float("DM_AGENT_SELF_UPDATE_RETRY_SECONDS", 300.0))
         self.self_script_path = Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__))
 
-        allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.com"]
+        allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.red", "civitai.com"]
         self.allowed_domains = {d.lower() for d in allowed if d}
         input_allowed = (
             _split_csv(_env_str("DM_INPUT_ALLOWED_DOMAINS"))
@@ -1369,9 +1369,11 @@ class DependencyAgent:
         self._agent_prefetch_executor: Optional[ThreadPoolExecutor] = None
         self._agent_execute_executor: Optional[ThreadPoolExecutor] = None
         self._agent_upload_executor: Optional[ThreadPoolExecutor] = None
+        self._agent_maintenance_executor: Optional[ThreadPoolExecutor] = None
         self._agent_prefetch_inflight: Set[Future[None]] = set()
         self._agent_execute_inflight: Set[Future[None]] = set()
         self._agent_upload_inflight: Set[Future[None]] = set()
+        self._agent_maintenance_inflight: Set[Future[None]] = set()
         self._pending_self_update: Optional[AgentSelfUpdateRelease] = None
         self._pending_self_update_source = ""
         self._self_update_retry_at_ms = 0
@@ -5162,6 +5164,14 @@ class DependencyAgent:
         with self._lock:
             self._agent_upload_inflight.add(future)
 
+    def _submit_agent_maintenance_item(self, item: Dict[str, Any]) -> None:
+        if self._agent_maintenance_executor is None:
+            raise RuntimeError("Agent maintenance executor is not initialized")
+        future = self._agent_maintenance_executor.submit(self._process_install_node_bundles_item, item)
+        with self._lock:
+            self._agent_maintenance_inflight.add(future)
+        self._request_agent_queue_poll()
+
     def _prefetch_agent_execute_lease(self, lease: AgentExecuteLease) -> None:
         retain_lease = False
         terminal_sent = False
@@ -5614,7 +5624,7 @@ class DependencyAgent:
             return
 
         if item_type == "install_node_bundles":
-            self._process_install_node_bundles_item(item)
+            self._submit_agent_maintenance_item(item)
             return
 
         if item_id and lease_id:
@@ -5707,10 +5717,12 @@ class DependencyAgent:
         self._agent_prefetch_executor = ThreadPoolExecutor(max_workers=agent_aux_workers)
         self._agent_execute_executor = ThreadPoolExecutor(max_workers=max(1, int(self.agent_max_execute_workers)))
         self._agent_upload_executor = ThreadPoolExecutor(max_workers=agent_aux_workers)
+        self._agent_maintenance_executor = ThreadPoolExecutor(max_workers=1)
         with self._lock:
             self._agent_prefetch_inflight.clear()
             self._agent_execute_inflight.clear()
             self._agent_upload_inflight.clear()
+            self._agent_maintenance_inflight.clear()
 
         next_dep_poll_at_ms = 0
         next_agent_poll_at_ms = 0
@@ -5741,6 +5753,7 @@ class DependencyAgent:
                     ("_agent_prefetch_inflight", "prefetch"),
                     ("_agent_execute_inflight", "execute"),
                     ("_agent_upload_inflight", "upload"),
+                    ("_agent_maintenance_inflight", "maintenance"),
                 ):
                     with self._lock:
                         inflight = getattr(self, inflight_name)
@@ -5796,9 +5809,10 @@ class DependencyAgent:
                 with self._lock:
                     active_leases = list(self._active_exec_by_item.values())
                     downloading_count = len(self._downloading)
+                    maintenance_count = len(self._agent_maintenance_inflight)
                 pending_self_update = self._pending_self_update is not None
 
-                if pending_self_update and not active_leases and len(dep_inflight) == 0 and downloading_count == 0:
+                if pending_self_update and not active_leases and len(dep_inflight) == 0 and downloading_count == 0 and maintenance_count == 0:
                     # A failed or backoff-delayed self-update must not stall queue intake.
                     # Keep the process working unless _perform_pending_self_update() actually
                     # execs into the new script.
@@ -5911,6 +5925,7 @@ class DependencyAgent:
                         or active_execute_count > 0
                         or active_prefetch_count > 0
                         or active_upload_count > 0
+                        or maintenance_count > 0
                     ):
                         # Once an instance is hot, keep queue fetches non-blocking so the
                         # main loop can react immediately when execution capacity opens up.
@@ -5972,6 +5987,8 @@ class DependencyAgent:
             self._agent_execute_executor.shutdown(wait=False, cancel_futures=True)
         if self._agent_upload_executor is not None:
             self._agent_upload_executor.shutdown(wait=False, cancel_futures=True)
+        if self._agent_maintenance_executor is not None:
+            self._agent_maintenance_executor.shutdown(wait=False, cancel_futures=True)
         logging.info("Dependency agent stopped.")
 
 
