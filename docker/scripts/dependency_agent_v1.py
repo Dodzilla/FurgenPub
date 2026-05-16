@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.7"
+AGENT_VERSION = "dm-agent-py/0.9.8"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 
 
@@ -2416,14 +2416,24 @@ class DependencyAgent:
                 continue
         return None
 
-    def _install_git_custom_node(self, repo_url: str, verify_dir_name: Optional[str] = None) -> None:
+    def _install_git_custom_node(
+        self,
+        repo_url: str,
+        verify_dir_name: Optional[str] = None,
+        git_ref: Optional[str] = None,
+        install_requirements: bool = True,
+    ) -> None:
         if not repo_url.startswith("https://github.com/"):
             raise RuntimeError(f"Unsupported custom node repository: {repo_url}")
+        if git_ref and not re.match(r"^[A-Za-z0-9._/@+-]{1,128}$", git_ref):
+            raise RuntimeError(f"Unsupported custom node git ref: {git_ref}")
         git = shutil.which("git")
         if not git:
             raise RuntimeError("git not found; cannot install custom node repository")
         pip = shutil.which("pip")
         node_dir = (verify_dir_name or os.path.basename(repo_url.rstrip("/"))).removesuffix(".git")
+        if not re.match(r"^[A-Za-z0-9_.-]{1,128}$", node_dir):
+            raise RuntimeError(f"Unsupported custom node directory name: {node_dir}")
         target = self.comfyui_dir / "custom_nodes" / node_dir
         requirements = target / "requirements.txt"
 
@@ -2452,7 +2462,16 @@ class DependencyAgent:
                 timeout=300,
             )
 
-        if pip and requirements.exists():
+        if git_ref:
+            subprocess.run(
+                [git, "-C", str(target), "checkout", git_ref],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=180,
+            )
+
+        if install_requirements and pip and requirements.exists():
             subprocess.run(
                 [pip, "install", "--no-cache-dir", "-r", str(requirements)],
                 check=True,
@@ -2460,6 +2479,36 @@ class DependencyAgent:
                 stderr=subprocess.PIPE,
                 timeout=600,
             )
+
+    def _install_node_bundle_from_spec(self, bundle_id: str, spec: Dict[str, Any]) -> bool:
+        if not isinstance(spec, dict):
+            return False
+        spec_type = spec.get("type")
+        if spec_type == "git_custom_node":
+            repository = spec.get("repository")
+            if not isinstance(repository, str) or not repository:
+                raise RuntimeError(f"Bundle {bundle_id} git_custom_node install spec is missing repository")
+            directory_name = spec.get("directoryName")
+            git_ref = spec.get("ref")
+            install_requirements = spec.get("installRequirements")
+            self._install_git_custom_node(
+                repository,
+                verify_dir_name=directory_name if isinstance(directory_name, str) and directory_name else None,
+                git_ref=git_ref if isinstance(git_ref, str) and git_ref else None,
+                install_requirements=install_requirements if isinstance(install_requirements, bool) else True,
+            )
+            return True
+        if spec_type == "git_custom_nodes":
+            repositories = spec.get("repositories")
+            if not isinstance(repositories, list) or not repositories:
+                raise RuntimeError(f"Bundle {bundle_id} git_custom_nodes install spec is missing repositories")
+            for index, entry in enumerate(repositories):
+                if not isinstance(entry, dict):
+                    raise RuntimeError(f"Bundle {bundle_id} repository spec #{index + 1} is invalid")
+                if not self._install_node_bundle_from_spec(f"{bundle_id}[{index}]", entry):
+                    raise RuntimeError(f"Bundle {bundle_id} repository spec #{index + 1} has unsupported type")
+            return True
+        return False
 
     def _install_video_gen_v2_node_bundle(self, bundle_id: str) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
@@ -4049,6 +4098,7 @@ class DependencyAgent:
 
         bundle_ids = [bundle_id for bundle_id in payload.get("bundleIds", []) if isinstance(bundle_id, str) and bundle_id]
         verify_class_types = [class_type for class_type in payload.get("verifyClassTypes", []) if isinstance(class_type, str) and class_type]
+        bundle_specs = payload.get("bundleSpecs") if isinstance(payload.get("bundleSpecs"), dict) else {}
         if not bundle_ids:
             self._agent_ack(item_id, lease_id, "command_ignored_stale")
             return
@@ -4069,7 +4119,9 @@ class DependencyAgent:
                 )
             elif (self.server_type or "").strip() == "video_gen_v2":
                 for bundle_id in bundle_ids:
-                    self._install_video_gen_v2_node_bundle(bundle_id)
+                    spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
+                    if not self._install_node_bundle_from_spec(bundle_id, spec if isinstance(spec, dict) else {}):
+                        self._install_video_gen_v2_node_bundle(bundle_id)
             else:
                 raise RuntimeError(f"install_node_bundles is not supported on server_type={self.server_type}")
             self._remove_local_readiness_file()
