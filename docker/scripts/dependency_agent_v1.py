@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.9"
+AGENT_VERSION = "dm-agent-py/0.9.10"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 
 
@@ -2484,6 +2484,14 @@ class DependencyAgent:
         if not isinstance(spec, dict):
             return False
         spec_type = spec.get("type")
+        if spec_type == "comfy_core_update":
+            git_ref = spec.get("ref")
+            install_requirements = spec.get("installRequirements")
+            self._update_comfyui_core(
+                git_ref=git_ref if isinstance(git_ref, str) and git_ref else None,
+                install_requirements=install_requirements if isinstance(install_requirements, bool) else True,
+            )
+            return True
         if spec_type == "git_custom_node":
             repository = spec.get("repository")
             if not isinstance(repository, str) or not repository:
@@ -2509,6 +2517,54 @@ class DependencyAgent:
                     raise RuntimeError(f"Bundle {bundle_id} repository spec #{index + 1} has unsupported type")
             return True
         return False
+
+    def _update_comfyui_core(
+        self,
+        git_ref: Optional[str] = None,
+        install_requirements: bool = True,
+    ) -> None:
+        if git_ref and not re.match(r"^[A-Za-z0-9._/@+-]{1,128}$", git_ref):
+            raise RuntimeError(f"Unsupported ComfyUI git ref: {git_ref}")
+        git = shutil.which("git")
+        if not git:
+            raise RuntimeError("git not found; cannot update ComfyUI core")
+        if not (self.comfyui_dir / ".git").exists():
+            raise RuntimeError(f"ComfyUI directory is not a git checkout: {self.comfyui_dir}")
+
+        subprocess.run(
+            [git, "-C", str(self.comfyui_dir), "config", "--global", "--add", "safe.directory", str(self.comfyui_dir)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        subprocess.run(
+            [git, "-C", str(self.comfyui_dir), "pull", "--ff-only"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+        if git_ref:
+            subprocess.run(
+                [git, "-C", str(self.comfyui_dir), "checkout", git_ref],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=180,
+            )
+
+        if install_requirements:
+            for requirements_name in ("requirements.txt", "manager_requirements.txt"):
+                requirements = self.comfyui_dir / requirements_name
+                if requirements.exists():
+                    subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "--no-cache-dir", "-r", str(requirements)],
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=900,
+                    )
 
     def _install_video_gen_v2_node_bundle(self, bundle_id: str) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
