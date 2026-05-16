@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.11"
+AGENT_VERSION = "dm-agent-py/0.9.12"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 
 
@@ -2422,6 +2422,7 @@ class DependencyAgent:
         verify_dir_name: Optional[str] = None,
         git_ref: Optional[str] = None,
         install_requirements: bool = True,
+        pip_args: Optional[List[str]] = None,
     ) -> None:
         if not repo_url.startswith("https://github.com/"):
             raise RuntimeError(f"Unsupported custom node repository: {repo_url}")
@@ -2473,7 +2474,7 @@ class DependencyAgent:
 
         if install_requirements and requirements.exists():
             subprocess.run(
-                [*pip_cmd, "install", "--no-cache-dir", "-r", str(requirements)],
+                [*pip_cmd, "install", "--no-cache-dir", *(pip_args or []), "-r", str(requirements)],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -2501,11 +2502,13 @@ class DependencyAgent:
             directory_name = spec.get("directoryName")
             git_ref = spec.get("ref")
             install_requirements = spec.get("installRequirements")
+            pip_args = spec.get("pipArgs")
             self._install_git_custom_node(
                 repository,
                 verify_dir_name=directory_name if isinstance(directory_name, str) and directory_name else None,
                 git_ref=git_ref if isinstance(git_ref, str) and git_ref else None,
                 install_requirements=install_requirements if isinstance(install_requirements, bool) else True,
+                pip_args=[arg for arg in pip_args if isinstance(arg, str)] if isinstance(pip_args, list) else None,
             )
             return True
         if spec_type == "git_custom_nodes":
