@@ -159,6 +159,10 @@ function load_node_pins_from_env() {
 
 function node_dir_from_repo() {
     local repo="$1"
+    if [[ "$repo" == "https://github.com/TenStrip/10S-Comfy-nodes" || "$repo" == "https://github.com/TenStrip/10S-Comfy-nodes.git" ]]; then
+        printf "%s" "10S_Nodes"
+        return 0
+    fi
     local dir="${repo##*/}"
     dir="${dir%.git}"
     printf "%s" "$dir"
@@ -256,6 +260,18 @@ function append_bundle_repos() {
             append_unique_node_repo "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
             append_unique_node_repo "https://github.com/kijai/ComfyUI-MelBandRoFormer"
             append_unique_node_repo "https://github.com/kijai/ComfyUI-KJNodes"
+            ;;
+        asset_gen_v5_10s_ltx_tiled_nodes)
+            append_unique_node_repo "https://github.com/TenStrip/10S-Comfy-nodes"
+            ;;
+        asset_gen_v5_kj_ltx_tiled_nodes)
+            append_unique_node_repo "https://github.com/kijai/ComfyUI-KJNodes"
+            ;;
+        asset_gen_v5_controlaltai_nodes)
+            append_unique_node_repo "https://github.com/gseth/ControlAltAI-Nodes"
+            ;;
+        asset_gen_v5_nvidia_rtx_nodes)
+            append_unique_node_repo "https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI"
             ;;
         *)
             printf "ERROR: Unknown asset_gen_v5 bundle id '%s'.\n" "$bundle_id"
@@ -378,6 +394,10 @@ function provisioning_install_selected_node_bundles() {
 
     if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_audio_annotation"; then
         provisioning_prewarm_audio_annotation_model || return 1
+    fi
+
+    if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_nvidia_rtx_nodes"; then
+        provisioning_install_nvidia_rtx_node_requirements || return 1
     fi
 }
 
@@ -985,6 +1005,14 @@ function provisioning_install_impact_pack_runtime_requirements() {
     printf "Installing ComfyUI-Impact-Pack runtime dependencies (opencv-python-headless, piexif, segment-anything)...\n"
     pip install --no-cache-dir "opencv-python-headless==4.11.0.86" "piexif==1.1.3" "segment-anything==1.0" || {
         printf "ERROR: Failed to install Impact-Pack runtime dependencies.\n"
+        return 1
+    }
+}
+
+function provisioning_install_nvidia_rtx_node_requirements() {
+    printf "Installing NVIDIA RTX node requirements...\n"
+    pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-vfx || {
+        printf "ERROR: Failed to install nvidia-vfx for Nvidia_RTX_Nodes_ComfyUI.\n"
         return 1
     }
 }

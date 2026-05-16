@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.12"
+AGENT_VERSION = "dm-agent-py/0.9.13"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 
 
@@ -4193,7 +4193,12 @@ class DependencyAgent:
         self._remove_local_readiness_file()
 
         try:
-            if (self.server_type or "").strip() == "asset_gen_v5":
+            if (self.server_type or "").strip() == "asset_gen_v5" and bundle_specs:
+                for bundle_id in bundle_ids:
+                    spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
+                    if not self._install_node_bundle_from_spec(bundle_id, spec if isinstance(spec, dict) else {}):
+                        raise RuntimeError(f"No Firestore install spec available for asset_gen_v5 bundle {bundle_id}")
+            elif (self.server_type or "").strip() == "asset_gen_v5":
                 script_path = self._resolve_asset_gen_v5_script()
                 if script_path is None:
                     raise RuntimeError("Unable to locate asset_gen_v5.sh on this instance.")
