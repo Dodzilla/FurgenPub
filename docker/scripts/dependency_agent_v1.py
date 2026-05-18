@@ -105,8 +105,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.13"
+AGENT_VERSION = "dm-agent-py/0.9.14"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
+RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -288,6 +290,38 @@ def _json_loads_or_none(text: str) -> Optional[Any]:
         return json.loads(text)
     except Exception:
         return None
+
+
+def _http_status_codes_from_error(err: Exception) -> List[int]:
+    msg = str(err)
+    codes: List[int] = []
+    patterns = (
+        r"\bHTTP(?:/\d(?:\.\d)?)?\s+(\d{3})\b",
+        r"\bERROR\s+(\d{3})\b",
+        r"\bstatus=(\d{3})\b",
+        r"\bHTTP Error\s+(\d{3})\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, msg, flags=re.IGNORECASE):
+            try:
+                code = int(match.group(1))
+            except Exception:
+                continue
+            if code not in codes:
+                codes.append(code)
+    return codes
+
+
+def _is_permanent_http_error(err: Exception) -> bool:
+    codes = _http_status_codes_from_error(err)
+    if not codes:
+        return False
+    for code in codes:
+        if code in RETRYABLE_HTTP_STATUS_CODES:
+            return False
+        if code >= 500:
+            return False
+    return any(400 <= code < 500 for code in codes)
 
 
 def api_json(
@@ -3331,6 +3365,23 @@ class DependencyAgent:
         self._last_dependency_queue_depth = len(out)
         return out
 
+    def _fetch_queue_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+        if not self._resolved_instance_id or not item_id:
+            return None
+        instance_id = self._resolved_instance_id
+        url = (
+            f"{self.api_base_url}/dependencies/queue-item"
+            f"?instanceId={urllib.parse.quote(instance_id)}"
+            f"&itemId={urllib.parse.quote(item_id)}"
+        )
+        status, resp = api_json("GET", url, headers=self._headers(use_token=True, include_secret=False), timeout_seconds=30.0)
+        if status != 200 or not isinstance(resp, dict):
+            raise RuntimeError(f"Unexpected queue item response: {status} {resp}")
+        item = resp.get("item")
+        if not isinstance(item, dict):
+            return None
+        return item
+
     def _agent_effective_execute_capacity(self) -> int:
         return max(1, min(int(self.agent_max_execute_workers), int(self._agent_max_concurrent_execute_jobs)))
 
@@ -4299,6 +4350,8 @@ class DependencyAgent:
 
     def _is_retryable_download_error(self, err: Exception) -> bool:
         msg = str(err).lower()
+        if _is_permanent_http_error(err):
+            return False
         # Configuration / policy errors won't resolve without human action.
         non_retry_substrings = [
             "missing resolved download info",
@@ -4313,6 +4366,67 @@ class DependencyAgent:
             "dm_download_tool",
         ]
         return not any(s in msg for s in non_retry_substrings)
+
+    def _forget_retry(self, dep_id: str, failed: bool = False) -> None:
+        if not dep_id:
+            return
+        with self._lock:
+            self._state.retry.pop(dep_id, None)
+            self._downloading.discard(dep_id)
+            if not failed:
+                self._state.failed.discard(dep_id)
+            self._save_state()
+
+    def _local_retry_item_if_current(self, dep_id: str, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        item_id = entry.get("itemId") if isinstance(entry.get("itemId"), str) and entry.get("itemId") else dep_id
+        try:
+            current = self._fetch_queue_item(item_id)
+        except ApiError as e:
+            if e.status == 404:
+                if isinstance(e.body, str) and '"exists":false' in e.body.replace(" ", ""):
+                    logging.info("Dropping local retry for %s: queue item no longer exists", dep_id)
+                    self._forget_retry(dep_id)
+                    return None
+                logging.warning("Dependency queue item validation endpoint returned 404 for %s; preserving local retry", dep_id)
+                resolved = entry.get("resolved")
+                if isinstance(resolved, dict):
+                    return {
+                        "itemId": item_id,
+                        "depId": dep_id,
+                        "op": "download",
+                        "resolved": resolved,
+                    }
+            raise
+
+        if not current:
+            logging.info("Dropping local retry for %s: queue item no longer exists", dep_id)
+            self._forget_retry(dep_id)
+            return None
+
+        state = current.get("state")
+        cancel_reason = current.get("cancelReason")
+        if isinstance(state, str) and state.lower() in NON_RETRYABLE_QUEUE_STATES:
+            logging.info("Dropping local retry for %s: queue item state is %s", dep_id, state)
+            self._forget_retry(dep_id)
+            return None
+        if isinstance(cancel_reason, str) and cancel_reason.strip():
+            logging.info("Dropping local retry for %s: queue item was cancelled (%s)", dep_id, cancel_reason.strip())
+            self._forget_retry(dep_id)
+            return None
+
+        resolved = current.get("resolved") if isinstance(current.get("resolved"), dict) else entry.get("resolved")
+        if not isinstance(resolved, dict):
+            logging.info("Dropping local retry for %s: queue item has no resolved download instructions", dep_id)
+            self._forget_retry(dep_id, failed=True)
+            return None
+
+        return {
+            **current,
+            "itemId": item_id,
+            "depId": dep_id,
+            "op": current.get("op") if isinstance(current.get("op"), str) else "download",
+            "resolved": resolved,
+        }
 
     def _compute_retry_delay_seconds(self, attempts: int, last_error: str) -> float:
         # Exponential backoff with jitter. Capped so we keep making progress.
@@ -4363,6 +4477,7 @@ class DependencyAgent:
                 "nextAttemptAtMs": next_at,
                 "lastError": err_msg,
                 "lastAttemptAtMs": now,
+                **({"requestedByJobId": item.get("requestedByJobId")} if isinstance(item.get("requestedByJobId"), str) else {}),
             }
             self._state.failed.add(dep_id)
             self._downloading.discard(dep_id)
@@ -4641,6 +4756,18 @@ class DependencyAgent:
             self._post_status(item, "failed", error=f"Unknown op: {op}")
             return
 
+        cancel_reason = item.get("cancelReason")
+        item_state = item.get("state")
+        if isinstance(cancel_reason, str) and cancel_reason.strip():
+            if dep_id:
+                self._forget_retry(dep_id)
+            self._post_status(item, "cancelled", error=f"Dependency queue item cancelled: {cancel_reason.strip()}")
+            return
+        if isinstance(item_state, str) and item_state.lower() in NON_RETRYABLE_QUEUE_STATES:
+            if dep_id:
+                self._forget_retry(dep_id)
+            return
+
         if op == "download":
             now = _now_ms()
             if dep_id:
@@ -4700,6 +4827,7 @@ class DependencyAgent:
 
                 with self._lock:
                     if dep_id:
+                        self._state.retry.pop(dep_id, None)
                         self._state.failed.add(dep_id)
                         self._downloading.discard(dep_id)
                         self._save_state()
@@ -5993,6 +6121,7 @@ class DependencyAgent:
                             pass
 
                     due_retry_items: List[Dict[str, Any]] = []
+                    retry_candidates: List[Tuple[str, Dict[str, Any]]] = []
                     retry_changed = False
                     retry_cap = max(0, int(self.max_parallel) - len(dep_inflight))
                     if retry_cap > 0:
@@ -6013,16 +6142,30 @@ class DependencyAgent:
                                     self._state.retry.pop(dep_id, None)
                                     retry_changed = True
                                     continue
-                                due_retry_items.append(
-                                    {
-                                        "itemId": entry.get("itemId") if isinstance(entry.get("itemId"), str) else dep_id,
-                                        "depId": dep_id,
-                                        "op": "download",
-                                        "resolved": resolved,
-                                    }
-                                )
+                                retry_candidates.append((dep_id, dict(entry)))
                             if retry_changed:
                                 self._save_state()
+
+                    for dep_id, entry in retry_candidates:
+                        if len(due_retry_items) >= retry_cap:
+                            break
+                        try:
+                            current_item = self._local_retry_item_if_current(dep_id, entry)
+                        except ApiError as e:
+                            if e.status in (401, 403):
+                                logging.warning("Dependency retry validation unauthorized (status=%d); re-registering.", e.status)
+                                try:
+                                    self._register()
+                                except Exception as re:
+                                    logging.error("Dependency re-register failed: %s", re)
+                                break
+                            logging.warning("Dependency retry validation API error for %s: %s", dep_id, e)
+                            break
+                        except Exception as e:
+                            logging.warning("Dependency retry validation failed for %s: %s", dep_id, e)
+                            break
+                        if current_item is not None:
+                            due_retry_items.append(current_item)
 
                     for it in due_retry_items:
                         if self._stop.is_set() or len(dep_inflight) >= self.max_parallel:
