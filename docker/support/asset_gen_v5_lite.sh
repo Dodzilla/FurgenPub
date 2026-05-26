@@ -15,9 +15,7 @@ export DM_ASSET_GEN_V5_LITE_SCRIPT="${DM_ASSET_GEN_V5_LITE_SCRIPT:-$(readlink -f
 # asset_gen_v5_lite templates should default to the matching server type while still
 # allowing template/runtime override when explicitly required.
 export SERVER_TYPE="${SERVER_TYPE:-asset_gen_v5_lite}"
-# Pin to the ComfyUI build used by asset_gen_v5 so Klein/Flux and OmniVoice behavior
-# stays aligned while this lite entrypoint trims unsupported bundle work.
-COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-7a063e83a7fd2c9d8770bb20e0a7547af7ec080b}"
+COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-}"
 ASSET_GEN_V5_INSTALL_MODE="${ASSET_GEN_V5_INSTALL_MODE:-bundle_manager_v1}"
 ASSET_GEN_V5_BOOTSTRAP_ENDPOINT="${ASSET_GEN_V5_BOOTSTRAP_ENDPOINT:-/provisioning/bootstrap-plan}"
 ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE="${ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE:-}"
@@ -172,11 +170,6 @@ function node_allows_unpinned_ref() {
 function validate_required_repo_pins() {
     local missing=0
     local repo dir
-
-    if [[ -z "${COMFYUI_PIN_COMMIT}" ]]; then
-        printf "ERROR: COMFYUI_PIN_COMMIT is empty; refusing unpinned ComfyUI provisioning.\n"
-        return 1
-    fi
 
     for repo in "${NODES[@]}"; do
         dir="$(node_dir_from_repo "$repo")"
@@ -428,6 +421,11 @@ function pin_node_to_ref() {
 }
 
 function provisioning_update_comfyui() {
+    if [[ -z "${COMFYUI_PIN_COMMIT}" ]]; then
+        printf "Using ComfyUI from the base image; no ComfyUI pin requested for asset_gen_v5_lite.\n"
+        return 0
+    fi
+
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
         printf "Updating ComfyUI to pinned version (%s)...\n" "${COMFYUI_PIN_COMMIT:0:7}"
@@ -464,12 +462,12 @@ function provisioning_verify_comfyui_dynamic_vram_support() {
     fi
 
     if ! grep -Fq -- '--enable-dynamic-vram' "${cli_args_file}"; then
-        printf "ERROR: Pinned ComfyUI checkout does not support --enable-dynamic-vram.\n"
-        printf "ERROR: Checked %s at pin %s\n" "${cli_args_file}" "${COMFYUI_PIN_COMMIT}"
+        printf "ERROR: ComfyUI checkout does not support --enable-dynamic-vram.\n"
+        printf "ERROR: Checked %s\n" "${cli_args_file}"
         return 1
     fi
 
-    printf "Verified ComfyUI dynamic VRAM flag support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
+    printf "Verified ComfyUI dynamic VRAM flag support.\n"
 }
 
 function provisioning_verify_flux_kv_cache_support() {
@@ -482,18 +480,18 @@ function provisioning_verify_flux_kv_cache_support() {
     fi
 
     if ! grep -Fq "FluxKVCache" "${flux_nodes_file}"; then
-        printf "ERROR: Pinned ComfyUI checkout does not expose FluxKVCache.\n"
-        printf "ERROR: Checked %s at pin %s\n" "${flux_nodes_file}" "${COMFYUI_PIN_COMMIT}"
+        printf "ERROR: ComfyUI checkout does not expose FluxKVCache.\n"
+        printf "ERROR: Checked %s\n" "${flux_nodes_file}"
         return 1
     fi
 
     if ! grep -Fq "FluxKontextMultiReferenceLatentMethod" "${flux_nodes_file}"; then
-        printf "ERROR: Pinned ComfyUI checkout does not expose FluxKontextMultiReferenceLatentMethod.\n"
-        printf "ERROR: Checked %s at pin %s\n" "${flux_nodes_file}" "${COMFYUI_PIN_COMMIT}"
+        printf "ERROR: ComfyUI checkout does not expose FluxKontextMultiReferenceLatentMethod.\n"
+        printf "ERROR: Checked %s\n" "${flux_nodes_file}"
         return 1
     fi
 
-    printf "Verified Flux KV cache node support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
+    printf "Verified Flux KV cache node support.\n"
 }
 
 function provisioning_verify_ltx_reference_audio_support() {
@@ -518,18 +516,18 @@ function provisioning_verify_ltx_reference_audio_support() {
     fi
 
     if ! grep -Fq "out['ref_audio']" "${model_base_file}"; then
-        printf "ERROR: Pinned ComfyUI checkout is missing ref_audio conditioning plumbing.\n"
-        printf "ERROR: Checked %s at pin %s\n" "${model_base_file}" "${COMFYUI_PIN_COMMIT}"
+        printf "ERROR: ComfyUI checkout is missing ref_audio conditioning plumbing.\n"
+        printf "ERROR: Checked %s\n" "${model_base_file}"
         return 1
     fi
 
     if ! grep -Fq "ref_audio_seq_len" "${av_model_file}"; then
-        printf "ERROR: Pinned ComfyUI checkout is missing LTX audio reference handling in av_model.py.\n"
-        printf "ERROR: Checked %s at pin %s\n" "${av_model_file}" "${COMFYUI_PIN_COMMIT}"
+        printf "ERROR: ComfyUI checkout is missing LTX audio reference handling in av_model.py.\n"
+        printf "ERROR: Checked %s\n" "${av_model_file}"
         return 1
     fi
 
-    printf "Verified LTX reference-audio plumbing at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
+    printf "Verified LTX reference-audio plumbing.\n"
 }
 
 function provisioning_start() {
