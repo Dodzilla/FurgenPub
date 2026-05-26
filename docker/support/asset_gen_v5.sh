@@ -129,7 +129,7 @@ NODE_PINS[ComfyUI_Comfyroll_CustomNodes]="d78b780ae43fcf8c6b7c6505e6ffb4584281ce
 NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
 NODE_PINS[ComfyUI-NAG]="c6f27116a8259f5b501d498a09e51c82fa72e35f"
 NODE_PINS[ComfyUI-SAM3]="978bb763cfadcad41363eba016e57686b414c27b"
-NODE_PINS[easy-comfy-nodes-async]="d4c651a65e885a05ce5ce09468a2597ab1f7925c"
+NODE_PINS[easy-comfy-nodes-async]="a7d58d21de8a47fc42537c204650f9c03066f22a"
 NODE_PINS[ComfyUI-OmniVoice-TTS]="30ecd70e5543ca8b0c5b2bf6e8fdffa8f611ef25"
 NODE_PINS[ComfyUI-Trellis2]="07574666fbe7c82939cec5f69373b8f0958caae1"
 NODE_PINS[ComfyUI-TrellisMeshPostprocess]="7c4b09752968ec09bc93f810773b4f9329e22c91"
@@ -230,7 +230,6 @@ function append_bundle_repos() {
     local bundle_id="$1"
     case "$bundle_id" in
         asset_gen_v5_runtime_helpers)
-            append_unique_node_repo "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
             append_unique_node_repo "https://github.com/Dodzilla/easy-comfy-nodes-async"
             ;;
         asset_gen_v5_flux_image)
@@ -376,7 +375,7 @@ function provisioning_install_selected_node_bundles() {
         provisioning_configure_trellis2_runtime || return 1
     fi
 
-    if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_runtime_helpers"; then
+    if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || [[ -d "${COMFYUI_DIR}/custom_nodes/ComfyUI-Impact-Pack" ]]; then
         provisioning_install_impact_pack_runtime_requirements || return 1
     fi
 
