@@ -349,9 +349,7 @@ function provisioning_install_selected_node_bundles() {
     else
         printf "Skipping FurgenVideoTools install for asset_gen_v5_lite.\n"
     fi
-    if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_runtime_helpers"; then
-        provisioning_install_furgen_ace_step_runtime_node || return 1
-    fi
+    printf "Skipping FurgenAceStepRuntime install for asset_gen_v5_lite.\n"
 
     if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_trellis"; then
         provisioning_patch_trellis2_allocator_override || return 1
@@ -412,7 +410,13 @@ function pin_node_to_ref() {
     fi
     printf "Pinning %s to %s...\n" "$dir" "$pin_ref"
     (
-        cd "$path" && git fetch --all --tags && git checkout --force "$pin_ref"
+        cd "$path" || exit 1
+        git cat-file -e "${pin_ref}^{commit}" 2>/dev/null || \
+            git fetch --depth=1 origin "$pin_ref" || \
+            git fetch --depth=1 origin "refs/tags/${pin_ref}:refs/tags/${pin_ref}" || \
+            git fetch --all --tags
+        git checkout --force "$pin_ref" || git checkout --force FETCH_HEAD
+        git submodule update --init --recursive --depth=1
     ) || {
         printf "ERROR: Failed to pin %s to %s.\n" "$dir" "$pin_ref"
         return 1
@@ -732,21 +736,39 @@ function provisioning_get_apt_packages() {
         return 0
     fi
 
-    printf "Installing apt package prerequisites: %s\n" "${APT_PACKAGES[*]}"
+    local packages_to_install=("${APT_PACKAGES[@]}")
+    if command -v dpkg-query >/dev/null 2>&1; then
+        packages_to_install=()
+        local package_name
+        for package_name in "${APT_PACKAGES[@]}"; do
+            if dpkg-query -W -f='${Status}' "$package_name" 2>/dev/null | grep -Fq "install ok installed"; then
+                printf "Apt package already installed: %s\n" "$package_name"
+            else
+                packages_to_install+=("$package_name")
+            fi
+        done
+    fi
+
+    if [[ ${#packages_to_install[@]} -eq 0 ]]; then
+        printf "All apt package prerequisites are already installed; skipping apt-get update/install.\n"
+        return 0
+    fi
+
+    printf "Installing missing apt package prerequisites: %s\n" "${packages_to_install[*]}"
     if command -v apt-get >/dev/null 2>&1; then
         if command -v sudo >/dev/null 2>&1; then
             sudo apt-get update
-            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages_to_install[@]}"
         else
             apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages_to_install[@]}"
         fi
     elif [[ -n "${APT_INSTALL:-}" ]]; then
         # Compatibility fallback for environments that predefine APT_INSTALL.
         if command -v sudo >/dev/null 2>&1; then
-            sudo ${APT_INSTALL} "${APT_PACKAGES[@]}"
+            sudo ${APT_INSTALL} "${packages_to_install[@]}"
         else
-            ${APT_INSTALL} "${APT_PACKAGES[@]}"
+            ${APT_INSTALL} "${packages_to_install[@]}"
         fi
     else
         printf "WARN: apt-get and APT_INSTALL are both unavailable; skipping apt package installation.\n"
@@ -781,10 +803,25 @@ function provisioning_get_nodes() {
             fi
         else
             printf "Downloading node: %s...\n" "${repo}"
-            git clone "${repo}" "${path}" --recursive || {
-                printf "ERROR: Failed to clone node repo %s\n" "${repo}"
-                return 1
-            }
+            if [[ -n "${NODE_PINS[$dir]:-}" ]]; then
+                mkdir -p "$path"
+                (
+                    cd "$path" || exit 1
+                    git init && \
+                        git remote add origin "$repo"
+                    git fetch --depth=1 origin "${NODE_PINS[$dir]}" || \
+                        git fetch --depth=1 origin "refs/tags/${NODE_PINS[$dir]}:refs/tags/${NODE_PINS[$dir]}" || \
+                        git fetch --all --tags
+                ) || {
+                    printf "ERROR: Failed to initialize shallow clone for node repo %s\n" "${repo}"
+                    return 1
+                }
+            else
+                git clone "${repo}" "${path}" --recursive || {
+                    printf "ERROR: Failed to clone node repo %s\n" "${repo}"
+                    return 1
+                }
+            fi
             pin_node_to_ref "$dir" "$path" || return 1
             if should_skip_node_requirements "$dir"; then
                 printf "Skipping requirements install for node %s to avoid slow source-build dependencies.\n" "$dir"
