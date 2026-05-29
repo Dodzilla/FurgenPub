@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.17"
+AGENT_VERSION = "dm-agent-py/0.9.18"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -4653,6 +4653,9 @@ class DependencyAgent:
             self._forget_retry(dep_id)
             return None
 
+        if self._clear_retry_if_forced(dep_id, current, entry):
+            entry = {}
+
         resolved = current.get("resolved") if isinstance(current.get("resolved"), dict) else entry.get("resolved")
         if not isinstance(resolved, dict):
             logging.info("Dropping local retry for %s: queue item has no resolved download instructions", dep_id)
@@ -4690,6 +4693,35 @@ class DependencyAgent:
         if last_error:
             return f"{prefix} Last error: {last_error}"
         return prefix
+
+    def _force_retry_after_ms(self, item: Dict[str, Any]) -> Optional[int]:
+        raw = item.get("forceRetryAfterMs")
+        if isinstance(raw, (int, float)) and raw > 0:
+            return int(raw)
+        return None
+
+    def _clear_retry_if_forced(self, dep_id: str, item: Dict[str, Any], retry_entry: Optional[Dict[str, Any]]) -> bool:
+        force_after_ms = self._force_retry_after_ms(item)
+        if not dep_id or force_after_ms is None:
+            return False
+
+        last_attempt = 0
+        if isinstance(retry_entry, dict):
+            raw_last_attempt = retry_entry.get("lastAttemptAtMs")
+            if isinstance(raw_last_attempt, (int, float)):
+                last_attempt = int(raw_last_attempt)
+
+        if force_after_ms <= last_attempt:
+            return False
+
+        logging.info(
+            "Clearing local dependency retry backoff due to forceRetryAfterMs. depId=%s forceRetryAfterMs=%d lastAttemptAtMs=%d",
+            dep_id,
+            force_after_ms,
+            last_attempt,
+        )
+        self._forget_retry(dep_id)
+        return True
 
     def _schedule_download_retry(self, item: Dict[str, Any], err: Exception) -> int:
         dep_id = item.get("depId")
@@ -5072,8 +5104,10 @@ class DependencyAgent:
             if dep_id:
                 with self._lock:
                     retry_entry = self._state.retry.get(dep_id) if isinstance(self._state.retry.get(dep_id), dict) else None
-                    next_at = int(retry_entry.get("nextAttemptAtMs")) if retry_entry and isinstance(retry_entry.get("nextAttemptAtMs"), int) else None
-                    last_err = retry_entry.get("lastError") if retry_entry and isinstance(retry_entry.get("lastError"), str) else ""
+                if retry_entry and self._clear_retry_if_forced(dep_id, item, retry_entry):
+                    retry_entry = None
+                next_at = int(retry_entry.get("nextAttemptAtMs")) if retry_entry and isinstance(retry_entry.get("nextAttemptAtMs"), int) else None
+                last_err = retry_entry.get("lastError") if retry_entry and isinstance(retry_entry.get("lastError"), str) else ""
                 if next_at is not None and now < next_at:
                     # Avoid hammering the same dep when we're intentionally backing off.
                     self._post_status(item, "retrying", error=self._format_backoff_error(dep_id, last_err, next_at))
