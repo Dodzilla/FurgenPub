@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.15"
+AGENT_VERSION = "dm-agent-py/0.9.16"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -252,9 +252,139 @@ def detect_public_ip(timeout_seconds: float = 5.0) -> Optional[str]:
     return None
 
 
-def disk_stats(path: Path) -> Dict[str, int]:
-    usage = shutil.disk_usage(str(path))
-    return {"totalBytes": int(usage.total), "freeBytes": int(usage.free), "usedBytes": int(usage.used)}
+def _nearest_existing_path(path: Path) -> Path:
+    current = path
+    for _ in range(32):
+        if current.exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            return current
+        current = parent
+    return path
+
+
+def _read_mountinfo() -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    try:
+        text = Path("/proc/self/mountinfo").read_text("utf-8", errors="ignore")
+    except Exception:
+        return rows
+
+    for line in text.splitlines():
+        try:
+            left, right = line.split(" - ", 1)
+            left_parts = left.split()
+            right_parts = right.split()
+            if len(left_parts) < 5 or len(right_parts) < 3:
+                continue
+            rows.append({
+                "mountPoint": left_parts[4].replace("\\040", " "),
+                "majorMinor": left_parts[2],
+                "root": left_parts[3].replace("\\040", " "),
+                "filesystemType": right_parts[0],
+                "source": right_parts[1],
+            })
+        except Exception:
+            continue
+    return rows
+
+
+def _mount_for_path(path: Path) -> Dict[str, str]:
+    try:
+        resolved = str(_nearest_existing_path(path).resolve())
+    except Exception:
+        resolved = str(path)
+
+    best: Dict[str, str] = {}
+    for row in _read_mountinfo():
+        mount_point = row.get("mountPoint") or ""
+        if not mount_point:
+            continue
+        if resolved == mount_point or resolved.startswith(mount_point.rstrip("/") + "/"):
+            if len(mount_point) > len(best.get("mountPoint", "")):
+                best = row
+    return best
+
+
+def disk_stats(path: Path) -> Dict[str, Any]:
+    usage_path = _nearest_existing_path(path)
+    usage = shutil.disk_usage(str(usage_path))
+    out: Dict[str, Any] = {
+        "path": str(path),
+        "statPath": str(usage_path),
+        "totalBytes": int(usage.total),
+        "freeBytes": int(usage.free),
+        "usedBytes": int(usage.used),
+    }
+    try:
+        out["resolvedPath"] = str(usage_path.resolve())
+    except Exception:
+        pass
+    mount = _mount_for_path(usage_path)
+    if mount:
+        out["mount"] = mount
+    return out
+
+
+def _scan_deleted_open_files(base_paths: Iterable[Path], max_examples: int = 20) -> Dict[str, Any]:
+    bases: List[str] = []
+    for base in base_paths:
+        try:
+            bases.append(str(_nearest_existing_path(base).resolve()))
+        except Exception:
+            continue
+    bases = sorted(set(bases), key=len, reverse=True)
+    if not bases:
+        return {"count": 0, "bytes": 0, "examples": [], "truncated": False}
+
+    count = 0
+    total_bytes = 0
+    examples: List[Dict[str, Any]] = []
+    truncated = False
+    proc = Path("/proc")
+    try:
+        pid_dirs = [p for p in proc.iterdir() if p.name.isdigit()]
+    except Exception:
+        return {"count": 0, "bytes": 0, "examples": [], "truncated": False}
+
+    for pid_dir in pid_dirs:
+        fd_dir = pid_dir / "fd"
+        try:
+            fds = list(fd_dir.iterdir())
+        except Exception:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(str(fd))
+            except Exception:
+                continue
+            if " (deleted)" not in target:
+                continue
+            clean_target = target.replace(" (deleted)", "")
+            try:
+                resolved_target = str(Path(clean_target).resolve())
+            except Exception:
+                resolved_target = clean_target
+            if not any(resolved_target == base or resolved_target.startswith(base.rstrip("/") + "/") for base in bases):
+                continue
+            size = 0
+            try:
+                size = int(os.stat(str(fd)).st_size)
+            except Exception:
+                size = 0
+            count += 1
+            total_bytes += max(0, size)
+            if len(examples) < max_examples:
+                examples.append({
+                    "pid": pid_dir.name,
+                    "fd": fd.name,
+                    "path": clean_target[:500],
+                    "sizeBytes": int(size),
+                })
+            else:
+                truncated = True
+    return {"count": count, "bytes": int(total_bytes), "examples": examples, "truncated": truncated}
 
 
 def safe_join(base_dir: Path, rel: str) -> Path:
@@ -2086,6 +2216,7 @@ class DependencyAgent:
 
         now_ms = _now_ms()
         stats = disk_stats(self.comfyui_dir)
+        diagnostics = self._disk_diagnostics_payload()
         return {
             "dependencyManager": {
                 "installedDepIdsStatic": installed_static,
@@ -2101,7 +2232,12 @@ class DependencyAgent:
                     "freeBytes": int(stats.get("freeBytes", 0)),
                     "usedBytes": int(stats.get("usedBytes", 0)),
                     "measuredAtMs": now_ms,
+                    "path": stats.get("path"),
+                    "statPath": stats.get("statPath"),
+                    "resolvedPath": stats.get("resolvedPath"),
+                    "mount": stats.get("mount"),
                 },
+                "diskDiagnostics": diagnostics,
                 "lastHeartbeatAtMs": now_ms,
             },
             "updatedAtMs": now_ms,
@@ -2109,6 +2245,46 @@ class DependencyAgent:
 
     def _write_dependency_runtime_mirror(self, queue_depth: Optional[int] = None) -> bool:
         return self._coordination_patch_runtime(self._collect_dependency_runtime_payload(queue_depth=queue_depth))
+
+    def _disk_diagnostics_payload(self) -> Dict[str, Any]:
+        paths: List[Tuple[str, Path]] = [
+            ("workspace", self.workspace),
+            ("comfyui", self.comfyui_dir),
+            ("models", self.comfyui_dir / "models"),
+            ("state", self.state_path.parent),
+            ("inputCache", self.input_cache_dir),
+            ("root", Path("/")),
+        ]
+        seen: Set[str] = set()
+        entries: List[Dict[str, Any]] = []
+        for label, path in paths:
+            try:
+                key = str(_nearest_existing_path(path).resolve())
+            except Exception:
+                key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                stats = disk_stats(path)
+                entries.append({
+                    "label": label,
+                    "path": stats.get("path"),
+                    "statPath": stats.get("statPath"),
+                    "resolvedPath": stats.get("resolvedPath"),
+                    "totalBytes": stats.get("totalBytes"),
+                    "freeBytes": stats.get("freeBytes"),
+                    "usedBytes": stats.get("usedBytes"),
+                    "mount": stats.get("mount"),
+                })
+            except Exception as e:
+                entries.append({"label": label, "path": str(path), "error": str(e)[:500]})
+
+        deleted_open = _scan_deleted_open_files([self.workspace, self.comfyui_dir], max_examples=20)
+        return {
+            "paths": entries,
+            "deletedOpenFiles": deleted_open,
+        }
 
     def _collect_agent_runtime_payload(self) -> Dict[str, Any]:
         held_leases = self._collect_active_leases()
@@ -2958,7 +3134,7 @@ class DependencyAgent:
 
         return freed
 
-    def _ensure_space_for_download(self, expected_size_bytes: int, dep_id: str) -> bool:
+    def _ensure_space_for_download(self, expected_size_bytes: int, dep_id: str, dest_abs: Optional[Path] = None) -> bool:
         policy = self._dynamic_policy()
         if not policy.get("enabled"):
             return False
@@ -2973,10 +3149,22 @@ class DependencyAgent:
             freed = self._evict_dynamic_locked(required_free_bytes=required_free, protect={dep_id})
             did_evict = freed > 0
 
-        stats = disk_stats(self.comfyui_dir)
+        stats_path = dest_abs.parent if isinstance(dest_abs, Path) else self.comfyui_dir
+        stats = disk_stats(stats_path)
         free_now = int(stats.get("freeBytes", 0))
         if free_now < required_free:
-            raise RuntimeError(f"Insufficient disk space: freeBytes={free_now} requiredFreeBytes={required_free}")
+            diag = self._disk_diagnostics_payload()
+            deleted_open = diag.get("deletedOpenFiles") if isinstance(diag, dict) else {}
+            deleted_count = deleted_open.get("count") if isinstance(deleted_open, dict) else 0
+            deleted_bytes = deleted_open.get("bytes") if isinstance(deleted_open, dict) else 0
+            mount = stats.get("mount") if isinstance(stats.get("mount"), dict) else {}
+            mount_point = mount.get("mountPoint") if isinstance(mount, dict) else None
+            fs_type = mount.get("filesystemType") if isinstance(mount, dict) else None
+            raise RuntimeError(
+                f"Insufficient disk space: freeBytes={free_now} requiredFreeBytes={required_free} "
+                f"path={stats.get('statPath') or stats_path} mount={mount_point or '-'} fs={fs_type or '-'} "
+                f"deletedOpenBytes={int(deleted_bytes or 0)} deletedOpenCount={int(deleted_count or 0)}"
+            )
 
         return did_evict
 
@@ -3298,6 +3486,7 @@ class DependencyAgent:
             "state": state,
             "activeDownloads": active_downloads,
             "diskStats": disk_stats(self.comfyui_dir),
+            "diskDiagnostics": self._disk_diagnostics_payload(),
             "dynamicBytesUsed": dynamic_bytes_used,
         }
         if error:
@@ -3335,6 +3524,7 @@ class DependencyAgent:
             "activeDownloads": active_downloads,
             "failedDepIds": failed,
             "diskStats": disk_stats(self.comfyui_dir),
+            "diskDiagnostics": self._disk_diagnostics_payload(),
             "dynamicBytesUsed": dynamic_bytes_used,
         }
         if queue_depth is not None:
@@ -4634,7 +4824,7 @@ class DependencyAgent:
                     self._clear_download_activity(dep_id)
                     return
 
-        did_evict = self._ensure_space_for_download(expected_size_bytes, dep_id)
+        did_evict = self._ensure_space_for_download(expected_size_bytes, dep_id, dest_abs=dest_abs)
         if did_evict and _now_ms() - int(self._last_heartbeat_ms) >= 2000:
             # Eviction changes inventory; push an early heartbeat to reduce scheduling race windows.
             try:
