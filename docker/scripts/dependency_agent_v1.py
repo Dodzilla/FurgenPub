@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.16"
+AGENT_VERSION = "dm-agent-py/0.9.17"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2817,7 +2817,36 @@ class DependencyAgent:
             return
         raise RuntimeError(f"Unsupported video_gen_v2 node bundle: {bundle_id}")
 
-    def _restart_local_comfy(self) -> None:
+    def _restart_local_comfy_with_supervisor(self) -> bool:
+        supervisorctl = shutil.which("supervisorctl")
+        if not supervisorctl:
+            return False
+        service_names = ["comfyui", "comfy", "comfyui-server"]
+        errors: List[str] = []
+        for service_name in service_names:
+            try:
+                proc = subprocess.run(
+                    [supervisorctl, "restart", service_name],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=90,
+                )
+            except Exception as exc:
+                errors.append(f"{service_name}: {exc}")
+                continue
+            combined = f"{proc.stdout}\n{proc.stderr}".lower()
+            if proc.returncode == 0 or "started" in combined or "startsecs" in combined:
+                logging.info("Restarted ComfyUI via supervisor service '%s'.", service_name)
+                return True
+            errors.append(f"{service_name}: rc={proc.returncode} {proc.stdout} {proc.stderr}".strip())
+        logging.warning("Supervisor ComfyUI restart failed: %s", " | ".join(errors)[-2000:])
+        return False
+
+    def _restart_local_comfy(self, prefer_process_restart: bool = False) -> None:
+        if prefer_process_restart and self._restart_local_comfy_with_supervisor():
+            return
+
         restart_endpoints = [
             "/manager/reboot",
             "/api/manager/reboot",
@@ -2834,19 +2863,8 @@ class DependencyAgent:
                 if "connection reset" in msg or "ecconnreset" in msg or "timeout" in msg:
                     return
 
-        supervisorctl = shutil.which("supervisorctl")
-        if supervisorctl:
-            proc = subprocess.run(
-                [supervisorctl, "restart", "comfyui"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=60,
-            )
-            combined = f"{proc.stdout}\n{proc.stderr}".lower()
-            if proc.returncode == 0 or "started" in combined or "startsecs" in combined:
-                return
-            raise RuntimeError(f"Local ComfyUI restart endpoints failed and supervisor restart failed: {proc.stdout} {proc.stderr}".strip())
+        if not prefer_process_restart and self._restart_local_comfy_with_supervisor():
+            return
 
         raise RuntimeError("All local ComfyUI restart endpoints failed or are unavailable.")
 
@@ -4527,6 +4545,34 @@ class DependencyAgent:
                 },
             )
 
+    def _agent_handle_restart_comfy_command(self, item: Dict[str, Any]) -> None:
+        item_id = item.get("itemId")
+        lease_id = item.get("leaseId")
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        if not isinstance(item_id, str) or not isinstance(lease_id, str):
+            return
+
+        prefer_process_restart = payload.get("preferProcessRestart") is not False
+        self._remove_local_readiness_file()
+        try:
+            self._restart_local_comfy(prefer_process_restart=prefer_process_restart)
+            self._wait_for_local_comfy_ready(timeout_seconds=300.0)
+            self._write_local_readiness_file()
+            self._agent_ack(item_id, lease_id, "command_succeeded")
+            try:
+                self._heartbeat(queue_depth=None)
+            except Exception:
+                pass
+        except Exception as exc:
+            self._remove_local_readiness_file()
+            self._agent_ack(
+                item_id,
+                lease_id,
+                "command_failed",
+                error_code="restart_comfy_failed",
+                error_message=str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
+            )
+
     def _resolve_auth_header(self, auth: Optional[str]) -> Optional[str]:
         a = (auth or "none").lower()
         if a == "none":
@@ -5705,7 +5751,11 @@ class DependencyAgent:
     def _submit_agent_maintenance_item(self, item: Dict[str, Any]) -> None:
         if self._agent_maintenance_executor is None:
             raise RuntimeError("Agent maintenance executor is not initialized")
-        future = self._agent_maintenance_executor.submit(self._process_install_node_bundles_item, item)
+        item_type = item.get("type")
+        if item_type == "restart_comfy":
+            future = self._agent_maintenance_executor.submit(self._agent_handle_restart_comfy_command, item)
+        else:
+            future = self._agent_maintenance_executor.submit(self._process_install_node_bundles_item, item)
         with self._lock:
             self._agent_maintenance_inflight.add(future)
         self._request_agent_queue_poll()
@@ -6162,6 +6212,10 @@ class DependencyAgent:
             return
 
         if item_type == "install_node_bundles":
+            self._submit_agent_maintenance_item(item)
+            return
+
+        if item_type == "restart_comfy":
             self._submit_agent_maintenance_item(item)
             return
 
