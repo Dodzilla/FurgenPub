@@ -70,7 +70,7 @@ Optional knobs:
 Queue item expectations:
   - The backend should include a `resolved` object for download items with:
       { url, auth, destRelativePath, sha256?, expectedSizeBytes?, kind? }
-  - For touch items, `resolved` should include at least:
+  - For touch/delete items, `resolved` should include at least:
       { destRelativePath, kind }
     The backend in this repo enriches /dependencies/queue responses accordingly.
 """
@@ -105,7 +105,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.14"
+AGENT_VERSION = "dm-agent-py/0.9.15"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2139,6 +2139,7 @@ class DependencyAgent:
                     "dependencyChannel": True,
                     "agentPullExecution": True,
                     "hybridOutputUploadsV1": True,
+                    "dependencyDeleteFiles": True,
                 },
             },
             "updatedAtMs": now_ms,
@@ -3398,6 +3399,7 @@ class DependencyAgent:
             "capabilities": {
                 "dependencyChannel": True,
                 "agentPullExecution": True,
+                "dependencyDeleteFiles": True,
                 "downloadTool": self.download_tool,
             },
         }
@@ -3667,6 +3669,7 @@ class DependencyAgent:
             "capabilities": {
                 "dependencyChannel": True,
                 "agentPullExecution": True,
+                "dependencyDeleteFiles": True,
             },
         }
         if self._coordination:
@@ -4741,6 +4744,66 @@ class DependencyAgent:
                 self._touch_dynamic_locked(dep_id, dest_rel if isinstance(dest_rel, str) else None)
             self._save_state()
 
+    def _delete_item(self, item: Dict[str, Any]) -> None:
+        dep_id = item.get("depId")
+        if not isinstance(dep_id, str) or not dep_id:
+            raise RuntimeError("Queue item missing depId")
+
+        resolved = item.get("resolved")
+        dest_rel: Optional[str] = None
+        if isinstance(resolved, dict) and isinstance(resolved.get("destRelativePath"), str):
+            dest_rel = resolved.get("destRelativePath")
+
+        with self._lock:
+            if dep_id in self._downloading:
+                raise RuntimeError(f"Cannot delete {dep_id} while it is downloading")
+            if not dest_rel:
+                entry = self._state.lru.get(dep_id)
+                if isinstance(entry, dict) and isinstance(entry.get("destRelativePath"), str):
+                    dest_rel = entry.get("destRelativePath")
+
+        if not dest_rel:
+            raise RuntimeError("Resolved dependency missing destRelativePath")
+
+        dest_abs = safe_join(self.comfyui_dir, dest_rel)
+        partial = dest_abs.with_suffix(dest_abs.suffix + ".partial")
+        deleted_paths: List[str] = []
+        freed_bytes = 0
+
+        for candidate in (dest_abs, partial):
+            try:
+                if not candidate.exists():
+                    continue
+                if candidate.is_dir():
+                    raise RuntimeError(f"Refusing to delete directory for dependency {dep_id}: {candidate}")
+                size = int(candidate.stat().st_size)
+                candidate.unlink()
+                freed_bytes += max(0, size)
+                deleted_paths.append(str(candidate))
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(f"Failed to delete {candidate}: {e}") from e
+
+        with self._lock:
+            prev = self._state.lru.pop(dep_id, None) or {}
+            prev_size = prev.get("sizeBytes") if isinstance(prev.get("sizeBytes"), int) else freed_bytes
+            self._dynamic_bytes_used = max(0, int(self._dynamic_bytes_used) - int(prev_size))
+            self._state.installed_dynamic.discard(dep_id)
+            self._state.installed_static.discard(dep_id)
+            self._state.failed.discard(dep_id)
+            self._state.retry.pop(dep_id, None)
+            self._downloading.discard(dep_id)
+            self._save_state()
+
+        logging.info(
+            "Deleted dependency %s (%d bytes, %d paths): %s",
+            dep_id,
+            int(freed_bytes),
+            len(deleted_paths),
+            ", ".join(deleted_paths) if deleted_paths else str(dest_abs),
+        )
+
     def _process_item(self, item: Dict[str, Any]) -> None:
         op = item.get("op")
         dep_id = item.get("depId")
@@ -4752,7 +4815,7 @@ class DependencyAgent:
         if not isinstance(dep_id, str):
             dep_id = ""
 
-        if op not in ("download", "touch"):
+        if op not in ("download", "touch", "delete"):
             self._post_status(item, "failed", error=f"Unknown op: {op}")
             return
 
@@ -4834,6 +4897,19 @@ class DependencyAgent:
                 logging.warning("Download failed (non-retryable) itemId=%s depId=%s: %s", item_id, dep_id, err_msg)
                 self._post_status(item, "failed", error=err_msg)
                 return
+
+        if op == "delete":
+            self._post_status(item, "running")
+            try:
+                self._delete_item(item)
+                self._post_status(item, "succeeded")
+                try:
+                    self._heartbeat(queue_depth=None)
+                except Exception:
+                    pass
+            except Exception as e:
+                self._post_status(item, "failed", error=str(e))
+            return
 
         # touch
         self._post_status(item, "running")
