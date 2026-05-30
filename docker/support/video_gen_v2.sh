@@ -57,6 +57,7 @@ NODES=(
     "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
     "https://github.com/GACLove/ComfyUI-VFI"
     "https://github.com/Lightricks/ComfyUI-LTXVideo"
+    "https://github.com/TenStrip/10S-Comfy-nodes"
 
     # WanVideo nodes
     "https://github.com/kijai/ComfyUI-WanVideoWrapper"
@@ -91,6 +92,7 @@ NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
 NODE_PINS[LoopsGroundingDino]="8d84e5501d147d974ba4b6bfeb5de67c324523a0"
 NODE_PINS[ComfyUI-RMBG]="b28ce10b51e1d505a2ebf2608184119f0cf662d3"
 NODE_PINS[ComfyUI-VideoHelperSuite]="08e8df15db24da292d4b7f943c460dc2ab442b24"
+NODE_PINS[10S_Nodes]="fb6edfed97abaf246a826812536eef018d7a1c3b"
 
 # New repos (latest as of now)
 NODE_PINS[ComfyUI-Frame-Interpolation]="a969c01dbccd9e5510641be04eb51fe93f6bfc3d"
@@ -125,6 +127,16 @@ function pin_node_if_requested() {
             cd "$path" && git fetch --all --tags && git checkout --force "$pin_ref"
         ) || echo "WARN: Failed to pin $dir to $pin_ref"
     fi
+}
+
+function node_dir_for_repo() {
+    local repo="$1"
+    local dir="${repo##*/}"
+    dir="${dir%.git}"
+    case "$dir" in
+        10S-Comfy-nodes) dir="10S_Nodes" ;;
+    esac
+    printf "%s" "$dir"
 }
 
 function provisioning_update_comfyui() {
@@ -267,64 +279,14 @@ class EZLoadImgFromUrlNode:
         return rgb, mask
 
 
-class LatentMotionSharpener:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "base_sharpen": ("FLOAT", {"default": 0.04, "min": 0.0, "max": 5.0, "step": 0.01}),
-                "motion_sharpen": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 5.0, "step": 0.01}),
-                "motion_thresh": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "temporal_smooth_mask": ("BOOLEAN", {"default": False}),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    FUNCTION = "execute"
-    CATEGORY = "Furgen/compat"
-
-    def execute(self, latent, base_sharpen=0.04, motion_sharpen=0.2, motion_thresh=0.0, temporal_smooth_mask=False):
-        return (latent,)
-
-
-class LatentTemporalInpainter:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "anchor_sigma": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "ghost_sigma": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "score_gamma": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1}),
-                "anchor_blend": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "debug_scores": ("BOOLEAN", {"default": False}),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    FUNCTION = "execute"
-    CATEGORY = "Furgen/compat"
-
-    def execute(self, latent, anchor_sigma=0.1, ghost_sigma=0.35, score_gamma=2.0, anchor_blend=0.4, seed=0, debug_scores=False):
-        return (latent,)
-
-
 NODE_CLASS_MAPPINGS = {
     "ImpactExecutionOrderController": ImpactExecutionOrderController,
     "EZLoadImgFromUrlNode": EZLoadImgFromUrlNode,
-    "LatentMotionSharpener": LatentMotionSharpener,
-    "LatentTemporalInpainter": LatentTemporalInpainter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ImpactExecutionOrderController": "Execution Order Controller",
     "EZLoadImgFromUrlNode": "Load Img From URL (EZ)",
-    "LatentMotionSharpener": "Latent Motion Sharpener",
-    "LatentTemporalInpainter": "Latent Temporal Inpainter",
 }
 PY
     python -m py_compile "$compat_path" || return 1
@@ -332,8 +294,7 @@ PY
 
 function provisioning_get_nodes() {
     for repo in "${NODES[@]}"; do
-        dir="${repo##*/}"
-        dir="${dir%.git}"
+        dir="$(node_dir_for_repo "$repo")"
         path="${COMFYUI_DIR}/custom_nodes/${dir}"
         requirements="${path}/requirements.txt"
         if [[ -d $path ]]; then

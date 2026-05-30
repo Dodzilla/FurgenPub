@@ -3387,64 +3387,14 @@ class EZLoadImgFromUrlNode:
         return rgb, mask
 
 
-class LatentMotionSharpener:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "base_sharpen": ("FLOAT", {"default": 0.04, "min": 0.0, "max": 5.0, "step": 0.01}),
-                "motion_sharpen": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 5.0, "step": 0.01}),
-                "motion_thresh": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "temporal_smooth_mask": ("BOOLEAN", {"default": False}),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    FUNCTION = "execute"
-    CATEGORY = "Furgen/compat"
-
-    def execute(self, latent, base_sharpen=0.04, motion_sharpen=0.2, motion_thresh=0.0, temporal_smooth_mask=False):
-        return (latent,)
-
-
-class LatentTemporalInpainter:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "latent": ("LATENT",),
-                "anchor_sigma": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "ghost_sigma": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "score_gamma": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1}),
-                "anchor_blend": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "debug_scores": ("BOOLEAN", {"default": False}),
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
-    FUNCTION = "execute"
-    CATEGORY = "Furgen/compat"
-
-    def execute(self, latent, anchor_sigma=0.1, ghost_sigma=0.35, score_gamma=2.0, anchor_blend=0.4, seed=0, debug_scores=False):
-        return (latent,)
-
-
 NODE_CLASS_MAPPINGS = {
     "ImpactExecutionOrderController": ImpactExecutionOrderController,
     "EZLoadImgFromUrlNode": EZLoadImgFromUrlNode,
-    "LatentMotionSharpener": LatentMotionSharpener,
-    "LatentTemporalInpainter": LatentTemporalInpainter,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ImpactExecutionOrderController": "Execution Order Controller",
     "EZLoadImgFromUrlNode": "Load Img From URL (EZ)",
-    "LatentMotionSharpener": "Latent Motion Sharpener",
-    "LatentTemporalInpainter": "Latent Temporal Inpainter",
 }
 ''',
             encoding="utf-8",
