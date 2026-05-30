@@ -1616,6 +1616,290 @@ class AgentSelfUpdateRelease:
     sha256: Optional[str] = None
 
 
+class PrlMinerController:
+    def __init__(self, workspace: Path, download_timeout_seconds: float, download_chunk_size: int) -> None:
+        self.root = Path(workspace) / ".fcs" / "prl"
+        self.binary_path = self.root / "prl_gpu_miner"
+        self.log_path = self.root / "prl_miner.log"
+        self.download_timeout_seconds = max(30.0, float(download_timeout_seconds))
+        self.download_chunk_size = max(1024 * 1024, int(download_chunk_size))
+        self._lock = threading.Lock()
+        self._proc: Optional[subprocess.Popen] = None
+        self._state = "stopped"
+        self._desired_state = "stopped"
+        self._worker = ""
+        self._pool_url = ""
+        self._miner_version = ""
+        self._started_at_ms = 0
+        self._stopped_at_ms = 0
+        self._last_exit_code: Optional[int] = None
+        self._last_error = ""
+
+    def _reap_locked(self) -> None:
+        if self._proc is None:
+            return
+        return_code = self._proc.poll()
+        if return_code is None:
+            return
+        self._last_exit_code = int(return_code)
+        self._proc = None
+        self._stopped_at_ms = _now_ms()
+        if self._desired_state in ("running", "starting"):
+            self._state = "failed" if return_code != 0 else "stopped"
+            if return_code != 0 and not self._last_error:
+                self._last_error = f"miner exited with code {return_code}"
+        else:
+            self._state = "stopped"
+            self._desired_state = "stopped"
+
+    def _is_running_locked(self) -> bool:
+        self._reap_locked()
+        return self._proc is not None and self._proc.poll() is None
+
+    def _set_error(self, message: str) -> None:
+        with self._lock:
+            self._state = "failed"
+            self._desired_state = "stopped"
+            self._last_error = str(message)[:MAX_AGENT_ERROR_MESSAGE_CHARS]
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            self._reap_locked()
+            pid = self._proc.pid if self._proc is not None and self._proc.poll() is None else None
+            out: Dict[str, Any] = {
+                "state": self._state,
+                "desiredState": self._desired_state,
+                "pid": int(pid) if pid else None,
+                "lastExitCode": self._last_exit_code,
+                "lastError": self._last_error or None,
+            }
+            if self._worker:
+                out["worker"] = self._worker
+            if self._pool_url:
+                out["poolUrl"] = self._pool_url
+            if self._miner_version:
+                out["minerVersion"] = self._miner_version
+            if self._started_at_ms > 0:
+                out["startedAtMs"] = int(self._started_at_ms)
+            if self._stopped_at_ms > 0:
+                out["stoppedAtMs"] = int(self._stopped_at_ms)
+            return out
+
+    def _ensure_binary(self, download_url: str, expected_sha256: str) -> Path:
+        expected = str(expected_sha256 or "").strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", expected):
+            raise RuntimeError("Invalid or missing PRL miner SHA-256.")
+        if not download_url:
+            raise RuntimeError("Missing PRL miner download URL.")
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        if self.binary_path.exists():
+            try:
+                if sha256_file(self.binary_path).lower() == expected:
+                    os.chmod(self.binary_path, 0o755)
+                    return self.binary_path
+            except Exception:
+                pass
+
+        tmp_path = self.root / f".prl_gpu_miner.{uuid.uuid4().hex}.tmp"
+        try:
+            http_download_to_file(
+                download_url,
+                tmp_path,
+                timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
+                chunk_size=int(self.download_chunk_size),
+                user_agent=f"dm-agent-prl-miner/{AGENT_VERSION}",
+            )
+            actual = sha256_file(tmp_path).lower()
+            if actual != expected:
+                raise RuntimeError(f"PRL miner checksum mismatch: expected {expected} got {actual}")
+            os.chmod(tmp_path, 0o755)
+            os.replace(str(tmp_path), str(self.binary_path))
+            return self.binary_path
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
+    def _terminate_process(self, proc: subprocess.Popen, sig: int) -> None:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(os.getpgid(proc.pid), sig)
+                return
+        except Exception:
+            pass
+        if sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
+
+    def start(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        pool_url = payload.get("poolUrl") if isinstance(payload.get("poolUrl"), str) else ""
+        payout_address = payload.get("payoutAddress") if isinstance(payload.get("payoutAddress"), str) else ""
+        worker = payload.get("worker") if isinstance(payload.get("worker"), str) else ""
+        download_url = payload.get("minerDownloadUrl") if isinstance(payload.get("minerDownloadUrl"), str) else ""
+        miner_sha256 = payload.get("minerSha256") if isinstance(payload.get("minerSha256"), str) else ""
+        miner_version = payload.get("minerVersion") if isinstance(payload.get("minerVersion"), str) else ""
+        static_difficulty = payload.get("staticDifficulty")
+        stop_timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
+
+        if not pool_url:
+            raise RuntimeError("Missing PRL pool URL.")
+        if not payout_address:
+            raise RuntimeError("Missing PRL payout address.")
+        if not worker:
+            raise RuntimeError("Missing PRL worker name.")
+
+        with self._lock:
+            already_running = self._is_running_locked()
+            same_target = (
+                already_running and
+                self._pool_url == pool_url and
+                self._worker == worker and
+                (not miner_version or self._miner_version == miner_version)
+            )
+            if same_target:
+                self._state = "running"
+                self._desired_state = "running"
+        if same_target:
+            return self.snapshot()
+
+        if already_running:
+            self.stop("replace_prl_miner", timeout_seconds=stop_timeout)
+
+        binary = self._ensure_binary(download_url, miner_sha256)
+        args = [
+            str(binary),
+            "--pool",
+            pool_url,
+            "--address",
+            payout_address,
+            "--worker",
+            worker,
+        ]
+        if isinstance(static_difficulty, (str, int, float)) and str(static_difficulty).strip():
+            args.extend(["--diff", str(static_difficulty).strip()])
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        log_file = self.log_path.open("ab")
+        try:
+            proc = subprocess.Popen(
+                args,
+                cwd=str(self.root),
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+                preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+            )
+        except Exception:
+            log_file.close()
+            raise
+        finally:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+
+        with self._lock:
+            self._proc = proc
+            self._state = "running"
+            self._desired_state = "running"
+            self._worker = worker
+            self._pool_url = pool_url
+            self._miner_version = miner_version
+            self._started_at_ms = _now_ms()
+            self._stopped_at_ms = 0
+            self._last_exit_code = None
+            self._last_error = ""
+        logging.info("Started idle PRL miner pid=%s worker=%s pool=%s", proc.pid, worker, pool_url)
+        return self.snapshot()
+
+    def stop(self, reason: str = "", timeout_seconds: float = 10.0) -> Dict[str, Any]:
+        timeout_seconds = max(1.0, min(120.0, float(timeout_seconds or 10.0)))
+        with self._lock:
+            self._reap_locked()
+            proc = self._proc
+            if proc is None:
+                self._state = "stopped"
+                self._desired_state = "stopped"
+                if self._stopped_at_ms <= 0:
+                    self._stopped_at_ms = _now_ms()
+                return_noop = True
+            else:
+                return_noop = False
+            if return_noop:
+                proc = None
+            else:
+                self._state = "stopping"
+                self._desired_state = "stopped"
+        if proc is None:
+            return self.snapshot()
+
+        logging.info("Stopping idle PRL miner pid=%s reason=%s", proc.pid, reason or "unspecified")
+        try:
+            self._terminate_process(proc, signal.SIGTERM)
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if proc.poll() is None:
+                self._terminate_process(proc, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=5.0)
+                except Exception:
+                    pass
+            else:
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+        finally:
+            with self._lock:
+                self._last_exit_code = int(proc.returncode) if proc.returncode is not None else None
+                self._proc = None
+                self._state = "stopped"
+                self._desired_state = "stopped"
+                self._stopped_at_ms = _now_ms()
+        return self.snapshot()
+
+    def stop_if_running(self, reason: str) -> None:
+        with self._lock:
+            running = self._is_running_locked()
+        if running:
+            self.stop(reason)
+
+    def handle_command(self, item: Dict[str, Any], ack_func: Callable[..., Dict[str, Any]]) -> None:
+        item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
+        lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        if not item_id or not lease_id:
+            return
+        action = str(payload.get("action") or "").strip().lower()
+        try:
+            if action == "start":
+                self.start(payload)
+            elif action == "stop":
+                timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
+                self.stop(str(payload.get("reason") or "backend_stop_command"), timeout_seconds=timeout)
+            else:
+                ack_func(item_id, lease_id, "command_ignored_stale")
+                return
+            ack_func(item_id, lease_id, "command_succeeded")
+        except Exception as exc:
+            self._set_error(str(exc))
+            ack_func(
+                item_id,
+                lease_id,
+                "command_failed",
+                error_code="prl_miner_failed",
+                error_message=str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
+            )
+
+
 class DependencyAgent:
     def __init__(self) -> None:
         self.api_base_url = (_env_str("FCS_API_BASE_URL") or "").rstrip("/")
@@ -1641,6 +1925,11 @@ class DependencyAgent:
         chunk_mib = _env_int("DM_DOWNLOAD_CHUNK_MIB", 1)
         chunk_mib = max(1, min(32, chunk_mib))
         self.download_chunk_size = int(chunk_mib) * 1024 * 1024
+        self._idle_prl_miner = PrlMinerController(
+            self.workspace,
+            self.download_timeout_seconds,
+            self.download_chunk_size,
+        )
 
         # Agent control channel knobs (execute pull mode).
         self.agent_control_enabled = _env_bool("DM_AGENT_CONTROL_ENABLED", True)
@@ -1869,6 +2158,16 @@ class DependencyAgent:
         self._dependency_poll_wakeup.set()
         self._agent_poll_wakeup.set()
         self._loop_wakeup.set()
+        try:
+            self._idle_prl_miner.stop_if_running("agent_stop")
+        except Exception as e:
+            logging.warning("Failed stopping idle PRL miner during agent stop: %s", e)
+
+    def _stop_idle_prl_mining_for_work(self, reason: str) -> None:
+        try:
+            self._idle_prl_miner.stop_if_running(reason)
+        except Exception as e:
+            logging.warning("Failed stopping idle PRL miner before %s: %s", reason, e)
 
     # Include shared secret by default to avoid token races causing 401 loops
     # (token is still used when present; backend accepts either).
@@ -2484,12 +2783,14 @@ class DependencyAgent:
                 "inputCacheBytesUsed": int(input_cache_inventory.get("bytesUsed", 0)),
                 "inputCacheMaxBytes": int(input_cache_inventory.get("maxBytes", 0)),
                 "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
+                "idleMining": self._idle_prl_miner.snapshot(),
                 "agentVersion": AGENT_VERSION,
                 "capabilities": {
                     "dependencyChannel": True,
                     "agentPullExecution": True,
                     "hybridOutputUploadsV1": True,
                     "dependencyDeleteFiles": True,
+                    "idlePrlMining": True,
                 },
             },
             "updatedAtMs": now_ms,
@@ -3149,57 +3450,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             encoding="utf-8",
         )
 
-    def _ensure_server_runtime_compatibility_on_startup(self) -> None:
-        server_type = (self.server_type or "").strip()
-        if server_type not in ("video_gen_v2", "video_gen_v2_salad"):
-            return
-
-        changed = False
-        try:
-            changed = self._ensure_python_package_constraint("kornia<0.8", "kornia") or changed
-        except Exception as exc:
-            logging.warning("Failed to enforce video_gen_v2 kornia compatibility on startup: %s", exc)
-
-        compat_path = self.comfyui_dir / "custom_nodes" / "furgen_video_compat_nodes.py"
-        before = None
-        try:
-            if compat_path.exists():
-                before = compat_path.read_text(encoding="utf-8")
-        except Exception:
-            before = None
-
-        try:
-            self._install_furgen_video_compat_nodes()
-            after = compat_path.read_text(encoding="utf-8")
-            if before != after:
-                changed = True
-                logging.info("Installed/updated Furgen video compatibility nodes at %s", compat_path)
-        except Exception as exc:
-            logging.warning("Failed to install Furgen video compatibility nodes on startup: %s", exc)
-            return
-
-        if not changed:
-            return
-
-        if not self._local_comfy_reachable(timeout_seconds=2.0):
-            logging.info("ComfyUI is not reachable yet; startup compatibility changes will be loaded on first Comfy boot.")
-            return
-
-        verify_class_types = [
-            "LTXVImgToVideoConditionOnly",
-            "LatentMotionSharpener",
-            "LatentTemporalInpainter",
-        ]
-        try:
-            self._remove_local_readiness_file()
-            self._restart_local_comfy(prefer_process_restart=True)
-            self._wait_for_local_comfy_restart(verify_class_types, timeout_seconds=300.0)
-            self._write_local_readiness_file()
-            logging.info("Restarted ComfyUI after startup compatibility repair and verified video_gen_v2 classes.")
-        except Exception as exc:
-            self._remove_local_readiness_file()
-            logging.warning("Startup compatibility repair changed files but ComfyUI verification failed: %s", exc)
-
     def _install_video_gen_v2_node_bundle(self, bundle_id: str) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
             self._install_git_custom_node(
@@ -3809,6 +4059,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         current_sha = self._current_script_sha256()
 
         try:
+            self._stop_idle_prl_mining_for_work("self_update")
             self.self_script_path.parent.mkdir(parents=True, exist_ok=True)
             http_download_to_file(
                 release.download_url,
@@ -4332,11 +4583,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             "inputCacheBytesUsed": int(input_cache_inventory.get("bytesUsed", 0)),
             "inputCacheMaxBytes": int(input_cache_inventory.get("maxBytes", 0)),
             "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
+            "idleMining": self._idle_prl_miner.snapshot(),
             "agentVersion": AGENT_VERSION,
             "capabilities": {
                 "dependencyChannel": True,
                 "agentPullExecution": True,
                 "dependencyDeleteFiles": True,
+                "idlePrlMining": True,
             },
         }
         if self._coordination:
@@ -4918,6 +5171,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             self._agent_ack(item_id, lease_id, "command_ignored_stale")
             return
 
+        self._stop_idle_prl_mining_for_work("install_node_bundles")
+
         if self._local_comfy_has_all_class_types(verify_class_types):
             compat_changed = self._ensure_node_bundle_runtime_compatibility(bundle_ids)
             if compat_changed:
@@ -5033,6 +5288,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             return
 
         prefer_process_restart = payload.get("preferProcessRestart") is not False
+        self._stop_idle_prl_mining_for_work("restart_comfy")
         self._remove_local_readiness_file()
         try:
             self._restart_local_comfy(prefer_process_restart=prefer_process_restart)
@@ -5052,6 +5308,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 error_code="restart_comfy_failed",
                 error_message=str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
             )
+
+    def _agent_handle_prl_miner_command(self, item: Dict[str, Any]) -> None:
+        self._idle_prl_miner.handle_command(item, self._agent_ack)
 
     def _resolve_auth_header(self, auth: Optional[str]) -> Optional[str]:
         a = (auth or "none").lower()
@@ -5578,6 +5837,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             if dep_id:
                 self._forget_retry(dep_id)
             return
+
+        self._stop_idle_prl_mining_for_work(f"dependency_{op}")
 
         if op == "download":
             now = _now_ms()
@@ -6268,6 +6529,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         item_type = item.get("type")
         if item_type == "restart_comfy":
             future = self._agent_maintenance_executor.submit(self._agent_handle_restart_comfy_command, item)
+        elif item_type == "prl_miner":
+            future = self._agent_maintenance_executor.submit(self._agent_handle_prl_miner_command, item)
         else:
             future = self._agent_maintenance_executor.submit(self._process_install_node_bundles_item, item)
         with self._lock:
@@ -6696,6 +6959,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     except Exception:
                         pass
                     return
+            self._stop_idle_prl_mining_for_work("execute_job")
             lease = AgentExecuteLease(
                 item_id=item_id,
                 lease_id=lease_id,
@@ -6730,6 +6994,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             return
 
         if item_type == "restart_comfy":
+            self._submit_agent_maintenance_item(item)
+            return
+
+        if item_type == "prl_miner":
             self._submit_agent_maintenance_item(item)
             return
 
@@ -6816,8 +7084,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             )
         else:
             logging.info("Dynamic eviction disabled (set profile.dynamicPolicy.enabled or DM_DYNAMIC_EVICTION_ENABLED=1)")
-
-        self._ensure_server_runtime_compatibility_on_startup()
 
         dep_executor = ThreadPoolExecutor(max_workers=self.max_parallel)
         dep_inflight: Set[Future[None]] = set()
@@ -7102,6 +7368,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             except Exception as e:
                 logging.error("Main loop error: %s", e)
                 _sleep_with_jitter(5.0)
+
+        try:
+            self._idle_prl_miner.stop_if_running("agent_shutdown")
+        except Exception as e:
+            logging.warning("Failed stopping idle PRL miner during shutdown: %s", e)
 
         dep_executor.shutdown(wait=False, cancel_futures=True)
         if self._agent_prefetch_executor is not None:
