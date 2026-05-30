@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.20"
+AGENT_VERSION = "dm-agent-py/0.9.21"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2866,6 +2866,44 @@ class DependencyAgent:
                 timeout=600,
             )
 
+    def _python_package_version(self, package_name: str) -> Optional[str]:
+        try:
+            import importlib.metadata as importlib_metadata
+            return importlib_metadata.version(package_name)
+        except Exception:
+            return None
+
+    def _ensure_python_package_constraint(self, requirement: str, package_name: str) -> bool:
+        before = self._python_package_version(package_name)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", requirement],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=600,
+        )
+        after = self._python_package_version(package_name)
+        changed = before != after
+        if changed:
+            logging.info(
+                "Adjusted Python package for node compatibility: %s %s -> %s (%s)",
+                package_name,
+                before or "missing",
+                after or "missing",
+                requirement,
+            )
+        return changed
+
+    def _ensure_node_bundle_runtime_compatibility(self, bundle_ids: List[str]) -> bool:
+        changed = False
+        if "video_gen_v2_10s_ltx_nodes" in set(bundle_ids):
+            # ComfyUI-LTXVideo currently imports `pad` from kornia's pyramid module.
+            # kornia 0.8 removed that symbol, so a live Comfy process can appear ready
+            # while the next restart will fail to import the node pack. Enforce the pin
+            # immediately before any bundle readiness marker is written.
+            changed = self._ensure_python_package_constraint("kornia<0.8", "kornia") or changed
+        return changed
+
     def _install_node_bundle_from_spec(self, bundle_id: str, spec: Dict[str, Any]) -> bool:
         if not isinstance(spec, dict):
             return False
@@ -3187,7 +3225,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             if status == 200 and isinstance(resp, dict):
                 if normalized in resp and isinstance(resp.get(normalized), dict):
                     return True
-                if any(key in resp for key in ("input", "output", "name")):
+                if resp.get("name") == normalized:
                     return True
         except Exception:
             pass
@@ -4780,6 +4818,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             return
 
         if self._local_comfy_has_all_class_types(verify_class_types):
+            compat_changed = self._ensure_node_bundle_runtime_compatibility(bundle_ids)
+            if compat_changed:
+                self._remove_local_readiness_file()
+                self._restart_local_comfy(prefer_process_restart=True)
+                self._wait_for_local_comfy_restart(
+                    verify_class_types,
+                    timeout_seconds=max(300.0, 120.0 * max(1, len(bundle_ids))),
+                )
             self._write_local_readiness_file()
             self._agent_ack(item_id, lease_id, "command_succeeded")
             return
@@ -4810,6 +4856,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         self._install_video_gen_v2_node_bundle(bundle_id)
             else:
                 raise RuntimeError(f"install_node_bundles is not supported on server_type={self.server_type}")
+            self._ensure_node_bundle_runtime_compatibility(bundle_ids)
             self._remove_local_readiness_file()
             self._restart_local_comfy()
             self._wait_for_local_comfy_restart(
