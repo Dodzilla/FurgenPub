@@ -77,6 +77,7 @@ Queue item expectations:
 
 from __future__ import annotations
 
+import base64
 from collections import deque
 import hashlib
 import http.client
@@ -105,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.18"
+AGENT_VERSION = "dm-agent-py/0.9.20"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -117,6 +118,89 @@ def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
         return default
     v = v.strip()
     return v if v else default
+
+
+def _first_env(*names: str) -> Optional[str]:
+    for name in names:
+        value = _env_str(name)
+        if value:
+            return value
+    return None
+
+
+def _decode_jwt_payload_unverified(token: str) -> Dict[str, Any]:
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("utf-8"))
+        data = json.loads(decoded.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _fetch_salad_imds_claims() -> Dict[str, Any]:
+    token_url = _env_str("SALAD_IMDS_TOKEN_URL", "http://169.254.169.254/v1/token")
+    if not token_url:
+        return {}
+    try:
+        req = urllib.request.Request(token_url, headers={"Accept": "application/json, text/plain, */*", "Metadata": "true"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=1.0) as resp:
+            raw = resp.read(16 * 1024).decode("utf-8", errors="replace").strip()
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and isinstance(parsed.get("jwt"), str):
+                raw = parsed["jwt"]
+        except Exception:
+            pass
+        return _decode_jwt_payload_unverified(raw)
+    except Exception as e:
+        logging.debug("Salad IMDS metadata fetch skipped/failed: %s", e)
+        return {}
+
+
+def detect_provider_metadata() -> Dict[str, Any]:
+    provider = (_first_env("DM_PROVIDER", "FCS_COMPUTE_PROVIDER", "COMPUTE_PROVIDER") or "").lower()
+    has_salad_env = any(
+        _env_str(name)
+        for name in (
+            "SALAD_CONTAINER_GROUP_INSTANCE_ID",
+            "SALAD_CONTAINER_GROUP_NAME",
+            "SALAD_MACHINE_ID",
+            "SALAD_PROJECT_NAME",
+            "SALAD_ORGANIZATION_NAME",
+        )
+    )
+    if provider != "salad" and not has_salad_env:
+        return {}
+
+    claims = _fetch_salad_imds_claims()
+    metadata: Dict[str, Any] = {
+        "provider": "salad",
+        "organizationName": _first_env("SALAD_ORGANIZATION_NAME", "DM_SALAD_ORGANIZATION_NAME") or claims.get("salad_organization_name") or claims.get("organization_name") or claims.get("organization"),
+        "projectName": _first_env("SALAD_PROJECT_NAME", "DM_SALAD_PROJECT_NAME") or claims.get("salad_project_name") or claims.get("project_name") or claims.get("project"),
+        "containerGroupName": _first_env("SALAD_CONTAINER_GROUP_NAME", "DM_SALAD_CONTAINER_GROUP_NAME") or claims.get("salad_container_group_name") or claims.get("container_group_name") or claims.get("container_group"),
+        "containerGroupInstanceId": (
+            _first_env("SALAD_CONTAINER_GROUP_INSTANCE_ID", "SALAD_INSTANCE_ID", "DM_SALAD_INSTANCE_ID")
+            or claims.get("salad_container_group_instance_id")
+            or claims.get("container_group_instance_id")
+            or claims.get("instance_id")
+            or claims.get("sub")
+        ),
+        "machineId": _first_env("SALAD_MACHINE_ID", "DM_SALAD_MACHINE_ID") or claims.get("salad_machine_id") or claims.get("machine_id"),
+        "replicaId": _first_env("SALAD_REPLICA_ID", "DM_SALAD_REPLICA_ID") or claims.get("salad_replica_id") or claims.get("replica_id"),
+        "allocationId": _first_env("SALAD_ALLOCATION_ID", "DM_SALAD_ALLOCATION_ID") or claims.get("allocation_id"),
+        "hostname": socket.gethostname(),
+        "identitySource": "env+imds" if claims else "env",
+    }
+    metadata = {k: v for k, v in metadata.items() if v is not None and v != ""}
+    if claims:
+        metadata["imdsClaims"] = claims
+    return metadata
 
 
 def _env_int(name: str, default: int) -> int:
@@ -385,6 +469,69 @@ def _scan_deleted_open_files(base_paths: Iterable[Path], max_examples: int = 20)
             else:
                 truncated = True
     return {"count": count, "bytes": int(total_bytes), "examples": examples, "truncated": truncated}
+
+
+def _is_path_open_by_process(path: Path) -> bool:
+    try:
+        target_path = str(path.resolve())
+    except Exception:
+        target_path = str(path)
+    proc = Path("/proc")
+    try:
+        pid_dirs = [p for p in proc.iterdir() if p.name.isdigit()]
+    except Exception:
+        return False
+    for pid_dir in pid_dirs:
+        fd_dir = pid_dir / "fd"
+        try:
+            fds = list(fd_dir.iterdir())
+        except Exception:
+            continue
+        for fd in fds:
+            try:
+                fd_target = os.readlink(str(fd)).replace(" (deleted)", "")
+            except Exception:
+                continue
+            try:
+                fd_target_resolved = str(Path(fd_target).resolve())
+            except Exception:
+                fd_target_resolved = fd_target
+            if fd_target_resolved == target_path:
+                return True
+    return False
+
+
+def _discard_oversized_partial(dest_partial: Path, expected_size_bytes: int, context: str) -> bool:
+    if expected_size_bytes <= 0:
+        return False
+    try:
+        if not dest_partial.exists():
+            return False
+        partial_bytes = int(dest_partial.stat().st_size)
+    except Exception:
+        return False
+    if partial_bytes <= int(expected_size_bytes):
+        return False
+    try:
+        dest_partial.unlink()
+        logging.warning(
+            "Discarded oversized partial for %s: got %d bytes, expected %d bytes, path=%s",
+            context,
+            int(partial_bytes),
+            int(expected_size_bytes),
+            str(dest_partial),
+        )
+        return True
+    except Exception as e:
+        logging.warning(
+            "Failed to discard oversized partial for %s: got %d bytes, expected %d bytes, path=%s err=%s",
+            context,
+            int(partial_bytes),
+            int(expected_size_bytes),
+            str(dest_partial),
+            e,
+        )
+        return False
 
 
 def safe_join(base_dir: Path, rel: str) -> Path:
@@ -672,10 +819,7 @@ def http_download(
 
     if expected_size_bytes > 0 and existing_bytes > expected_size_bytes:
         # Corrupt partial (or wrong file); restart.
-        try:
-            dest_partial.unlink()
-        except Exception:
-            pass
+        _discard_oversized_partial(dest_partial, int(expected_size_bytes), safe_url)
         existing_bytes = 0
 
     if expected_size_bytes > 0 and existing_bytes == expected_size_bytes:
@@ -794,6 +938,10 @@ def http_download(
                         break
                     f.write(chunk)
                     downloaded += len(chunk)
+                    if expected_total is not None and downloaded > int(expected_total):
+                        raise RuntimeError(
+                            f"Download exceeded expected size for {safe_url}: got {downloaded} bytes, expected {expected_total} bytes"
+                        )
                     if progress_cb:
                         try:
                             progress_cb(int(downloaded), int(expected_total or expected_size_bytes or 0))
@@ -815,6 +963,8 @@ def http_download(
             except Exception:
                 actual_size = 0
             if actual_size != int(expected_total):
+                if actual_size > int(expected_total):
+                    _discard_oversized_partial(dest_partial, int(expected_total), safe_url)
                 raise RuntimeError(f"Incomplete download for {safe_url}: got {actual_size} bytes, expected {expected_total} bytes")
     except urllib.error.HTTPError as e:
         code = int(getattr(e, "code", 0) or 0)
@@ -857,6 +1007,10 @@ def http_download(
             partial_bytes = int(dest_partial.stat().st_size) if dest_partial.exists() else 0
         except Exception:
             partial_bytes = 0
+        discarded_oversized = False
+        expected_for_discard = int(expected_total or expected_size_bytes or 0)
+        if expected_for_discard > 0 and partial_bytes > expected_for_discard:
+            discarded_oversized = _discard_oversized_partial(dest_partial, expected_for_discard, safe_url)
         parts: List[str] = [
             f"type={type(e).__name__}",
             f"url={safe_url}",
@@ -874,6 +1028,8 @@ def http_download(
         elif expected_size_bytes > 0:
             size_part += f"/{int(expected_size_bytes)}"
         parts.append(size_part)
+        if discarded_oversized:
+            parts.append("discardedOversizedPartial=1")
 
         if isinstance(content_length, str) and content_length:
             parts.append(f"cl={content_length}")
@@ -921,10 +1077,7 @@ def wget_download(
         existing_bytes = 0
 
     if expected_size_bytes > 0 and existing_bytes > expected_size_bytes:
-        try:
-            dest_partial.unlink()
-        except Exception:
-            pass
+        _discard_oversized_partial(dest_partial, int(expected_size_bytes), safe_url)
         existing_bytes = 0
 
     if expected_size_bytes > 0 and existing_bytes == expected_size_bytes:
@@ -998,6 +1151,7 @@ def wget_download(
     stderr_thread.start()
 
     last_progress_at = 0.0
+    oversize_error: Optional[str] = None
     while True:
         ret = proc.poll()
         now = time.time()
@@ -1012,12 +1166,29 @@ def wget_download(
                 progress_cb(int(current_bytes), int(expected_size_bytes or 0))
             except Exception:
                 pass
+            if expected_size_bytes > 0 and current_bytes > int(expected_size_bytes):
+                oversize_error = (
+                    f"Download exceeded expected size for {safe_url}: "
+                    f"got {current_bytes} bytes, expected {int(expected_size_bytes)} bytes"
+                )
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
             last_progress_at = now
         if ret is not None:
             break
         time.sleep(1.0)
 
     stderr_thread.join(timeout=5.0)
+    if oversize_error:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        _discard_oversized_partial(dest_partial, int(expected_size_bytes), safe_url)
+        raise RuntimeError(oversize_error)
     stderr = "".join(stderr_lines)
     locations: List[str] = []
     statuses: List[int] = []
@@ -1063,6 +1234,8 @@ def wget_download(
         except Exception:
             actual_size = 0
         if actual_size != int(expected_size_bytes):
+            if actual_size > int(expected_size_bytes):
+                _discard_oversized_partial(dest_partial, int(expected_size_bytes), safe_url)
             raise RuntimeError(
                 f"Incomplete download for {safe_url}: got {actual_size} bytes, expected {int(expected_size_bytes)} bytes"
             )
@@ -1453,6 +1626,7 @@ class DependencyAgent:
         self.civitai_token = _env_str("CIVITAI_TOKEN")
         self.instance_id = _env_str("DM_INSTANCE_ID")
         self.instance_ip = _env_str("DM_INSTANCE_IP")
+        self.provider_metadata = detect_provider_metadata()
         self.workspace = Path(_env_str("WORKSPACE", "/workspace") or "/workspace")
         self.comfyui_dir = Path(_env_str("DM_COMFYUI_DIR") or str(self.workspace / "ComfyUI"))
         self.state_path = Path(_env_str("DM_STATE_PATH") or str(self.workspace / "dependency_agent_state.json"))
@@ -2808,14 +2982,149 @@ class DependencyAgent:
                         timeout=900,
                     )
 
+    def _install_furgen_video_compat_nodes(self) -> None:
+        custom_nodes_dir = self.comfyui_dir / "custom_nodes"
+        custom_nodes_dir.mkdir(parents=True, exist_ok=True)
+        compat_path = custom_nodes_dir / "furgen_video_compat_nodes.py"
+        compat_path.write_text(
+            '''import io
+
+import numpy as np
+import requests
+import torch
+from PIL import Image, ImageOps
+
+
+class AnyType(str):
+    def __ne__(self, other):
+        return False
+
+
+ANY_TYPE = AnyType("*")
+
+
+class ImpactExecutionOrderController:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "signal": (ANY_TYPE,),
+                "value": (ANY_TYPE,),
+            }
+        }
+
+    RETURN_TYPES = (ANY_TYPE, ANY_TYPE)
+    RETURN_NAMES = ("signal", "value")
+    FUNCTION = "execute"
+    CATEGORY = "Furgen/compat"
+
+    def execute(self, signal, value):
+        return signal, value
+
+
+class EZLoadImgFromUrlNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": ""}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "load"
+    CATEGORY = "Furgen/compat"
+
+    def load(self, url):
+        response = requests.get(url, timeout=45)
+        response.raise_for_status()
+        image = Image.open(io.BytesIO(response.content))
+        image = ImageOps.exif_transpose(image).convert("RGBA")
+
+        rgba = np.array(image).astype(np.float32) / 255.0
+        rgb = torch.from_numpy(rgba[:, :, :3])[None,]
+        mask = torch.from_numpy(1.0 - rgba[:, :, 3])[None,]
+        return rgb, mask
+
+
+NODE_CLASS_MAPPINGS = {
+    "ImpactExecutionOrderController": ImpactExecutionOrderController,
+    "EZLoadImgFromUrlNode": EZLoadImgFromUrlNode,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "ImpactExecutionOrderController": "Execution Order Controller",
+    "EZLoadImgFromUrlNode": "Load Img From URL (EZ)",
+}
+''',
+            encoding="utf-8",
+        )
+
     def _install_video_gen_v2_node_bundle(self, bundle_id: str) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
+            self._install_git_custom_node(
+                "https://github.com/Lightricks/ComfyUI-LTXVideo",
+                verify_dir_name="ComfyUI-LTXVideo",
+                install_requirements=True,
+                pip_args=["kornia<0.8"],
+            )
             self._install_git_custom_node(
                 "https://github.com/TenStrip/10S-Comfy-nodes",
                 verify_dir_name="10S_Nodes",
             )
+            self._install_git_custom_node(
+                "https://github.com/evanspearman/ComfyMath",
+                verify_dir_name="ComfyMath",
+            )
+            self._install_git_custom_node(
+                "https://github.com/GACLove/ComfyUI-VFI",
+                verify_dir_name="ComfyUI-VFI",
+                install_requirements=False,
+            )
+            self._install_furgen_video_compat_nodes()
+            return
+        if bundle_id == "asset_gen_v5_ltx23_fp8":
+            self._install_git_custom_node(
+                "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+                verify_dir_name="ComfyUI-VideoHelperSuite",
+                git_ref="08e8df15db24da292d4b7f943c460dc2ab442b24",
+            )
+            self._install_git_custom_node(
+                "https://github.com/kijai/ComfyUI-MelBandRoFormer",
+                verify_dir_name="ComfyUI-MelBandRoFormer",
+            )
             return
         raise RuntimeError(f"Unsupported video_gen_v2 node bundle: {bundle_id}")
+
+    def _video_gen_v2_bundle_verify_class_types(self, bundle_id: str) -> List[str]:
+        if bundle_id == "video_gen_v2_10s_ltx_nodes":
+            return [
+                "CM_FloatToInt",
+                "EZLoadImgFromUrlNode",
+                "ImpactExecutionOrderController",
+                "LatentMotionSharpener",
+                "LatentTemporalInpainter",
+                "LTXVImgToVideoConditionOnly",
+                "LTXAddVideoICLoRAGuide",
+                "RIFEInterpolation",
+            ]
+        if bundle_id == "asset_gen_v5_ltx23_fp8":
+            return [
+                "MelBandRoFormerModelLoader",
+                "MelBandRoFormerSampler",
+                "VHS_LoadAudioUpload",
+            ]
+        return []
+
+    def _local_comfy_has_all_class_types(self, class_types: List[str]) -> bool:
+        wanted = [class_type for class_type in class_types if isinstance(class_type, str) and class_type.strip()]
+        if not wanted:
+            return False
+        for class_type in wanted:
+            if not self._local_comfy_has_class_type(class_type, timeout_seconds=5.0):
+                return False
+        return True
 
     def _restart_local_comfy_with_supervisor(self) -> bool:
         supervisorctl = shutil.which("supervisorctl")
@@ -3131,6 +3440,9 @@ class DependencyAgent:
             size = 0
             try:
                 if path.exists():
+                    if _is_path_open_by_process(path):
+                        logging.warning("Skipping eviction of open dynamic dependency %s: %s", dep_id, dest_rel)
+                        continue
                     size = int(path.stat().st_size)
                     path.unlink()
             except Exception as e:
@@ -3425,12 +3737,14 @@ class DependencyAgent:
 
     def _register(self) -> None:
         instance_ip = self.instance_ip
-        if not self.instance_id and not instance_ip:
+        if not self.instance_id and not instance_ip and self.provider_metadata.get("provider") != "salad":
             instance_ip = detect_public_ip()
             if instance_ip:
                 logging.info("Detected public IP: %s", instance_ip)
             else:
                 logging.warning("Could not detect public IP; set DM_INSTANCE_ID or DM_INSTANCE_IP for reliable registration.")
+        elif not self.instance_id and not instance_ip and self.provider_metadata.get("provider") == "salad":
+            logging.info("Using Salad provider metadata for registration identity.")
 
         url = f"{self.api_base_url}/dependencies/register"
         headers = {}
@@ -3453,6 +3767,9 @@ class DependencyAgent:
             body["instanceId"] = self.instance_id
         if instance_ip:
             body["instanceIp"] = instance_ip
+        if self.provider_metadata:
+            body["provider"] = self.provider_metadata.get("provider")
+            body["providerMetadata"] = self.provider_metadata
 
         status, resp = api_json("POST", url, body=body, headers=headers, timeout_seconds=30.0)
         if status != 200 or not isinstance(resp, dict):
@@ -3617,6 +3934,9 @@ class DependencyAgent:
             # Reuse dependency-channel token as bootstrap proof when a dedicated
             # bootstrap token is not explicitly provided.
             body["instanceBootstrapToken"] = self._token
+        if self.provider_metadata:
+            body["provider"] = self.provider_metadata.get("provider")
+            body["providerMetadata"] = self.provider_metadata
 
         resp = self._agent_api(
             "POST",
@@ -4447,9 +4767,21 @@ class DependencyAgent:
 
         bundle_ids = [bundle_id for bundle_id in payload.get("bundleIds", []) if isinstance(bundle_id, str) and bundle_id]
         verify_class_types = [class_type for class_type in payload.get("verifyClassTypes", []) if isinstance(class_type, str) and class_type]
+        if not verify_class_types and (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad"):
+            seen_verify_classes: Set[str] = set()
+            for bundle_id in bundle_ids:
+                for class_type in self._video_gen_v2_bundle_verify_class_types(bundle_id):
+                    if class_type not in seen_verify_classes:
+                        seen_verify_classes.add(class_type)
+                        verify_class_types.append(class_type)
         bundle_specs = payload.get("bundleSpecs") if isinstance(payload.get("bundleSpecs"), dict) else {}
         if not bundle_ids:
             self._agent_ack(item_id, lease_id, "command_ignored_stale")
+            return
+
+        if self._local_comfy_has_all_class_types(verify_class_types):
+            self._write_local_readiness_file()
+            self._agent_ack(item_id, lease_id, "command_succeeded")
             return
 
         self._remove_local_readiness_file()
@@ -4471,7 +4803,7 @@ class DependencyAgent:
                     check=True,
                     timeout=max(1800, 300 * max(1, len(bundle_ids))),
                 )
-            elif (self.server_type or "").strip() == "video_gen_v2":
+            elif (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad"):
                 for bundle_id in bundle_ids:
                     spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
                     if not self._install_node_bundle_from_spec(bundle_id, spec if isinstance(spec, dict) else {}):
