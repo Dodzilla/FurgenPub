@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.22"
+AGENT_VERSION = "dm-agent-py/0.9.23"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3148,6 +3148,57 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 ''',
             encoding="utf-8",
         )
+
+    def _ensure_server_runtime_compatibility_on_startup(self) -> None:
+        server_type = (self.server_type or "").strip()
+        if server_type not in ("video_gen_v2", "video_gen_v2_salad"):
+            return
+
+        changed = False
+        try:
+            changed = self._ensure_python_package_constraint("kornia<0.8", "kornia") or changed
+        except Exception as exc:
+            logging.warning("Failed to enforce video_gen_v2 kornia compatibility on startup: %s", exc)
+
+        compat_path = self.comfyui_dir / "custom_nodes" / "furgen_video_compat_nodes.py"
+        before = None
+        try:
+            if compat_path.exists():
+                before = compat_path.read_text(encoding="utf-8")
+        except Exception:
+            before = None
+
+        try:
+            self._install_furgen_video_compat_nodes()
+            after = compat_path.read_text(encoding="utf-8")
+            if before != after:
+                changed = True
+                logging.info("Installed/updated Furgen video compatibility nodes at %s", compat_path)
+        except Exception as exc:
+            logging.warning("Failed to install Furgen video compatibility nodes on startup: %s", exc)
+            return
+
+        if not changed:
+            return
+
+        if not self._local_comfy_reachable(timeout_seconds=2.0):
+            logging.info("ComfyUI is not reachable yet; startup compatibility changes will be loaded on first Comfy boot.")
+            return
+
+        verify_class_types = [
+            "LTXVImgToVideoConditionOnly",
+            "LatentMotionSharpener",
+            "LatentTemporalInpainter",
+        ]
+        try:
+            self._remove_local_readiness_file()
+            self._restart_local_comfy(prefer_process_restart=True)
+            self._wait_for_local_comfy_restart(verify_class_types, timeout_seconds=300.0)
+            self._write_local_readiness_file()
+            logging.info("Restarted ComfyUI after startup compatibility repair and verified video_gen_v2 classes.")
+        except Exception as exc:
+            self._remove_local_readiness_file()
+            logging.warning("Startup compatibility repair changed files but ComfyUI verification failed: %s", exc)
 
     def _install_video_gen_v2_node_bundle(self, bundle_id: str) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
@@ -6765,6 +6816,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             )
         else:
             logging.info("Dynamic eviction disabled (set profile.dynamicPolicy.enabled or DM_DYNAMIC_EVICTION_ENABLED=1)")
+
+        self._ensure_server_runtime_compatibility_on_startup()
 
         dep_executor = ThreadPoolExecutor(max_workers=self.max_parallel)
         dep_inflight: Set[Future[None]] = set()
