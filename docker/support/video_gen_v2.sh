@@ -38,6 +38,7 @@ PIP_PACKAGES=(
     "flash-attn"
     "triton"
     "sageattention"
+    "kornia<0.8"
     "onnxruntime"
     # For authenticated snapshot downloads from Hugging Face (avoids git/LFS auth issues)
     "huggingface_hub>=0.20.0"
@@ -169,6 +170,7 @@ function provisioning_start() {
         printf "WARN: Provisioning step 'provisioning_get_pip_packages' failed with exit code %s; continuing.\n" "$?"
         soft_failures=1
     }
+    provisioning_fix_python_compatibility || return 1
     provisioning_print_end || return 1
     if [[ "$soft_failures" -ne 0 ]]; then
         printf "Provisioning completed with non-fatal warnings.\n"
@@ -185,6 +187,15 @@ function provisioning_get_pip_packages() {
     if [[ -n $PIP_PACKAGES ]]; then
             pip install --no-cache-dir ${PIP_PACKAGES[@]}
     fi
+}
+
+function provisioning_fix_python_compatibility() {
+    printf "Enforcing video_gen_v2 Python compatibility pins...\n"
+    pip install --no-cache-dir "kornia<0.8" || return 1
+    python - <<'PY' || return 1
+from kornia.geometry.transform.pyramid import pad
+print("Verified kornia pyramid.pad import for ComfyUI-LTXVideo")
+PY
 }
 
 function provisioning_get_nodes() {
