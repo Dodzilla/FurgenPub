@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.24"
+AGENT_VERSION = "dm-agent-py/0.9.25"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1634,6 +1634,9 @@ class PrlMinerController:
         self._stopped_at_ms = 0
         self._last_exit_code: Optional[int] = None
         self._last_error = ""
+        self._last_start_payload: Dict[str, Any] = {}
+        self._paused_start_payload: Optional[Dict[str, Any]] = None
+        self._paused_reason = ""
 
     def _reap_locked(self) -> None:
         if self._proc is None:
@@ -1763,6 +1766,9 @@ class PrlMinerController:
             if same_target:
                 self._state = "running"
                 self._desired_state = "running"
+                self._last_start_payload = dict(payload)
+                self._paused_start_payload = None
+                self._paused_reason = ""
         if same_target:
             return self.snapshot()
 
@@ -1814,10 +1820,18 @@ class PrlMinerController:
             self._stopped_at_ms = 0
             self._last_exit_code = None
             self._last_error = ""
+            self._last_start_payload = dict(payload)
+            self._paused_start_payload = None
+            self._paused_reason = ""
         logging.info("Started idle PRL miner pid=%s worker=%s pool=%s", proc.pid, worker, pool_url)
         return self.snapshot()
 
     def stop(self, reason: str = "", timeout_seconds: float = 10.0) -> Dict[str, Any]:
+        normalized_reason = str(reason or "").strip()
+        if normalized_reason not in ("execute_job",):
+            with self._lock:
+                self._paused_start_payload = None
+                self._paused_reason = ""
         timeout_seconds = max(1.0, min(120.0, float(timeout_seconds or 10.0)))
         with self._lock:
             self._reap_locked()
@@ -1871,6 +1885,32 @@ class PrlMinerController:
             running = self._is_running_locked()
         if running:
             self.stop(reason)
+
+    def pause_for_work(self, reason: str) -> None:
+        with self._lock:
+            running = self._is_running_locked()
+            payload = dict(self._last_start_payload) if self._last_start_payload else {}
+        if not running:
+            return
+        if not payload:
+            self.stop(reason)
+            return
+        self.stop(reason)
+        with self._lock:
+            self._paused_start_payload = payload
+            self._paused_reason = str(reason or "")
+
+    def resume_if_paused(self, reason: str) -> bool:
+        with self._lock:
+            self._reap_locked()
+            if self._is_running_locked():
+                return False
+            payload = dict(self._paused_start_payload) if self._paused_start_payload else None
+        if not payload:
+            return False
+        logging.info("Resuming idle PRL miner after %s", reason or self._paused_reason or "work")
+        self.start(payload)
+        return True
 
     def handle_command(self, item: Dict[str, Any], ack_func: Callable[..., Dict[str, Any]]) -> None:
         item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
@@ -2165,9 +2205,30 @@ class DependencyAgent:
 
     def _stop_idle_prl_mining_for_work(self, reason: str) -> None:
         try:
-            self._idle_prl_miner.stop_if_running(reason)
+            if reason == "execute_job":
+                self._idle_prl_miner.pause_for_work(reason)
+            else:
+                self._idle_prl_miner.stop_if_running(reason)
         except Exception as e:
             logging.warning("Failed stopping idle PRL miner before %s: %s", reason, e)
+
+    def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
+        try:
+            with self._lock:
+                active_leases = len(self._active_exec_by_item)
+                maintenance_count = len(self._agent_maintenance_inflight)
+            if active_leases > 0 or maintenance_count > 0:
+                return
+            if self._pending_self_update is not None:
+                return
+            if not self._local_comfy_reachable():
+                return
+            if not self._local_readiness_file_present():
+                return
+            if self._idle_prl_miner.resume_if_paused(reason):
+                self._request_agent_queue_poll()
+        except Exception as e:
+            logging.warning("Failed resuming idle PRL miner after %s: %s", reason, e)
 
     # Include shared secret by default to avoid token races causing 401 loops
     # (token is still used when present; backend accepts either).
@@ -4647,6 +4708,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     def _cleanup_agent_lease(self, lease: AgentExecuteLease) -> None:
         tmp_root = Path(lease.tmp_root) if isinstance(lease.tmp_root, str) and lease.tmp_root else None
         self._finish_active_lease(lease.item_id)
+        self._resume_idle_prl_mining_if_idle("execute_job_complete")
         self._request_agent_queue_poll()
         if tmp_root is not None:
             try:
