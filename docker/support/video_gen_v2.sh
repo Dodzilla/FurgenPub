@@ -12,8 +12,9 @@ fi
 
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
-# Pin to the latest official ComfyUI release (v0.18.2, 2026-03-25).
-COMFYUI_PIN="${COMFYUI_PIN:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
+# Leave the Vast image's bundled ComfyUI version in place by default. Set
+# COMFYUI_PIN to an explicit commit/tag only when we need to override the image.
+COMFYUI_PIN="${COMFYUI_PIN:-}"
 
 # NOTE:
 # - Do NOT put Hugging Face tokens in this file (or in git clone URLs).
@@ -128,6 +129,10 @@ function pin_node_if_requested() {
 
 function provisioning_update_comfyui() {
     echo "DEBUG: Checking for ComfyUI git repository in ${COMFYUI_DIR}"
+    if [[ -z "${COMFYUI_PIN}" ]]; then
+        echo "DEBUG: COMFYUI_PIN is unset; preserving the ComfyUI version bundled in the Vast image."
+        return 0
+    fi
     if [[ -d "${COMFYUI_DIR}/.git" ]]; then
         printf "Updating ComfyUI to pinned version (%s)...\n" "${COMFYUI_PIN:0:7}"
         if ! (
