@@ -60,6 +60,7 @@ Optional knobs:
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
   - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
+  - DM_MINING_ONLY                (set to 1 for PRL mining-only instances; skips Comfy probes and job execution)
   - DM_INPUT_CACHE_DIR            (persistent remote-input cache dir; default: $WORKSPACE/.dm_input_cache)
   - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 20GiB)
   - DM_AGENT_SELF_UPDATE_ENABLED  (allow backend-directed in-place script updates; default: true)
@@ -106,7 +107,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.30"
+AGENT_VERSION = "dm-agent-py/0.9.32"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2005,6 +2006,7 @@ class DependencyAgent:
     def __init__(self) -> None:
         self.api_base_url = (_env_str("FCS_API_BASE_URL") or "").rstrip("/")
         self.server_type = (_env_str("SERVER_TYPE") or "").strip()
+        self.mining_only = _env_bool("DM_MINING_ONLY", False)
         self.shared_secret = _env_str("DEPENDENCY_MANAGER_SHARED_SECRET")
         self.instance_bootstrap_token = _env_str("DM_INSTANCE_BOOTSTRAP_TOKEN") or _env_str("AGENT_INSTANCE_BOOTSTRAP_TOKEN")
         self.hf_token = _env_str("HF_TOKEN")
@@ -2042,7 +2044,7 @@ class DependencyAgent:
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         self.agent_local_readiness_file = self._agent_local_readiness_file_env or "provisioning_complete.txt"
-        self.agent_max_execute_workers = max(1, min(8, _env_int("DM_AGENT_MAX_EXEC_WORKERS", 2)))
+        self.agent_max_execute_workers = 0 if self.mining_only else max(1, min(8, _env_int("DM_AGENT_MAX_EXEC_WORKERS", 2)))
         self.asset_gen_v5_script = _env_str("DM_ASSET_GEN_V5_SCRIPT")
         self._resolved_local_comfy_base_url = self.agent_local_comfy_base_url
         self._last_local_comfy_discovery_ms = 0
@@ -2278,13 +2280,9 @@ class DependencyAgent:
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
-                active_gpu_leases = sum(
-                    1
-                    for lease in self._active_exec_by_item.values()
-                    if lease.stage == "executing"
-                )
+                active_execute_leases = len(self._active_exec_by_item)
                 maintenance_count = len(self._agent_maintenance_inflight)
-            if active_gpu_leases > 0 or maintenance_count > 0:
+            if active_execute_leases > 0 or maintenance_count > 0:
                 return
             if self._pending_self_update is not None:
                 return
@@ -2893,9 +2891,9 @@ class DependencyAgent:
 
     def _collect_agent_runtime_payload(self) -> Dict[str, Any]:
         held_leases = self._collect_active_leases()
-        local_comfy = self._local_comfy_reachable()
-        readiness_present = self._local_readiness_file_present()
-        queue_summary = self._local_comfy_queue_summary(timeout_seconds=5.0)
+        local_comfy = True if self.mining_only else self._local_comfy_reachable()
+        readiness_present = True if self.mining_only else self._local_readiness_file_present()
+        queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
         input_cache_inventory = self._collect_input_cache_inventory()
         now_ms = _now_ms()
         return {
@@ -2919,10 +2917,11 @@ class DependencyAgent:
                 "agentVersion": AGENT_VERSION,
                 "capabilities": {
                     "dependencyChannel": True,
-                    "agentPullExecution": True,
+                    "agentPullExecution": not self.mining_only,
                     "hybridOutputUploadsV1": True,
                     "dependencyDeleteFiles": True,
                     "idlePrlMining": True,
+                    "miningOnly": bool(self.mining_only),
                 },
             },
             "updatedAtMs": now_ms,
@@ -4381,6 +4380,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         return item
 
     def _agent_effective_execute_capacity(self) -> int:
+        if self.mining_only:
+            return 0
         return max(1, min(int(self.agent_max_execute_workers), int(self._agent_max_concurrent_execute_jobs)))
 
     def _agent_effective_prefetch_capacity(self) -> int:
@@ -4642,10 +4643,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             return {}
 
         held_leases = self._collect_active_leases()
-        local_comfy = self._local_comfy_reachable()
-        readiness_present = self._local_readiness_file_present()
+        local_comfy = True if self.mining_only else self._local_comfy_reachable()
+        readiness_present = True if self.mining_only else self._local_readiness_file_present()
         queue_depth = len(held_leases)
-        queue_summary = self._local_comfy_queue_summary(timeout_seconds=5.0)
+        queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
         input_cache_inventory = self._collect_input_cache_inventory()
 
         body: Dict[str, Any] = {
@@ -4669,9 +4670,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             "agentVersion": AGENT_VERSION,
             "capabilities": {
                 "dependencyChannel": True,
-                "agentPullExecution": True,
+                "agentPullExecution": not self.mining_only,
                 "dependencyDeleteFiles": True,
                 "idlePrlMining": True,
+                "miningOnly": bool(self.mining_only),
             },
         }
         if self._coordination:
@@ -5239,6 +5241,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         if not item_id or not lease_id:
             return
+        if self.mining_only:
+            self._agent_ack(item_id, lease_id, "command_ignored_stale")
+            return
 
         bundle_ids = [bundle_id for bundle_id in payload.get("bundleIds", []) if isinstance(bundle_id, str) and bundle_id]
         verify_class_types = [class_type for class_type in payload.get("verifyClassTypes", []) if isinstance(class_type, str) and class_type]
@@ -5368,6 +5373,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         lease_id = item.get("leaseId")
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         if not isinstance(item_id, str) or not isinstance(lease_id, str):
+            return
+        if self.mining_only:
+            self._agent_ack(item_id, lease_id, "command_ignored_stale")
             return
 
         prefer_process_restart = payload.get("preferProcessRestart") is not False
@@ -7042,6 +7050,32 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     except Exception:
                         pass
                     return
+            if self.mining_only:
+                lease = AgentExecuteLease(
+                    item_id=item_id,
+                    lease_id=lease_id,
+                    job_id=job_id,
+                    execution_attempt=int(execution_attempt),
+                    attempt_epoch=int(attempt_epoch),
+                    started_at_ms=_now_ms(),
+                    lease_order=self._next_agent_lease_order(),
+                    command_id=payload.get("commandId") if isinstance(payload.get("commandId"), str) else "",
+                    payload=payload,
+                )
+                self._register_active_lease(lease)
+                try:
+                    self._emit_agent_event(lease, "job_dispatched", {"commandId": lease.command_id} if lease.command_id else None)
+                    self._emit_agent_event(
+                        lease,
+                        "job_failed",
+                        {
+                            "errorCode": "mining_only_instance",
+                            "errorMessage": "This instance is configured for PRL mining only and does not execute jobs.",
+                        },
+                    )
+                finally:
+                    self._cleanup_agent_lease(lease)
+                return
             lease = AgentExecuteLease(
                 item_id=item_id,
                 lease_id=lease_id,
@@ -7139,7 +7173,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds localComfy=%s readinessFile=%s maxExecWorkers=%d",
+            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds localComfy=%s readinessFile=%s maxExecWorkers=%d miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
@@ -7147,6 +7181,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             self.agent_local_comfy_base_url,
             self.agent_local_readiness_file,
             int(self.agent_max_execute_workers),
+            "yes" if self.mining_only else "no",
         )
         logging.info(
             "Self-update: enabled=%s allowDowngrade=%s scriptPath=%s retrySeconds=%.0f",
@@ -7224,7 +7259,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 self._resume_idle_prl_mining_if_idle("agent_loop_idle")
 
                 # Heartbeats.
-                if now - self._last_heartbeat_ms >= int(self.heartbeat_seconds * 1000):
+                if not self.mining_only and now - self._last_heartbeat_ms >= int(self.heartbeat_seconds * 1000):
                     try:
                         self._heartbeat(queue_depth=None)
                     except ApiError as e:
@@ -7280,7 +7315,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 # Otherwise a failed or deferred update can leave the process heartbeating
                 # but refusing both dependency work and agent jobs indefinitely.
                 # Only perform the restart when the process is actually idle.
-                if now >= next_dep_poll_at_ms:
+                if not self.mining_only and now >= next_dep_poll_at_ms:
                     try:
                         items = self._fetch_queue(limit=25)
                     except ApiError as e:
