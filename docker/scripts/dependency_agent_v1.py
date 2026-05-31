@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.34"
+AGENT_VERSION = "dm-agent-py/0.9.35"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2087,16 +2087,19 @@ class PrlMinerController:
         if running:
             self.stop(reason)
 
-    def pause_for_work(self, reason: str) -> None:
+    def pause_for_work(self, reason: str, timeout_seconds: Optional[float] = None) -> None:
         with self._lock:
             running = self._is_running_locked()
             payload = dict(self._last_start_payload) if self._last_start_payload else {}
         if not running:
             return
         if not payload:
-            self.stop(reason)
+            self.stop(reason, timeout_seconds=timeout_seconds or 10.0)
             return
-        self.stop(reason)
+        if timeout_seconds is None:
+            raw_timeout = payload.get("stopTimeoutSec")
+            timeout_seconds = float(raw_timeout) if isinstance(raw_timeout, (int, float)) else 10.0
+        self.stop(reason, timeout_seconds=timeout_seconds)
         with self._lock:
             self._paused_start_payload = payload
             self._paused_reason = str(reason or "")
@@ -2166,7 +2169,7 @@ class PrlMinerController:
                 item_reason = item.get("reason") if isinstance(item.get("reason"), str) else ""
                 reason = str(payload.get("reason") or item_reason or "backend_stop_command")
                 if reason.strip() in PRL_MINER_TRANSIENT_STOP_REASONS:
-                    self.pause_for_work(reason)
+                    self.pause_for_work(reason, timeout_seconds=timeout)
                 else:
                     self.stop(reason, timeout_seconds=timeout)
             else:
@@ -2462,9 +2465,13 @@ class DependencyAgent:
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
-                active_execute_leases = len(self._active_exec_by_item)
+                gpu_execute_leases = sum(
+                    1
+                    for lease in self._active_exec_by_item.values()
+                    if lease.stage == "executing"
+                )
                 maintenance_count = len(self._agent_maintenance_inflight)
-            if active_execute_leases > 0 or maintenance_count > 0:
+            if gpu_execute_leases > 0 or maintenance_count > 0:
                 return
             if self._pending_self_update is not None:
                 return
