@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.27"
+AGENT_VERSION = "dm-agent-py/0.9.28"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2222,13 +2222,18 @@ class DependencyAgent:
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
-                active_leases = len(self._active_exec_by_item)
+                active_gpu_leases = sum(
+                    1
+                    for lease in self._active_exec_by_item.values()
+                    if lease.stage == "executing"
+                )
                 maintenance_count = len(self._agent_maintenance_inflight)
-            if active_leases > 0 or maintenance_count > 0:
+            if active_gpu_leases > 0 or maintenance_count > 0:
                 return
             if self._pending_self_update is not None:
                 return
             if self._idle_prl_miner.resume_if_paused(reason):
+                logging.info("Resumed idle PRL miner after %s", reason)
                 self._request_agent_queue_poll()
         except Exception as e:
             logging.warning("Failed resuming idle PRL miner after %s: %s", reason, e)
@@ -6709,6 +6714,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 self._copy_input_to_comfy(Path(cache_path), input_name)
 
             workflow = self._parse_workflow_from_payload(lease.payload)
+            self._stop_idle_prl_mining_for_work("execute_job")
             prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{lease.job_id}-{uuid.uuid4().hex[:12]}")
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
@@ -6791,6 +6797,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     active.stage = "uploading"
                     active.history_entry = history_entry
                     active.prompt_id = prompt_id
+            self._resume_idle_prl_mining_if_idle("comfy_execution_complete")
             self._request_agent_queue_poll()
             self._emit_agent_event(lease, "output_commit_started", {"promptId": prompt_id})
 
@@ -6972,7 +6979,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     except Exception:
                         pass
                     return
-            self._stop_idle_prl_mining_for_work("execute_job")
             lease = AgentExecuteLease(
                 item_id=item_id,
                 lease_id=lease_id,
