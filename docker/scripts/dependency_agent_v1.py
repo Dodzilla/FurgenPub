@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.29"
+AGENT_VERSION = "dm-agent-py/0.9.30"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1980,7 +1980,8 @@ class PrlMinerController:
                 self.start(payload)
             elif action == "stop":
                 timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
-                reason = str(payload.get("reason") or "backend_stop_command")
+                item_reason = item.get("reason") if isinstance(item.get("reason"), str) else ""
+                reason = str(payload.get("reason") or item_reason or "backend_stop_command")
                 if reason.strip() in PRL_MINER_TRANSIENT_STOP_REASONS:
                     self.pause_for_work(reason)
                 else:
