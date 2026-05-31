@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.33"
+AGENT_VERSION = "dm-agent-py/0.9.34"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -162,6 +162,82 @@ def _read_tail_text(path: Path, max_bytes: int = 32768) -> str:
 
 
 def _query_gpu_telemetry() -> Dict[str, Any]:
+    fields = [
+        "name",
+        "utilization.gpu",
+        "memory.used",
+        "memory.total",
+        "power.draw",
+        "power.limit",
+        "temperature.gpu",
+        "clocks.current.graphics",
+        "clocks.current.sm",
+        "clocks.current.memory",
+        "clocks.current.video",
+        "pstate",
+        "clocks_throttle_reasons.active",
+    ]
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--query-gpu={','.join(fields)}",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.5,
+            check=False,
+        )
+        line = (proc.stdout or "").strip().splitlines()[0] if proc.stdout else ""
+        if proc.returncode != 0 or not line:
+            return _query_basic_gpu_telemetry()
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < len(fields):
+            return _query_basic_gpu_telemetry()
+        out: Dict[str, Any] = {
+            "gpuName": parts[0][:160],
+            "gpuTelemetryAtMs": _now_ms(),
+        }
+
+        def assign_float(index: int, key: str, min_value: float = 0.0, max_value: Optional[float] = None) -> None:
+            try:
+                raw = parts[index]
+                if not raw or raw.upper() == "N/A":
+                    return
+                value = float(raw)
+                if value < min_value:
+                    return
+                if max_value is not None and value > max_value:
+                    return
+                out[key] = value
+            except Exception:
+                pass
+
+        def assign_string(index: int, key: str, max_len: int = 160) -> None:
+            raw = parts[index] if index < len(parts) else ""
+            if raw and raw.upper() != "N/A":
+                out[key] = raw[:max_len]
+
+        assign_float(1, "gpuUtilizationPct", 0.0, 100.0)
+        assign_float(2, "gpuMemoryUsedMb")
+        assign_float(3, "gpuMemoryTotalMb")
+        assign_float(4, "gpuPowerDrawW")
+        assign_float(5, "gpuPowerLimitW")
+        assign_float(6, "gpuTemperatureC")
+        assign_float(7, "gpuGraphicsClockMhz")
+        assign_float(8, "gpuSmClockMhz")
+        assign_float(9, "gpuMemoryClockMhz")
+        assign_float(10, "gpuVideoClockMhz")
+        assign_string(11, "gpuPstate", 32)
+        assign_string(12, "gpuClocksThrottleReasonsActive", 200)
+        return out
+    except Exception:
+        return _query_basic_gpu_telemetry()
+
+
+def _query_basic_gpu_telemetry() -> Dict[str, Any]:
     try:
         proc = subprocess.run(
             [
@@ -181,7 +257,10 @@ def _query_gpu_telemetry() -> Dict[str, Any]:
         parts = [part.strip() for part in line.split(",")]
         if len(parts) < 4:
             return {}
-        out: Dict[str, Any] = {"gpuName": parts[0][:160]}
+        out: Dict[str, Any] = {
+            "gpuName": parts[0][:160],
+            "gpuTelemetryAtMs": _now_ms(),
+        }
         try:
             out["gpuUtilizationPct"] = max(0.0, min(100.0, float(parts[1])))
         except Exception:
@@ -1792,8 +1871,7 @@ class PrlMinerController:
             if self._last_auto_restart_reason:
                 out["lastAutoRestartReason"] = self._last_auto_restart_reason
         try:
-            if running:
-                out.update(_query_gpu_telemetry())
+            out.update(_query_gpu_telemetry())
             if self.log_path.exists():
                 stat = self.log_path.stat()
                 out["logSizeBytes"] = int(stat.st_size)
