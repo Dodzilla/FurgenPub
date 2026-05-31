@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.26"
+AGENT_VERSION = "dm-agent-py/0.9.27"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2212,8 +2212,10 @@ class DependencyAgent:
         try:
             if reason == "execute_job":
                 self._idle_prl_miner.pause_for_work(reason)
-            else:
+            elif reason == "self_update":
                 self._idle_prl_miner.stop_if_running(reason)
+            else:
+                logging.debug("Keeping idle PRL miner running during %s", reason)
         except Exception as e:
             logging.warning("Failed stopping idle PRL miner before %s: %s", reason, e)
 
@@ -2225,10 +2227,6 @@ class DependencyAgent:
             if active_leases > 0 or maintenance_count > 0:
                 return
             if self._pending_self_update is not None:
-                return
-            if not self._local_comfy_reachable():
-                return
-            if not self._local_readiness_file_present():
                 return
             if self._idle_prl_miner.resume_if_paused(reason):
                 self._request_agent_queue_poll()
