@@ -106,10 +106,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.25"
+AGENT_VERSION = "dm-agent-py/0.9.26"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
+PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -1828,7 +1829,7 @@ class PrlMinerController:
 
     def stop(self, reason: str = "", timeout_seconds: float = 10.0) -> Dict[str, Any]:
         normalized_reason = str(reason or "").strip()
-        if normalized_reason not in ("execute_job",):
+        if normalized_reason not in PRL_MINER_TRANSIENT_STOP_REASONS:
             with self._lock:
                 self._paused_start_payload = None
                 self._paused_reason = ""
@@ -1924,7 +1925,11 @@ class PrlMinerController:
                 self.start(payload)
             elif action == "stop":
                 timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
-                self.stop(str(payload.get("reason") or "backend_stop_command"), timeout_seconds=timeout)
+                reason = str(payload.get("reason") or "backend_stop_command")
+                if reason.strip() in PRL_MINER_TRANSIENT_STOP_REASONS:
+                    self.pause_for_work(reason)
+                else:
+                    self.stop(reason, timeout_seconds=timeout)
             else:
                 ack_func(item_id, lease_id, "command_ignored_stale")
                 return
@@ -7148,6 +7153,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                             f.result()
                         except Exception as e:
                             logging.error("Unhandled agent %s worker error: %s", label, e)
+
+                self._resume_idle_prl_mining_if_idle("agent_loop_idle")
 
                 # Heartbeats.
                 if now - self._last_heartbeat_ms >= int(self.heartbeat_seconds * 1000):
