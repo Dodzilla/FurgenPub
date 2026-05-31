@@ -106,7 +106,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.28"
+AGENT_VERSION = "dm-agent-py/0.9.29"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1638,6 +1638,10 @@ class PrlMinerController:
         self._last_start_payload: Dict[str, Any] = {}
         self._paused_start_payload: Optional[Dict[str, Any]] = None
         self._paused_reason = ""
+        self._consecutive_failures = 0
+        self._last_auto_restart_attempt_ms = 0
+        self._last_auto_restart_reason = ""
+        self._auto_restart_count = 0
 
     def _reap_locked(self) -> None:
         if self._proc is None:
@@ -1652,9 +1656,16 @@ class PrlMinerController:
             self._state = "failed" if return_code != 0 else "stopped"
             if return_code != 0 and not self._last_error:
                 self._last_error = f"miner exited with code {return_code}"
+            if return_code != 0:
+                runtime_ms = max(0, int(self._stopped_at_ms) - int(self._started_at_ms or 0))
+                if runtime_ms >= 60_000:
+                    self._consecutive_failures = 1
+                else:
+                    self._consecutive_failures += 1
         else:
             self._state = "stopped"
             self._desired_state = "stopped"
+            self._consecutive_failures = 0
 
     def _is_running_locked(self) -> bool:
         self._reap_locked()
@@ -1687,6 +1698,12 @@ class PrlMinerController:
                 out["startedAtMs"] = int(self._started_at_ms)
             if self._stopped_at_ms > 0:
                 out["stoppedAtMs"] = int(self._stopped_at_ms)
+            if self._auto_restart_count > 0:
+                out["autoRestartCount"] = int(self._auto_restart_count)
+            if self._last_auto_restart_attempt_ms > 0:
+                out["lastAutoRestartAttemptAtMs"] = int(self._last_auto_restart_attempt_ms)
+            if self._last_auto_restart_reason:
+                out["lastAutoRestartReason"] = self._last_auto_restart_reason
             return out
 
     def _ensure_binary(self, download_url: str, expected_sha256: str) -> Path:
@@ -1910,6 +1927,44 @@ class PrlMinerController:
         if not payload:
             return False
         logging.info("Resuming idle PRL miner after %s", reason or self._paused_reason or "work")
+        self.start(payload)
+        return True
+
+    def restart_if_desired(self, reason: str) -> bool:
+        now_ms = _now_ms()
+        with self._lock:
+            self._reap_locked()
+            if self._is_running_locked():
+                return False
+            desired = self._desired_state in ("running", "starting")
+            payload = dict(self._last_start_payload) if desired and self._last_start_payload else None
+            failures = max(0, int(self._consecutive_failures))
+            last_attempt_ms = int(self._last_auto_restart_attempt_ms or 0)
+        if not payload:
+            return False
+
+        if failures <= 1:
+            backoff_ms = 2_000
+        elif failures == 2:
+            backoff_ms = 5_000
+        elif failures == 3:
+            backoff_ms = 15_000
+        else:
+            backoff_ms = 30_000
+        if last_attempt_ms > 0 and now_ms - last_attempt_ms < backoff_ms:
+            return False
+
+        with self._lock:
+            self._last_auto_restart_attempt_ms = now_ms
+            self._last_auto_restart_reason = str(reason or "auto_restart")[:120]
+            self._auto_restart_count += 1
+        logging.warning(
+            "Restarting failed idle PRL miner after %s (worker=%s failures=%d backoffMs=%d)",
+            reason or "auto_restart",
+            payload.get("worker"),
+            failures,
+            backoff_ms,
+        )
         self.start(payload)
         return True
 
@@ -2232,8 +2287,15 @@ class DependencyAgent:
                 return
             if self._pending_self_update is not None:
                 return
-            if self._idle_prl_miner.resume_if_paused(reason):
-                logging.info("Resumed idle PRL miner after %s", reason)
+            resumed = self._idle_prl_miner.resume_if_paused(reason)
+            restarted = False if resumed else self._idle_prl_miner.restart_if_desired(reason)
+            if resumed or restarted:
+                logging.info(
+                    "%s idle PRL miner after %s",
+                    "Resumed" if resumed else "Restarted failed",
+                    reason,
+                )
+                self._last_agent_heartbeat_ms = 0
                 self._request_agent_queue_poll()
         except Exception as e:
             logging.warning("Failed resuming idle PRL miner after %s: %s", reason, e)
