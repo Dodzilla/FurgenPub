@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.36"
+AGENT_VERSION = "dm-agent-py/0.9.37"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1971,7 +1971,7 @@ class PrlMinerController:
             parts = [part.decode("utf-8", errors="ignore") for part in raw.split(b"\0") if part]
             if not parts:
                 continue
-            if parts[0] == target or target in parts[0]:
+            if parts[0] == target or target in parts[0] or any(part == target for part in parts[1:]):
                 pids.append(pid)
         return sorted(set(pids))
 
@@ -2187,27 +2187,32 @@ class PrlMinerController:
         return self.snapshot()
 
     def stop_if_running(self, reason: str) -> None:
-        with self._lock:
-            running = self._is_running_locked()
-        if running:
-            self.stop(reason)
+        with self._process_op_lock:
+            with self._lock:
+                running = self._is_running_locked()
+            if running:
+                self._stop_serialized(reason)
+            else:
+                self._cleanup_miner_processes(reason or "stop_if_running_without_tracked_proc")
 
     def pause_for_work(self, reason: str, timeout_seconds: Optional[float] = None) -> None:
-        with self._lock:
-            running = self._is_running_locked()
-            payload = dict(self._last_start_payload) if self._last_start_payload else {}
-        if not running:
-            return
-        if not payload:
-            self.stop(reason, timeout_seconds=timeout_seconds or 10.0)
-            return
-        if timeout_seconds is None:
-            raw_timeout = payload.get("stopTimeoutSec")
-            timeout_seconds = float(raw_timeout) if isinstance(raw_timeout, (int, float)) else 10.0
-        self.stop(reason, timeout_seconds=timeout_seconds)
-        with self._lock:
-            self._paused_start_payload = payload
-            self._paused_reason = str(reason or "")
+        with self._process_op_lock:
+            with self._lock:
+                running = self._is_running_locked()
+                payload = dict(self._last_start_payload) if self._last_start_payload else {}
+            if not running:
+                self._cleanup_miner_processes(reason or "pause_without_tracked_proc", timeout_seconds=timeout_seconds or 10.0)
+                return
+            if not payload:
+                self._stop_serialized(reason, timeout_seconds=timeout_seconds or 10.0)
+                return
+            if timeout_seconds is None:
+                raw_timeout = payload.get("stopTimeoutSec")
+                timeout_seconds = float(raw_timeout) if isinstance(raw_timeout, (int, float)) else 10.0
+            self._stop_serialized(reason, timeout_seconds=timeout_seconds)
+            with self._lock:
+                self._paused_start_payload = payload
+                self._paused_reason = str(reason or "")
 
     def resume_if_paused(self, reason: str) -> bool:
         with self._lock:
