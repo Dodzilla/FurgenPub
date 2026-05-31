@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.35"
+AGENT_VERSION = "dm-agent-py/0.9.36"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1790,6 +1790,7 @@ class PrlMinerController:
         self.download_timeout_seconds = max(30.0, float(download_timeout_seconds))
         self.download_chunk_size = max(1024 * 1024, int(download_chunk_size))
         self._lock = threading.Lock()
+        self._process_op_lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
         self._state = "stopped"
         self._desired_state = "stopped"
@@ -1871,6 +1872,10 @@ class PrlMinerController:
             if self._last_auto_restart_reason:
                 out["lastAutoRestartReason"] = self._last_auto_restart_reason
         try:
+            existing_pids = self._find_existing_miner_pids()
+            out["minerProcessCount"] = int(len(existing_pids))
+            if existing_pids:
+                out["minerProcessPids"] = [int(existing_pid) for existing_pid in existing_pids[:20]]
             out.update(_query_gpu_telemetry())
             if self.log_path.exists():
                 stat = self.log_path.stat()
@@ -1939,7 +1944,98 @@ class PrlMinerController:
         else:
             proc.kill()
 
+    def _find_existing_miner_pids(self) -> List[int]:
+        target = str(self.binary_path)
+        pids: List[int] = []
+        proc_root = Path("/proc")
+        if not proc_root.exists():
+            return pids
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid <= 0 or pid == os.getpid():
+                continue
+            try:
+                raw = (entry / "cmdline").read_bytes()
+            except Exception:
+                continue
+            if not raw:
+                continue
+            try:
+                status_text = (entry / "status").read_text(errors="ignore")
+                if re.search(r"^State:\s+Z\b", status_text, flags=re.MULTILINE):
+                    continue
+            except Exception:
+                pass
+            parts = [part.decode("utf-8", errors="ignore") for part in raw.split(b"\0") if part]
+            if not parts:
+                continue
+            if parts[0] == target or target in parts[0]:
+                pids.append(pid)
+        return sorted(set(pids))
+
+    def _pid_running(self, pid: int) -> bool:
+        try:
+            status_text = (Path("/proc") / str(pid) / "status").read_text(errors="ignore")
+            if re.search(r"^State:\s+Z\b", status_text, flags=re.MULTILINE):
+                return False
+        except FileNotFoundError:
+            return False
+        except Exception:
+            pass
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    def _terminate_pid(self, pid: int, sig: int) -> None:
+        try:
+            if hasattr(os, "killpg"):
+                process_group_id = os.getpgid(pid)
+                if process_group_id > 0 and process_group_id != os.getpgrp():
+                    os.killpg(process_group_id, sig)
+                    return
+        except Exception:
+            pass
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def _cleanup_miner_processes(self, reason: str, keep_pid: Optional[int] = None, timeout_seconds: float = 2.0) -> int:
+        pids = [pid for pid in self._find_existing_miner_pids() if keep_pid is None or pid != keep_pid]
+        if not pids:
+            return 0
+        logging.warning(
+            "Cleaning up %d stray idle PRL miner process(es) reason=%s pids=%s keepPid=%s",
+            len(pids),
+            reason or "unspecified",
+            ",".join(str(pid) for pid in pids[:20]),
+            keep_pid or "-",
+        )
+        for pid in pids:
+            self._terminate_pid(pid, signal.SIGTERM)
+        deadline = time.time() + max(0.2, min(10.0, float(timeout_seconds or 2.0)))
+        while time.time() < deadline:
+            if not any(self._pid_running(pid) for pid in pids):
+                break
+            time.sleep(0.1)
+        remaining = [pid for pid in pids if self._pid_running(pid)]
+        for pid in remaining:
+            self._terminate_pid(pid, signal.SIGKILL)
+        return len(pids)
+
     def start(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        with self._process_op_lock:
+            return self._start_serialized(payload)
+
+    def _start_serialized(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         pool_url = payload.get("poolUrl") if isinstance(payload.get("poolUrl"), str) else ""
         payout_address = payload.get("payoutAddress") if isinstance(payload.get("payoutAddress"), str) else ""
         worker = payload.get("worker") if isinstance(payload.get("worker"), str) else ""
@@ -1970,13 +2066,16 @@ class PrlMinerController:
                 self._last_start_payload = dict(payload)
                 self._paused_start_payload = None
                 self._paused_reason = ""
+                current_pid = self._proc.pid if self._proc is not None else None
+                self._cleanup_miner_processes("dedupe_prl_miner_same_target", keep_pid=current_pid, timeout_seconds=stop_timeout)
         if same_target:
             return self.snapshot()
 
         if already_running:
-            self.stop("replace_prl_miner", timeout_seconds=stop_timeout)
+            self._stop_serialized("replace_prl_miner", timeout_seconds=stop_timeout)
 
         binary = self._ensure_binary(download_url, miner_sha256)
+        self._cleanup_miner_processes("before_prl_miner_start", timeout_seconds=stop_timeout)
         args = [
             str(binary),
             "--pool",
@@ -2028,6 +2127,10 @@ class PrlMinerController:
         return self.snapshot()
 
     def stop(self, reason: str = "", timeout_seconds: float = 10.0) -> Dict[str, Any]:
+        with self._process_op_lock:
+            return self._stop_serialized(reason, timeout_seconds=timeout_seconds)
+
+    def _stop_serialized(self, reason: str = "", timeout_seconds: float = 10.0) -> Dict[str, Any]:
         normalized_reason = str(reason or "").strip()
         if normalized_reason not in PRL_MINER_TRANSIENT_STOP_REASONS:
             with self._lock:
@@ -2051,6 +2154,7 @@ class PrlMinerController:
                 self._state = "stopping"
                 self._desired_state = "stopped"
         if proc is None:
+            self._cleanup_miner_processes(reason or "stop_without_tracked_proc", timeout_seconds=timeout_seconds)
             return self.snapshot()
 
         logging.info("Stopping idle PRL miner pid=%s reason=%s", proc.pid, reason or "unspecified")
@@ -2079,6 +2183,7 @@ class PrlMinerController:
                 self._state = "stopped"
                 self._desired_state = "stopped"
                 self._stopped_at_ms = _now_ms()
+            self._cleanup_miner_processes(reason or "post_stop_cleanup", timeout_seconds=1.0)
         return self.snapshot()
 
     def stop_if_running(self, reason: str) -> None:
