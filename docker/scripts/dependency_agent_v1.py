@@ -107,11 +107,96 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.32"
+AGENT_VERSION = "dm-agent-py/0.9.33"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
+HASHRATE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?H)\s*/?\s*s(?:ec)?", re.IGNORECASE)
+
+
+def _hashrate_to_hps(value: float, unit: str) -> float:
+    unit = str(unit or "").strip().upper()
+    multiplier = {
+        "H": 1.0,
+        "KH": 1_000.0,
+        "MH": 1_000_000.0,
+        "GH": 1_000_000_000.0,
+        "TH": 1_000_000_000_000.0,
+    }.get(unit, 1.0)
+    return float(value) * multiplier
+
+
+def _format_hps(hps: float) -> str:
+    value = float(hps)
+    for suffix, divisor in (("TH/s", 1_000_000_000_000.0), ("GH/s", 1_000_000_000.0), ("MH/s", 1_000_000.0), ("KH/s", 1_000.0)):
+        if abs(value) >= divisor:
+            return f"{value / divisor:.2f} {suffix}"
+    return f"{value:.2f} H/s"
+
+
+def _parse_latest_hashrate_from_text(text: str) -> Tuple[Optional[float], str]:
+    latest: Optional[Tuple[float, str]] = None
+    for match in HASHRATE_RE.finditer(text or ""):
+        try:
+            latest = (float(match.group("value")), str(match.group("unit")))
+        except Exception:
+            continue
+    if latest is None:
+        return None, ""
+    hps = _hashrate_to_hps(latest[0], latest[1])
+    return hps, _format_hps(hps)
+
+
+def _read_tail_text(path: Path, max_bytes: int = 32768) -> str:
+    try:
+        if not path.exists() or not path.is_file():
+            return ""
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(max(0, size - max_bytes))
+            return f.read(max_bytes).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _query_gpu_telemetry() -> Dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,utilization.gpu,memory.used,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.5,
+            check=False,
+        )
+        line = (proc.stdout or "").strip().splitlines()[0] if proc.stdout else ""
+        if proc.returncode != 0 or not line:
+            return {}
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 4:
+            return {}
+        out: Dict[str, Any] = {"gpuName": parts[0][:160]}
+        try:
+            out["gpuUtilizationPct"] = max(0.0, min(100.0, float(parts[1])))
+        except Exception:
+            pass
+        try:
+            out["gpuMemoryUsedMb"] = max(0.0, float(parts[2]))
+        except Exception:
+            pass
+        try:
+            out["gpuPowerDrawW"] = max(0.0, float(parts[3]))
+        except Exception:
+            pass
+        return out
+    except Exception:
+        return {}
 
 
 def _env_str(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -1682,6 +1767,7 @@ class PrlMinerController:
         with self._lock:
             self._reap_locked()
             pid = self._proc.pid if self._proc is not None and self._proc.poll() is None else None
+            running = pid is not None
             out: Dict[str, Any] = {
                 "state": self._state,
                 "desiredState": self._desired_state,
@@ -1705,7 +1791,25 @@ class PrlMinerController:
                 out["lastAutoRestartAttemptAtMs"] = int(self._last_auto_restart_attempt_ms)
             if self._last_auto_restart_reason:
                 out["lastAutoRestartReason"] = self._last_auto_restart_reason
-            return out
+        try:
+            if running:
+                out.update(_query_gpu_telemetry())
+            if self.log_path.exists():
+                stat = self.log_path.stat()
+                out["logSizeBytes"] = int(stat.st_size)
+                out["logUpdatedAtMs"] = int(stat.st_mtime * 1000)
+                tail = _read_tail_text(self.log_path)
+                hps, text = _parse_latest_hashrate_from_text(tail)
+                if hps is not None:
+                    out["localHashrateHps"] = float(hps)
+                    out["localHashrateText"] = text
+                if tail:
+                    lower_tail = tail.lower()
+                    out["recentAcceptedShares"] = lower_tail.count("accepted")
+                    out["recentRejectedShares"] = lower_tail.count("rejected")
+        except Exception as exc:
+            out["telemetryError"] = str(exc)[:300]
+        return out
 
     def _ensure_binary(self, download_url: str, expected_sha256: str) -> Path:
         expected = str(expected_sha256 or "").strip().lower()
