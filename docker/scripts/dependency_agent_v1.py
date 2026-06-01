@@ -2575,13 +2575,9 @@ class DependencyAgent:
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
-                gpu_execute_leases = sum(
-                    1
-                    for lease in self._active_exec_by_item.values()
-                    if lease.stage == "executing"
-                )
+                active_job_leases = len(self._active_exec_by_item)
                 maintenance_count = len(self._agent_maintenance_inflight)
-            if gpu_execute_leases > 0 or maintenance_count > 0:
+            if active_job_leases > 0 or maintenance_count > 0:
                 return
             if self._pending_self_update is not None:
                 return
