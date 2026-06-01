@@ -1856,6 +1856,51 @@ function dependency_manager_install_agent_artifact() {
     chmod +x "$agent_path" || true
 }
 
+function dependency_manager_persist_agent_env() {
+    local env_path key value
+    env_path="${DM_AGENT_ENV_PATH:-${WORKSPACE}/dependency_agent.env}"
+
+    mkdir -p "$(dirname "$env_path")" || true
+    : > "$env_path" || {
+        echo "WARN: Dependency manager: failed to write env file at $env_path"
+        return 0
+    }
+
+    for key in \
+        WORKSPACE \
+        DM_COMFYUI_DIR \
+        SERVER_TYPE \
+        FCS_API_BASE_URL \
+        DEPENDENCY_MANAGER_SHARED_SECRET \
+        DM_INSTANCE_ID \
+        DM_INSTANCE_IP \
+        VAST_CONTAINERLABEL \
+        DM_AGENT_DISABLE \
+        DM_AGENT_PATH \
+        DM_AGENT_LOG_PATH \
+        DM_AGENT_PID_PATH \
+        DM_AGENT_URL \
+        AGENT_URL \
+        DM_AGENT_WATCHDOG_PATH \
+        DM_AGENT_WATCHDOG_LOG_PATH \
+        DM_AGENT_WATCHDOG_PID_PATH \
+        DM_AGENT_WATCHDOG_SECONDS \
+        HF_TOKEN \
+        CIVITAI_TOKEN \
+        COMFYUI_ARGS \
+        COMFY_NODE_PINS \
+        COMFYUI_PIN_COMMIT
+    do
+        if [[ "${!key+x}" == "x" ]]; then
+            value="${!key}"
+            printf 'export %s=%q\n' "$key" "$value" >> "$env_path" || true
+        fi
+    done
+
+    printf 'export DM_AGENT_ENV_PATH=%q\n' "$env_path" >> "$env_path" || true
+    chmod 600 "$env_path" || true
+}
+
 function dependency_manager_render_watchdog() {
     local watchdog_path
     watchdog_path="${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE}/dependency_agent_watchdog.sh}"
@@ -1994,6 +2039,12 @@ source = path.read_text(encoding="utf-8")
 
 block = (
     "# FURGEN dependency agent watchdog bootstrap\n"
+    "dm_agent_env_path=\"${DM_AGENT_ENV_PATH:-${WORKSPACE:-/workspace}/dependency_agent.env}\"\n"
+    "if [[ -r \"${dm_agent_env_path}\" ]]; then\n"
+    "    set -a\n"
+    "    source \"${dm_agent_env_path}\"\n"
+    "    set +a\n"
+    "fi\n"
     "dm_agent_disable=\"$(printf '%s' \"${DM_AGENT_DISABLE:-}\" | tr '[:upper:]' '[:lower:]')\"\n"
     "if [[ \"${dm_agent_disable}\" != \"1\" && \"${dm_agent_disable}\" != \"true\" ]]; then\n"
     "    watchdog_path=\"${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.sh}\"\n"
@@ -2041,6 +2092,7 @@ function dependency_manager_start_agent() {
     fi
 
     dependency_manager_install_agent_artifact || true
+    dependency_manager_persist_agent_env
     dependency_manager_render_watchdog
     dependency_manager_configure_supervisor_watchdog
 
@@ -2068,3 +2120,7 @@ if [[ ! -f /.noprovisioning ]]; then
         exit 1
     }
 fi
+
+# Re-apply the watchdog bootstrap after provisioning in case image startup scripts
+# were regenerated while ComfyUI or custom nodes were updated.
+dependency_manager_start_agent
