@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.37"
+AGENT_VERSION = "dm-agent-py/0.9.38"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2044,6 +2044,7 @@ class PrlMinerController:
         miner_version = payload.get("minerVersion") if isinstance(payload.get("minerVersion"), str) else ""
         static_difficulty = payload.get("staticDifficulty")
         stop_timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
+        force_restart = payload.get("forceRestart") is True
 
         if not pool_url:
             raise RuntimeError("Missing PRL pool URL.")
@@ -2067,12 +2068,16 @@ class PrlMinerController:
                 self._paused_start_payload = None
                 self._paused_reason = ""
                 current_pid = self._proc.pid if self._proc is not None else None
-                self._cleanup_miner_processes("dedupe_prl_miner_same_target", keep_pid=current_pid, timeout_seconds=stop_timeout)
-        if same_target:
+                if not force_restart:
+                    self._cleanup_miner_processes("dedupe_prl_miner_same_target", keep_pid=current_pid, timeout_seconds=stop_timeout)
+        if same_target and not force_restart:
             return self.snapshot()
 
         if already_running:
-            self._stop_serialized("replace_prl_miner", timeout_seconds=stop_timeout)
+            self._stop_serialized(
+                "force_restart_prl_miner" if force_restart else "replace_prl_miner",
+                timeout_seconds=stop_timeout,
+            )
 
         binary = self._ensure_binary(download_url, miner_sha256)
         self._cleanup_miner_processes("before_prl_miner_start", timeout_seconds=stop_timeout)
@@ -2575,9 +2580,9 @@ class DependencyAgent:
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
-                active_job_leases = len(self._active_exec_by_item)
+                execute_count, _, _ = self._agent_stage_counts_locked()
                 maintenance_count = len(self._agent_maintenance_inflight)
-            if active_job_leases > 0 or maintenance_count > 0:
+            if execute_count > 0 or maintenance_count > 0:
                 return
             if self._pending_self_update is not None:
                 return
@@ -6703,6 +6708,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 return
 
             workflow = self._parse_workflow_from_payload(payload)
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                if active:
+                    active.stage = "executing"
+            self._stop_idle_prl_mining_for_work("execute_job")
             prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{job_id}-{uuid.uuid4().hex[:12]}")
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
@@ -6778,6 +6788,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 time.sleep(0.5)
 
             emit("output_commit_started", {"promptId": prompt_id})
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                if active:
+                    active.stage = "uploading"
+            self._resume_idle_prl_mining_if_idle("comfy_execution_complete")
 
             output_targets_initial = command_state.get("outputTargets")
             if not isinstance(output_targets_initial, list) or len(output_targets_initial) == 0:
