@@ -1890,8 +1890,22 @@ class PrlMinerController:
                     lower_tail = tail.lower()
                     out["recentAcceptedShares"] = lower_tail.count("accepted")
                     out["recentRejectedShares"] = lower_tail.count("rejected")
+                    if any(token in lower_tail for token in ("accepted", "rejected", "share", "job", "stratum")):
+                        out["lastShareLikeLogAtMs"] = int(stat.st_mtime * 1000)
         except Exception as exc:
             out["telemetryError"] = str(exc)[:300]
+        out["watch"] = {
+            "minerAlive": bool(running or int(out.get("minerProcessCount") or 0) > 0),
+            "minerProcessCount": int(out.get("minerProcessCount") or 0),
+            "gpuUtilizationPct": out.get("gpuUtilizationPct"),
+            "gpuPowerDrawW": out.get("gpuPowerDrawW"),
+            "localHashrateHps": out.get("localHashrateHps"),
+            "localHashrateText": out.get("localHashrateText"),
+            "poolConnected": bool(self._pool_url and out.get("state") in ("running", "starting")),
+            "lastShareLikeLogAtMs": out.get("lastShareLikeLogAtMs"),
+            "lastTelemetryAtMs": int(_now_ms()),
+            "telemetryError": out.get("telemetryError"),
+        }
         return out
 
     def _ensure_binary(self, download_url: str, expected_sha256: str) -> Path:
