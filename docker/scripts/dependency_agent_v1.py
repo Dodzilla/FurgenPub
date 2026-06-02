@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.38"
+AGENT_VERSION = "dm-agent-py/0.9.39"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3195,6 +3195,7 @@ class DependencyAgent:
         readiness_present = True if self.mining_only else self._local_readiness_file_present()
         queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
         input_cache_inventory = self._collect_input_cache_inventory()
+        stage_counts = self._agent_stage_counts_payload()
         now_ms = _now_ms()
         return {
             "agentControl": {
@@ -3204,6 +3205,7 @@ class DependencyAgent:
                 "localReadinessFile": self.agent_local_readiness_file,
                 "queueDepth": int(len(held_leases)),
                 **({"queueSummary": queue_summary} if queue_summary else {}),
+                "stageCounts": stage_counts,
                 "heldLeases": held_leases,
                 "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
                 "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
@@ -4902,6 +4904,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     "jobId": lease.job_id,
                     "executionAttempt": lease.execution_attempt,
                     "attemptEpoch": lease.attempt_epoch,
+                    "stage": lease.stage,
                 }
             )
         return out
@@ -4948,6 +4951,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         queue_depth = len(held_leases)
         queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
         input_cache_inventory = self._collect_input_cache_inventory()
+        stage_counts = self._agent_stage_counts_payload()
 
         body: Dict[str, Any] = {
             "schemaVersion": 1,
@@ -4957,6 +4961,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             "localReadinessFile": self.agent_local_readiness_file,
             "queueDepth": int(queue_depth),
             **({"queueSummary": queue_summary} if queue_summary else {}),
+            "stageCounts": stage_counts,
             "heldLeases": held_leases,
             "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
             "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
@@ -5022,17 +5027,31 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         self._loop_wakeup.set()
 
     def _agent_stage_counts_locked(self) -> Tuple[int, int, int]:
-        execute_count = 0
-        prefetch_count = 0
-        upload_count = 0
-        for lease in self._active_exec_by_item.values():
-            if lease.stage in ("leased", "prefetching", "ready"):
-                prefetch_count += 1
-            elif lease.stage in ("waiting_dependencies", "executing"):
-                execute_count += 1
-            elif lease.stage == "uploading":
-                upload_count += 1
+        counts = self._agent_stage_counts_map_locked()
+        execute_count = int(counts.get("executing", 0))
+        prefetch_count = sum(int(counts.get(stage, 0)) for stage in ("leased", "prefetching", "ready", "waiting_dependencies"))
+        upload_count = int(counts.get("uploading", 0))
         return execute_count, prefetch_count, upload_count
+
+    def _agent_stage_counts_map_locked(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {
+            "leased": 0,
+            "prefetching": 0,
+            "ready": 0,
+            "waiting_dependencies": 0,
+            "executing": 0,
+            "uploading": 0,
+        }
+        for lease in self._active_exec_by_item.values():
+            stage = lease.stage if lease.stage in counts else "leased"
+            counts[stage] += 1
+        return counts
+
+    def _agent_stage_counts_payload(self) -> Dict[str, int]:
+        with self._lock:
+            counts = dict(self._agent_stage_counts_map_locked())
+        counts["checkedAtMs"] = _now_ms()
+        return counts
 
     def _next_agent_lease_order(self) -> int:
         with self._lock:
@@ -6980,6 +6999,50 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         return
                     prefetched_inputs.append(self._ensure_cached_input(lease, row, idx))
 
+            required_dep_ids_raw = lease.payload.get("requiredDepIds")
+            required_dep_ids = [d for d in required_dep_ids_raw if isinstance(d, str) and d] if isinstance(required_dep_ids_raw, list) else []
+            timeouts = lease.payload.get("timeouts") if isinstance(lease.payload.get("timeouts"), dict) else {}
+            dep_wait_timeout_sec = int(timeouts.get("dependencyWaitTimeoutSec")) if isinstance(timeouts.get("dependencyWaitTimeoutSec"), (int, float)) else 900
+            if required_dep_ids:
+                dep_wait_started = _now_ms()
+                last_wait_emit_ms = 0
+                with self._lock:
+                    active = self._active_exec_by_item.get(lease.item_id)
+                    if active:
+                        active.stage = "waiting_dependencies"
+                while True:
+                    if self._is_cancel_requested(lease):
+                        self._emit_agent_event(
+                            lease,
+                            "job_cancelled",
+                            {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested while waiting for dependencies."},
+                        )
+                        terminal_sent = True
+                        return
+
+                    installed = self._current_installed_dep_ids()
+                    missing = [dep for dep in required_dep_ids if dep not in installed]
+                    if not missing:
+                        break
+
+                    now_ms = _now_ms()
+                    if now_ms - dep_wait_started > max(1, dep_wait_timeout_sec) * 1000:
+                        self._emit_agent_event(
+                            lease,
+                            "job_failed",
+                            {
+                                "errorCode": "dependencies_timeout",
+                                "errorMessage": f"Dependencies did not become ready in {dep_wait_timeout_sec}s.",
+                            },
+                        )
+                        terminal_sent = True
+                        return
+
+                    if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= 15_000:
+                        self._emit_agent_event(lease, "waiting_dependencies", {"missingDepIds": missing[:200]})
+                        last_wait_emit_ms = now_ms
+                    time.sleep(2.0)
+
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 if not active:
@@ -7022,52 +7085,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         retain_lease = False
         terminal_sent = False
         try:
-            required_dep_ids_raw = lease.payload.get("requiredDepIds")
-            required_dep_ids = [d for d in required_dep_ids_raw if isinstance(d, str) and d] if isinstance(required_dep_ids_raw, list) else []
             timeouts = lease.payload.get("timeouts") if isinstance(lease.payload.get("timeouts"), dict) else {}
-            dep_wait_timeout_sec = int(timeouts.get("dependencyWaitTimeoutSec")) if isinstance(timeouts.get("dependencyWaitTimeoutSec"), (int, float)) else 900
             execution_timeout_sec = int(timeouts.get("executionTimeoutSec")) if isinstance(timeouts.get("executionTimeoutSec"), (int, float)) else 2400
-
-            if required_dep_ids:
-                dep_wait_started = _now_ms()
-                last_wait_emit_ms = 0
-                with self._lock:
-                    active = self._active_exec_by_item.get(lease.item_id)
-                    if active:
-                        active.stage = "waiting_dependencies"
-                while True:
-                    if self._is_cancel_requested(lease):
-                        self._comfy_interrupt()
-                        self._emit_agent_event(
-                            lease,
-                            "job_cancelled",
-                            {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before execution started."},
-                        )
-                        terminal_sent = True
-                        return
-
-                    installed = self._current_installed_dep_ids()
-                    missing = [dep for dep in required_dep_ids if dep not in installed]
-                    if not missing:
-                        break
-
-                    now_ms = _now_ms()
-                    if now_ms - dep_wait_started > max(1, dep_wait_timeout_sec) * 1000:
-                        self._emit_agent_event(
-                            lease,
-                            "job_failed",
-                            {
-                                "errorCode": "dependencies_timeout",
-                                "errorMessage": f"Dependencies did not become ready in {dep_wait_timeout_sec}s.",
-                            },
-                        )
-                        terminal_sent = True
-                        return
-
-                    if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= 15_000:
-                        self._emit_agent_event(lease, "waiting_dependencies", {"missingDepIds": missing[:200]})
-                        last_wait_emit_ms = now_ms
-                    time.sleep(2.0)
 
             if self._is_cancel_requested(lease):
                 self._comfy_interrupt()
@@ -7733,7 +7752,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     execute_and_prefetch_budget = max(
                         0,
                         (execute_capacity + prefetch_capacity) -
-                        (active_execute_count + active_prefetch_count + active_upload_count),
+                        (active_execute_count + active_prefetch_count),
                     )
                     poll_limit = max(1, min(20, execute_and_prefetch_budget + 2))
 
