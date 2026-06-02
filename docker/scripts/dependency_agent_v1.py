@@ -107,12 +107,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.40"
+AGENT_VERSION = "dm-agent-py/0.9.41"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
 HASHRATE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?H)\s*/?\s*s(?:ec)?", re.IGNORECASE)
+ALPHA_HASHRATE_RE = re.compile(r"\b(?:hashrate|share_equiv)_th_s=(?P<value>\d+(?:\.\d+)?)\b", re.IGNORECASE)
 
 
 def _hashrate_to_hps(value: float, unit: str) -> float:
@@ -136,16 +137,20 @@ def _format_hps(hps: float) -> str:
 
 
 def _parse_latest_hashrate_from_text(text: str) -> Tuple[Optional[float], str]:
-    latest: Optional[Tuple[float, str]] = None
-    for match in HASHRATE_RE.finditer(text or ""):
+    latest_hps: Optional[float] = None
+    for match in ALPHA_HASHRATE_RE.finditer(text or ""):
         try:
-            latest = (float(match.group("value")), str(match.group("unit")))
+            latest_hps = float(match.group("value")) * 1_000_000_000_000.0
         except Exception:
             continue
-    if latest is None:
+    for match in HASHRATE_RE.finditer(text or ""):
+        try:
+            latest_hps = _hashrate_to_hps(float(match.group("value")), str(match.group("unit")))
+        except Exception:
+            continue
+    if latest_hps is None:
         return None, ""
-    hps = _hashrate_to_hps(latest[0], latest[1])
-    return hps, _format_hps(hps)
+    return latest_hps, _format_hps(latest_hps)
 
 
 def _read_tail_text(path: Path, max_bytes: int = 32768) -> str:
