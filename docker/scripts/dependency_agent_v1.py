@@ -107,13 +107,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.41"
+AGENT_VERSION = "dm-agent-py/0.9.42"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
 HASHRATE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?H)\s*/?\s*s(?:ec)?", re.IGNORECASE)
-ALPHA_HASHRATE_RE = re.compile(r"\b(?:hashrate|share_equiv)_th_s=(?P<value>\d+(?:\.\d+)?)\b", re.IGNORECASE)
+ALPHA_HASHRATE_RE = re.compile(r"\bhashrate_th_s=(?P<value>\d+(?:\.\d+)?)\b", re.IGNORECASE)
 
 
 def _hashrate_to_hps(value: float, unit: str) -> float:
