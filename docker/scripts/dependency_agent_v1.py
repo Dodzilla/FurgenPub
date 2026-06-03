@@ -57,6 +57,8 @@ Optional knobs:
   - DM_AGENT_POLL_SECONDS         (poll cadence for /agent/queue; default: 2)
   - DM_AGENT_HEARTBEAT_SECONDS    (heartbeat cadence for /agent/heartbeat; default: 8)
   - DM_AGENT_QUEUE_WAIT_SEC       (long-poll waitSec for /agent/queue; default: 2)
+  - DM_AGENT_WAITING_DEPS_EVENT_SECONDS (waiting_dependencies event cadence; default: 60)
+  - DM_AGENT_PROGRESS_EVENT_SECONDS (execution_progress event cadence; default: 60)
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
   - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
@@ -107,7 +109,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.42"
+AGENT_VERSION = "dm-agent-py/0.9.43"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2360,6 +2362,8 @@ class DependencyAgent:
         self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 2.0))
         self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 8.0))
         self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
+        self.agent_waiting_deps_event_ms = int(max(15.0, _env_float("DM_AGENT_WAITING_DEPS_EVENT_SECONDS", 60.0)) * 1000)
+        self.agent_progress_event_ms = int(max(15.0, _env_float("DM_AGENT_PROGRESS_EVENT_SECONDS", 60.0)) * 1000)
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         self.agent_local_readiness_file = self._agent_local_readiness_file_env or "provisioning_complete.txt"
@@ -6675,7 +6679,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         terminal_sent = True
                         return
 
-                    if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= 15_000:
+                    if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= self.agent_waiting_deps_event_ms:
                         emit("waiting_dependencies", {"missingDepIds": missing[:200]})
                         last_wait_emit_ms = now_ms
                     time.sleep(2.0)
@@ -6820,7 +6824,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if completed:
                     break
 
-                if _now_ms() - last_progress_emit_ms >= 15_000:
+                if _now_ms() - last_progress_emit_ms >= self.agent_progress_event_ms:
                     emit("execution_progress", {"promptId": prompt_id})
                     last_progress_emit_ms = _now_ms()
                 time.sleep(0.5)
@@ -7057,7 +7061,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         terminal_sent = True
                         return
 
-                    if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= 15_000:
+                    if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= self.agent_waiting_deps_event_ms:
                         self._emit_agent_event(lease, "waiting_dependencies", {"missingDepIds": missing[:200]})
                         last_wait_emit_ms = now_ms
                     time.sleep(2.0)
@@ -7205,7 +7209,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if completed:
                     break
 
-                if _now_ms() - last_progress_emit_ms >= 15_000:
+                if _now_ms() - last_progress_emit_ms >= self.agent_progress_event_ms:
                     self._emit_agent_event(lease, "execution_progress", {"promptId": prompt_id})
                     last_progress_emit_ms = _now_ms()
                 time.sleep(0.5)
@@ -7521,11 +7525,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds localComfy=%s readinessFile=%s maxExecWorkers=%d miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
             int(self.agent_queue_wait_sec),
+            self.agent_progress_event_ms / 1000.0,
+            self.agent_waiting_deps_event_ms / 1000.0,
             self.agent_local_comfy_base_url,
             self.agent_local_readiness_file,
             int(self.agent_max_execute_workers),
