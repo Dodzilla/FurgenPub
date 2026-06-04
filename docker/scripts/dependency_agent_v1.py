@@ -58,6 +58,7 @@ Optional knobs:
   - DM_AGENT_HEARTBEAT_SECONDS    (heartbeat cadence for /agent/heartbeat; default: 8)
   - DM_AGENT_QUEUE_WAIT_SEC       (long-poll waitSec for /agent/queue; default: 2)
   - DM_AGENT_WAITING_DEPS_EVENT_SECONDS (waiting_dependencies event cadence; default: 60)
+  - DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS (dependency readiness poll while waiting; default: 0.5)
   - DM_AGENT_PROGRESS_EVENT_SECONDS (execution_progress event cadence; default: 60)
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
@@ -109,7 +110,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.45"
+AGENT_VERSION = "dm-agent-py/0.9.46"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2365,6 +2366,7 @@ class DependencyAgent:
         self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
         self.agent_full_capacity_poll_seconds = max(5.0, min(300.0, _env_float("DM_AGENT_FULL_CAPACITY_POLL_SECONDS", 30.0)))
         self.agent_waiting_deps_event_ms = int(max(15.0, _env_float("DM_AGENT_WAITING_DEPS_EVENT_SECONDS", 60.0)) * 1000)
+        self.agent_dependency_wait_poll_seconds = max(0.1, min(5.0, _env_float("DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS", 0.5)))
         self.agent_progress_event_ms = int(max(15.0, _env_float("DM_AGENT_PROGRESS_EVENT_SECONDS", 60.0)) * 1000)
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
@@ -2623,6 +2625,19 @@ class DependencyAgent:
                 self._request_agent_queue_poll()
         except Exception as e:
             logging.warning("Failed resuming idle PRL miner after %s: %s", reason, e)
+
+    def _mark_agent_gpu_work_finished(
+        self,
+        lease: AgentExecuteLease,
+        reason: str,
+        final_stage: str = "finalizing",
+    ) -> None:
+        with self._lock:
+            active = self._active_exec_by_item.get(lease.item_id)
+            if active:
+                active.stage = final_stage
+        self._resume_idle_prl_mining_if_idle(reason)
+        self._request_agent_queue_poll()
 
     # Include shared secret by default to avoid token races causing 401 loops
     # (token is still used when present; backend accepts either).
@@ -5070,6 +5085,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             "waiting_dependencies": 0,
             "executing": 0,
             "uploading": 0,
+            "finalizing": 0,
         }
         for lease in self._active_exec_by_item.values():
             stage = lease.stage if lease.stage in counts else "leased"
@@ -6688,7 +6704,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= self.agent_waiting_deps_event_ms:
                         emit("waiting_dependencies", {"missingDepIds": missing[:200]})
                         last_wait_emit_ms = now_ms
-                    time.sleep(2.0)
+                    time.sleep(self.agent_dependency_wait_poll_seconds)
 
             if self._is_cancel_requested(lease):
                 self._comfy_interrupt()
@@ -6777,6 +6793,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             while True:
                 if self._is_cancel_requested(lease):
                     self._comfy_interrupt()
+                    self._mark_agent_gpu_work_finished(lease, "comfy_execution_cancelled")
                     emit(
                         "job_cancelled",
                         {
@@ -6789,6 +6806,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     return
 
                 if _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
+                    self._comfy_interrupt()
+                    self._mark_agent_gpu_work_finished(lease, "comfy_execution_timeout")
                     emit(
                         "job_failed",
                         {
@@ -6816,6 +6835,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 completed = status_obj.get("completed") is True or status_str in ("success", "succeeded", "completed")
 
                 if failed:
+                    self._mark_agent_gpu_work_finished(lease, "comfy_execution_failed")
                     emit(
                         "job_failed",
                         {
@@ -6835,12 +6855,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     last_progress_emit_ms = _now_ms()
                 time.sleep(0.5)
 
-            emit("output_commit_started", {"promptId": prompt_id})
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 if active:
                     active.stage = "uploading"
-            self._resume_idle_prl_mining_if_idle("comfy_execution_complete")
+            self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
+            emit("output_commit_started", {"promptId": prompt_id})
 
             output_targets_initial = command_state.get("outputTargets")
             if not isinstance(output_targets_initial, list) or len(output_targets_initial) == 0:
@@ -6929,6 +6949,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if prompt_id:
                     payload["promptId"] = prompt_id
                 try:
+                    self._mark_agent_gpu_work_finished(lease, "comfy_execution_error")
                     emit(event_type, payload)
                     terminal_sent = True
                 except Exception as event_err:
@@ -7070,7 +7091,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= self.agent_waiting_deps_event_ms:
                         self._emit_agent_event(lease, "waiting_dependencies", {"missingDepIds": missing[:200]})
                         last_wait_emit_ms = now_ms
-                    time.sleep(2.0)
+                    time.sleep(self.agent_dependency_wait_poll_seconds)
 
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
@@ -7159,6 +7180,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             while True:
                 if self._is_cancel_requested(lease):
                     self._comfy_interrupt()
+                    self._mark_agent_gpu_work_finished(lease, "comfy_execution_cancelled")
                     self._emit_agent_event(
                         lease,
                         "job_cancelled",
@@ -7172,6 +7194,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     return
 
                 if _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
+                    self._comfy_interrupt()
+                    self._mark_agent_gpu_work_finished(lease, "comfy_execution_timeout")
                     self._emit_agent_event(
                         lease,
                         "job_failed",
@@ -7200,6 +7224,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 completed = status_obj.get("completed") is True or status_str in ("success", "succeeded", "completed")
 
                 if failed:
+                    self._mark_agent_gpu_work_finished(lease, "comfy_execution_failed")
                     self._emit_agent_event(
                         lease,
                         "job_failed",
@@ -7226,8 +7251,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     active.stage = "uploading"
                     active.history_entry = history_entry
                     active.prompt_id = prompt_id
-            self._resume_idle_prl_mining_if_idle("comfy_execution_complete")
-            self._request_agent_queue_poll()
+            self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
             self._emit_agent_event(lease, "output_commit_started", {"promptId": prompt_id})
 
             self._submit_agent_upload(lease)
@@ -7248,6 +7272,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if prompt_id:
                     payload["promptId"] = prompt_id
                 try:
+                    self._mark_agent_gpu_work_finished(lease, "comfy_execution_error")
                     self._emit_agent_event(lease, event_type, payload)
                     terminal_sent = True
                 except Exception as event_err:
