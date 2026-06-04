@@ -109,7 +109,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.44"
+AGENT_VERSION = "dm-agent-py/0.9.45"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2357,6 +2357,7 @@ class DependencyAgent:
 
         # Agent control channel knobs (execute pull mode).
         self.agent_control_enabled = _env_bool("DM_AGENT_CONTROL_ENABLED", True)
+        self.agent_runtime_config_overrides_env = _env_bool("DM_AGENT_RUNTIME_CONFIG_OVERRIDES_ENV", True)
         self._agent_poll_seconds_env = _env_str("DM_AGENT_POLL_SECONDS") is not None
         self._agent_heartbeat_seconds_env = _env_str("DM_AGENT_HEARTBEAT_SECONDS") is not None
         self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 2.0))
@@ -3028,13 +3029,17 @@ class DependencyAgent:
 
         changes: List[str] = []
         heartbeat_seconds = self._runtime_config_seconds(raw.get("agentHeartbeatSec"), 2.0, 30.0)
-        if heartbeat_seconds is not None and not self._agent_heartbeat_seconds_env:
+        if heartbeat_seconds is not None and (
+            self.agent_runtime_config_overrides_env or not self._agent_heartbeat_seconds_env
+        ):
             if abs(float(self.agent_heartbeat_seconds) - heartbeat_seconds) >= 0.1:
                 self.agent_heartbeat_seconds = heartbeat_seconds
                 changes.append(f"heartbeat={heartbeat_seconds:.1f}s")
 
         poll_seconds = self._runtime_config_seconds(raw.get("agentPollSec"), 0.5, 30.0)
-        if poll_seconds is not None and not self._agent_poll_seconds_env:
+        if poll_seconds is not None and (
+            self.agent_runtime_config_overrides_env or not self._agent_poll_seconds_env
+        ):
             if abs(float(self.agent_poll_seconds) - poll_seconds) >= 0.1:
                 self.agent_poll_seconds = poll_seconds
                 changes.append(f"poll={poll_seconds:.1f}s")
