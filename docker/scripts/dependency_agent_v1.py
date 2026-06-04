@@ -109,7 +109,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.43"
+AGENT_VERSION = "dm-agent-py/0.9.44"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2362,6 +2362,7 @@ class DependencyAgent:
         self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 2.0))
         self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 8.0))
         self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
+        self.agent_full_capacity_poll_seconds = max(5.0, min(300.0, _env_float("DM_AGENT_FULL_CAPACITY_POLL_SECONDS", 30.0)))
         self.agent_waiting_deps_event_ms = int(max(15.0, _env_float("DM_AGENT_WAITING_DEPS_EVENT_SECONDS", 60.0)) * 1000)
         self.agent_progress_event_ms = int(max(15.0, _env_float("DM_AGENT_PROGRESS_EVENT_SECONDS", 60.0)) * 1000)
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
@@ -7525,11 +7526,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
             int(self.agent_queue_wait_sec),
+            self.agent_full_capacity_poll_seconds,
             self.agent_progress_event_ms / 1000.0,
             self.agent_waiting_deps_event_ms / 1000.0,
             self.agent_local_comfy_base_url,
@@ -7578,12 +7580,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         while not self._stop.is_set():
             try:
                 now = _now_ms()
+                agent_poll_wakeup_requested = False
                 if self._dependency_poll_wakeup.is_set():
                     self._dependency_poll_wakeup.clear()
                     next_dep_poll_at_ms = 0
                 if self._agent_poll_wakeup.is_set():
                     self._agent_poll_wakeup.clear()
                     next_agent_poll_at_ms = 0
+                    agent_poll_wakeup_requested = True
 
                 # Keep both worker sets clean.
                 done_dep = {f for f in dep_inflight if f.done()}
@@ -7779,6 +7783,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         (execute_capacity + prefetch_capacity) -
                         (active_execute_count + active_prefetch_count),
                     )
+                    if execute_and_prefetch_budget <= 0 and not agent_poll_wakeup_requested:
+                        next_agent_poll_at_ms = now + int(self.agent_full_capacity_poll_seconds * 1000)
+                        continue
+
                     poll_limit = max(1, min(20, execute_and_prefetch_budget + 2))
 
                     queue_wait_sec = self.agent_queue_wait_sec
