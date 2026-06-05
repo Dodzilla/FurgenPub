@@ -60,6 +60,10 @@ Optional knobs:
   - DM_AGENT_WAITING_DEPS_EVENT_SECONDS (waiting_dependencies event cadence; default: 60)
   - DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS (dependency readiness poll while waiting; default: 0.5)
   - DM_AGENT_PROGRESS_EVENT_SECONDS (execution_progress event cadence; default: 60)
+  - DM_AGENT_API_RETRY_ATTEMPTS    (agent API retry attempts for transient network/5xx/401; default: 5)
+  - DM_AGENT_API_RETRY_BASE_SECONDS (initial agent API retry backoff; default: 1)
+  - DM_AGENT_API_RETRY_MAX_SECONDS (max agent API retry backoff; default: 20)
+  - DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS (extra retries for terminal job events; default: 8)
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
   - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
@@ -110,7 +114,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.46"
+AGENT_VERSION = "dm-agent-py/0.9.47"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2368,6 +2372,14 @@ class DependencyAgent:
         self.agent_waiting_deps_event_ms = int(max(15.0, _env_float("DM_AGENT_WAITING_DEPS_EVENT_SECONDS", 60.0)) * 1000)
         self.agent_dependency_wait_poll_seconds = max(0.1, min(5.0, _env_float("DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS", 0.5)))
         self.agent_progress_event_ms = int(max(15.0, _env_float("DM_AGENT_PROGRESS_EVENT_SECONDS", 60.0)) * 1000)
+        self.agent_api_retry_attempts = max(1, min(10, _env_int("DM_AGENT_API_RETRY_ATTEMPTS", 5)))
+        self.agent_api_retry_base_seconds = max(0.1, min(10.0, _env_float("DM_AGENT_API_RETRY_BASE_SECONDS", 1.0)))
+        self.agent_api_retry_max_seconds = max(
+            self.agent_api_retry_base_seconds,
+            min(120.0, _env_float("DM_AGENT_API_RETRY_MAX_SECONDS", 20.0)),
+        )
+        self.agent_terminal_event_retry_attempts = max(1, min(20, _env_int("DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS", 8)))
+        self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         self.agent_local_readiness_file = self._agent_local_readiness_file_env or "provisioning_complete.txt"
@@ -2681,6 +2693,41 @@ class DependencyAgent:
             return
         self._agent_server_time_offset_ms = int(ms - _now_ms())
 
+    def _sleep_agent_api_retry(self, label: str, attempt_idx: int, error: Exception) -> None:
+        base = float(getattr(self, "agent_api_retry_base_seconds", 1.0) or 1.0)
+        cap = float(getattr(self, "agent_api_retry_max_seconds", 20.0) or 20.0)
+        delay = min(cap, base * (2 ** max(0, int(attempt_idx))))
+        delay = delay * (0.75 + random.random() * 0.5)
+        logging.warning(
+            "Transient agent %s failure; retrying in %.1fs (attempt=%d): %s",
+            label,
+            delay,
+            int(attempt_idx) + 2,
+            error,
+        )
+        time.sleep(max(0.1, delay))
+
+    def _is_retryable_agent_control_error(self, error: Exception) -> bool:
+        if isinstance(error, NetworkError):
+            return True
+        if isinstance(error, ApiError):
+            return error.status in RETRYABLE_HTTP_STATUS_CODES or error.status in (401, 403) or error.status >= 500
+        if isinstance(error, (OSError, socket.timeout, TimeoutError, http.client.HTTPException)):
+            return True
+        msg = str(error).lower()
+        return any(
+            token in msg
+            for token in (
+                "temporary failure in name resolution",
+                "name or service not known",
+                "connection reset",
+                "connection refused",
+                "timed out",
+                "agent_token_invalid",
+                "agent_token_expired",
+            )
+        )
+
     def _agent_api(
         self,
         method: str,
@@ -2702,13 +2749,41 @@ class DependencyAgent:
                 sep = "&" if "?" in url else "?"
                 url = f"{url}{sep}{urllib.parse.urlencode(query_items)}"
 
-        status, resp = api_json(
-            method,
-            url,
-            body=body,
-            headers=self._agent_headers(use_token=use_token, include_secret=include_secret),
-            timeout_seconds=timeout_seconds,
-        )
+        attempts = max(1, int(getattr(self, "agent_api_retry_attempts", 1) or 1))
+        last_error: Optional[Exception] = None
+        for attempt_idx in range(attempts):
+            try:
+                status, resp = api_json(
+                    method,
+                    url,
+                    body=body,
+                    headers=self._agent_headers(use_token=use_token, include_secret=include_secret),
+                    timeout_seconds=timeout_seconds,
+                )
+                break
+            except ApiError as e:
+                last_error = e
+                should_retry = e.status in RETRYABLE_HTTP_STATUS_CODES or e.status >= 500
+                if use_token and e.status in (401, 403) and endpoint != "/agent/register":
+                    should_retry = True
+                    self._agent_access_token = None
+                    self._agent_access_token_expires_at_ms = 0
+                    try:
+                        self._agent_register()
+                    except Exception as refresh_err:
+                        logging.warning("Agent token refresh before retry failed: %s", refresh_err)
+                if not should_retry or attempt_idx >= attempts - 1:
+                    raise
+                self._sleep_agent_api_retry("api", attempt_idx, e)
+            except NetworkError as e:
+                last_error = e
+                if attempt_idx >= attempts - 1:
+                    raise
+                self._sleep_agent_api_retry("api", attempt_idx, e)
+        else:
+            if last_error:
+                raise last_error
+            raise RuntimeError("Agent API failed without an error")
         if status != 200 or not isinstance(resp, dict):
             raise RuntimeError(f"Unexpected agent API response ({status}): {resp}")
         self._note_server_time(resp.get("serverTime") if isinstance(resp.get("serverTime"), str) else None)
@@ -4936,6 +5011,41 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 event_version = int(lease.event_version)
         return self._agent_event(lease, event_version, event_type, payload=payload)
 
+    def _emit_agent_event_best_effort(self, lease: AgentExecuteLease, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            self._emit_agent_event(lease, event_type, payload)
+        except Exception as e:
+            logging.debug("Best-effort agent event failed: jobId=%s type=%s err=%s", lease.job_id, event_type, e)
+
+    def _emit_agent_event_durable(self, lease: AgentExecuteLease, event_type: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        emit_override = self.__dict__.get("_emit_agent_event")
+        if callable(emit_override):
+            result = emit_override(lease, event_type, payload)
+            return result if isinstance(result, dict) else {}
+
+        with self._lock:
+            active = self._active_exec_by_item.get(lease.item_id)
+            if active:
+                active.event_version += 1
+                event_version = int(active.event_version)
+            else:
+                lease.event_version += 1
+                event_version = int(lease.event_version)
+
+        attempts = max(1, int(getattr(self, "agent_terminal_event_retry_attempts", 1) or 1))
+        last_error: Optional[Exception] = None
+        for attempt_idx in range(attempts):
+            try:
+                return self._agent_event(lease, event_version, event_type, payload=payload)
+            except Exception as e:
+                last_error = e
+                if attempt_idx >= attempts - 1 or not self._is_retryable_agent_control_error(e):
+                    break
+                self._sleep_agent_api_retry(f"terminal event {event_type}", attempt_idx, e)
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Durable agent event {event_type} failed without an error")
+
     def _collect_active_leases(self) -> List[Dict[str, Any]]:
         with self._lock:
             active = list(self._active_exec_by_item.values())
@@ -6561,23 +6671,52 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     upload_headers[hk] = hv
 
         upload_method = target.get("uploadMethod") if isinstance(target.get("uploadMethod"), str) else ""
-        if upload_method == "agent_api_put":
-            upload_headers["X-DM-Instance-Id"] = str(self._resolved_instance_id or "")
-            upload_headers["X-Agent-Job-Id"] = lease.job_id
-            upload_headers["X-Agent-Execution-Attempt"] = str(int(lease.execution_attempt))
-            upload_headers["X-Agent-Attempt-Epoch"] = str(int(lease.attempt_epoch))
-            upload_headers["X-Agent-Lease-Id"] = lease.lease_id
-            upload_headers["X-Agent-Logical-Output-Key"] = logical_key
-            upload_headers["X-Agent-Source-Filename"] = filename
-            if self._agent_access_token:
-                upload_headers["Authorization"] = f"Bearer {self._agent_access_token}"
 
-        status, body, _resp_headers = http_put_file_stream(
-            upload_url,
-            local_output,
-            headers=upload_headers,
-            timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
-        )
+        def build_upload_headers() -> Dict[str, str]:
+            headers = dict(upload_headers)
+            if upload_method == "agent_api_put":
+                headers["X-DM-Instance-Id"] = str(self._resolved_instance_id or "")
+                headers["X-Agent-Job-Id"] = lease.job_id
+                headers["X-Agent-Execution-Attempt"] = str(int(lease.execution_attempt))
+                headers["X-Agent-Attempt-Epoch"] = str(int(lease.attempt_epoch))
+                headers["X-Agent-Lease-Id"] = lease.lease_id
+                headers["X-Agent-Logical-Output-Key"] = logical_key
+                headers["X-Agent-Source-Filename"] = filename
+                if self._agent_access_token:
+                    headers["Authorization"] = f"Bearer {self._agent_access_token}"
+            return headers
+
+        status = 0
+        body = ""
+        upload_attempts = max(1, int(getattr(self, "agent_upload_retry_attempts", 1) or 1))
+        for attempt_idx in range(upload_attempts):
+            try:
+                status, body, _resp_headers = http_put_file_stream(
+                    upload_url,
+                    local_output,
+                    headers=build_upload_headers(),
+                    timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                )
+            except (OSError, socket.timeout, TimeoutError, http.client.HTTPException) as e:
+                if attempt_idx >= upload_attempts - 1:
+                    raise RuntimeError(f"Output upload network failure: {e}") from e
+                self._sleep_agent_api_retry("output upload", attempt_idx, e)
+                continue
+
+            if status in (401, 403) and upload_method == "agent_api_put" and attempt_idx < upload_attempts - 1:
+                self._agent_access_token = None
+                self._agent_access_token_expires_at_ms = 0
+                try:
+                    self._agent_register()
+                except Exception as refresh_err:
+                    logging.warning("Agent token refresh before output upload retry failed: %s", refresh_err)
+                self._sleep_agent_api_retry("output upload auth", attempt_idx, RuntimeError(f"status={status}"))
+                continue
+
+            if (status in RETRYABLE_HTTP_STATUS_CODES or status >= 500) and attempt_idx < upload_attempts - 1:
+                self._sleep_agent_api_retry("output upload", attempt_idx, RuntimeError(f"status={status}: {body[:200]}"))
+                continue
+            break
         if status == 412:
             verify_url = target.get("verifyHeadUrl")
             if isinstance(verify_url, str) and verify_url:
@@ -6662,6 +6801,30 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             event_version += 1
             return self._agent_event(lease, event_version, event_type, payload=extra)
 
+        def emit_best_effort(event_type: str, extra: Optional[Dict[str, Any]] = None) -> None:
+            try:
+                emit(event_type, extra)
+            except Exception as e:
+                logging.debug("Best-effort agent event failed: jobId=%s type=%s err=%s", lease.job_id, event_type, e)
+
+        def emit_durable(event_type: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            nonlocal event_version
+            event_version += 1
+            durable_version = event_version
+            attempts = max(1, int(getattr(self, "agent_terminal_event_retry_attempts", 1) or 1))
+            last_error: Optional[Exception] = None
+            for attempt_idx in range(attempts):
+                try:
+                    return self._agent_event(lease, durable_version, event_type, payload=extra)
+                except Exception as e:
+                    last_error = e
+                    if attempt_idx >= attempts - 1 or not self._is_retryable_agent_control_error(e):
+                        break
+                    self._sleep_agent_api_retry(f"terminal event {event_type}", attempt_idx, e)
+            if last_error:
+                raise last_error
+            raise RuntimeError(f"Durable agent event {event_type} failed without an error")
+
         try:
             try:
                 emit("job_dispatched", {"commandId": lease.command_id} if lease.command_id else None)
@@ -6680,7 +6843,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 while True:
                     if self._is_cancel_requested(lease):
                         self._comfy_interrupt()
-                        emit("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before execution started."})
+                        emit_durable("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before execution started."})
                         terminal_sent = True
                         return
 
@@ -6691,7 +6854,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
                     now_ms = _now_ms()
                     if now_ms - dep_wait_started > max(1, dep_wait_timeout_sec) * 1000:
-                        emit(
+                        emit_durable(
                             "job_failed",
                             {
                                 "errorCode": "dependencies_timeout",
@@ -6702,13 +6865,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         return
 
                     if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= self.agent_waiting_deps_event_ms:
-                        emit("waiting_dependencies", {"missingDepIds": missing[:200]})
+                        emit_best_effort("waiting_dependencies", {"missingDepIds": missing[:200]})
                         last_wait_emit_ms = now_ms
                     time.sleep(self.agent_dependency_wait_poll_seconds)
 
             if self._is_cancel_requested(lease):
                 self._comfy_interrupt()
-                emit("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before input preparation."})
+                emit_durable("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before input preparation."})
                 terminal_sent = True
                 return
 
@@ -6737,7 +6900,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         continue
                     if self._is_cancel_requested(lease):
                         self._comfy_interrupt()
-                        emit("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested while downloading inputs."})
+                        emit_durable("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested while downloading inputs."})
                         terminal_sent = True
                         return
 
@@ -6763,11 +6926,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
                     self._copy_input_to_comfy(local_path, name)
 
-            emit("inputs_ready", None)
+            emit_best_effort("inputs_ready", None)
 
             if self._is_cancel_requested(lease):
                 self._comfy_interrupt()
-                emit("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before prompt submit."})
+                emit_durable("job_cancelled", {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before prompt submit."})
                 terminal_sent = True
                 return
 
@@ -6783,8 +6946,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if active:
                     active.prompt_id = prompt_id
 
-            emit("prompt_submitted", {"promptId": prompt_id})
-            emit("execution_started", {"promptId": prompt_id})
+            emit_best_effort("prompt_submitted", {"promptId": prompt_id})
+            emit_best_effort("execution_started", {"promptId": prompt_id})
 
             start_exec_ms = _now_ms()
             last_progress_emit_ms = 0
@@ -6794,7 +6957,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if self._is_cancel_requested(lease):
                     self._comfy_interrupt()
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_cancelled")
-                    emit(
+                    emit_durable(
                         "job_cancelled",
                         {
                             "promptId": prompt_id,
@@ -6808,7 +6971,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
                     self._comfy_interrupt()
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_timeout")
-                    emit(
+                    emit_durable(
                         "job_failed",
                         {
                             "promptId": prompt_id,
@@ -6836,7 +6999,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
                 if failed:
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_failed")
-                    emit(
+                    emit_durable(
                         "job_failed",
                         {
                             "promptId": prompt_id,
@@ -6851,7 +7014,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     break
 
                 if _now_ms() - last_progress_emit_ms >= self.agent_progress_event_ms:
-                    emit("execution_progress", {"promptId": prompt_id})
+                    emit_best_effort("execution_progress", {"promptId": prompt_id})
                     last_progress_emit_ms = _now_ms()
                 time.sleep(0.5)
 
@@ -6860,7 +7023,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if active:
                     active.stage = "uploading"
             self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
-            emit("output_commit_started", {"promptId": prompt_id})
+            emit_best_effort("output_commit_started", {"promptId": prompt_id})
 
             output_targets_initial = command_state.get("outputTargets")
             if not isinstance(output_targets_initial, list) or len(output_targets_initial) == 0:
@@ -6919,7 +7082,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 )
                 uploaded_outputs.append(out_meta)
                 try:
-                    emit("output_uploaded", out_meta)
+                    emit_best_effort("output_uploaded", out_meta)
                 except Exception as e:
                     logging.debug(
                         "output_uploaded emit failed for %s/%s: %s",
@@ -6931,7 +7094,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             if not uploaded_outputs:
                 raise RuntimeError("No outputs were uploaded.")
 
-            emit("job_completed", {"promptId": prompt_id, "outputs": uploaded_outputs})
+            try:
+                emit_durable("job_completed", {"promptId": prompt_id, "outputs": uploaded_outputs})
+            except Exception as terminal_err:
+                logging.error(
+                    "job_completed terminal event failed after retries; leaving job for backend recovery instead of marking failed: jobId=%s err=%s",
+                    lease.job_id,
+                    terminal_err,
+                )
+                return
             terminal_sent = True
         except Exception as e:
             if not terminal_sent:
@@ -6950,7 +7121,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     payload["promptId"] = prompt_id
                 try:
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_error")
-                    emit(event_type, payload)
+                    emit_durable(event_type, payload)
                     terminal_sent = True
                 except Exception as event_err:
                     logging.warning("Failed emitting terminal event for %s: %s", lease.job_id, event_err)
@@ -7021,7 +7192,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 logging.debug("job_dispatched emit failed for %s: %s", lease.job_id, e)
 
             if self._is_cancel_requested(lease):
-                self._emit_agent_event(
+                self._emit_agent_event_durable(
                     lease,
                     "job_cancelled",
                     {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before input prefetch."},
@@ -7040,7 +7211,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     if not isinstance(row, dict):
                         continue
                     if self._is_cancel_requested(lease):
-                        self._emit_agent_event(
+                        self._emit_agent_event_durable(
                             lease,
                             "job_cancelled",
                             {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested while prefetching inputs."},
@@ -7062,7 +7233,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         active.stage = "waiting_dependencies"
                 while True:
                     if self._is_cancel_requested(lease):
-                        self._emit_agent_event(
+                        self._emit_agent_event_durable(
                             lease,
                             "job_cancelled",
                             {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested while waiting for dependencies."},
@@ -7077,7 +7248,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
                     now_ms = _now_ms()
                     if now_ms - dep_wait_started > max(1, dep_wait_timeout_sec) * 1000:
-                        self._emit_agent_event(
+                        self._emit_agent_event_durable(
                             lease,
                             "job_failed",
                             {
@@ -7089,7 +7260,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         return
 
                     if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= self.agent_waiting_deps_event_ms:
-                        self._emit_agent_event(lease, "waiting_dependencies", {"missingDepIds": missing[:200]})
+                        self._emit_agent_event_best_effort(lease, "waiting_dependencies", {"missingDepIds": missing[:200]})
                         last_wait_emit_ms = now_ms
                     time.sleep(self.agent_dependency_wait_poll_seconds)
 
@@ -7103,7 +7274,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             retain_lease = True
             self._request_agent_queue_poll()
             try:
-                self._emit_agent_event(lease, "inputs_ready", None)
+                self._emit_agent_event_best_effort(lease, "inputs_ready", None)
             except Exception as e:
                 logging.debug("inputs_ready emit failed for %s: %s", lease.job_id, e)
         except Exception as e:
@@ -7111,7 +7282,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
                 err_code = "cancel_requested" if event_type == "job_cancelled" else "prefetch_error"
                 try:
-                    self._emit_agent_event(
+                    self._emit_agent_event_durable(
                         lease,
                         event_type,
                         {"errorCode": err_code, "errorMessage": str(e)[:MAX_AGENT_ERROR_MESSAGE_CHARS]},
@@ -7140,7 +7311,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
             if self._is_cancel_requested(lease):
                 self._comfy_interrupt()
-                self._emit_agent_event(
+                self._emit_agent_event_durable(
                     lease,
                     "job_cancelled",
                     {"errorCode": "cancel_requested", "errorMessage": "Cancellation requested before prompt submit."},
@@ -7171,7 +7342,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if active:
                     active.prompt_id = prompt_id
 
-            self._emit_agent_event(lease, "execution_started", {"promptId": prompt_id})
+            self._emit_agent_event_best_effort(lease, "execution_started", {"promptId": prompt_id})
 
             start_exec_ms = _now_ms()
             last_progress_emit_ms = 0
@@ -7181,7 +7352,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if self._is_cancel_requested(lease):
                     self._comfy_interrupt()
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_cancelled")
-                    self._emit_agent_event(
+                    self._emit_agent_event_durable(
                         lease,
                         "job_cancelled",
                         {
@@ -7196,7 +7367,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
                     self._comfy_interrupt()
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_timeout")
-                    self._emit_agent_event(
+                    self._emit_agent_event_durable(
                         lease,
                         "job_failed",
                         {
@@ -7225,7 +7396,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
                 if failed:
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_failed")
-                    self._emit_agent_event(
+                    self._emit_agent_event_durable(
                         lease,
                         "job_failed",
                         {
@@ -7241,7 +7412,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     break
 
                 if _now_ms() - last_progress_emit_ms >= self.agent_progress_event_ms:
-                    self._emit_agent_event(lease, "execution_progress", {"promptId": prompt_id})
+                    self._emit_agent_event_best_effort(lease, "execution_progress", {"promptId": prompt_id})
                     last_progress_emit_ms = _now_ms()
                 time.sleep(0.5)
 
@@ -7252,7 +7423,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     active.history_entry = history_entry
                     active.prompt_id = prompt_id
             self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
-            self._emit_agent_event(lease, "output_commit_started", {"promptId": prompt_id})
+            self._emit_agent_event_best_effort(lease, "output_commit_started", {"promptId": prompt_id})
 
             self._submit_agent_upload(lease)
             retain_lease = True
@@ -7273,7 +7444,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     payload["promptId"] = prompt_id
                 try:
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_error")
-                    self._emit_agent_event(lease, event_type, payload)
+                    self._emit_agent_event_durable(lease, event_type, payload)
                     terminal_sent = True
                 except Exception as event_err:
                     logging.warning("Failed emitting execute terminal event for %s: %s", lease.job_id, event_err)
@@ -7354,7 +7525,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 )
                 uploaded_outputs.append(out_meta)
                 try:
-                    self._emit_agent_event(lease, "output_uploaded", out_meta)
+                    self._emit_agent_event_best_effort(lease, "output_uploaded", out_meta)
                 except Exception as e:
                     logging.debug(
                         "output_uploaded emit failed for %s/%s: %s",
@@ -7369,7 +7540,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             completion_payload: Dict[str, Any] = {"outputs": uploaded_outputs}
             if isinstance(lease.prompt_id, str) and lease.prompt_id:
                 completion_payload["promptId"] = lease.prompt_id
-            self._emit_agent_event(lease, "job_completed", completion_payload)
+            try:
+                self._emit_agent_event_durable(lease, "job_completed", completion_payload)
+            except Exception as terminal_err:
+                logging.error(
+                    "job_completed terminal event failed after retries; leaving job for backend recovery instead of marking failed: jobId=%s err=%s",
+                    lease.job_id,
+                    terminal_err,
+                )
+                return
             terminal_sent = True
         except Exception as e:
             if not terminal_sent:
@@ -7380,7 +7559,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if isinstance(lease.prompt_id, str) and lease.prompt_id:
                     payload["promptId"] = lease.prompt_id
                 try:
-                    self._emit_agent_event(lease, "job_failed", payload)
+                    self._emit_agent_event_durable(lease, "job_failed", payload)
                     terminal_sent = True
                 except Exception as event_err:
                     logging.warning("Failed emitting upload terminal event for %s: %s", lease.job_id, event_err)
@@ -7448,7 +7627,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 self._register_active_lease(lease)
                 try:
                     self._emit_agent_event(lease, "job_dispatched", {"commandId": lease.command_id} if lease.command_id else None)
-                    self._emit_agent_event(
+                    self._emit_agent_event_durable(
                         lease,
                         "job_failed",
                         {
