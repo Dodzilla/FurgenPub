@@ -114,7 +114,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.47"
+AGENT_VERSION = "dm-agent-py/0.9.48"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -6947,7 +6947,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     active.prompt_id = prompt_id
 
             emit_best_effort("prompt_submitted", {"promptId": prompt_id})
-            emit_best_effort("execution_started", {"promptId": prompt_id})
+            emit_durable("execution_started", {"promptId": prompt_id})
 
             start_exec_ms = _now_ms()
             last_progress_emit_ms = 0
@@ -7023,7 +7023,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if active:
                     active.stage = "uploading"
             self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
-            emit_best_effort("output_commit_started", {"promptId": prompt_id})
+            emit_durable("output_commit_started", {"promptId": prompt_id})
 
             output_targets_initial = command_state.get("outputTargets")
             if not isinstance(output_targets_initial, list) or len(output_targets_initial) == 0:
@@ -7342,7 +7342,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 if active:
                     active.prompt_id = prompt_id
 
-            self._emit_agent_event_best_effort(lease, "execution_started", {"promptId": prompt_id})
+            self._emit_agent_event_durable(lease, "execution_started", {"promptId": prompt_id})
 
             start_exec_ms = _now_ms()
             last_progress_emit_ms = 0
@@ -7423,7 +7423,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     active.history_entry = history_entry
                     active.prompt_id = prompt_id
             self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
-            self._emit_agent_event_best_effort(lease, "output_commit_started", {"promptId": prompt_id})
+            self._emit_agent_event_durable(lease, "output_commit_started", {"promptId": prompt_id})
 
             self._submit_agent_upload(lease)
             retain_lease = True
