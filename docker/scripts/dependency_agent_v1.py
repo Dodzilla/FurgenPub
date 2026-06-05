@@ -64,6 +64,7 @@ Optional knobs:
   - DM_AGENT_API_RETRY_BASE_SECONDS (initial agent API retry backoff; default: 1)
   - DM_AGENT_API_RETRY_MAX_SECONDS (max agent API retry backoff; default: 20)
   - DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS (extra retries for terminal job events; default: 8)
+  - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
   - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
@@ -114,7 +115,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.48"
+AGENT_VERSION = "dm-agent-py/0.9.49"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1785,6 +1786,10 @@ class AgentExecuteLease:
     prefetched_inputs: List[Dict[str, Any]] = field(default_factory=list)
     history_entry: Dict[str, Any] = field(default_factory=dict)
     tmp_root: Optional[str] = None
+    ready_at_ms: int = 0
+    execute_started_at_ms: int = 0
+    upload_enqueued_at_ms: int = 0
+    upload_started_at_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -2384,6 +2389,8 @@ class DependencyAgent:
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         self.agent_local_readiness_file = self._agent_local_readiness_file_env or "provisioning_complete.txt"
         self.agent_max_execute_workers = 0 if self.mining_only else max(1, min(8, _env_int("DM_AGENT_MAX_EXEC_WORKERS", 2)))
+        default_upload_workers = max(4, int(self.agent_max_execute_workers) * 2)
+        self.agent_max_upload_workers = 0 if self.mining_only else max(1, min(16, _env_int("DM_AGENT_MAX_UPLOAD_WORKERS", default_upload_workers)))
         self.asset_gen_v5_script = _env_str("DM_ASSET_GEN_V5_SCRIPT")
         self._resolved_local_comfy_base_url = self.agent_local_comfy_base_url
         self._last_local_comfy_discovery_ms = 0
@@ -3329,6 +3336,7 @@ class DependencyAgent:
                 "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
                 "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
                 "maxPrefetchJobs": int(self._agent_effective_prefetch_capacity()),
+                "maxUploadJobs": int(self.agent_max_upload_workers),
                 "inputCacheKeys": input_cache_inventory.get("keys", []),
                 "inputCacheKeyCount": int(input_cache_inventory.get("keyCount", 0)),
                 "inputCacheBytesUsed": int(input_cache_inventory.get("bytesUsed", 0)),
@@ -5059,6 +5067,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     "executionAttempt": lease.execution_attempt,
                     "attemptEpoch": lease.attempt_epoch,
                     "stage": lease.stage,
+                    **({"readyAgeMs": max(0, _now_ms() - int(lease.ready_at_ms))} if int(lease.ready_at_ms or 0) > 0 and lease.stage == "ready" else {}),
+                    **({"uploadWorkerQueueMs": max(0, _now_ms() - int(lease.upload_enqueued_at_ms))} if int(lease.upload_enqueued_at_ms or 0) > 0 and lease.stage == "uploading" else {}),
                 }
             )
         return out
@@ -5120,6 +5130,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             "runningItemIds": [row["itemId"] for row in held_leases if isinstance(row.get("itemId"), str)],
             "maxConcurrentExecuteJobs": int(self._agent_effective_execute_capacity()),
             "maxPrefetchJobs": int(self._agent_effective_prefetch_capacity()),
+            "maxUploadJobs": int(self.agent_max_upload_workers),
             "inputCacheKeys": input_cache_inventory.get("keys", []),
             "inputCacheKeyCount": int(input_cache_inventory.get("keyCount", 0)),
             "inputCacheBytesUsed": int(input_cache_inventory.get("bytesUsed", 0)),
@@ -5205,7 +5216,16 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     def _agent_stage_counts_payload(self) -> Dict[str, int]:
         with self._lock:
             counts = dict(self._agent_stage_counts_map_locked())
+            ready_ages = [
+                max(0, _now_ms() - int(lease.ready_at_ms))
+                for lease in self._active_exec_by_item.values()
+                if lease.stage == "ready" and int(lease.ready_at_ms or 0) > 0
+            ]
         counts["checkedAtMs"] = _now_ms()
+        upload_capacity = max(0, int(getattr(self, "agent_max_upload_workers", 0) or 0))
+        counts["uploadWorkerCapacity"] = upload_capacity
+        counts["uploadBacklog"] = max(0, int(counts.get("uploading", 0)) - upload_capacity)
+        counts["readyMaxAgeMs"] = max(ready_ages) if ready_ages else 0
         return counts
 
     def _next_agent_lease_order(self) -> int:
@@ -6635,6 +6655,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         )
 
         if should_stage:
+            upload_started_ms = _now_ms()
             gcs_resumable_upload_file(
                 staged_upload_url,
                 local_output,
@@ -6642,6 +6663,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 timeout_seconds=max(300.0, float(self.download_timeout_seconds)),
                 chunk_size=8 * 1024 * 1024,
             )
+            upload_ms = max(0, _now_ms() - upload_started_ms)
             out_meta: Dict[str, Any] = {
                 "logicalOutputKey": logical_key,
                 "attemptObjectPath": attempt_object_path,
@@ -6650,6 +6672,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 "sha256": sha256_sum,
                 "contentType": content_type,
                 "deliveryPath": "gcs_staged",
+                "uploadTiming": {
+                    "agentUploadMs": upload_ms,
+                    "agentUploadAttempts": 1,
+                    "deliveryPath": "gcs_staged",
+                },
             }
             bucket = target.get("bucket") if isinstance(target.get("bucket"), str) and target.get("bucket") else None
             if bucket:
@@ -6689,7 +6716,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         status = 0
         body = ""
         upload_attempts = max(1, int(getattr(self, "agent_upload_retry_attempts", 1) or 1))
+        attempts_used = 0
+        upload_started_ms = _now_ms()
         for attempt_idx in range(upload_attempts):
+            attempts_used = attempt_idx + 1
             try:
                 status, body, _resp_headers = http_put_file_stream(
                     upload_url,
@@ -6717,6 +6747,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 self._sleep_agent_api_retry("output upload", attempt_idx, RuntimeError(f"status={status}: {body[:200]}"))
                 continue
             break
+        upload_ms = max(0, _now_ms() - upload_started_ms)
         if status == 412:
             verify_url = target.get("verifyHeadUrl")
             if isinstance(verify_url, str) and verify_url:
@@ -6731,6 +6762,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         response_payload = _json_loads_or_none(body) if isinstance(body, str) and body else None
         response_data = response_payload.get("data") if isinstance(response_payload, dict) and isinstance(response_payload.get("data"), dict) else {}
         public_url = response_data.get("cdnUrl") if isinstance(response_data.get("cdnUrl"), str) and response_data.get("cdnUrl") else None
+        backend_timing = response_data.get("uploadTiming") if isinstance(response_data.get("uploadTiming"), dict) else None
 
         out_meta = {
             "logicalOutputKey": logical_key,
@@ -6744,6 +6776,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             "sha256": sha256_sum,
             "contentType": content_type,
             "deliveryPath": "direct_bunny",
+            "uploadTiming": {
+                "agentUploadMs": upload_ms,
+                "agentUploadAttempts": attempts_used,
+                "deliveryPath": "direct_bunny",
+                **({"backend": backend_timing} if backend_timing else {}),
+            },
             **({"publicUrl": public_url} if public_url else {}),
         }
         source_filename = target.get("sourceFilename") if isinstance(target.get("sourceFilename"), str) and target.get("sourceFilename") else filename
@@ -7158,6 +7196,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     def _submit_agent_upload(self, lease: AgentExecuteLease) -> None:
         if self._agent_upload_executor is None:
             raise RuntimeError("Agent upload executor is not initialized")
+        lease.upload_enqueued_at_ms = _now_ms()
         future = self._agent_upload_executor.submit(self._upload_agent_outputs, lease)
         with self._lock:
             self._agent_upload_inflight.add(future)
@@ -7270,6 +7309,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     return
                 active.prefetched_inputs = prefetched_inputs
                 active.stage = "ready"
+                active.ready_at_ms = _now_ms()
                 self._enqueue_ready_locked(active)
             retain_lease = True
             self._request_agent_queue_poll()
@@ -7324,6 +7364,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 prefetched_inputs = list(active.prefetched_inputs) if active else list(lease.prefetched_inputs)
                 if active:
                     active.stage = "executing"
+                    active.execute_started_at_ms = _now_ms()
+                    lease.execute_started_at_ms = active.execute_started_at_ms
+                else:
+                    lease.execute_started_at_ms = _now_ms()
 
             for entry in prefetched_inputs:
                 cache_path = entry.get("cache_path")
@@ -7462,6 +7506,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
     def _upload_agent_outputs(self, lease: AgentExecuteLease) -> None:
         terminal_sent = False
+        output_commit_started_ms = _now_ms()
+        lease.upload_started_at_ms = output_commit_started_ms
+        upload_worker_queue_ms = (
+            max(0, output_commit_started_ms - int(lease.upload_enqueued_at_ms))
+            if int(lease.upload_enqueued_at_ms or 0) > 0
+            else 0
+        )
         try:
             output_targets_initial = lease.command_state.get("outputTargets")
             if not isinstance(output_targets_initial, list) or len(output_targets_initial) == 0:
@@ -7507,14 +7558,18 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     continue
 
                 local_output = output_tmp_dir / f"{len(uploaded_outputs):02d}_{os.path.basename(filename)}"
+                download_started_ms = _now_ms()
                 http_download_to_file(
                     self._comfy_view_url(filename=filename, subfolder=subfolder if subfolder else None, file_type=file_type),
                     local_output,
                     timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
                     chunk_size=int(self.download_chunk_size),
                 )
+                download_ms = max(0, _now_ms() - download_started_ms)
                 bytes_written = int(local_output.stat().st_size)
+                hash_started_ms = _now_ms()
                 sha256_sum = sha256_file(local_output)
+                hash_ms = max(0, _now_ms() - hash_started_ms)
                 out_meta = self._upload_output_artifact(
                     lease,
                     target,
@@ -7523,6 +7578,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     bytes_written,
                     sha256_sum,
                 )
+                timing = out_meta.get("uploadTiming") if isinstance(out_meta.get("uploadTiming"), dict) else {}
+                out_meta["uploadTiming"] = {
+                    **timing,
+                    "agentDownloadFromComfyMs": download_ms,
+                    "agentHashMs": hash_ms,
+                    "agentUploadWorkerQueueMs": upload_worker_queue_ms,
+                }
                 uploaded_outputs.append(out_meta)
                 try:
                     self._emit_agent_event_best_effort(lease, "output_uploaded", out_meta)
@@ -7537,11 +7599,26 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             if not uploaded_outputs:
                 raise RuntimeError("No outputs were uploaded.")
 
-            completion_payload: Dict[str, Any] = {"outputs": uploaded_outputs}
+            completion_payload: Dict[str, Any] = {
+                "outputs": uploaded_outputs,
+                "agentTiming": {
+                    "uploadWorkerQueueMs": upload_worker_queue_ms,
+                    "outputCommitToTerminalEventStartMs": max(0, _now_ms() - output_commit_started_ms),
+                    "uploadWorkerCapacity": int(getattr(self, "agent_max_upload_workers", 0) or 0),
+                },
+            }
             if isinstance(lease.prompt_id, str) and lease.prompt_id:
                 completion_payload["promptId"] = lease.prompt_id
             try:
+                terminal_emit_started_ms = _now_ms()
                 self._emit_agent_event_durable(lease, "job_completed", completion_payload)
+                logging.info(
+                    "Agent job_completed event posted: jobId=%s terminalEventMs=%d uploadWorkerQueueMs=%d outputs=%d",
+                    lease.job_id,
+                    max(0, _now_ms() - terminal_emit_started_ms),
+                    upload_worker_queue_ms,
+                    len(uploaded_outputs),
+                )
             except Exception as terminal_err:
                 logging.error(
                     "job_completed terminal event failed after retries; leaving job for backend recovery instead of marking failed: jobId=%s err=%s",
@@ -7735,7 +7812,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
@@ -7746,6 +7823,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             self.agent_local_comfy_base_url,
             self.agent_local_readiness_file,
             int(self.agent_max_execute_workers),
+            int(self.agent_max_upload_workers),
             "yes" if self.mining_only else "no",
         )
         logging.info(
@@ -7772,7 +7850,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         agent_aux_workers = max(2, int(self.agent_max_execute_workers))
         self._agent_prefetch_executor = ThreadPoolExecutor(max_workers=agent_aux_workers)
         self._agent_execute_executor = ThreadPoolExecutor(max_workers=max(1, int(self.agent_max_execute_workers)))
-        self._agent_upload_executor = ThreadPoolExecutor(max_workers=agent_aux_workers)
+        self._agent_upload_executor = ThreadPoolExecutor(max_workers=max(1, int(self.agent_max_upload_workers)))
         self._agent_maintenance_executor = ThreadPoolExecutor(max_workers=1)
         with self._lock:
             self._agent_prefetch_inflight.clear()
