@@ -66,7 +66,6 @@ APT_PACKAGES=(
     "ffmpeg"
     "sox"
     "libgl1"
-    "libopengl0"
     "libglib2.0-0"
 )
 
