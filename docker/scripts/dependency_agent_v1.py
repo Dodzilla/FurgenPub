@@ -115,7 +115,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.49"
+AGENT_VERSION = "dm-agent-py/0.9.50"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -5194,7 +5194,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     def _agent_stage_counts_locked(self) -> Tuple[int, int, int]:
         counts = self._agent_stage_counts_map_locked()
         execute_count = int(counts.get("executing", 0))
-        prefetch_count = sum(int(counts.get(stage, 0)) for stage in ("leased", "prefetching", "ready", "waiting_dependencies"))
+        prefetch_count = sum(int(counts.get(stage, 0)) for stage in ("leased", "prefetching", "ready", "waiting_dependencies", "preparing_prompt"))
         upload_count = int(counts.get("uploading", 0))
         return execute_count, prefetch_count, upload_count
 
@@ -5204,6 +5204,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             "prefetching": 0,
             "ready": 0,
             "waiting_dependencies": 0,
+            "preparing_prompt": 0,
             "executing": 0,
             "uploading": 0,
             "finalizing": 0,
@@ -5256,7 +5257,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 lease = self._active_exec_by_item.get(item_id)
                 if not lease or lease.stage != "ready":
                     continue
-                lease.stage = "executing"
+                lease.stage = "preparing_prompt"
                 return lease
         return None
 
@@ -7362,12 +7363,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 prefetched_inputs = list(active.prefetched_inputs) if active else list(lease.prefetched_inputs)
-                if active:
-                    active.stage = "executing"
-                    active.execute_started_at_ms = _now_ms()
-                    lease.execute_started_at_ms = active.execute_started_at_ms
-                else:
-                    lease.execute_started_at_ms = _now_ms()
 
             for entry in prefetched_inputs:
                 cache_path = entry.get("cache_path")
@@ -7379,6 +7374,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 self._copy_input_to_comfy(Path(cache_path), input_name)
 
             workflow = self._parse_workflow_from_payload(lease.payload)
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                execute_started_at_ms = _now_ms()
+                if active:
+                    active.stage = "executing"
+                    active.execute_started_at_ms = execute_started_at_ms
+                lease.execute_started_at_ms = execute_started_at_ms
             self._stop_idle_prl_mining_for_work("execute_job")
             prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{lease.job_id}-{uuid.uuid4().hex[:12]}")
             with self._lock:
