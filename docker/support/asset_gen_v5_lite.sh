@@ -741,8 +741,14 @@ function provisioning_get_apt_packages() {
         packages_to_install=()
         local package_name
         for package_name in "${APT_PACKAGES[@]}"; do
+            local resolved_package_name="$package_name"
+            if [[ "$package_name" == "libglib2.0-0" ]] && dpkg-query -W -f='${Status}' "libglib2.0-0t64" 2>/dev/null | grep -Fq "install ok installed"; then
+                resolved_package_name="libglib2.0-0t64"
+            fi
             if dpkg-query -W -f='${Status}' "$package_name" 2>/dev/null | grep -Fq "install ok installed"; then
                 printf "Apt package already installed: %s\n" "$package_name"
+            elif [[ "$resolved_package_name" != "$package_name" ]]; then
+                printf "Apt package already installed: %s (satisfies %s)\n" "$resolved_package_name" "$package_name"
             else
                 packages_to_install+=("$package_name")
             fi
