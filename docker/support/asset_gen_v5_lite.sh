@@ -546,11 +546,13 @@ function provisioning_start() {
     fi
     provisioning_patch_comfyui_xformers_fallback || return 1
     provisioning_configure_pytorch_allocator_env || true
+    provisioning_configure_shared_library_paths || true
     provisioning_get_apt_packages || return 1
     provisioning_fetch_bootstrap_bundle_plan || return 1
     provisioning_install_selected_node_bundles || return 1
     provisioning_configure_comfyui_launch_args || true
     provisioning_configure_pytorch_allocator_env || true
+    provisioning_configure_shared_library_paths || true
     printf "Skipping Trellis2 model downloads in asset_gen_v5_lite provisioning.\n"
     provisioning_get_pip_packages || return 1
     # models are now installed by DM agent
@@ -566,6 +568,7 @@ function provisioning_install_requested_bundles() {
     provisioning_install_selected_node_bundles || return 1
     provisioning_configure_comfyui_launch_args || true
     provisioning_configure_pytorch_allocator_env || true
+    provisioning_configure_shared_library_paths || true
 }
 
 function provisioning_install_furgen_video_tools_node() {
@@ -784,6 +787,131 @@ function provisioning_get_apt_packages() {
 function provisioning_get_pip_packages() {
     if [[ -n $PIP_PACKAGES ]]; then
             pip install --no-cache-dir ${PIP_PACKAGES[@]}
+    fi
+}
+
+function provisioning_collect_runtime_library_dirs() {
+    local seen=":"
+    local dir
+    local candidates=(
+        "/venv/main/lib"
+        "/venv/main/lib/python3.12/site-packages/torch/lib"
+        "/opt/miniforge3/lib"
+        "/usr/local/cuda/lib64"
+        "/usr/lib/x86_64-linux-gnu"
+    )
+
+    for dir in "${candidates[@]}"; do
+        if [[ -d "${dir}" && "${seen}" != *":${dir}:"* ]]; then
+            printf "%s\n" "${dir}"
+            seen="${seen}${dir}:"
+        fi
+    done
+
+    while IFS= read -r dir; do
+        [[ -z "${dir}" ]] && continue
+        if [[ "${seen}" != *":${dir}:"* ]]; then
+            printf "%s\n" "${dir}"
+            seen="${seen}${dir}:"
+        fi
+    done < <(find /venv/main/lib -type d \( -path "*/site-packages/nvidia/*/lib" -o -path "*/site-packages/nvidia/cuda_runtime/lib" -o -path "*/site-packages/nvidia/cu*/lib" \) 2>/dev/null)
+}
+
+function provisioning_configure_shared_library_paths() {
+    local runtime_dirs=()
+    local runtime_dir
+    while IFS= read -r runtime_dir; do
+        [[ -n "${runtime_dir}" ]] && runtime_dirs+=("${runtime_dir}")
+    done < <(provisioning_collect_runtime_library_dirs)
+
+    if [[ ${#runtime_dirs[@]} -eq 0 ]]; then
+        printf "WARN: No runtime shared-library directories found for asset_gen_v5_lite.\n"
+        return 0
+    fi
+
+    local as_root=""
+    if command -v sudo >/dev/null 2>&1; then
+        as_root="sudo"
+    fi
+
+    for runtime_dir in "${runtime_dirs[@]}"; do
+        export LD_LIBRARY_PATH="${runtime_dir}:${LD_LIBRARY_PATH:-}"
+    done
+
+    {
+        for runtime_dir in "${runtime_dirs[@]}"; do
+            printf "%s\n" "${runtime_dir}"
+        done
+    } | ${as_root} tee /etc/ld.so.conf.d/furgen_asset_gen_v5_lite_runtime.conf >/dev/null || true
+    ${as_root} ldconfig || true
+
+    {
+        printf "# FURGEN asset_gen_v5_lite shared-library paths\n"
+        printf "export LD_LIBRARY_PATH=\""
+        local first=1
+        for runtime_dir in "${runtime_dirs[@]}"; do
+            if [[ ${first} -eq 0 ]]; then
+                printf ":"
+            fi
+            first=0
+            printf "%s" "${runtime_dir}"
+        done
+        printf ":\${LD_LIBRARY_PATH:-}\"\n"
+    } | ${as_root} tee /etc/profile.d/furgen_asset_gen_v5_lite_runtime.sh >/dev/null || true
+    ${as_root} chmod 644 /etc/profile.d/furgen_asset_gen_v5_lite_runtime.sh || true
+
+    local launch_script
+    launch_script="/opt/supervisor-scripts/comfyui.sh"
+    if [[ -f "${launch_script}" ]]; then
+        /venv/main/bin/python - "${launch_script}" "${runtime_dirs[@]}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+dirs = [d for d in sys.argv[2:] if d]
+source = path.read_text(encoding="utf-8")
+
+pattern = re.compile(
+    r"# FURGEN asset_gen_v5_lite shared-library bootstrap\n(?:.*\n)*?# /FURGEN asset_gen_v5_lite shared-library bootstrap\n",
+    re.MULTILINE,
+)
+source = pattern.sub("", source)
+
+lines = [
+    "# FURGEN asset_gen_v5_lite shared-library bootstrap",
+    "for _fcs_runtime_lib_dir in \\",
+]
+for index, directory in enumerate(dirs):
+    suffix = " \\" if index < len(dirs) - 1 else "; do"
+    lines.append(f'    "{directory}"{suffix}')
+lines.extend([
+    '    if [ -d "${_fcs_runtime_lib_dir}" ]; then',
+    '        export LD_LIBRARY_PATH="${_fcs_runtime_lib_dir}:${LD_LIBRARY_PATH:-}"',
+    "    fi",
+    "done",
+    "unset _fcs_runtime_lib_dir",
+    "# /FURGEN asset_gen_v5_lite shared-library bootstrap",
+])
+block = "\n".join(lines) + "\n"
+
+anchor = "# Launch ComfyUI\n"
+if anchor in source:
+    insert_at = source.find(anchor)
+else:
+    launch_idx = source.find("python main.py")
+    insert_at = source.rfind("\n", 0, launch_idx) + 1 if launch_idx != -1 else 0
+
+patched = source[:insert_at] + block + source[insert_at:]
+if patched != path.read_text(encoding="utf-8"):
+    path.write_text(patched, encoding="utf-8")
+    print("Applied asset_gen_v5_lite shared-library launch bootstrap.")
+else:
+    print("asset_gen_v5_lite shared-library launch bootstrap already present.")
+PY
+        chmod +x "${launch_script}" || true
+    else
+        printf "WARN: ComfyUI launch script not found for shared-library bootstrap: %s\n" "${launch_script}"
     fi
 }
 
