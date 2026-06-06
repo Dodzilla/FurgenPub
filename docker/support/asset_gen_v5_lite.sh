@@ -423,6 +423,63 @@ function pin_node_to_ref() {
     return 0
 }
 
+function provisioning_download_node_archive() {
+    local repo="$1"; shift
+    local dir="$1"; shift
+    local ref="$1"; shift
+    local path="$1"
+
+    if [[ -z "${ref}" ]]; then
+        printf "ERROR: Cannot download archive for %s without a pinned ref.\n" "${dir}"
+        return 1
+    fi
+
+    printf "Downloading node archive fallback for %s at %s...\n" "${dir}" "${ref}"
+    /venv/main/bin/python - "${repo}" "${ref}" "${path}" <<'PY'
+import io
+import pathlib
+import re
+import shutil
+import sys
+import tarfile
+import tempfile
+import urllib.parse
+import urllib.request
+
+repo = sys.argv[1].strip()
+ref = sys.argv[2].strip()
+dest = pathlib.Path(sys.argv[3])
+
+match = re.search(r"github\.com[:/](?P<owner>[^/]+)/(?P<name>[^/#?]+?)(?:\.git)?(?:[/?#].*)?$", repo)
+if not match:
+    raise SystemExit(f"unsupported GitHub repo URL for archive fallback: {repo}")
+
+owner = match.group("owner")
+name = match.group("name")
+url = f"https://codeload.github.com/{owner}/{name}/tar.gz/{urllib.parse.quote(ref, safe='')}"
+print(f"Fetching {url}")
+
+with urllib.request.urlopen(url, timeout=120) as response:
+    data = response.read()
+
+with tempfile.TemporaryDirectory(prefix="furgen_node_archive_") as tmp_name:
+    tmp = pathlib.Path(tmp_name)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        archive.extractall(tmp)
+
+    children = [child for child in tmp.iterdir() if child.is_dir()]
+    if len(children) != 1:
+        raise SystemExit(f"unexpected archive layout for {repo}@{ref}: {children}")
+
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(children[0]), str(dest))
+
+print(f"Installed {repo}@{ref} to {dest}")
+PY
+}
+
 function provisioning_update_comfyui() {
     if [[ -z "${COMFYUI_PIN_COMMIT}" ]]; then
         printf "Using ComfyUI from the base image; no ComfyUI pin requested for asset_gen_v5_lite.\n"
@@ -925,7 +982,13 @@ function provisioning_get_nodes() {
                 printf "Updating node: %s...\n" "${repo}"
                 ( cd "$path" && git pull )
             fi
-            pin_node_to_ref "$dir" "$path" || return 1
+            if ! pin_node_to_ref "$dir" "$path"; then
+                if [[ -n "${NODE_PINS[$dir]:-}" ]]; then
+                    provisioning_download_node_archive "$repo" "$dir" "${NODE_PINS[$dir]}" "$path" || return 1
+                else
+                    return 1
+                fi
+            fi
             if should_skip_node_requirements "$dir"; then
                printf "Skipping requirements install for node %s to avoid slow source-build dependencies.\n" "$dir"
             elif [[ -e $requirements ]]; then
@@ -942,20 +1005,23 @@ function provisioning_get_nodes() {
                     cd "$path" || exit 1
                     git init && \
                         git remote add origin "$repo"
-                    git fetch --depth=1 origin "${NODE_PINS[$dir]}" || \
+                        git fetch --depth=1 origin "${NODE_PINS[$dir]}" || \
                         git fetch --depth=1 origin "refs/tags/${NODE_PINS[$dir]}:refs/tags/${NODE_PINS[$dir]}" || \
                         git fetch --all --tags
                 ) || {
                     printf "ERROR: Failed to initialize shallow clone for node repo %s\n" "${repo}"
-                    return 1
+                    provisioning_download_node_archive "$repo" "$dir" "${NODE_PINS[$dir]}" "$path" || return 1
                 }
+                if [[ -d "${path}/.git" ]] && ! pin_node_to_ref "$dir" "$path"; then
+                    provisioning_download_node_archive "$repo" "$dir" "${NODE_PINS[$dir]}" "$path" || return 1
+                fi
             else
                 git clone "${repo}" "${path}" --recursive || {
                     printf "ERROR: Failed to clone node repo %s\n" "${repo}"
                     return 1
                 }
+                pin_node_to_ref "$dir" "$path" || return 1
             fi
-            pin_node_to_ref "$dir" "$path" || return 1
             if should_skip_node_requirements "$dir"; then
                 printf "Skipping requirements install for node %s to avoid slow source-build dependencies.\n" "$dir"
             elif [[ -e $requirements ]]; then
