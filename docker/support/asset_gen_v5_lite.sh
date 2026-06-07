@@ -2197,7 +2197,7 @@ source = legacy_args_pattern.sub("", source)
 
 block = (
     "# FURGEN ComfyUI launch args normalization\n"
-    "COMFYUI_ARGS=${COMFYUI_ARGS:---disable-auto-launch --port 18188 --enable-cors-header}\n"
+    "COMFYUI_ARGS=${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header}\n"
     "COMFYUI_ARGS=\"${COMFYUI_ARGS// --disable-cuda-malloc/}\"\n"
     "COMFYUI_ARGS=\"${COMFYUI_ARGS//--disable-cuda-malloc/}\"\n"
     "asset_gen_v5_disable_cuda_malloc=\"$(printf '%s' \"${ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC:-false}\" | tr '[:upper:]' '[:lower:]')\"\n"
