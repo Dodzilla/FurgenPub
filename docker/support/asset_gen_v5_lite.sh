@@ -93,6 +93,7 @@ BOOTSTRAP_PLAN_JSON=""
 # required for the current asset_gen image workflows and can stall provisioning.
 SKIP_NODE_REQUIREMENTS=(
     "ComfyUI-Impact-Pack"
+    "was-node-suite-comfyui"
 )
 
 UNPINNED_NODE_DIRS=(
@@ -603,11 +604,15 @@ function provisioning_start() {
     provisioning_patch_comfyui_xformers_fallback || return 1
     provisioning_configure_pytorch_allocator_env || true
     provisioning_configure_shared_library_paths || true
+    provisioning_repair_torch_cuda_import || true
+    provisioning_configure_shared_library_paths || true
     provisioning_get_apt_packages || return 1
     provisioning_fetch_bootstrap_bundle_plan || return 1
     provisioning_install_selected_node_bundles || return 1
     provisioning_configure_comfyui_launch_args || true
     provisioning_configure_pytorch_allocator_env || true
+    provisioning_configure_shared_library_paths || true
+    provisioning_repair_torch_cuda_import || true
     provisioning_configure_shared_library_paths || true
     printf "Skipping Trellis2 model downloads in asset_gen_v5_lite provisioning.\n"
     provisioning_get_pip_packages || return 1
@@ -928,27 +933,21 @@ path = pathlib.Path(sys.argv[1])
 dirs = [d for d in sys.argv[2:] if d]
 source = path.read_text(encoding="utf-8")
 
+def _shell_double_quote(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+
 pattern = re.compile(
     r"# FURGEN asset_gen_v5_lite shared-library bootstrap\n(?:.*\n)*?# /FURGEN asset_gen_v5_lite shared-library bootstrap\n",
     re.MULTILINE,
 )
 source = pattern.sub("", source)
 
+ld_path = ":".join(_shell_double_quote(directory) for directory in dirs)
 lines = [
     "# FURGEN asset_gen_v5_lite shared-library bootstrap",
-    "for _fcs_runtime_lib_dir in \\",
-]
-for index, directory in enumerate(dirs):
-    suffix = " \\" if index < len(dirs) - 1 else "; do"
-    lines.append(f'    "{directory}"{suffix}')
-lines.extend([
-    '    if [ -d "${_fcs_runtime_lib_dir}" ]; then',
-    '        export LD_LIBRARY_PATH="${_fcs_runtime_lib_dir}:${LD_LIBRARY_PATH:-}"',
-    "    fi",
-    "done",
-    "unset _fcs_runtime_lib_dir",
+    f'export LD_LIBRARY_PATH="{ld_path}:${{LD_LIBRARY_PATH:-}}"',
     "# /FURGEN asset_gen_v5_lite shared-library bootstrap",
-])
+]
 block = "\n".join(lines) + "\n"
 
 anchor = "# Launch ComfyUI\n"
@@ -969,6 +968,32 @@ PY
     else
         printf "WARN: ComfyUI launch script not found for shared-library bootstrap: %s\n" "${launch_script}"
     fi
+}
+
+function provisioning_repair_torch_cuda_import() {
+    if /venv/main/bin/python - <<'PY' >/dev/null 2>&1
+import torch
+print(torch.__version__)
+PY
+    then
+        printf "Torch CUDA import check passed.\n"
+        return 0
+    fi
+
+    printf "WARN: Torch import failed; reinstalling pinned CUDA 12.8 torch stack for asset_gen_v5_lite.\n"
+    pip install --no-cache-dir --force-reinstall \
+        --index-url https://download.pytorch.org/whl/cu128 \
+        "torch==2.10.0+cu128" \
+        "torchvision==0.25.0+cu128" \
+        "torchaudio==2.10.0+cu128" || {
+            printf "ERROR: Failed to reinstall pinned CUDA torch stack.\n"
+            return 1
+        }
+
+    /venv/main/bin/python - <<'PY'
+import torch
+print(f"Torch CUDA import repaired: torch={torch.__version__} cuda_available={torch.cuda.is_available()}")
+PY
 }
 
 function provisioning_get_nodes() {
