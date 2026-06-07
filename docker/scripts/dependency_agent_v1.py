@@ -115,7 +115,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.50"
+AGENT_VERSION = "dm-agent-py/0.9.51"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -5356,6 +5356,61 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             if isinstance(inline_json, dict):
                 return inline_json
             raise RuntimeError("inline workflow missing inlineJson")
+        if mode in ("download_url", "url"):
+            download_url = workflow_ref.get("downloadUrl")
+            if not isinstance(download_url, str) or not download_url.strip():
+                raise RuntimeError("download_url workflow missing downloadUrl")
+            expected_size_raw = workflow_ref.get("expectedSizeBytes")
+            expected_size = int(expected_size_raw) if isinstance(expected_size_raw, (int, float)) and expected_size_raw > 0 else 0
+            if expected_size > 32 * 1024 * 1024:
+                raise RuntimeError(f"download_url workflow too large: {expected_size} bytes")
+            expected_sha = workflow_ref.get("sha256")
+            expected_sha_norm = expected_sha.strip().lower() if isinstance(expected_sha, str) and re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha.strip()) else ""
+            cache_name = f"{expected_sha_norm or uuid.uuid4().hex}.json"
+            cache_path = self.workspace / "workflow_payloads" / cache_name
+
+            cache_valid = False
+            if cache_path.exists():
+                try:
+                    if expected_size > 0 and int(cache_path.stat().st_size) != expected_size:
+                        cache_valid = False
+                    elif expected_sha_norm and sha256_file(cache_path).lower() != expected_sha_norm:
+                        cache_valid = False
+                    else:
+                        cache_valid = True
+                except Exception:
+                    cache_valid = False
+
+            if not cache_valid:
+                tmp_path = cache_path.with_suffix(".tmp")
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+                http_download_to_file(
+                    download_url.strip(),
+                    tmp_path,
+                    timeout_seconds=max(30.0, min(float(self.download_timeout_seconds), 300.0)),
+                    chunk_size=int(self.download_chunk_size),
+                    user_agent=f"{AGENT_VERSION} workflow-fetch",
+                )
+                if expected_size > 0 and int(tmp_path.stat().st_size) != expected_size:
+                    raise RuntimeError(
+                        f"workflow download size mismatch: expected {expected_size} got {int(tmp_path.stat().st_size)}"
+                    )
+                if expected_sha_norm:
+                    actual_sha = sha256_file(tmp_path).lower()
+                    if actual_sha != expected_sha_norm:
+                        raise RuntimeError(f"workflow download checksum mismatch: expected {expected_sha_norm} got {actual_sha}")
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(str(tmp_path), str(cache_path))
+
+            raw = cache_path.read_text("utf-8")
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            raise RuntimeError("downloaded workflow is not a JSON object")
         raise RuntimeError(f"Unsupported workflowRef.mode: {mode}")
 
     def _input_cache_expected_size_bytes(self, row: Dict[str, Any]) -> int:
