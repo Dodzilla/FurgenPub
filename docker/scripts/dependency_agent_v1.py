@@ -119,7 +119,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.53"
+AGENT_VERSION = "dm-agent-py/0.9.54"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3315,6 +3315,8 @@ class DependencyAgent:
             timeout_seconds=timeout_seconds,
         )
         if status == 200:
+            if resp == "null":
+                return None
             return resp
         if status == 204:
             return None
@@ -3423,7 +3425,7 @@ class DependencyAgent:
         except Exception as e:
             logging.warning("RTDB queue read failed for %s: %s", queue_path_key, e)
             return None
-        if raw is None:
+        if raw is None or raw == "null":
             return []
         if not isinstance(raw, dict):
             logging.warning("RTDB queue root for %s was not an object; falling back to HTTP.", queue_path_key)
