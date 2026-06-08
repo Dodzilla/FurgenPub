@@ -119,7 +119,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.54"
+AGENT_VERSION = "dm-agent-py/0.9.55"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1896,6 +1896,10 @@ class PrlMinerController:
                 out["lastAutoRestartAttemptAtMs"] = int(self._last_auto_restart_attempt_ms)
             if self._last_auto_restart_reason:
                 out["lastAutoRestartReason"] = self._last_auto_restart_reason
+            if self._paused_start_payload:
+                out["pausedForWork"] = True
+                if self._paused_reason:
+                    out["pausedReason"] = self._paused_reason
         try:
             existing_pids = self._find_existing_miner_pids()
             out["minerProcessCount"] = int(len(existing_pids))
@@ -2372,6 +2376,15 @@ class DependencyAgent:
             self.download_timeout_seconds,
             self.download_chunk_size,
         )
+        self.idle_prl_free_comfy_before_start = _env_bool("DM_IDLE_PRL_FREE_COMFY_BEFORE_START", True)
+        self.idle_prl_free_comfy_min_interval_ms = int(
+            max(5.0, min(600.0, _env_float("DM_IDLE_PRL_FREE_COMFY_MIN_INTERVAL_SECONDS", 30.0))) * 1000
+        )
+        self.idle_prl_free_comfy_timeout_seconds = max(
+            2.0,
+            min(30.0, _env_float("DM_IDLE_PRL_FREE_COMFY_TIMEOUT_SECONDS", 10.0)),
+        )
+        self._last_idle_prl_comfy_free_ms = 0
 
         # Agent control channel knobs (execute pull mode).
         self.agent_control_enabled = _env_bool("DM_AGENT_CONTROL_ENABLED", True)
@@ -2642,6 +2655,38 @@ class DependencyAgent:
         except Exception as e:
             logging.warning("Failed stopping idle PRL miner before %s: %s", reason, e)
 
+    def _free_local_comfy_for_idle_prl_mining(self, reason: str) -> None:
+        if self.mining_only or not self.idle_prl_free_comfy_before_start:
+            return
+        now_ms = _now_ms()
+        if (
+            self._last_idle_prl_comfy_free_ms > 0 and
+            now_ms - self._last_idle_prl_comfy_free_ms < self.idle_prl_free_comfy_min_interval_ms
+        ):
+            return
+        self._last_idle_prl_comfy_free_ms = now_ms
+        try:
+            timeout = self.idle_prl_free_comfy_timeout_seconds
+            base_url = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=min(5.0, timeout))
+            status, _resp = api_json(
+                "POST",
+                f"{base_url}/free",
+                body={"unload_models": True, "free_memory": True},
+                timeout_seconds=timeout,
+            )
+            logging.info(
+                "Requested local Comfy memory free before idle PRL miner start reason=%s status=%s baseUrl=%s",
+                reason or "unspecified",
+                status,
+                base_url,
+            )
+        except Exception as e:
+            logging.warning(
+                "Failed freeing local Comfy memory before idle PRL miner start reason=%s: %s",
+                reason or "unspecified",
+                e,
+            )
+
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
@@ -2651,6 +2696,16 @@ class DependencyAgent:
                 return
             if self._pending_self_update is not None:
                 return
+            miner_snapshot = self._idle_prl_miner.snapshot()
+            should_attempt_resume = bool(miner_snapshot.get("pausedForWork"))
+            if (
+                should_attempt_resume or
+                (
+                    str(miner_snapshot.get("desiredState") or "") in ("running", "starting") and
+                    str(miner_snapshot.get("state") or "") != "running"
+                )
+            ):
+                self._free_local_comfy_for_idle_prl_mining(reason)
             resumed = self._idle_prl_miner.resume_if_paused(reason)
             restarted = False if resumed else self._idle_prl_miner.restart_if_desired(reason)
             if resumed or restarted:
@@ -6349,6 +6404,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             )
 
     def _agent_handle_prl_miner_command(self, item: Dict[str, Any]) -> None:
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        action = str(payload.get("action") or "").strip().lower()
+        if action == "start":
+            self._free_local_comfy_for_idle_prl_mining("prl_miner_start_command")
         self._idle_prl_miner.handle_command(item, self._agent_ack)
 
     def _resolve_auth_header(self, auth: Optional[str]) -> Optional[str]:
