@@ -57,6 +57,8 @@ Optional knobs:
   - DM_AGENT_POLL_SECONDS         (poll cadence for /agent/queue; default: 2)
   - DM_AGENT_HEARTBEAT_SECONDS    (heartbeat cadence for /agent/heartbeat; default: 8)
   - DM_AGENT_QUEUE_WAIT_SEC       (long-poll waitSec for /agent/queue; default: 2)
+  - DM_AGENT_RTDB_SIGNAL_WAIT_ENABLED (when RTDB coordination is healthy, wait locally for queue signals; default: true)
+  - DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS (minimum fallback /agent/queue probe when signal stream is healthy; default: 60)
   - DM_AGENT_WAITING_DEPS_EVENT_SECONDS (waiting_dependencies event cadence; default: 60)
   - DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS (dependency readiness poll while waiting; default: 0.5)
   - DM_AGENT_PROGRESS_EVENT_SECONDS (execution_progress event cadence; default: 60)
@@ -115,7 +117,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.51"
+AGENT_VERSION = "dm-agent-py/0.9.52"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2373,6 +2375,11 @@ class DependencyAgent:
         self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 2.0))
         self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 8.0))
         self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
+        self.agent_rtdb_signal_wait_enabled = _env_bool("DM_AGENT_RTDB_SIGNAL_WAIT_ENABLED", True)
+        self.agent_rtdb_signal_safety_min_seconds = max(
+            15.0,
+            min(600.0, _env_float("DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS", 60.0)),
+        )
         self.agent_full_capacity_poll_seconds = max(5.0, min(300.0, _env_float("DM_AGENT_FULL_CAPACITY_POLL_SECONDS", 30.0)))
         self.agent_waiting_deps_event_ms = int(max(15.0, _env_float("DM_AGENT_WAITING_DEPS_EVENT_SECONDS", 60.0)) * 1000)
         self.agent_dependency_wait_poll_seconds = max(0.1, min(5.0, _env_float("DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS", 0.5)))
@@ -2460,7 +2467,9 @@ class DependencyAgent:
         self._coordination_stream_thread: Optional[threading.Thread] = None
         self._coordination_stream_stop = threading.Event()
         self._coordination_stream_healthy = False
-        self._coordination_http_checkpoint_due_ms = 0
+        self._coordination_dependency_http_checkpoint_due_ms = 0
+        self._coordination_agent_http_checkpoint_due_ms = 0
+        self._last_agent_http_transition_signature = ""
 
         # Best-effort local reconciliation (no API calls).
         with self._lock:
@@ -3078,7 +3087,8 @@ class DependencyAgent:
         self._coordination_id_token = None
         self._coordination_refresh_token = None
         self._coordination_id_token_expires_at_ms = 0
-        self._coordination_http_checkpoint_due_ms = 0
+        self._coordination_dependency_http_checkpoint_due_ms = 0
+        self._coordination_agent_http_checkpoint_due_ms = 0
         self._coordination_restart_stream()
         if had_coordination and not had_stream_healthy:
             self._request_agent_queue_poll()
@@ -3100,13 +3110,15 @@ class DependencyAgent:
         self._coordination_id_token = None
         self._coordination_refresh_token = None
         self._coordination_id_token_expires_at_ms = 0
-        self._coordination_http_checkpoint_due_ms = 0
+        self._coordination_dependency_http_checkpoint_due_ms = 0
+        self._coordination_agent_http_checkpoint_due_ms = 0
         logging.info(
-            "RTDB coordination enabled from %s: db=%s dependencySafetyPoll=%.1fs agentSafetyPoll=%.1fs checkpoint=%.0fs",
+            "RTDB coordination enabled from %s: db=%s dependencySafetyPoll=%.1fs agentSafetyPoll=%.1fs agentSignalSafetyMin=%.1fs checkpoint=%.0fs",
             source,
             _safe_url_for_logs(str(normalized.get("databaseUrl") or "")),
             float(normalized["safetyPollSeconds"]["dependencies"]),
             float(normalized["safetyPollSeconds"]["agent"]),
+            float(self.agent_rtdb_signal_safety_min_seconds),
             float(normalized["firestoreCheckpointSeconds"]),
         )
         self._coordination_restart_stream()
@@ -3145,7 +3157,7 @@ class DependencyAgent:
             logging.info("Applied agent runtime config from %s: %s", source, ", ".join(changes))
 
     def _coordination_should_use_safety_polls(self) -> bool:
-        return bool(self._coordination and self._coordination_stream_healthy)
+        return bool(self._coordination and self._coordination_stream_healthy and self.agent_rtdb_signal_wait_enabled)
 
     def _coordination_dependency_poll_seconds(self) -> float:
         if self._coordination_should_use_safety_polls():
@@ -3154,24 +3166,39 @@ class DependencyAgent:
 
     def _coordination_agent_poll_seconds(self) -> float:
         if self._coordination_should_use_safety_polls():
-            return float(self._coordination["safetyPollSeconds"]["agent"])
+            return max(
+                float(self._coordination["safetyPollSeconds"]["agent"]),
+                float(self.agent_rtdb_signal_safety_min_seconds),
+            )
         return float(self.agent_poll_seconds)
 
-    def _coordination_http_checkpoint_due(self, now_ms: Optional[int] = None) -> bool:
+    def _coordination_http_checkpoint_due(self, now_ms: Optional[int] = None, channel: str = "dependencyManager") -> bool:
         if not self._coordination:
             return True
         if self._coordination.get("legacyHttpFallback") is not True:
             return False
         at_ms = int(now_ms if isinstance(now_ms, int) else _now_ms())
-        return at_ms >= int(self._coordination_http_checkpoint_due_ms)
+        due_ms = (
+            self._coordination_agent_http_checkpoint_due_ms
+            if channel == "agentControl"
+            else self._coordination_dependency_http_checkpoint_due_ms
+        )
+        return at_ms >= int(due_ms)
 
-    def _coordination_note_http_checkpoint(self, now_ms: Optional[int] = None) -> None:
+    def _coordination_note_http_checkpoint(self, now_ms: Optional[int] = None, channel: str = "dependencyManager") -> None:
         at_ms = int(now_ms if isinstance(now_ms, int) else _now_ms())
         if not self._coordination:
-            self._coordination_http_checkpoint_due_ms = at_ms
+            if channel == "agentControl":
+                self._coordination_agent_http_checkpoint_due_ms = at_ms
+            else:
+                self._coordination_dependency_http_checkpoint_due_ms = at_ms
             return
         interval_sec = float(self._coordination.get("firestoreCheckpointSeconds") or 60.0)
-        self._coordination_http_checkpoint_due_ms = at_ms + int(max(300.0, interval_sec) * 1000)
+        next_due_ms = at_ms + int(max(300.0, interval_sec) * 1000)
+        if channel == "agentControl":
+            self._coordination_agent_http_checkpoint_due_ms = next_due_ms
+        else:
+            self._coordination_dependency_http_checkpoint_due_ms = next_due_ms
 
     def _coordination_runtime_retry_delay_seconds(self, attempt: int) -> float:
         return min(2.0, 0.5 * (2 ** max(0, int(attempt))))
@@ -3358,6 +3385,43 @@ class DependencyAgent:
 
     def _write_agent_runtime_mirror(self) -> bool:
         return self._coordination_patch_runtime(self._collect_agent_runtime_payload(), timeout_seconds=10.0)
+
+    def _agent_runtime_transition_signature(self, body: Dict[str, Any]) -> str:
+        stage_counts_raw = body.get("stageCounts") if isinstance(body.get("stageCounts"), dict) else {}
+        stage_counts = {
+            key: int(stage_counts_raw.get(key) or 0)
+            for key in (
+                "leased",
+                "prefetching",
+                "ready",
+                "waiting_dependencies",
+                "preparing_prompt",
+                "executing",
+                "uploading",
+                "uploadWorkerCapacity",
+                "uploadBacklog",
+            )
+        }
+        idle_raw = body.get("idleMining") if isinstance(body.get("idleMining"), dict) else {}
+        idle_signature = {
+            key: idle_raw.get(key)
+            for key in ("desired", "running", "state", "enabled", "active", "lastError")
+            if key in idle_raw
+        }
+        payload = {
+            "localComfyReachable": body.get("localComfyReachable") is True,
+            "localReadinessFilePresent": body.get("localReadinessFilePresent") is True,
+            "localReadinessFile": str(body.get("localReadinessFile") or ""),
+            "queueDepth": int(body.get("queueDepth") or 0),
+            "runningItemIds": sorted([str(v) for v in body.get("runningItemIds", []) if isinstance(v, str)]),
+            "stageCounts": stage_counts,
+            "inputCacheKeyCount": int(body.get("inputCacheKeyCount") or 0),
+            "inputCacheBytesUsed": int(body.get("inputCacheBytesUsed") or 0),
+            "inputCacheMaxBytes": int(body.get("inputCacheMaxBytes") or 0),
+            "inputCacheInventoryTruncated": body.get("inputCacheInventoryTruncated") is True,
+            "idleMining": idle_signature,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     def _coordination_handle_stream_event(self, event_name: str, raw_data: str) -> None:
         event = (event_name or "").strip().lower()
@@ -4769,7 +4833,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         if status != 200 or not isinstance(resp, dict):
             raise RuntimeError(f"Unexpected heartbeat response: {status} {resp}")
         self._maybe_queue_self_update(resp.get("agentUpdate"), "dependencies/heartbeat")
-        self._coordination_note_http_checkpoint(now_ms)
+        self._coordination_note_http_checkpoint(now_ms, channel="dependencyManager")
         self._last_heartbeat_ms = now_ms
 
     def _fetch_queue(self, limit: int = 20) -> List[Dict[str, Any]]:
@@ -5146,12 +5210,28 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 "miningOnly": bool(self.mining_only),
             },
         }
+        now_ms = _now_ms()
+        transition_signature = self._agent_runtime_transition_signature(body)
+        has_active_agent_work = len(held_leases) > 0
+        rtdb_ok = True
         if self._coordination:
-            self._write_agent_runtime_mirror()
+            rtdb_ok = self._write_agent_runtime_mirror()
+        if (
+            self._coordination
+            and rtdb_ok
+            and not has_active_agent_work
+            and not self._coordination_http_checkpoint_due(now_ms, channel="agentControl")
+            and transition_signature == self._last_agent_http_transition_signature
+        ):
+            self._last_agent_heartbeat_ms = now_ms
+            return {}
+
         resp = self._agent_api("POST", "/agent/heartbeat", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         self._apply_agent_runtime_config(data.get("agentRuntimeConfig"), "/agent/heartbeat")
         self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/heartbeat")
+        self._coordination_note_http_checkpoint(now_ms, channel="agentControl")
+        self._last_agent_http_transition_signature = transition_signature
         self._last_agent_heartbeat_ms = _now_ms()
 
         lease_results = data.get("leases")
@@ -7869,11 +7949,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
             int(self.agent_queue_wait_sec),
+            "yes" if self.agent_rtdb_signal_wait_enabled else "no",
+            float(self.agent_rtdb_signal_safety_min_seconds),
             self.agent_full_capacity_poll_seconds,
             self.agent_progress_event_ms / 1000.0,
             self.agent_waiting_deps_event_ms / 1000.0,
