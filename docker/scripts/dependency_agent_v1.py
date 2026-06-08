@@ -119,11 +119,19 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.55"
+AGENT_VERSION = "dm-agent-py/0.9.56"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
+PRL_MINER_SHARE_SIGNAL_RE = re.compile(
+    r"\b(accepted|rejected|share submission returned error|stratum error response|dropped reason=|action=drop_share|action=reconnect_drop_ambiguous_share)\b",
+    re.IGNORECASE,
+)
+PRL_MINER_POOL_ERROR_RE = re.compile(
+    r"(stratum (?:connection closed|recv timeout|recv\(\) failed|send\(\) failed|send\(\) timed out)|pool did not accept|share submission returned error)",
+    re.IGNORECASE,
+)
 HASHRATE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?H)\s*/?\s*s(?:ec)?", re.IGNORECASE)
 ALPHA_HASHRATE_RE = re.compile(r"\bhashrate_th_s=(?P<value>\d+(?:\.\d+)?)\b", re.IGNORECASE)
 
@@ -163,6 +171,21 @@ def _parse_latest_hashrate_from_text(text: str) -> Tuple[Optional[float], str]:
     if latest_hps is None:
         return None, ""
     return latest_hps, _format_hps(latest_hps)
+
+
+def _parse_prl_miner_log_signals(text: str) -> Dict[str, Any]:
+    lower = (text or "").lower()
+    accepted = len(re.findall(r"\baccepted\b", lower))
+    rejected = len(re.findall(r"\brejected\b", lower))
+    share_errors = len(PRL_MINER_POOL_ERROR_RE.findall(text or ""))
+    share_signals = len(PRL_MINER_SHARE_SIGNAL_RE.findall(text or ""))
+    return {
+        "accepted": accepted,
+        "rejected": rejected,
+        "shareErrors": share_errors,
+        "hasShareSignal": share_signals > 0,
+        "poolHealthy": accepted > 0,
+    }
 
 
 def _read_tail_text(path: Path, max_bytes: int = 32768) -> str:
@@ -1916,10 +1939,11 @@ class PrlMinerController:
                     out["localHashrateHps"] = float(hps)
                     out["localHashrateText"] = text
                 if tail:
-                    lower_tail = tail.lower()
-                    out["recentAcceptedShares"] = lower_tail.count("accepted")
-                    out["recentRejectedShares"] = lower_tail.count("rejected")
-                    if any(token in lower_tail for token in ("accepted", "rejected", "share", "job", "stratum")):
+                    signals = _parse_prl_miner_log_signals(tail)
+                    out["recentAcceptedShares"] = int(signals["accepted"])
+                    out["recentRejectedShares"] = int(signals["rejected"])
+                    out["recentShareErrors"] = int(signals["shareErrors"])
+                    if signals["hasShareSignal"]:
                         out["lastShareLikeLogAtMs"] = int(stat.st_mtime * 1000)
         except Exception as exc:
             out["telemetryError"] = str(exc)[:300]
@@ -1930,7 +1954,7 @@ class PrlMinerController:
             "gpuPowerDrawW": out.get("gpuPowerDrawW"),
             "localHashrateHps": out.get("localHashrateHps"),
             "localHashrateText": out.get("localHashrateText"),
-            "poolConnected": bool(self._pool_url and out.get("state") in ("running", "starting")),
+            "poolConnected": bool(self._pool_url and out.get("state") in ("running", "starting") and int(out.get("recentAcceptedShares") or 0) > 0),
             "lastShareLikeLogAtMs": out.get("lastShareLikeLogAtMs"),
             "lastTelemetryAtMs": int(_now_ms()),
             "telemetryError": out.get("telemetryError"),
@@ -2293,8 +2317,12 @@ class PrlMinerController:
             backoff_ms = 5_000
         elif failures == 3:
             backoff_ms = 15_000
+        elif failures <= 6:
+            backoff_ms = 60_000
+        elif failures <= 10:
+            backoff_ms = 5 * 60_000
         else:
-            backoff_ms = 30_000
+            backoff_ms = 15 * 60_000
         if last_attempt_ms > 0 and now_ms - last_attempt_ms < backoff_ms:
             return False
 
