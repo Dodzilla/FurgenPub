@@ -59,6 +59,8 @@ Optional knobs:
   - DM_AGENT_QUEUE_WAIT_SEC       (long-poll waitSec for /agent/queue; default: 2)
   - DM_AGENT_RTDB_SIGNAL_WAIT_ENABLED (when RTDB coordination is healthy, wait locally for queue signals; default: true)
   - DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS (minimum fallback /agent/queue probe when signal stream is healthy; default: 60)
+  - DM_AGENT_RTDB_QUEUE_CLAIM_ENABLED (allow server-gated direct RTDB queue claims; default: true)
+  - DM_AGENT_RTDB_LEASE_HEARTBEAT_ENABLED (allow server-gated active lease heartbeats through RTDB; default: true)
   - DM_AGENT_WAITING_DEPS_EVENT_SECONDS (waiting_dependencies event cadence; default: 60)
   - DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS (dependency readiness poll while waiting; default: 0.5)
   - DM_AGENT_PROGRESS_EVENT_SECONDS (execution_progress event cadence; default: 60)
@@ -117,7 +119,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.52"
+AGENT_VERSION = "dm-agent-py/0.9.53"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -463,6 +465,10 @@ def _now_ms() -> int:
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _ms_to_iso(ms: int) -> str:
+    return datetime.fromtimestamp(int(ms) / 1000.0, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _iso_to_ms(value: Optional[str]) -> Optional[int]:
@@ -2376,6 +2382,8 @@ class DependencyAgent:
         self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 8.0))
         self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
         self.agent_rtdb_signal_wait_enabled = _env_bool("DM_AGENT_RTDB_SIGNAL_WAIT_ENABLED", True)
+        self.agent_rtdb_queue_claim_enabled = _env_bool("DM_AGENT_RTDB_QUEUE_CLAIM_ENABLED", True)
+        self.agent_rtdb_lease_heartbeat_enabled = _env_bool("DM_AGENT_RTDB_LEASE_HEARTBEAT_ENABLED", True)
         self.agent_rtdb_signal_safety_min_seconds = max(
             15.0,
             min(600.0, _env_float("DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS", 60.0)),
@@ -2469,6 +2477,8 @@ class DependencyAgent:
         self._coordination_stream_healthy = False
         self._coordination_dependency_http_checkpoint_due_ms = 0
         self._coordination_agent_http_checkpoint_due_ms = 0
+        self._coordination_agent_direct_empty_probe_ms = 0
+        self._coordination_dependency_direct_empty_probe_ms = 0
         self._last_agent_http_transition_signature = ""
 
         # Best-effort local reconciliation (no API calls).
@@ -2841,6 +2851,7 @@ class DependencyAgent:
         paths = raw.get("paths") if isinstance(raw.get("paths"), dict) else {}
         signals = paths.get("signals") if isinstance(paths.get("signals"), dict) else {}
         runtime = paths.get("runtime") if isinstance(paths.get("runtime"), dict) else {}
+        queues = paths.get("queues") if isinstance(paths.get("queues"), dict) else {}
         instance_root = self._normalize_coordination_path(paths.get("instanceRoot"))
         signals_root = self._normalize_coordination_path(signals.get("root"))
         agent_signal = self._normalize_coordination_path(signals.get("agentQueue"))
@@ -2848,6 +2859,8 @@ class DependencyAgent:
         runtime_root = self._normalize_coordination_path(runtime.get("root"))
         agent_runtime = self._normalize_coordination_path(runtime.get("agentControl"))
         dependency_runtime = self._normalize_coordination_path(runtime.get("dependencyManager"))
+        agent_queue_items = self._normalize_coordination_path(queues.get("agentQueueItems"))
+        dependency_queue_items = self._normalize_coordination_path(queues.get("dependencyQueueItems"))
         if mode != "rtdb_v1":
             return None
         if not isinstance(database_url, str) or not database_url.strip():
@@ -2858,11 +2871,17 @@ class DependencyAgent:
             return None
         if not all((instance_root, signals_root, agent_signal, dependency_signal, runtime_root, agent_runtime, dependency_runtime)):
             return None
+        if not agent_queue_items:
+            agent_queue_items = self._normalize_coordination_path(f"{instance_root}/agentQueue/items")
+        if not dependency_queue_items:
+            dependency_queue_items = self._normalize_coordination_path(f"{instance_root}/dependencyQueue/items")
 
         safety = raw.get("safetyPollSeconds") if isinstance(raw.get("safetyPollSeconds"), dict) else {}
         agent_safety = safety.get("agent")
         dep_safety = safety.get("dependencies")
         checkpoint = raw.get("firestoreCheckpointSeconds")
+        lease_duration = raw.get("leaseDurationSeconds")
+        features = raw.get("features") if isinstance(raw.get("features"), dict) else {}
         try:
             agent_safety_sec = max(1.0, float(agent_safety if isinstance(agent_safety, (int, float)) else 15.0))
         except Exception:
@@ -2875,6 +2894,10 @@ class DependencyAgent:
             checkpoint_sec = max(5.0, float(checkpoint if isinstance(checkpoint, (int, float)) else 60.0))
         except Exception:
             checkpoint_sec = 60.0
+        try:
+            lease_duration_sec = max(10.0, min(600.0, float(lease_duration if isinstance(lease_duration, (int, float)) else 90.0)))
+        except Exception:
+            lease_duration_sec = 90.0
 
         normalized = {
             "enabled": True,
@@ -2890,12 +2913,20 @@ class DependencyAgent:
                 "runtimeRoot": runtime_root,
                 "agentControlRuntime": agent_runtime,
                 "dependencyManagerRuntime": dependency_runtime,
+                "agentQueueItems": agent_queue_items,
+                "dependencyQueueItems": dependency_queue_items,
             },
             "safetyPollSeconds": {
                 "agent": agent_safety_sec,
                 "dependencies": dep_safety_sec,
             },
             "firestoreCheckpointSeconds": checkpoint_sec,
+            "leaseDurationSeconds": lease_duration_sec,
+            "features": {
+                "agentQueueClaimV1": bool(features.get("agentQueueClaimV1")) and bool(agent_queue_items),
+                "dependencyQueueClaimV1": bool(features.get("dependencyQueueClaimV1")) and bool(dependency_queue_items),
+                "agentLeaseHeartbeatV1": bool(features.get("agentLeaseHeartbeatV1")),
+            },
             "legacyHttpFallback": raw.get("legacyHttpFallback") is not False,
         }
         normalized["configKey"] = json.dumps(
@@ -2904,6 +2935,8 @@ class DependencyAgent:
                 "paths": normalized["paths"],
                 "safetyPollSeconds": normalized["safetyPollSeconds"],
                 "firestoreCheckpointSeconds": normalized["firestoreCheckpointSeconds"],
+                "leaseDurationSeconds": normalized["leaseDurationSeconds"],
+                "features": normalized["features"],
             },
             sort_keys=True,
         )
@@ -3089,6 +3122,8 @@ class DependencyAgent:
         self._coordination_id_token_expires_at_ms = 0
         self._coordination_dependency_http_checkpoint_due_ms = 0
         self._coordination_agent_http_checkpoint_due_ms = 0
+        self._coordination_agent_direct_empty_probe_ms = 0
+        self._coordination_dependency_direct_empty_probe_ms = 0
         self._coordination_restart_stream()
         if had_coordination and not had_stream_healthy:
             self._request_agent_queue_poll()
@@ -3112,14 +3147,17 @@ class DependencyAgent:
         self._coordination_id_token_expires_at_ms = 0
         self._coordination_dependency_http_checkpoint_due_ms = 0
         self._coordination_agent_http_checkpoint_due_ms = 0
+        self._coordination_agent_direct_empty_probe_ms = 0
+        self._coordination_dependency_direct_empty_probe_ms = 0
         logging.info(
-            "RTDB coordination enabled from %s: db=%s dependencySafetyPoll=%.1fs agentSafetyPoll=%.1fs agentSignalSafetyMin=%.1fs checkpoint=%.0fs",
+            "RTDB coordination enabled from %s: db=%s dependencySafetyPoll=%.1fs agentSafetyPoll=%.1fs agentSignalSafetyMin=%.1fs checkpoint=%.0fs features=%s",
             source,
             _safe_url_for_logs(str(normalized.get("databaseUrl") or "")),
             float(normalized["safetyPollSeconds"]["dependencies"]),
             float(normalized["safetyPollSeconds"]["agent"]),
             float(self.agent_rtdb_signal_safety_min_seconds),
             float(normalized["firestoreCheckpointSeconds"]),
+            json.dumps(normalized.get("features", {}), sort_keys=True),
         )
         self._coordination_restart_stream()
 
@@ -3256,6 +3294,273 @@ class DependencyAgent:
         except Exception as e:
             logging.warning("RTDB runtime patch retry failed: %s", e)
             return False
+
+    def _coordination_feature_enabled(self, name: str) -> bool:
+        coord = self._coordination
+        if not coord:
+            return False
+        features = coord.get("features") if isinstance(coord.get("features"), dict) else {}
+        enabled = bool(features.get(name))
+        if name in ("agentQueueClaimV1", "dependencyQueueClaimV1"):
+            return enabled and bool(self.agent_rtdb_queue_claim_enabled)
+        if name == "agentLeaseHeartbeatV1":
+            return enabled and bool(self.agent_rtdb_lease_heartbeat_enabled)
+        return enabled
+
+    def _coordination_get_json(self, node_path: str, timeout_seconds: float = 10.0) -> Optional[Any]:
+        id_token = self._ensure_coordination_id_token()
+        status, resp = api_json(
+            "GET",
+            self._coordination_rtdb_url(node_path, id_token=id_token),
+            timeout_seconds=timeout_seconds,
+        )
+        if status == 200:
+            return resp
+        if status == 204:
+            return None
+        raise RuntimeError(f"Unexpected RTDB GET response: {status} {resp}")
+
+    def _coordination_get_json_with_etag(
+        self,
+        node_path: str,
+        timeout_seconds: float = 10.0,
+    ) -> Tuple[Optional[Any], str]:
+        id_token = self._ensure_coordination_id_token()
+        url = self._coordination_rtdb_url(node_path, id_token=id_token)
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/json",
+                "X-Firebase-ETag": "true",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                parsed = _json_loads_or_none(raw) if raw else None
+                return parsed, str(resp.headers.get("ETag") or "")
+        except urllib.error.HTTPError as e:
+            raw = ""
+            try:
+                raw = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            raise ApiError(int(getattr(e, "code", 500) or 500), raw) from None
+        except (urllib.error.URLError, socket.timeout, TimeoutError, http.client.HTTPException) as e:
+            raise NetworkError(url, e) from None
+
+    def _coordination_put_json_if_match(
+        self,
+        node_path: str,
+        value: Dict[str, Any],
+        etag: str,
+        timeout_seconds: float = 10.0,
+    ) -> bool:
+        if not etag:
+            return False
+        id_token = self._ensure_coordination_id_token()
+        url = self._coordination_rtdb_url(node_path, id_token=id_token)
+        payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            method="PUT",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "If-Match": etag,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                return int(resp.status) in (200, 204)
+        except urllib.error.HTTPError as e:
+            if int(getattr(e, "code", 500) or 500) == 412:
+                return False
+            raw = ""
+            try:
+                raw = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            raise ApiError(int(getattr(e, "code", 500) or 500), raw) from None
+        except (urllib.error.URLError, socket.timeout, TimeoutError, http.client.HTTPException) as e:
+            raise NetworkError(url, e) from None
+
+    def _coordination_queue_item_path(self, root_path: str, encoded_key: str) -> str:
+        root = self._normalize_coordination_path(root_path) or ""
+        key = str(encoded_key or "").strip().strip("/")
+        if not root or not key:
+            raise RuntimeError("RTDB queue item path is unavailable")
+        return f"{root}/{key}"
+
+    def _coordination_candidate_sort_key(self, item: Dict[str, Any]) -> Tuple[float, int, str]:
+        priority = item.get("priority")
+        created = item.get("createdAtMs")
+        return (
+            -float(priority if isinstance(priority, (int, float)) else 0),
+            int(created if isinstance(created, (int, float)) else 0),
+            str(item.get("itemId") or ""),
+        )
+
+    def _coordination_claim_queue_items(
+        self,
+        queue_path_key: str,
+        feature_name: str,
+        target_state: str,
+        limit: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        if not self._coordination or not self._coordination_stream_healthy:
+            return None
+        if not self._coordination_feature_enabled(feature_name):
+            return None
+        paths = self._coordination.get("paths") if isinstance(self._coordination.get("paths"), dict) else {}
+        root_path = paths.get(queue_path_key)
+        if not isinstance(root_path, str) or not root_path:
+            return None
+        try:
+            raw = self._coordination_get_json(root_path, timeout_seconds=10.0)
+        except Exception as e:
+            logging.warning("RTDB queue read failed for %s: %s", queue_path_key, e)
+            return None
+        if raw is None:
+            return []
+        if not isinstance(raw, dict):
+            logging.warning("RTDB queue root for %s was not an object; falling back to HTTP.", queue_path_key)
+            return None
+
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
+        for encoded_key, value in raw.items():
+            if not isinstance(encoded_key, str) or not isinstance(value, dict):
+                continue
+            item = dict(value)
+            item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else encoded_key
+            if not isinstance(item_id, str) or not item_id:
+                continue
+            item["itemId"] = item_id
+            if str(item.get("state") or "") != "queued":
+                continue
+            if queue_path_key == "dependencyQueueItems":
+                op = item.get("op")
+                resolved = item.get("resolved")
+                if op in ("download", "touch", "delete") and not isinstance(resolved, dict):
+                    logging.info("RTDB dependency queue item %s lacks resolved payload; falling back to HTTP.", item_id)
+                    return None
+            candidates.append((encoded_key, item))
+
+        if not candidates:
+            return []
+
+        claimed: List[Dict[str, Any]] = []
+        instance_id = str(self._resolved_instance_id or "")
+        lease_duration_sec = float(self._coordination.get("leaseDurationSeconds") or 90.0)
+        for encoded_key, item in sorted(candidates, key=lambda row: self._coordination_candidate_sort_key(row[1])):
+            if len(claimed) >= max(1, int(limit)):
+                break
+            item_path = self._coordination_queue_item_path(root_path, encoded_key)
+            try:
+                current, etag = self._coordination_get_json_with_etag(item_path, timeout_seconds=10.0)
+                if not isinstance(current, dict) or str(current.get("state") or "") != "queued":
+                    continue
+                lease_id = f"lease_{uuid.uuid4().hex}"
+                lease_expires_at_ms = self._server_now_ms() + int(max(10.0, lease_duration_sec) * 1000)
+                attempts = int(current.get("attempts") or 0) if isinstance(current.get("attempts"), (int, float)) else 0
+                next_value = dict(current)
+                next_value.update(
+                    {
+                        "state": target_state,
+                        "leaseOwner": instance_id,
+                        "leaseId": lease_id,
+                        "leaseExpiresAtMs": lease_expires_at_ms,
+                        "leaseExpiresAt": _ms_to_iso(lease_expires_at_ms),
+                        "attempts": attempts + 1,
+                        "updatedAtMs": self._server_now_ms(),
+                    }
+                )
+                if not self._coordination_put_json_if_match(item_path, next_value, etag, timeout_seconds=10.0):
+                    continue
+                claimed_item = dict(next_value)
+                claimed_item["itemId"] = str(current.get("itemId") or item.get("itemId") or encoded_key)
+                claimed.append(claimed_item)
+            except Exception as e:
+                logging.warning("RTDB queue claim failed for %s/%s: %s", queue_path_key, item.get("itemId"), e)
+                return None
+        return claimed
+
+    def _coordination_fetch_agent_queue(self, limit: int) -> Optional[List[Dict[str, Any]]]:
+        items = self._coordination_claim_queue_items(
+            "agentQueueItems",
+            "agentQueueClaimV1",
+            "leased",
+            limit,
+        )
+        if items == [] and self._coordination_direct_empty_probe_due("agent"):
+            return None
+        return items
+
+    def _coordination_fetch_dependency_queue(self, limit: int) -> Optional[List[Dict[str, Any]]]:
+        items = self._coordination_claim_queue_items(
+            "dependencyQueueItems",
+            "dependencyQueueClaimV1",
+            "running",
+            limit,
+        )
+        if items == [] and self._coordination_direct_empty_probe_due("dependency"):
+            return None
+        return items
+
+    def _coordination_check_active_lease_cancels(self, held_leases: List[Dict[str, Any]]) -> None:
+        if not held_leases or not self._coordination_feature_enabled("agentLeaseHeartbeatV1"):
+            return
+        paths = self._coordination.get("paths") if isinstance(self._coordination.get("paths"), dict) else {}
+        root_path = paths.get("agentQueueItems")
+        if not isinstance(root_path, str) or not root_path:
+            return
+        try:
+            root = self._coordination_get_json(root_path, timeout_seconds=10.0)
+        except Exception as e:
+            logging.warning("RTDB active lease cancel check failed: %s", e)
+            return
+        if not isinstance(root, dict):
+            return
+        by_item_id: Dict[str, Dict[str, Any]] = {}
+        for value in root.values():
+            if isinstance(value, dict) and isinstance(value.get("itemId"), str):
+                by_item_id[value["itemId"]] = value
+        for lease in held_leases:
+            item_id = lease.get("itemId")
+            lease_id = lease.get("leaseId")
+            if not isinstance(item_id, str) or not isinstance(lease_id, str):
+                continue
+            row = by_item_id.get(item_id)
+            if not isinstance(row, dict):
+                continue
+            if row.get("leaseId") == lease_id and row.get("state") == "cancel_requested":
+                self._mark_cancel_signal(
+                    {
+                        "jobId": lease.get("jobId"),
+                        "executionAttempt": lease.get("executionAttempt"),
+                        "attemptEpoch": lease.get("attemptEpoch"),
+                        "leaseId": lease_id,
+                        "reason": row.get("cancelReason") if isinstance(row.get("cancelReason"), str) else "cancel_requested",
+                    }
+                )
+
+    def _coordination_direct_empty_probe_due(self, channel: str) -> bool:
+        if not self._coordination:
+            return True
+        now_ms = _now_ms()
+        if channel == "agent":
+            interval_ms = int(max(15.0, float(self._coordination["safetyPollSeconds"]["agent"])) * 1000)
+            if now_ms - int(self._coordination_agent_direct_empty_probe_ms) >= interval_ms:
+                self._coordination_agent_direct_empty_probe_ms = now_ms
+                return True
+            return False
+        interval_ms = int(max(15.0, float(self._coordination["safetyPollSeconds"]["dependencies"])) * 1000)
+        if now_ms - int(self._coordination_dependency_direct_empty_probe_ms) >= interval_ms:
+            self._coordination_dependency_direct_empty_probe_ms = now_ms
+            return True
+        return False
 
     def _collect_dependency_runtime_payload(self, queue_depth: Optional[int] = None) -> Dict[str, Any]:
         with self._lock:
@@ -3438,6 +3743,7 @@ class DependencyAgent:
         if not isinstance(path, str):
             path = "/"
         if path == "/" or path.startswith("/agentQueue"):
+            self._last_agent_heartbeat_ms = 0
             self._request_agent_queue_poll()
         if path == "/" or path.startswith("/dependencyQueue"):
             self._request_dependency_queue_poll()
@@ -4839,6 +5145,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     def _fetch_queue(self, limit: int = 20) -> List[Dict[str, Any]]:
         if not self._resolved_instance_id:
             return []
+        rtdb_items = self._coordination_fetch_dependency_queue(limit)
+        if rtdb_items is not None:
+            self._last_dependency_queue_depth = len(rtdb_items)
+            return rtdb_items
         instance_id = self._resolved_instance_id
         url = f"{self.api_base_url}/dependencies/queue?instanceId={urllib.parse.quote(instance_id)}&limit={int(limit)}"
         status, resp = api_json("GET", url, headers=self._headers(use_token=True, include_secret=False), timeout_seconds=30.0)
@@ -4980,6 +5290,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             return []
         if not self._agent_access_token:
             return []
+        rtdb_items = self._coordination_fetch_agent_queue(limit)
+        if rtdb_items is not None:
+            return rtdb_items
         wait_value = self.agent_queue_wait_sec if wait_sec is None else wait_sec
         resp = self._agent_api(
             "GET",
@@ -5216,10 +5529,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         rtdb_ok = True
         if self._coordination:
             rtdb_ok = self._write_agent_runtime_mirror()
+            if rtdb_ok and has_active_agent_work:
+                self._coordination_check_active_lease_cancels(held_leases)
+        rtdb_lease_heartbeat = self._coordination_feature_enabled("agentLeaseHeartbeatV1")
         if (
             self._coordination
             and rtdb_ok
-            and not has_active_agent_work
+            and (not has_active_agent_work or rtdb_lease_heartbeat)
             and not self._coordination_http_checkpoint_due(now_ms, channel="agentControl")
             and transition_signature == self._last_agent_http_transition_signature
         ):
