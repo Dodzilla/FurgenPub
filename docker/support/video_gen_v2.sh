@@ -33,6 +33,9 @@ unset __xtrace_was_on
 # Packages are installed after nodes so we can fix them...
 
 APT_PACKAGES=(
+    "ca-certificates"
+    "curl"
+    "libgnutls30"
 )
 
 PIP_PACKAGES=(
@@ -196,8 +199,42 @@ function provisioning_start() {
 }
 
 function provisioning_get_apt_packages() {
-    if [[ -n $APT_PACKAGES ]]; then
-            sudo $APT_INSTALL ${APT_PACKAGES[@]}
+    if [[ ${#APT_PACKAGES[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    local packages_to_install=("${APT_PACKAGES[@]}")
+    if command -v dpkg-query >/dev/null 2>&1; then
+        packages_to_install=()
+        local package_name
+        for package_name in "${APT_PACKAGES[@]}"; do
+            if dpkg-query -W -f='${Status}' "$package_name" 2>/dev/null | grep -Fq "install ok installed"; then
+                printf "Apt package already installed: %s\n" "$package_name"
+            else
+                packages_to_install+=("$package_name")
+            fi
+        done
+    fi
+
+    if [[ ${#packages_to_install[@]} -eq 0 ]]; then
+        printf "All apt package prerequisites are already installed; skipping apt-get update/install.\n"
+        return 0
+    fi
+
+    printf "Installing missing apt package prerequisites: %s\n" "${packages_to_install[*]}"
+    if command -v apt-get >/dev/null 2>&1; then
+        if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages_to_install[@]}"
+        else
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages_to_install[@]}"
+        fi
+    elif [[ -n ${APT_INSTALL:-} ]]; then
+        sudo ${APT_INSTALL} "${packages_to_install[@]}"
+    else
+        printf "WARN: No apt installer available; skipping package install: %s\n" "${packages_to_install[*]}"
+        return 1
     fi
 }
 
@@ -495,6 +532,34 @@ function dependency_manager_is_disabled() {
     [[ "$dm_agent_disable" == "1" || "$dm_agent_disable" == "true" ]]
 }
 
+function dependency_manager_download_agent_url() {
+    local url="$1"
+    local output_path="$2"
+    local python_bin
+
+    python_bin="$(command -v python3 || true)"
+    if [[ -z "$python_bin" && -x /venv/main/bin/python ]]; then
+        python_bin="/venv/main/bin/python"
+    fi
+    if [[ -z "$python_bin" ]]; then
+        printf "WARN: Dependency manager: no python interpreter available to download %s\n" "$url"
+        return 1
+    fi
+
+    "$python_bin" - "$url" "$output_path" <<'PY'
+import pathlib
+import sys
+import urllib.request
+
+url = sys.argv[1]
+output_path = pathlib.Path(sys.argv[2])
+output_path.parent.mkdir(parents=True, exist_ok=True)
+request = urllib.request.Request(url, headers={"User-Agent": "furgen-video-gen-v2-bootstrap/1.0"})
+with urllib.request.urlopen(request, timeout=120) as response:
+    output_path.write_bytes(response.read())
+PY
+}
+
 function dependency_manager_start_agent() {
     # Allow opt-out.
     if dependency_manager_is_disabled; then
@@ -522,7 +587,7 @@ function dependency_manager_start_agent() {
     # Install agent to WORKSPACE (prefer explicit URL, else bundled copy, else GitHub raw fallback).
     if [[ -n "$agent_url" ]]; then
         echo "Dependency manager: downloading agent from DM_AGENT_URL/AGENT_URL."
-        curl -fsSL "$agent_url" -o "$agent_path" || {
+        dependency_manager_download_agent_url "$agent_url" "$agent_path" || {
             echo "WARN: Dependency manager: failed to download agent from $agent_url"
             return 0
         }
@@ -539,7 +604,7 @@ function dependency_manager_start_agent() {
         else
             fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/main/docker/scripts/dependency_agent_v1.py"
             echo "Dependency manager: downloading agent from fallback URL ($fallback_url)."
-            curl -fsSL "$fallback_url" -o "$agent_path" || {
+            dependency_manager_download_agent_url "$fallback_url" "$agent_path" || {
                 echo "WARN: Dependency manager: failed to download agent from fallback URL"
                 return 0
             }
@@ -563,7 +628,7 @@ function dependency_manager_install_agent_artifact() {
 
     if [[ -n "$agent_url" ]]; then
         echo "Dependency manager: downloading agent from DM_AGENT_URL/AGENT_URL."
-        curl -fsSL "$agent_url" -o "$agent_path" || {
+        dependency_manager_download_agent_url "$agent_url" "$agent_path" || {
             echo "WARN: Dependency manager: failed to download agent from $agent_url"
             return 1
         }
@@ -579,7 +644,7 @@ function dependency_manager_install_agent_artifact() {
         else
             fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
             echo "Dependency manager: downloading agent from fallback URL ($fallback_url)."
-            curl -fsSL "$fallback_url" -o "$agent_path" || {
+            dependency_manager_download_agent_url "$fallback_url" "$agent_path" || {
                 echo "WARN: Dependency manager: failed to download agent from fallback URL"
                 return 1
             }
@@ -676,6 +741,34 @@ dependency_manager_agent_running() {
     return 1
 }
 
+dependency_manager_download_agent_url() {
+    local url="$1"
+    local output_path="$2"
+    local python_bin
+
+    python_bin="$(command -v python3 || true)"
+    if [[ -z "$python_bin" && -x /venv/main/bin/python ]]; then
+        python_bin="/venv/main/bin/python"
+    fi
+    if [[ -z "$python_bin" ]]; then
+        printf "WARN: Dependency manager: no python interpreter available to download %s\n" "$url"
+        return 1
+    fi
+
+    "$python_bin" - "$url" "$output_path" <<'PY'
+import pathlib
+import sys
+import urllib.request
+
+url = sys.argv[1]
+output_path = pathlib.Path(sys.argv[2])
+output_path.parent.mkdir(parents=True, exist_ok=True)
+request = urllib.request.Request(url, headers={"User-Agent": "furgen-video-gen-v2-watchdog/1.0"})
+with urllib.request.urlopen(request, timeout=120) as response:
+    output_path.write_bytes(response.read())
+PY
+}
+
 dependency_manager_install_agent_if_missing() {
     mkdir -p "$(dirname "$agent_path")" || true
     mkdir -p "${DM_COMFYUI_DIR}" || true
@@ -687,13 +780,13 @@ dependency_manager_install_agent_if_missing() {
 
     if [[ -n "$agent_url" ]]; then
         echo "Dependency manager: watchdog downloading agent from DM_AGENT_URL/AGENT_URL."
-        curl -fsSL "$agent_url" -o "$agent_path" || {
+        dependency_manager_download_agent_url "$agent_url" "$agent_path" || {
             echo "WARN: Dependency manager: watchdog failed to download agent from $agent_url"
             return 1
         }
     else
         echo "Dependency manager: watchdog downloading agent from fallback URL ($fallback_url)."
-        curl -fsSL "$fallback_url" -o "$agent_path" || {
+        dependency_manager_download_agent_url "$fallback_url" "$agent_path" || {
             echo "WARN: Dependency manager: watchdog failed to download agent from fallback URL"
             return 1
         }
