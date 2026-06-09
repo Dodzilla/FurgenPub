@@ -6,6 +6,8 @@ export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$WORKSPACE/ComfyUI}"
 export SERVER_TYPE="${SERVER_TYPE:-video_gen_v2}"
 
+mkdir -p "${WORKSPACE}" "${DM_COMFYUI_DIR}" || true
+
 if [[ -z "$DM_INSTANCE_ID" && -n "$VAST_CONTAINERLABEL" ]]; then
     DM_INSTANCE_ID="${VAST_CONTAINERLABEL#C.}"
     export DM_INSTANCE_ID
