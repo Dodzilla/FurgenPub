@@ -119,7 +119,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.57"
+AGENT_VERSION = "dm-agent-py/0.9.58"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2728,9 +2728,9 @@ class DependencyAgent:
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
-                execute_count, _, _ = self._agent_stage_counts_locked()
+                active_agent_work_count = len(self._active_exec_by_item)
                 maintenance_count = len(self._agent_maintenance_inflight)
-            if execute_count > 0 or maintenance_count > 0:
+            if active_agent_work_count > 0 or maintenance_count > 0:
                 return
             if self._pending_self_update is not None:
                 return
