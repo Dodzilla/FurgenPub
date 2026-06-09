@@ -4,6 +4,7 @@ set -x
 
 export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$WORKSPACE/ComfyUI}"
+export SERVER_TYPE="${SERVER_TYPE:-video_gen_v2}"
 
 if [[ -z "$DM_INSTANCE_ID" && -n "$VAST_CONTAINERLABEL" ]]; then
     DM_INSTANCE_ID="${VAST_CONTAINERLABEL#C.}"
@@ -177,6 +178,7 @@ function provisioning_start() {
     local soft_failures=0
 
     provisioning_print_header
+    provisioning_configure_comfyui_launch_args || true
     provisioning_update_comfyui
     provisioning_get_apt_packages
     load_node_pins_from_env
@@ -196,6 +198,143 @@ function provisioning_start() {
     if [[ "$soft_failures" -ne 0 ]]; then
         printf "Provisioning completed with non-fatal warnings.\n"
     fi
+}
+
+function provisioning_configure_comfyui_launch_args() {
+    local launch_script
+    launch_script="/opt/supervisor-scripts/comfyui.sh"
+    if [[ ! -f "${launch_script}" ]]; then
+        printf "WARN: ComfyUI launch script not found for args normalization: %s\n" "${launch_script}"
+        return 0
+    fi
+
+    /venv/main/bin/python - "${launch_script}" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+original = source
+
+managed_pattern = re.compile(
+    r"# FURGEN ComfyUI launch args normalization\n(?:.*\n)*?# /FURGEN ComfyUI launch args normalization\n",
+    re.MULTILINE,
+)
+source = managed_pattern.sub("", source)
+legacy_args_pattern = re.compile(
+    r'COMFYUI_ARGS=\$\{COMFYUI_ARGS:---disable-auto-launch --port 18188 --enable-cors-header\}\n'
+    r'if \[\[ " \$\{COMFYUI_ARGS\} " != \*" --disable-cuda-malloc "\* \]\]; then\n'
+    r'    COMFYUI_ARGS="\$\{COMFYUI_ARGS\} --disable-cuda-malloc"\n'
+    r'fi\n',
+    re.MULTILINE,
+)
+source = legacy_args_pattern.sub("", source)
+
+block = (
+    "# FURGEN ComfyUI launch args normalization\n"
+    "COMFYUI_ARGS=${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header}\n"
+    "COMFYUI_ARGS=\"${COMFYUI_ARGS// --disable-cuda-malloc/}\"\n"
+    "COMFYUI_ARGS=\"${COMFYUI_ARGS//--disable-cuda-malloc/}\"\n"
+    "video_gen_v2_disable_cuda_malloc=\"$(printf '%s' \"${VIDEO_GEN_V2_COMFY_DISABLE_CUDA_MALLOC:-false}\" | tr '[:upper:]' '[:lower:]')\"\n"
+    "if [[ \"${video_gen_v2_disable_cuda_malloc}\" == \"1\" || \"${video_gen_v2_disable_cuda_malloc}\" == \"true\" ]]; then\n"
+    "    COMFYUI_ARGS=\"${COMFYUI_ARGS} --disable-cuda-malloc\"\n"
+    "fi\n"
+    "unset video_gen_v2_disable_cuda_malloc\n"
+    "furgen_comfyui_port=\"$(printf '%s\\n' \"${COMFYUI_ARGS}\" | sed -n 's/.*--port[ =]\\([0-9][0-9]*\\).*/\\1/p' | tail -n 1)\"\n"
+    "furgen_comfyui_port=\"${furgen_comfyui_port:-8188}\"\n"
+    "if [[ \"$(printf '%s' \"${FURGEN_COMFYUI_PORT_CLEANUP:-true}\" | tr '[:upper:]' '[:lower:]')\" != \"false\" ]]; then\n"
+    "    FURGEN_COMFYUI_PORT=\"${furgen_comfyui_port}\" /venv/main/bin/python - <<'PY'\n"
+    "import os\n"
+    "import signal\n"
+    "import time\n"
+    "\n"
+    "port = int(os.environ.get('FURGEN_COMFYUI_PORT') or '8188')\n"
+    "port_hex = f'{port:04X}'\n"
+    "listen_inodes = set()\n"
+    "for proc_net in ('/proc/net/tcp', '/proc/net/tcp6'):\n"
+    "    try:\n"
+    "        rows = open(proc_net, encoding='utf-8').read().splitlines()[1:]\n"
+    "    except OSError:\n"
+    "        continue\n"
+    "    for row in rows:\n"
+    "        cols = row.split()\n"
+    "        if len(cols) > 9 and cols[3] == '0A' and cols[1].rsplit(':', 1)[-1].upper() == port_hex:\n"
+    "            listen_inodes.add(cols[9])\n"
+    "\n"
+    "if not listen_inodes:\n"
+    "    raise SystemExit(0)\n"
+    "\n"
+    "own_pids = {os.getpid(), os.getppid()}\n"
+    "killed = []\n"
+    "for name in os.listdir('/proc'):\n"
+    "    if not name.isdigit():\n"
+    "        continue\n"
+    "    pid = int(name)\n"
+    "    if pid in own_pids:\n"
+    "        continue\n"
+    "    fd_dir = f'/proc/{pid}/fd'\n"
+    "    try:\n"
+    "        fds = os.listdir(fd_dir)\n"
+    "    except OSError:\n"
+    "        continue\n"
+    "    matched = False\n"
+    "    for fd in fds:\n"
+    "        try:\n"
+    "            target = os.readlink(os.path.join(fd_dir, fd))\n"
+    "        except OSError:\n"
+    "            continue\n"
+    "        if target.startswith('socket:[') and target[8:-1] in listen_inodes:\n"
+    "            matched = True\n"
+    "            break\n"
+    "    if not matched:\n"
+    "        continue\n"
+    "    try:\n"
+    "        cmdline = open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\\0', b' ').decode('utf-8', 'replace').strip()\n"
+    "    except OSError:\n"
+    "        cmdline = ''\n"
+    "    print(f'Terminating stale listener on Comfy port {port}: pid={pid} {cmdline[:200]}', flush=True)\n"
+    "    try:\n"
+    "        os.kill(pid, signal.SIGTERM)\n"
+    "        killed.append(pid)\n"
+    "    except ProcessLookupError:\n"
+    "        pass\n"
+    "\n"
+    "if killed:\n"
+    "    time.sleep(2)\n"
+    "    for pid in killed:\n"
+    "        if os.path.exists(f'/proc/{pid}'):\n"
+    "            try:\n"
+    "                os.kill(pid, signal.SIGKILL)\n"
+    "            except ProcessLookupError:\n"
+    "                pass\n"
+    "PY\n"
+    "fi\n"
+    "unset furgen_comfyui_port\n"
+    "# Bypass Vast's unbuffer-based pty wrapper for Comfy. The wrapper can exit\n"
+    "# cleanly while long GPU jobs are still running, causing supervisor to\n"
+    "# restart Comfy and strand queued_on_comfy jobs.\n"
+    "export DISABLE_PTY=\"${DISABLE_PTY:-true}\"\n"
+    "# /FURGEN ComfyUI launch args normalization\n"
+)
+
+anchor = "# Launch ComfyUI\n"
+if anchor in source:
+    insert_at = source.find(anchor)
+else:
+    launch_idx = source.find("python main.py")
+    insert_at = source.rfind("\n", 0, launch_idx) + 1 if launch_idx != -1 else len(source)
+
+patched = source[:insert_at] + block + source[insert_at:]
+
+if patched != original:
+    path.write_text(patched, encoding="utf-8")
+    print("Applied ComfyUI launch args normalization patch.")
+else:
+    print("ComfyUI launch args normalization already present.")
+PY
+
+    chmod +x "${launch_script}" || true
 }
 
 function provisioning_get_apt_packages() {
