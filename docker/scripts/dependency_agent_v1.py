@@ -119,13 +119,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.56"
+AGENT_VERSION = "dm-agent-py/0.9.57"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
 PRL_MINER_SHARE_SIGNAL_RE = re.compile(
     r"\b(accepted|rejected|share submission returned error|stratum error response|dropped reason=|action=drop_share|action=reconnect_drop_ambiguous_share)\b",
+    re.IGNORECASE,
+)
+PRL_MINER_POOL_ACTIVITY_RE = re.compile(
+    r"\b(?:component=share\s+submitted|share\s+submitted|component=pool\s+(?:job_update|difficulty_set)|pool\s+(?:job_update|difficulty_set))\b",
     re.IGNORECASE,
 )
 PRL_MINER_POOL_ERROR_RE = re.compile(
@@ -176,15 +180,18 @@ def _parse_latest_hashrate_from_text(text: str) -> Tuple[Optional[float], str]:
 def _parse_prl_miner_log_signals(text: str) -> Dict[str, Any]:
     lower = (text or "").lower()
     accepted = len(re.findall(r"\baccepted\b", lower))
+    submitted = len(re.findall(r"\bshare\s+submitted\b", lower))
     rejected = len(re.findall(r"\brejected\b", lower))
     share_errors = len(PRL_MINER_POOL_ERROR_RE.findall(text or ""))
     share_signals = len(PRL_MINER_SHARE_SIGNAL_RE.findall(text or ""))
+    pool_activity = len(PRL_MINER_POOL_ACTIVITY_RE.findall(text or ""))
     return {
         "accepted": accepted,
+        "submitted": submitted,
         "rejected": rejected,
         "shareErrors": share_errors,
-        "hasShareSignal": share_signals > 0,
-        "poolHealthy": accepted > 0,
+        "hasShareSignal": share_signals > 0 or submitted > 0 or pool_activity > 0,
+        "poolHealthy": accepted > 0 or submitted > 0 or pool_activity > 0,
     }
 
 
@@ -1941,10 +1948,13 @@ class PrlMinerController:
                 if tail:
                     signals = _parse_prl_miner_log_signals(tail)
                     out["recentAcceptedShares"] = int(signals["accepted"])
+                    out["recentSubmittedShares"] = int(signals["submitted"])
                     out["recentRejectedShares"] = int(signals["rejected"])
                     out["recentShareErrors"] = int(signals["shareErrors"])
                     if signals["hasShareSignal"]:
                         out["lastShareLikeLogAtMs"] = int(stat.st_mtime * 1000)
+                    if signals["poolHealthy"]:
+                        out["poolHealthy"] = True
         except Exception as exc:
             out["telemetryError"] = str(exc)[:300]
         out["watch"] = {
@@ -1954,7 +1964,7 @@ class PrlMinerController:
             "gpuPowerDrawW": out.get("gpuPowerDrawW"),
             "localHashrateHps": out.get("localHashrateHps"),
             "localHashrateText": out.get("localHashrateText"),
-            "poolConnected": bool(self._pool_url and out.get("state") in ("running", "starting") and int(out.get("recentAcceptedShares") or 0) > 0),
+            "poolConnected": bool(self._pool_url and out.get("state") in ("running", "starting") and bool(out.get("poolHealthy"))),
             "lastShareLikeLogAtMs": out.get("lastShareLikeLogAtMs"),
             "lastTelemetryAtMs": int(_now_ms()),
             "telemetryError": out.get("telemetryError"),
