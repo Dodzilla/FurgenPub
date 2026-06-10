@@ -43,7 +43,7 @@ Optional knobs:
   - DM_STATE_PATH           (default: $WORKSPACE/dependency_agent_state.json)
   - DM_ALLOWED_DOMAINS      (comma-separated allowlist for dependency/model downloads; default: huggingface.co,hf.co,civitai.red,civitai.com)
   - DM_INPUT_ALLOWED_DOMAINS (optional comma-separated allowlist for job input/prefetch downloads; default: allow all)
-  - DM_DOWNLOAD_TOOL             (default: wget; options: wget, python)
+  - DM_DOWNLOAD_TOOL             (default: auto; options: auto, wget, python, aria2; auto prefers aria2c when installed)
   - DM_DOWNLOAD_TIMEOUT_SECONDS (socket timeout for downloads; default: 300)
   - DM_DOWNLOAD_CHUNK_MIB        (download read chunk size in MiB; default: 1)
   - DM_DOWNLOAD_DEBUG            (enable extra download diagnostics; default: false)
@@ -119,7 +119,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.9.59"
+AGENT_VERSION = "dm-agent-py/0.10.0"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1458,6 +1458,180 @@ def wget_download(
             )
 
 
+def aria2_download(
+    url: str,
+    dest_partial: Path,
+    auth_header: Optional[str],
+    expected_size_bytes: int = 0,
+    timeout_seconds: float = 300.0,
+    allowed_domains: Optional[Set[str]] = None,
+    debug: bool = False,
+    user_agent: str = "dm-agent-aria2/1.0",
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> None:
+    """Multi-connection download via aria2c (-x8 -s8). Single-stream HTTP from the
+    model CDNs is frequently the bottleneck on Vast hosts; splitting the transfer
+    rescues hosts whose per-connection throughput collapses.
+
+    Domain allowlisting is enforced on the initial URL host (redirect-chain
+    enforcement is wget-only); final size is verified the same as other tools.
+    """
+    if not _command_exists("aria2c"):
+        raise RuntimeError("aria2c not found on PATH (install aria2 or set DM_DOWNLOAD_TOOL=wget).")
+
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("Invalid download URL")
+
+    if allowed_domains:
+        ok = any(host == d or host.endswith("." + d) for d in allowed_domains)
+        if not ok:
+            raise ValueError(f"Download domain not allowed: {host}")
+
+    safe_url = _safe_url_for_logs(url)
+    dest_partial.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_bytes = 0
+    try:
+        if dest_partial.exists():
+            existing_bytes = int(dest_partial.stat().st_size)
+    except Exception:
+        existing_bytes = 0
+
+    if expected_size_bytes > 0 and existing_bytes > expected_size_bytes:
+        _discard_oversized_partial(dest_partial, int(expected_size_bytes), safe_url)
+        existing_bytes = 0
+
+    if expected_size_bytes > 0 and existing_bytes == expected_size_bytes:
+        return
+
+    cmd: List[str] = [
+        "aria2c",
+        "--continue=true",
+        "--max-connection-per-server=8",
+        "--split=8",
+        "--min-split-size=4M",
+        "--file-allocation=none",
+        "--max-tries=3",
+        "--retry-wait=5",
+        f"--timeout={int(max(1.0, float(timeout_seconds)))}",
+        "--connect-timeout=30",
+        "--auto-file-renaming=false",
+        "--allow-overwrite=true",
+        "--console-log-level=warn",
+        "--summary-interval=0",
+        "--user-agent",
+        user_agent,
+        "--dir",
+        str(dest_partial.parent),
+        "--out",
+        dest_partial.name,
+    ]
+    if auth_header:
+        cmd += ["--header", f"Authorization: {auth_header}"]
+
+    if debug:
+        logging.info(
+            "aria2 start: url=%s existingBytes=%d expectedBytes=%d timeout=%.1fs",
+            safe_url,
+            int(existing_bytes),
+            int(expected_size_bytes or 0),
+            float(timeout_seconds),
+        )
+
+    proc = subprocess.Popen(
+        cmd + [url],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    output_lines: List[str] = []
+
+    def _drain_output() -> None:
+        stream = proc.stdout
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                output_lines.append(line)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    output_thread = threading.Thread(target=_drain_output, daemon=True)
+    output_thread.start()
+
+    def _current_downloaded_bytes() -> int:
+        # Segmented writes make the file sparse; st_blocks reflects bytes actually
+        # written, while st_size jumps to the furthest segment offset.
+        try:
+            if not dest_partial.exists():
+                return 0
+            st = dest_partial.stat()
+            block_bytes = int(getattr(st, "st_blocks", 0)) * 512
+            if block_bytes > 0:
+                return min(int(st.st_size), block_bytes)
+            return int(st.st_size)
+        except Exception:
+            return 0
+
+    last_progress_at = 0.0
+    oversize_error: Optional[str] = None
+    while True:
+        ret = proc.poll()
+        now = time.time()
+        if progress_cb and (ret is not None or now - last_progress_at >= 2.0):
+            current_bytes = _current_downloaded_bytes()
+            try:
+                progress_cb(int(current_bytes), int(expected_size_bytes or 0))
+            except Exception:
+                pass
+            if expected_size_bytes > 0 and current_bytes > int(expected_size_bytes):
+                oversize_error = (
+                    f"Download exceeded expected size for {safe_url}: "
+                    f"got {current_bytes} bytes, expected {int(expected_size_bytes)} bytes"
+                )
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            last_progress_at = now
+        if ret is not None:
+            break
+        time.sleep(1.0)
+
+    output_thread.join(timeout=5.0)
+    if oversize_error:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        _discard_oversized_partial(dest_partial, int(expected_size_bytes), safe_url)
+        raise RuntimeError(oversize_error)
+
+    if proc.returncode != 0:
+        tail = "\n".join("".join(output_lines).splitlines()[-30:])
+        raise RuntimeError(f"aria2c failed (exit={proc.returncode}) for {safe_url}: {tail}")
+
+    if expected_size_bytes > 0:
+        actual_size = 0
+        try:
+            actual_size = int(dest_partial.stat().st_size)
+        except Exception:
+            actual_size = 0
+        if actual_size != int(expected_size_bytes):
+            if actual_size > int(expected_size_bytes):
+                _discard_oversized_partial(dest_partial, int(expected_size_bytes), safe_url)
+            raise RuntimeError(
+                f"Incomplete download for {safe_url}: got {actual_size} bytes, expected {int(expected_size_bytes)} bytes"
+            )
+
+
 def http_download_to_file(
     url: str,
     dest_path: Path,
@@ -2403,7 +2577,7 @@ class DependencyAgent:
         self.max_parallel = max(1, min(4, _env_int("MAX_PARALLEL_DOWNLOADS", 3)))
         self.verbose_progress = (_env_str("DM_VERBOSE_PROGRESS") or "").lower() in ("1", "true", "yes", "on")
         self.download_debug = _env_bool("DM_DOWNLOAD_DEBUG", False)
-        self.download_tool = (_env_str("DM_DOWNLOAD_TOOL") or "wget").strip().lower()
+        self.download_tool = (_env_str("DM_DOWNLOAD_TOOL") or "auto").strip().lower()
 
         self.download_timeout_seconds = max(30.0, min(3600.0, _env_float("DM_DOWNLOAD_TIMEOUT_SECONDS", 300.0)))
         chunk_mib = _env_int("DM_DOWNLOAD_CHUNK_MIB", 1)
@@ -2543,6 +2717,12 @@ class DependencyAgent:
             raise SystemExit("Missing required env var: FCS_API_BASE_URL")
         if not self.server_type:
             raise SystemExit("Missing required env var: SERVER_TYPE")
+
+    def _resolve_download_tool(self) -> str:
+        tool = (self.download_tool or "auto").strip().lower()
+        if tool == "auto":
+            return "aria2" if _command_exists("aria2c") else "wget"
+        return tool
 
     def _download_allowed_domains_for_item(
         self,
@@ -5296,7 +5476,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 "dependencyChannel": True,
                 "agentPullExecution": True,
                 "dependencyDeleteFiles": True,
-                "downloadTool": self.download_tool,
+                "downloadTool": self._resolve_download_tool(),
             },
         }
         if self.instance_bootstrap_token:
@@ -6673,7 +6853,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             expected_bytes=int(expected_size_bytes),
             downloaded_bytes=0,
             stage="preparing",
-            tool=self.download_tool,
+            tool=self._resolve_download_tool(),
         )
 
         def _progress_cb(stage_name: str, tool_name: str) -> Callable[[int, int], None]:
@@ -6786,7 +6966,19 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 pass
 
         try:
-            if self.download_tool == "wget":
+            resolved_tool = self._resolve_download_tool()
+            if resolved_tool == "aria2":
+                aria2_download(
+                    url=url,
+                    dest_partial=partial,
+                    auth_header=auth_header,
+                    expected_size_bytes=int(expected_size_bytes),
+                    timeout_seconds=float(self.download_timeout_seconds),
+                    allowed_domains=allowed_domains,
+                    debug=self.download_debug,
+                    progress_cb=_progress_cb("downloading", "aria2"),
+                )
+            elif resolved_tool == "wget":
                 wget_download(
                     url=url,
                     dest_partial=partial,
@@ -6797,7 +6989,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     debug=self.download_debug,
                     progress_cb=_progress_cb("downloading", "wget"),
                 )
-            elif self.download_tool == "python":
+            elif resolved_tool == "python":
                 http_download(
                     url=url,
                     dest_partial=partial,
@@ -7001,7 +7193,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     expected_bytes=expected_size_bytes,
                     downloaded_bytes=0,
                     stage="starting",
-                    tool=self.download_tool,
+                    tool=self._resolve_download_tool(),
                 )
             self._post_status(item, "running")
 
@@ -8355,8 +8547,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         else:
             logging.info("Allowed input prefetch download domains: unrestricted")
         logging.info(
-            "Download settings: tool=%s timeout=%.1fs chunkMiB=%d verbose=%s debug=%s",
+            "Download settings: tool=%s (resolved=%s) timeout=%.1fs chunkMiB=%d verbose=%s debug=%s",
             self.download_tool,
+            self._resolve_download_tool(),
             float(self.download_timeout_seconds),
             int(self.download_chunk_size / (1024 * 1024)),
             "yes" if self.verbose_progress else "no",
