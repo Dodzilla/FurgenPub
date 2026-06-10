@@ -1,0 +1,48 @@
+# Build the baked image_gen_v1 image.
+# Run from the FurgenPub repo root:
+#   gcloud builds submit . --config=docker/images/image_gen_v1/cloudbuild.yaml \
+#     --substitutions=_TAG=<tag> --project=furgencontentserver
+substitutions:
+  _BASE_IMAGE: "vastai/comfy:v0.18.2-cuda-12.9-py312"
+  _IMAGE: "us-central1-docker.pkg.dev/furgencontentserver/vast-public/image-gen-v1"
+  _TAG: "dev"
+steps:
+  # Discover where the ComfyUI checkout lives inside the base image.
+  - id: discover-comfy-dir
+    name: "${_BASE_IMAGE}"
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        dir=$(find /opt /root /ComfyUI /workspace -maxdepth 3 -type d -name ComfyUI 2>/dev/null | head -1)
+        if [[ -z "$dir" ]]; then
+          echo "ComfyUI directory not found in base image" >&2
+          find / -maxdepth 2 -type d 2>/dev/null >&2
+          exit 1
+        fi
+        echo "Found ComfyUI at $dir"
+        echo -n "$dir" > /workspace/comfy_dir.txt
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        COMFY_DIR=$(cat /workspace/comfy_dir.txt)
+        docker build \
+          --build-arg BASE_IMAGE=${_BASE_IMAGE} \
+          --build-arg COMFY_DIR=$$COMFY_DIR \
+          -t ${_IMAGE}:${_TAG} \
+          -f docker/images/image_gen_v1/Dockerfile \
+          docker/images/image_gen_v1
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_IMAGE}:${_TAG}"]
+images:
+  - "${_IMAGE}:${_TAG}"
+options:
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 300
+timeout: 5400s

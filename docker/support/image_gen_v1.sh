@@ -136,6 +136,14 @@ function provisioning_verify_flux_kv_cache_support() {
 
 function provisioning_start() {
     provisioning_print_header
+    if [[ "${FURGEN_BAKED:-0}" == "1" ]]; then
+        # Baked images ship ComfyUI (pinned), custom nodes, and python deps preinstalled,
+        # so readiness only waits on model downloads handled by the dependency agent.
+        echo "Baked image detected (FURGEN_BAKED=1); skipping ComfyUI/node/pip provisioning."
+        provisioning_verify_flux_kv_cache_support || echo "WARN: baked image flux verification failed"
+        provisioning_print_end
+        return 0
+    fi
     provisioning_update_comfyui
     provisioning_verify_flux_kv_cache_support
     provisioning_get_apt_packages
