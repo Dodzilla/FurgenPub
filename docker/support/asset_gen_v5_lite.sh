@@ -2978,6 +2978,17 @@ function dependency_manager_start_agent() {
     nohup "$watchdog_path" >> "$watchdog_log_path" 2>&1 &
 }
 
+# Best-effort aria2 install before the agent starts so model downloads can use
+# multi-connection transfers (the agent falls back to wget when aria2c is absent).
+if ! command -v aria2c >/dev/null 2>&1; then
+    echo "Installing aria2 for multi-connection downloads..."
+    apt_runner=""
+    if command -v sudo >/dev/null 2>&1; then apt_runner="sudo"; fi
+    ($apt_runner apt-get update -qq >/dev/null 2>&1 || true) && \
+        $apt_runner apt-get install -y -qq aria2 >/dev/null 2>&1 || \
+        echo "WARN: aria2 install failed; dependency agent will fall back to wget."
+fi
+
 # Start the dependency manager agent (best-effort; safe if required env vars are missing).
 dependency_manager_start_agent
 
