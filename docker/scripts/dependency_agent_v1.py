@@ -120,7 +120,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.2"
+AGENT_VERSION = "dm-agent-py/0.10.3"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -219,6 +219,21 @@ def _normalize_download_urls(primary_url: str, alternate_urls: Any = None) -> Li
         add(alternate_urls)
     add(primary_url)
     return urls
+
+
+def _normalize_prl_static_difficulty(value: Any) -> str:
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (str, int, float)):
+        cleaned = str(value).strip()
+        return cleaned[:64] if cleaned else ""
+    return ""
+
+
+def _clean_prl_payload_string(value: Any, max_length: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:max_length]
 
 
 def _host_from_url(raw_url: str) -> str:
@@ -2317,6 +2332,9 @@ class PrlMinerController:
         self._last_error = ""
         self._last_failure_category = ""
         self._last_network_diagnostics: Dict[str, Any] = {}
+        self._static_difficulty = ""
+        self._static_difficulty_source = ""
+        self._static_difficulty_matched_gpu_name = ""
         self._last_start_payload: Dict[str, Any] = {}
         self._paused_start_payload: Optional[Dict[str, Any]] = None
         self._paused_reason = ""
@@ -2380,6 +2398,12 @@ class PrlMinerController:
                 out["poolUrl"] = self._pool_url
             if self._miner_version:
                 out["minerVersion"] = self._miner_version
+            if self._static_difficulty:
+                out["staticDifficulty"] = self._static_difficulty
+            if self._static_difficulty_source:
+                out["staticDifficultySource"] = self._static_difficulty_source
+            if self._static_difficulty_matched_gpu_name:
+                out["staticDifficultyMatchedGpuName"] = self._static_difficulty_matched_gpu_name
             if self._started_at_ms > 0:
                 out["startedAtMs"] = int(self._started_at_ms)
             if self._stopped_at_ms > 0:
@@ -2601,7 +2625,9 @@ class PrlMinerController:
         download_urls = _normalize_download_urls(download_url, payload.get("minerDownloadUrls"))
         miner_sha256 = payload.get("minerSha256") if isinstance(payload.get("minerSha256"), str) else ""
         miner_version = payload.get("minerVersion") if isinstance(payload.get("minerVersion"), str) else ""
-        static_difficulty = payload.get("staticDifficulty")
+        static_difficulty = _normalize_prl_static_difficulty(payload.get("staticDifficulty"))
+        static_difficulty_source = _clean_prl_payload_string(payload.get("staticDifficultySource"), 80)
+        static_difficulty_matched_gpu_name = _clean_prl_payload_string(payload.get("staticDifficultyMatchedGpuName"), 160)
         stop_timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
         force_restart = payload.get("forceRestart") is True
 
@@ -2632,11 +2658,15 @@ class PrlMinerController:
                 already_running and
                 self._pool_url == pool_url and
                 self._worker == worker and
+                self._static_difficulty == static_difficulty and
                 (not miner_version or self._miner_version == miner_version)
             )
             if same_target:
                 self._state = "running"
                 self._desired_state = "running"
+                self._static_difficulty = static_difficulty
+                self._static_difficulty_source = static_difficulty_source
+                self._static_difficulty_matched_gpu_name = static_difficulty_matched_gpu_name
                 self._last_start_payload = dict(payload)
                 self._paused_start_payload = None
                 self._paused_reason = ""
@@ -2663,8 +2693,8 @@ class PrlMinerController:
             "--worker",
             worker,
         ]
-        if isinstance(static_difficulty, (str, int, float)) and str(static_difficulty).strip():
-            args.extend(["--password", f"x;d={str(static_difficulty).strip()}"])
+        if static_difficulty:
+            args.extend(["--password", f"x;d={static_difficulty}"])
 
         self.root.mkdir(parents=True, exist_ok=True)
         log_file = self.log_path.open("ab")
@@ -2694,6 +2724,9 @@ class PrlMinerController:
             self._worker = worker
             self._pool_url = pool_url
             self._miner_version = miner_version
+            self._static_difficulty = static_difficulty
+            self._static_difficulty_source = static_difficulty_source
+            self._static_difficulty_matched_gpu_name = static_difficulty_matched_gpu_name
             self._started_at_ms = _now_ms()
             self._stopped_at_ms = 0
             self._last_exit_code = None
@@ -2702,7 +2735,13 @@ class PrlMinerController:
             self._last_start_payload = dict(payload)
             self._paused_start_payload = None
             self._paused_reason = ""
-        logging.info("Started idle PRL miner pid=%s worker=%s pool=%s", proc.pid, worker, pool_url)
+        logging.info(
+            "Started idle PRL miner pid=%s worker=%s pool=%s staticDifficulty=%s",
+            proc.pid,
+            worker,
+            pool_url,
+            static_difficulty or "vardiff",
+        )
         return self.snapshot()
 
     def stop(self, reason: str = "", timeout_seconds: float = 10.0) -> Dict[str, Any]:
@@ -4334,6 +4373,9 @@ class DependencyAgent:
                 "lastShareLikeLogAtMs",
                 "lastError",
                 "lastFailureCategory",
+                "staticDifficulty",
+                "staticDifficultySource",
+                "staticDifficultyMatchedGpuName",
             )
             if key in idle_raw
         }
