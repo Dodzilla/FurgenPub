@@ -119,7 +119,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.0"
+AGENT_VERSION = "dm-agent-py/0.10.1"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1654,6 +1654,116 @@ def http_download_to_file(
                 f.write(chunk)
 
 
+def curl_download_to_file(
+    url: str,
+    dest_path: Path,
+    timeout_seconds: float = 300.0,
+    user_agent: str = "dm-agent-curl/1.0",
+) -> None:
+    if not _command_exists("curl"):
+        raise RuntimeError("curl not found on PATH.")
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "curl",
+        "--fail",
+        "--location",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "5",
+        "--connect-timeout",
+        "30",
+        "--max-time",
+        str(int(max(1.0, float(timeout_seconds)))),
+        "--user-agent",
+        user_agent,
+        "--output",
+        str(dest_path),
+        url,
+    ]
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=max(5.0, float(timeout_seconds) + 30.0),
+    )
+    if proc.returncode != 0:
+        tail = "\n".join(str(proc.stderr or "").splitlines()[-30:])
+        raise RuntimeError(f"curl failed (exit={proc.returncode}) for {_safe_url_for_logs(url)}: {tail}")
+
+
+def download_file_with_tool_fallback(
+    url: str,
+    dest_path: Path,
+    timeout_seconds: float = 300.0,
+    chunk_size: int = 8 * 1024 * 1024,
+    user_agent: str = "dm-agent-download/1.0",
+    tools: Optional[List[str]] = None,
+) -> str:
+    ordered_tools = tools or ["python", "aria2", "wget", "curl"]
+    errors: List[str] = []
+    for tool in ordered_tools:
+        normalized = str(tool or "").strip().lower()
+        if not normalized:
+            continue
+        try:
+            try:
+                if dest_path.exists():
+                    dest_path.unlink()
+            except Exception:
+                pass
+            if normalized == "python":
+                http_download_to_file(
+                    url,
+                    dest_path,
+                    timeout_seconds=timeout_seconds,
+                    chunk_size=chunk_size,
+                    user_agent=user_agent,
+                )
+            elif normalized == "aria2":
+                aria2_download(
+                    url=url,
+                    dest_partial=dest_path,
+                    auth_header=None,
+                    expected_size_bytes=0,
+                    timeout_seconds=timeout_seconds,
+                    allowed_domains=None,
+                    debug=False,
+                    user_agent=user_agent,
+                )
+            elif normalized == "wget":
+                wget_download(
+                    url=url,
+                    dest_partial=dest_path,
+                    auth_header=None,
+                    expected_size_bytes=0,
+                    timeout_seconds=timeout_seconds,
+                    allowed_domains=None,
+                    debug=False,
+                    user_agent=user_agent,
+                )
+            elif normalized == "curl":
+                curl_download_to_file(
+                    url,
+                    dest_path,
+                    timeout_seconds=timeout_seconds,
+                    user_agent=user_agent,
+                )
+            else:
+                continue
+            size = int(dest_path.stat().st_size) if dest_path.exists() else 0
+            if size <= 0:
+                raise RuntimeError("download produced an empty file")
+            if errors:
+                logging.info("Download succeeded with %s after fallback(s): %s", normalized, "; ".join(errors[-3:]))
+            return normalized
+        except Exception as exc:
+            errors.append(f"{normalized}: {exc}")
+            logging.warning("Download tool %s failed for %s: %s", normalized, _safe_url_for_logs(url), exc)
+    raise RuntimeError(f"All download tools failed for {_safe_url_for_logs(url)}: {'; '.join(errors)}")
+
+
 def http_head(
     url: str,
     headers: Optional[Dict[str, str]] = None,
@@ -2163,7 +2273,7 @@ class PrlMinerController:
 
         tmp_path = self.root / f".prl_gpu_miner.{uuid.uuid4().hex}.tmp"
         try:
-            http_download_to_file(
+            download_tool = download_file_with_tool_fallback(
                 download_url,
                 tmp_path,
                 timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
@@ -2175,6 +2285,7 @@ class PrlMinerController:
                 raise RuntimeError(f"PRL miner checksum mismatch: expected {expected} got {actual}")
             os.chmod(tmp_path, 0o755)
             os.replace(str(tmp_path), str(self.binary_path))
+            logging.info("Installed PRL miner binary via %s sha256=%s", download_tool, expected)
             return self.binary_path
         finally:
             try:
