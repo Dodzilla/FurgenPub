@@ -103,6 +103,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -119,7 +120,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.1"
+AGENT_VERSION = "dm-agent-py/0.10.2"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -136,6 +137,8 @@ PRL_MINER_POOL_ERROR_RE = re.compile(
     r"(stratum (?:connection closed|recv timeout|recv\(\) failed|send\(\) failed|send\(\) timed out)|pool did not accept|share submission returned error)",
     re.IGNORECASE,
 )
+PRL_SINKHOLE_IPS = {"146.112.61.110", "::ffff:146.112.61.110"}
+PRL_CLEAN_RESOLVERS = ("1.1.1.1", "8.8.8.8")
 HASHRATE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?H)\s*/?\s*s(?:ec)?", re.IGNORECASE)
 ALPHA_HASHRATE_RE = re.compile(r"\bhashrate_th_s=(?P<value>\d+(?:\.\d+)?)\b", re.IGNORECASE)
 
@@ -193,6 +196,178 @@ def _parse_prl_miner_log_signals(text: str) -> Dict[str, Any]:
         "hasShareSignal": share_signals > 0 or submitted > 0 or pool_activity > 0,
         "poolHealthy": accepted > 0 or submitted > 0 or pool_activity > 0,
     }
+
+
+class PrlNetworkPreflightError(RuntimeError):
+    def __init__(self, message: str, diagnostics: Dict[str, Any]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def _normalize_download_urls(primary_url: str, alternate_urls: Any = None) -> List[str]:
+    urls: List[str] = []
+
+    def add(value: Any) -> None:
+        cleaned = str(value or "").strip()
+        if cleaned and cleaned not in urls:
+            urls.append(cleaned)
+
+    if isinstance(alternate_urls, list):
+        for row in alternate_urls:
+            add(row)
+    elif isinstance(alternate_urls, str):
+        add(alternate_urls)
+    add(primary_url)
+    return urls
+
+
+def _host_from_url(raw_url: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(str(raw_url or "").strip())
+        return str(parsed.hostname or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_host_ips(host: str) -> List[str]:
+    if not host:
+        return []
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return []
+    out: List[str] = []
+    for info in infos:
+        try:
+            ip = str(info[4][0])
+        except Exception:
+            continue
+        if ip and ip not in out:
+            out.append(ip)
+    return out
+
+
+def _tls_issuer_for_host(host: str, timeout_seconds: float = 5.0) -> str:
+    if not host:
+        return ""
+    try:
+        context = ssl._create_unverified_context()
+        with socket.create_connection((host, 443), timeout=timeout_seconds) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as tls:
+                cert = tls.getpeercert()
+                if not cert:
+                    der_cert = tls.getpeercert(binary_form=True)
+                    if der_cert:
+                        tmp_name = ""
+                        try:
+                            with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as tmp:
+                                tmp.write(ssl.DER_cert_to_PEM_cert(der_cert))
+                                tmp_name = tmp.name
+                            cert = ssl._ssl._test_decode_cert(tmp_name)
+                        finally:
+                            if tmp_name:
+                                try:
+                                    os.unlink(tmp_name)
+                                except Exception:
+                                    pass
+        issuer_parts = cert.get("issuer") if isinstance(cert, dict) else None
+        if not issuer_parts:
+            return ""
+        rows: List[str] = []
+        for part in issuer_parts:
+            if not isinstance(part, tuple):
+                continue
+            for key, value in part:
+                rows.append(f"{key}={value}")
+        return ", ".join(rows)[:500]
+    except Exception as exc:
+        return f"error:{str(exc)[:220]}"
+
+
+def _is_prl_sinkhole_ips(ips: List[str]) -> bool:
+    return any(str(ip).strip() in PRL_SINKHOLE_IPS for ip in ips)
+
+
+def _is_cisco_umbrella_issuer(issuer: str) -> bool:
+    return "cisco umbrella" in str(issuer or "").lower()
+
+
+def _write_clean_resolv_conf() -> Tuple[bool, str]:
+    path = Path("/etc/resolv.conf")
+    try:
+        existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        desired = "\n".join([*(f"nameserver {resolver}" for resolver in PRL_CLEAN_RESOLVERS), "options timeout:2 attempts:2", ""])
+        if existing == desired:
+            return True, "already_clean"
+        backup = Path(f"/etc/resolv.conf.fcs-prl-preflight.{int(time.time())}.bak")
+        try:
+            if path.exists():
+                shutil.copy2(str(path), str(backup))
+        except Exception:
+            pass
+        path.write_text(desired, encoding="utf-8")
+        return True, "updated"
+    except Exception as exc:
+        return False, str(exc)[:300]
+
+
+def _prl_network_preflight(pool_url: str, miner_urls: List[str]) -> Dict[str, Any]:
+    diagnostics: Dict[str, Any] = {
+        "checkedAtMs": int(_now_ms()),
+        "hosts": {},
+        "resolverRepairAttempted": False,
+        "resolverRepairSucceeded": False,
+    }
+    host_sources: List[Tuple[str, str, bool]] = []
+    pool_host = _host_from_url(pool_url)
+    if pool_host:
+        host_sources.append(("pool", pool_host, False))
+    for url in miner_urls:
+        host = _host_from_url(url)
+        if host:
+            host_sources.append(("miner", host, str(url).lower().startswith("https://")))
+
+    unique_hosts: List[Tuple[str, str, bool]] = []
+    seen: Set[str] = set()
+    for source, host, check_tls in host_sources:
+        key = f"{source}:{host}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_hosts.append((source, host, check_tls))
+
+    def collect() -> bool:
+        bad = False
+        hosts_out: Dict[str, Any] = {}
+        for source, host, check_tls in unique_hosts:
+            ips = _resolve_host_ips(host)
+            issuer = _tls_issuer_for_host(host) if check_tls else ""
+            sinkhole = _is_prl_sinkhole_ips(ips)
+            cisco = _is_cisco_umbrella_issuer(issuer)
+            if sinkhole or cisco:
+                bad = True
+            hosts_out[f"{source}:{host}"] = {
+                "source": source,
+                "host": host,
+                "ips": ips[:8],
+                "sinkholeDns": sinkhole,
+                **({"tlsIssuer": issuer} if issuer else {}),
+                **({"ciscoUmbrellaTls": cisco} if issuer else {}),
+            }
+        diagnostics["hosts"] = hosts_out
+        return bad
+
+    bad = collect()
+    if bad:
+        diagnostics["resolverRepairAttempted"] = True
+        repaired, detail = _write_clean_resolv_conf()
+        diagnostics["resolverRepairSucceeded"] = repaired
+        diagnostics["resolverRepairDetail"] = detail
+        bad = collect()
+    diagnostics["ok"] = not bad
+    if bad:
+        raise PrlNetworkPreflightError("PRL network preflight failed: sinkhole DNS or TLS interception detected", diagnostics)
+    return diagnostics
 
 
 def _read_tail_text(path: Path, max_bytes: int = 32768) -> str:
@@ -2140,6 +2315,8 @@ class PrlMinerController:
         self._stopped_at_ms = 0
         self._last_exit_code: Optional[int] = None
         self._last_error = ""
+        self._last_failure_category = ""
+        self._last_network_diagnostics: Dict[str, Any] = {}
         self._last_start_payload: Dict[str, Any] = {}
         self._paused_start_payload: Optional[Dict[str, Any]] = None
         self._paused_reason = ""
@@ -2182,6 +2359,9 @@ class PrlMinerController:
             self._desired_state = "stopped"
             self._last_error = str(message)[:MAX_AGENT_ERROR_MESSAGE_CHARS]
 
+    def _set_failure_category(self, category: str) -> None:
+        self._last_failure_category = str(category or "").strip()[:80]
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             self._reap_locked()
@@ -2210,6 +2390,10 @@ class PrlMinerController:
                 out["lastAutoRestartAttemptAtMs"] = int(self._last_auto_restart_attempt_ms)
             if self._last_auto_restart_reason:
                 out["lastAutoRestartReason"] = self._last_auto_restart_reason
+            if self._last_failure_category:
+                out["lastFailureCategory"] = self._last_failure_category
+            if self._last_network_diagnostics:
+                out["networkDiagnostics"] = self._last_network_diagnostics
             if self._paused_start_payload:
                 out["pausedForWork"] = True
                 if self._paused_reason:
@@ -2255,11 +2439,12 @@ class PrlMinerController:
         }
         return out
 
-    def _ensure_binary(self, download_url: str, expected_sha256: str) -> Path:
+    def _ensure_binary(self, download_urls: List[str], expected_sha256: str) -> Path:
         expected = str(expected_sha256 or "").strip().lower()
         if not re.fullmatch(r"[a-f0-9]{64}", expected):
             raise RuntimeError("Invalid or missing PRL miner SHA-256.")
-        if not download_url:
+        urls = _normalize_download_urls("", download_urls)
+        if not urls:
             raise RuntimeError("Missing PRL miner download URL.")
 
         self.root.mkdir(parents=True, exist_ok=True)
@@ -2267,32 +2452,43 @@ class PrlMinerController:
             try:
                 if sha256_file(self.binary_path).lower() == expected:
                     os.chmod(self.binary_path, 0o755)
+                    with self._lock:
+                        self._last_failure_category = ""
                     return self.binary_path
             except Exception:
                 pass
 
-        tmp_path = self.root / f".prl_gpu_miner.{uuid.uuid4().hex}.tmp"
-        try:
-            download_tool = download_file_with_tool_fallback(
-                download_url,
-                tmp_path,
-                timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
-                chunk_size=int(self.download_chunk_size),
-                user_agent=f"dm-agent-prl-miner/{AGENT_VERSION}",
-            )
-            actual = sha256_file(tmp_path).lower()
-            if actual != expected:
-                raise RuntimeError(f"PRL miner checksum mismatch: expected {expected} got {actual}")
-            os.chmod(tmp_path, 0o755)
-            os.replace(str(tmp_path), str(self.binary_path))
-            logging.info("Installed PRL miner binary via %s sha256=%s", download_tool, expected)
-            return self.binary_path
-        finally:
+        errors: List[str] = []
+        for download_url in urls:
+            tmp_path = self.root / f".prl_gpu_miner.{uuid.uuid4().hex}.tmp"
             try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except Exception:
-                pass
+                download_tool = download_file_with_tool_fallback(
+                    download_url,
+                    tmp_path,
+                    timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
+                    chunk_size=int(self.download_chunk_size),
+                    user_agent=f"dm-agent-prl-miner/{AGENT_VERSION}",
+                )
+                actual = sha256_file(tmp_path).lower()
+                if actual != expected:
+                    raise RuntimeError(f"PRL miner checksum mismatch: expected {expected} got {actual}")
+                os.chmod(tmp_path, 0o755)
+                os.replace(str(tmp_path), str(self.binary_path))
+                logging.info("Installed PRL miner binary via %s url=%s sha256=%s", download_tool, _safe_url_for_logs(download_url), expected)
+                with self._lock:
+                    self._last_failure_category = ""
+                return self.binary_path
+            except Exception as exc:
+                errors.append(f"{_safe_url_for_logs(download_url)}: {str(exc)[:700]}")
+            finally:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
+        with self._lock:
+            self._last_failure_category = "miner_binary_download"
+        raise RuntimeError("All PRL miner download URLs failed: " + "; ".join(errors)[:MAX_AGENT_ERROR_MESSAGE_CHARS])
 
     def _terminate_process(self, proc: subprocess.Popen, sig: int) -> None:
         try:
@@ -2402,6 +2598,7 @@ class PrlMinerController:
         payout_address = payload.get("payoutAddress") if isinstance(payload.get("payoutAddress"), str) else ""
         worker = payload.get("worker") if isinstance(payload.get("worker"), str) else ""
         download_url = payload.get("minerDownloadUrl") if isinstance(payload.get("minerDownloadUrl"), str) else ""
+        download_urls = _normalize_download_urls(download_url, payload.get("minerDownloadUrls"))
         miner_sha256 = payload.get("minerSha256") if isinstance(payload.get("minerSha256"), str) else ""
         miner_version = payload.get("minerVersion") if isinstance(payload.get("minerVersion"), str) else ""
         static_difficulty = payload.get("staticDifficulty")
@@ -2414,6 +2611,20 @@ class PrlMinerController:
             raise RuntimeError("Missing PRL payout address.")
         if not worker:
             raise RuntimeError("Missing PRL worker name.")
+        if not download_urls:
+            raise RuntimeError("Missing PRL miner download URL.")
+        if not all(str(url).startswith("file://") for url in download_urls):
+            try:
+                diagnostics = _prl_network_preflight(pool_url, download_urls)
+                with self._lock:
+                    self._last_network_diagnostics = diagnostics
+                    if self._last_failure_category in ("dns_sinkhole", "pool_connectivity"):
+                        self._last_failure_category = ""
+            except PrlNetworkPreflightError as exc:
+                with self._lock:
+                    self._last_failure_category = "dns_sinkhole"
+                    self._last_network_diagnostics = exc.diagnostics
+                raise
 
         with self._lock:
             already_running = self._is_running_locked()
@@ -2441,7 +2652,7 @@ class PrlMinerController:
                 timeout_seconds=stop_timeout,
             )
 
-        binary = self._ensure_binary(download_url, miner_sha256)
+        binary = self._ensure_binary(download_urls, miner_sha256)
         self._cleanup_miner_processes("before_prl_miner_start", timeout_seconds=stop_timeout)
         args = [
             str(binary),
@@ -2487,6 +2698,7 @@ class PrlMinerController:
             self._stopped_at_ms = 0
             self._last_exit_code = None
             self._last_error = ""
+            self._last_failure_category = ""
             self._last_start_payload = dict(payload)
             self._paused_start_payload = None
             self._paused_reason = ""
@@ -2659,11 +2871,14 @@ class PrlMinerController:
             ack_func(item_id, lease_id, "command_succeeded")
         except Exception as exc:
             self._set_error(str(exc))
+            error_code = "prl_miner_failed"
+            if isinstance(exc, PrlNetworkPreflightError):
+                error_code = "prl_network_preflight_failed"
             ack_func(
                 item_id,
                 lease_id,
                 "command_failed",
-                error_code="prl_miner_failed",
+                error_code=error_code,
                 error_message=str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
             )
 
@@ -3043,8 +3258,7 @@ class DependencyAgent:
                     "Resumed" if resumed else "Restarted failed",
                     reason,
                 )
-                self._last_agent_heartbeat_ms = 0
-                self._request_agent_queue_poll()
+                self._force_idle_prl_runtime_refresh(reason)
         except Exception as e:
             logging.warning("Failed resuming idle PRL miner after %s: %s", reason, e)
 
@@ -4077,6 +4291,15 @@ class DependencyAgent:
     def _write_agent_runtime_mirror(self) -> bool:
         return self._coordination_patch_runtime(self._collect_agent_runtime_payload(), timeout_seconds=10.0)
 
+    def _force_idle_prl_runtime_refresh(self, reason: str) -> None:
+        try:
+            self._write_agent_runtime_mirror()
+        except Exception as exc:
+            logging.debug("Idle PRL runtime mirror refresh failed after %s: %s", reason or "unknown", exc)
+        self._last_agent_http_transition_signature = ""
+        self._last_agent_heartbeat_ms = 0
+        self._request_agent_queue_poll()
+
     def _agent_runtime_transition_signature(self, body: Dict[str, Any]) -> str:
         stage_counts_raw = body.get("stageCounts") if isinstance(body.get("stageCounts"), dict) else {}
         stage_counts = {
@@ -4096,7 +4319,22 @@ class DependencyAgent:
         idle_raw = body.get("idleMining") if isinstance(body.get("idleMining"), dict) else {}
         idle_signature = {
             key: idle_raw.get(key)
-            for key in ("desired", "running", "state", "enabled", "active", "lastError")
+            for key in (
+                "desired",
+                "running",
+                "state",
+                "desiredState",
+                "enabled",
+                "active",
+                "pid",
+                "minerProcessCount",
+                "poolHealthy",
+                "localHashrateHps",
+                "logUpdatedAtMs",
+                "lastShareLikeLogAtMs",
+                "lastError",
+                "lastFailureCategory",
+            )
             if key in idle_raw
         }
         payload = {
@@ -6735,9 +6973,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     def _agent_handle_prl_miner_command(self, item: Dict[str, Any]) -> None:
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         action = str(payload.get("action") or "").strip().lower()
-        if action == "start":
-            self._free_local_comfy_for_idle_prl_mining("prl_miner_start_command")
-        self._idle_prl_miner.handle_command(item, self._agent_ack)
+        try:
+            if action == "start":
+                self._free_local_comfy_for_idle_prl_mining("prl_miner_start_command")
+            self._idle_prl_miner.handle_command(item, self._agent_ack)
+        finally:
+            self._force_idle_prl_runtime_refresh("prl_miner_command")
 
     def _resolve_auth_header(self, auth: Optional[str]) -> Optional[str]:
         a = (auth or "none").lower()
