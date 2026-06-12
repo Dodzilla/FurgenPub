@@ -135,21 +135,12 @@ function provisioning_verify_flux_kv_cache_support() {
 }
 
 function provisioning_install_impact_pack_runtime_requirements() {
-    local node_path requirements_path
+    local node_path
     node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-Impact-Pack"
-    requirements_path="${node_path}/requirements.txt"
 
     if [[ ! -d "${node_path}" ]]; then
         printf "ERROR: ComfyUI-Impact-Pack directory missing; LatentPixelScale cannot be installed.\n"
         return 1
-    fi
-
-    if [[ -e "${requirements_path}" ]]; then
-        printf "Re-applying ComfyUI-Impact-Pack requirements...\n"
-        pip install --no-cache-dir -r "${requirements_path}" || {
-            printf "ERROR: Failed to install ComfyUI-Impact-Pack requirements.\n"
-            return 1
-        }
     fi
 
     printf "Installing ComfyUI-Impact-Pack runtime dependencies (opencv-python-headless, piexif, segment-anything)...\n"
@@ -228,14 +219,22 @@ function provisioning_get_nodes() {
             fi
             pin_node_if_requested "$dir" "$path"
             if [[ -e $requirements ]]; then
-               pip install --no-cache-dir -r "$requirements"
+               if [[ "${dir}" == "ComfyUI-Impact-Pack" ]]; then
+                   printf "Skipping full ComfyUI-Impact-Pack requirements; installing pinned runtime subset instead.\n"
+               else
+                   pip install --no-cache-dir -r "$requirements"
+               fi
             fi
         else
             printf "Downloading node: %s...\n" "${repo}"
             git clone "${repo}" "${path}" --recursive
             pin_node_if_requested "$dir" "$path"
             if [[ -e $requirements ]]; then
-                pip install --no-cache-dir -r "${requirements}"
+                if [[ "${dir}" == "ComfyUI-Impact-Pack" ]]; then
+                    printf "Skipping full ComfyUI-Impact-Pack requirements; installing pinned runtime subset instead.\n"
+                else
+                    pip install --no-cache-dir -r "${requirements}"
+                fi
             fi
         fi
     done
