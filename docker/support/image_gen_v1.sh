@@ -196,7 +196,9 @@ function provisioning_start() {
     provisioning_get_nodes || return 1
     provisioning_install_impact_pack_runtime_requirements || return 1
     provisioning_verify_latent_pixel_scale_support || return 1
-    provisioning_get_pip_packages || return 1
+    provisioning_get_pip_packages || {
+        printf "WARN: Optional image_gen_v1 pip package install failed; continuing after required node verification.\n"
+    }
     # models are now installed by DM agent
     provisioning_print_end || return 1
 }
