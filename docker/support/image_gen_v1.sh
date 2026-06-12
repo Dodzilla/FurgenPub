@@ -134,24 +134,71 @@ function provisioning_verify_flux_kv_cache_support() {
     printf "Verified Flux KV cache node support at pin %s.\n" "${COMFYUI_PIN_COMMIT}"
 }
 
+function provisioning_install_impact_pack_runtime_requirements() {
+    local node_path requirements_path
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-Impact-Pack"
+    requirements_path="${node_path}/requirements.txt"
+
+    if [[ ! -d "${node_path}" ]]; then
+        printf "ERROR: ComfyUI-Impact-Pack directory missing; LatentPixelScale cannot be installed.\n"
+        return 1
+    fi
+
+    if [[ -e "${requirements_path}" ]]; then
+        printf "Re-applying ComfyUI-Impact-Pack requirements...\n"
+        pip install --no-cache-dir -r "${requirements_path}" || {
+            printf "ERROR: Failed to install ComfyUI-Impact-Pack requirements.\n"
+            return 1
+        }
+    fi
+
+    printf "Installing ComfyUI-Impact-Pack runtime dependencies (opencv-python-headless, piexif, segment-anything)...\n"
+    pip install --no-cache-dir "opencv-python-headless==4.11.0.86" "piexif==1.1.3" "segment-anything==1.0" || {
+        printf "ERROR: Failed to install Impact-Pack runtime dependencies.\n"
+        return 1
+    }
+}
+
+function provisioning_verify_latent_pixel_scale_support() {
+    local node_path
+    node_path="${COMFYUI_DIR}/custom_nodes/ComfyUI-Impact-Pack"
+
+    if [[ ! -d "${node_path}" ]]; then
+        printf "ERROR: ComfyUI-Impact-Pack directory missing while verifying LatentPixelScale.\n"
+        return 1
+    fi
+
+    if ! grep -R --include='*.py' -Fq "LatentPixelScale" "${node_path}"; then
+        printf "ERROR: ComfyUI-Impact-Pack checkout does not expose LatentPixelScale.\n"
+        printf "ERROR: Checked %s at pin %s\n" "${node_path}" "${NODE_PINS[ComfyUI-Impact-Pack]}"
+        return 1
+    fi
+
+    printf "Verified LatentPixelScale support in ComfyUI-Impact-Pack at pin %s.\n" "${NODE_PINS[ComfyUI-Impact-Pack]}"
+}
+
 function provisioning_start() {
-    provisioning_print_header
+    provisioning_print_header || return 1
     if [[ "${FURGEN_BAKED:-0}" == "1" ]]; then
         # Baked images ship ComfyUI (pinned), custom nodes, and python deps preinstalled,
         # so readiness only waits on model downloads handled by the dependency agent.
         echo "Baked image detected (FURGEN_BAKED=1); skipping ComfyUI/node/pip provisioning."
-        provisioning_verify_flux_kv_cache_support || echo "WARN: baked image flux verification failed"
-        provisioning_print_end
+        load_node_pins_from_env || return 1
+        provisioning_verify_flux_kv_cache_support || return 1
+        provisioning_verify_latent_pixel_scale_support || return 1
+        provisioning_print_end || return 1
         return 0
     fi
-    provisioning_update_comfyui
-    provisioning_verify_flux_kv_cache_support
-    provisioning_get_apt_packages
-    load_node_pins_from_env
-    provisioning_get_nodes
-    provisioning_get_pip_packages
+    provisioning_update_comfyui || return 1
+    provisioning_verify_flux_kv_cache_support || return 1
+    provisioning_get_apt_packages || return 1
+    load_node_pins_from_env || return 1
+    provisioning_get_nodes || return 1
+    provisioning_install_impact_pack_runtime_requirements || return 1
+    provisioning_verify_latent_pixel_scale_support || return 1
+    provisioning_get_pip_packages || return 1
     # models are now installed by DM agent
-    provisioning_print_end
+    provisioning_print_end || return 1
 }
 
 function provisioning_get_apt_packages() {
@@ -643,7 +690,10 @@ dependency_manager_start_agent
 
 # Allow user to disable provisioning if they started with a script they didn't want
 if [[ ! -f /.noprovisioning ]]; then
-    provisioning_start
+    provisioning_start || {
+        echo "ERROR: image_gen_v1 provisioning failed."
+        exit 1
+    }
 fi
 
 # Re-apply the watchdog bootstrap after provisioning in case image startup scripts
