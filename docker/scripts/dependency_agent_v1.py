@@ -120,7 +120,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.5"
+AGENT_VERSION = "dm-agent-py/0.10.6"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2441,17 +2441,17 @@ class PrlMinerController:
             out["suspendCount"] = int(self._suspend_count)
             out["resumeSignalCount"] = int(self._resume_signal_count)
             out["keepRunningBypassCount"] = int(self._keep_running_bypass_count)
-            if self._paused_start_payload:
-                out["pausedForWork"] = True
-                if self._paused_reason:
-                    out["pausedReason"] = self._paused_reason
-            if self._suspended_for_work:
-                out["pausedForWork"] = True
-                out["suspendedForWork"] = True
-                if self._suspended_at_ms > 0:
-                    out["suspendedAtMs"] = int(self._suspended_at_ms)
-                if self._paused_reason:
-                    out["pausedReason"] = self._paused_reason
+            paused_for_work = bool(self._paused_start_payload or self._suspended_for_work)
+            out["pausedForWork"] = paused_for_work
+            out["suspendedForWork"] = bool(self._suspended_for_work)
+            if paused_for_work and self._paused_reason:
+                out["pausedReason"] = self._paused_reason
+            else:
+                out["pausedReason"] = None
+            if self._suspended_for_work and self._suspended_at_ms > 0:
+                out["suspendedAtMs"] = int(self._suspended_at_ms)
+            else:
+                out["suspendedAtMs"] = None
         try:
             existing_pids = self._find_existing_miner_pids()
             out["minerProcessCount"] = int(len(existing_pids))
