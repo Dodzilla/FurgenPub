@@ -120,11 +120,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.3"
+AGENT_VERSION = "dm-agent-py/0.10.4"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
+PRL_MINER_PAUSE_MODES = {"stop_start", "suspend_resume", "keep_running"}
+DEFAULT_PRL_MINER_PAUSE_MODE = "stop_start"
 PRL_MINER_SHARE_SIGNAL_RE = re.compile(
     r"\b(accepted|rejected|share submission returned error|stratum error response|dropped reason=|action=drop_share|action=reconnect_drop_ambiguous_share)\b",
     re.IGNORECASE,
@@ -196,6 +198,11 @@ def _parse_prl_miner_log_signals(text: str) -> Dict[str, Any]:
         "hasShareSignal": share_signals > 0 or submitted > 0 or pool_activity > 0,
         "poolHealthy": accepted > 0 or submitted > 0 or pool_activity > 0,
     }
+
+
+def _normalize_prl_pause_mode(value: Any) -> str:
+    cleaned = str(value or "").strip().lower().replace("-", "_")
+    return cleaned if cleaned in PRL_MINER_PAUSE_MODES else DEFAULT_PRL_MINER_PAUSE_MODE
 
 
 class PrlNetworkPreflightError(RuntimeError):
@@ -2335,9 +2342,17 @@ class PrlMinerController:
         self._static_difficulty = ""
         self._static_difficulty_source = ""
         self._static_difficulty_matched_gpu_name = ""
+        self._pause_mode = DEFAULT_PRL_MINER_PAUSE_MODE
         self._last_start_payload: Dict[str, Any] = {}
         self._paused_start_payload: Optional[Dict[str, Any]] = None
         self._paused_reason = ""
+        self._suspended_for_work = False
+        self._suspended_at_ms = 0
+        self._pause_stop_count = 0
+        self._resume_start_count = 0
+        self._suspend_count = 0
+        self._resume_signal_count = 0
+        self._keep_running_bypass_count = 0
         self._consecutive_failures = 0
         self._last_auto_restart_attempt_ms = 0
         self._last_auto_restart_reason = ""
@@ -2418,8 +2433,21 @@ class PrlMinerController:
                 out["lastFailureCategory"] = self._last_failure_category
             if self._last_network_diagnostics:
                 out["networkDiagnostics"] = self._last_network_diagnostics
+            out["pauseMode"] = self._pause_mode
+            out["pauseStopCount"] = int(self._pause_stop_count)
+            out["resumeStartCount"] = int(self._resume_start_count)
+            out["suspendCount"] = int(self._suspend_count)
+            out["resumeSignalCount"] = int(self._resume_signal_count)
+            out["keepRunningBypassCount"] = int(self._keep_running_bypass_count)
             if self._paused_start_payload:
                 out["pausedForWork"] = True
+                if self._paused_reason:
+                    out["pausedReason"] = self._paused_reason
+            if self._suspended_for_work:
+                out["pausedForWork"] = True
+                out["suspendedForWork"] = True
+                if self._suspended_at_ms > 0:
+                    out["suspendedAtMs"] = int(self._suspended_at_ms)
                 if self._paused_reason:
                     out["pausedReason"] = self._paused_reason
         try:
@@ -2514,13 +2542,22 @@ class PrlMinerController:
             self._last_failure_category = "miner_binary_download"
         raise RuntimeError("All PRL miner download URLs failed: " + "; ".join(errors)[:MAX_AGENT_ERROR_MESSAGE_CHARS])
 
-    def _terminate_process(self, proc: subprocess.Popen, sig: int) -> None:
+    def _signal_process(self, proc: subprocess.Popen, sig: int) -> None:
         try:
             if hasattr(os, "killpg"):
                 os.killpg(os.getpgid(proc.pid), sig)
                 return
         except Exception:
             pass
+        try:
+            os.kill(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def _terminate_process(self, proc: subprocess.Popen, sig: int) -> None:
+        if sig not in (signal.SIGTERM, signal.SIGKILL):
+            self._signal_process(proc, sig)
+            return
         if sig == signal.SIGTERM:
             proc.terminate()
         else:
@@ -2628,6 +2665,7 @@ class PrlMinerController:
         static_difficulty = _normalize_prl_static_difficulty(payload.get("staticDifficulty"))
         static_difficulty_source = _clean_prl_payload_string(payload.get("staticDifficultySource"), 80)
         static_difficulty_matched_gpu_name = _clean_prl_payload_string(payload.get("staticDifficultyMatchedGpuName"), 160)
+        pause_mode = _normalize_prl_pause_mode(payload.get("pauseMode"))
         stop_timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
         force_restart = payload.get("forceRestart") is True
 
@@ -2659,6 +2697,7 @@ class PrlMinerController:
                 self._pool_url == pool_url and
                 self._worker == worker and
                 self._static_difficulty == static_difficulty and
+                self._pause_mode == pause_mode and
                 (not miner_version or self._miner_version == miner_version)
             )
             if same_target:
@@ -2667,12 +2706,18 @@ class PrlMinerController:
                 self._static_difficulty = static_difficulty
                 self._static_difficulty_source = static_difficulty_source
                 self._static_difficulty_matched_gpu_name = static_difficulty_matched_gpu_name
+                self._pause_mode = pause_mode
                 self._last_start_payload = dict(payload)
-                self._paused_start_payload = None
-                self._paused_reason = ""
                 current_pid = self._proc.pid if self._proc is not None else None
                 if not force_restart:
                     self._cleanup_miner_processes("dedupe_prl_miner_same_target", keep_pid=current_pid, timeout_seconds=stop_timeout)
+                    if self._suspended_for_work:
+                        self._state = "paused"
+                    else:
+                        self._paused_start_payload = None
+                        self._paused_reason = ""
+                        self._suspended_for_work = False
+                        self._suspended_at_ms = 0
         if same_target and not force_restart:
             return self.snapshot()
 
@@ -2727,6 +2772,7 @@ class PrlMinerController:
             self._static_difficulty = static_difficulty
             self._static_difficulty_source = static_difficulty_source
             self._static_difficulty_matched_gpu_name = static_difficulty_matched_gpu_name
+            self._pause_mode = pause_mode
             self._started_at_ms = _now_ms()
             self._stopped_at_ms = 0
             self._last_exit_code = None
@@ -2735,12 +2781,15 @@ class PrlMinerController:
             self._last_start_payload = dict(payload)
             self._paused_start_payload = None
             self._paused_reason = ""
+            self._suspended_for_work = False
+            self._suspended_at_ms = 0
         logging.info(
-            "Started idle PRL miner pid=%s worker=%s pool=%s staticDifficulty=%s",
+            "Started idle PRL miner pid=%s worker=%s pool=%s staticDifficulty=%s pauseMode=%s",
             proc.pid,
             worker,
             pool_url,
             static_difficulty or "vardiff",
+            pause_mode,
         )
         return self.snapshot()
 
@@ -2750,10 +2799,7 @@ class PrlMinerController:
 
     def _stop_serialized(self, reason: str = "", timeout_seconds: float = 10.0) -> Dict[str, Any]:
         normalized_reason = str(reason or "").strip()
-        if normalized_reason not in PRL_MINER_TRANSIENT_STOP_REASONS:
-            with self._lock:
-                self._paused_start_payload = None
-                self._paused_reason = ""
+        clear_pause_after_stop = normalized_reason not in PRL_MINER_TRANSIENT_STOP_REASONS
         timeout_seconds = max(1.0, min(120.0, float(timeout_seconds or 10.0)))
         with self._lock:
             self._reap_locked()
@@ -2771,12 +2817,21 @@ class PrlMinerController:
             else:
                 self._state = "stopping"
                 self._desired_state = "stopped"
+                was_suspended = bool(self._suspended_for_work)
         if proc is None:
+            if clear_pause_after_stop:
+                with self._lock:
+                    self._paused_start_payload = None
+                    self._paused_reason = ""
+                    self._suspended_for_work = False
+                    self._suspended_at_ms = 0
             self._cleanup_miner_processes(reason or "stop_without_tracked_proc", timeout_seconds=timeout_seconds)
             return self.snapshot()
 
         logging.info("Stopping idle PRL miner pid=%s reason=%s", proc.pid, reason or "unspecified")
         try:
+            if was_suspended:
+                self._signal_process(proc, signal.SIGCONT)
             self._terminate_process(proc, signal.SIGTERM)
             deadline = time.time() + timeout_seconds
             while time.time() < deadline:
@@ -2801,6 +2856,11 @@ class PrlMinerController:
                 self._state = "stopped"
                 self._desired_state = "stopped"
                 self._stopped_at_ms = _now_ms()
+                self._suspended_for_work = False
+                self._suspended_at_ms = 0
+                if clear_pause_after_stop:
+                    self._paused_start_payload = None
+                    self._paused_reason = ""
             self._cleanup_miner_processes(reason or "post_stop_cleanup", timeout_seconds=1.0)
         return self.snapshot()
 
@@ -2818,11 +2878,31 @@ class PrlMinerController:
             with self._lock:
                 running = self._is_running_locked()
                 payload = dict(self._last_start_payload) if self._last_start_payload else {}
+                proc = self._proc
+                pause_mode = self._pause_mode
             if not running:
                 self._cleanup_miner_processes(reason or "pause_without_tracked_proc", timeout_seconds=timeout_seconds or 10.0)
                 return
+            if pause_mode == "keep_running":
+                with self._lock:
+                    self._keep_running_bypass_count += 1
+                    self._paused_reason = str(reason or "")
+                logging.info("Keeping idle PRL miner running during %s pauseMode=keep_running", reason or "work")
+                return
             if not payload:
                 self._stop_serialized(reason, timeout_seconds=timeout_seconds or 10.0)
+                return
+            if pause_mode == "suspend_resume" and proc is not None:
+                logging.info("Suspending idle PRL miner pid=%s reason=%s", proc.pid, reason or "work")
+                self._signal_process(proc, signal.SIGSTOP)
+                with self._lock:
+                    self._state = "paused"
+                    self._desired_state = "running"
+                    self._paused_start_payload = payload
+                    self._paused_reason = str(reason or "")
+                    self._suspended_for_work = True
+                    self._suspended_at_ms = _now_ms()
+                    self._suspend_count += 1
                 return
             if timeout_seconds is None:
                 raw_timeout = payload.get("stopTimeoutSec")
@@ -2831,8 +2911,29 @@ class PrlMinerController:
             with self._lock:
                 self._paused_start_payload = payload
                 self._paused_reason = str(reason or "")
+                self._pause_stop_count += 1
 
     def resume_if_paused(self, reason: str) -> bool:
+        with self._lock:
+            self._reap_locked()
+            if self._suspended_for_work and self._proc is not None and self._proc.poll() is None:
+                proc = self._proc
+                paused_reason = self._paused_reason
+            else:
+                proc = None
+                paused_reason = self._paused_reason
+        if proc is not None:
+            logging.info("Continuing suspended idle PRL miner after %s", reason or paused_reason or "work")
+            self._signal_process(proc, signal.SIGCONT)
+            with self._lock:
+                self._state = "running"
+                self._desired_state = "running"
+                self._paused_start_payload = None
+                self._paused_reason = ""
+                self._suspended_for_work = False
+                self._suspended_at_ms = 0
+                self._resume_signal_count += 1
+            return True
         with self._lock:
             self._reap_locked()
             if self._is_running_locked():
@@ -2842,6 +2943,8 @@ class PrlMinerController:
             return False
         logging.info("Resuming idle PRL miner after %s", reason or self._paused_reason or "work")
         self.start(payload)
+        with self._lock:
+            self._resume_start_count += 1
         return True
 
     def restart_if_desired(self, reason: str) -> bool:
