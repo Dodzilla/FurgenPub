@@ -120,7 +120,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.4"
+AGENT_VERSION = "dm-agent-py/0.10.5"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -361,14 +361,16 @@ def _prl_network_preflight(pool_url: str, miner_urls: List[str]) -> Dict[str, An
     def collect() -> bool:
         bad = False
         hosts_out: Dict[str, Any] = {}
-        for source, host, check_tls in unique_hosts:
+        for index, (source, host, check_tls) in enumerate(unique_hosts):
             ips = _resolve_host_ips(host)
             issuer = _tls_issuer_for_host(host) if check_tls else ""
             sinkhole = _is_prl_sinkhole_ips(ips)
             cisco = _is_cisco_umbrella_issuer(issuer)
             if sinkhole or cisco:
                 bad = True
-            hosts_out[f"{source}:{host}"] = {
+            # RTDB rejects map keys containing ".", "#", "$", "[", or "]".
+            # Keep the actual host in the value and use a stable safe key for mirrors.
+            hosts_out[f"{source}_{index}"] = {
                 "source": source,
                 "host": host,
                 "ips": ips[:8],
