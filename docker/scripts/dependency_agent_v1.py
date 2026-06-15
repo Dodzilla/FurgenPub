@@ -61,6 +61,7 @@ Optional knobs:
   - DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS (minimum fallback /agent/queue probe when signal stream is healthy; default: 60)
   - DM_AGENT_RTDB_QUEUE_CLAIM_ENABLED (allow server-gated direct RTDB queue claims; default: true)
   - DM_AGENT_RTDB_LEASE_HEARTBEAT_ENABLED (allow server-gated active lease heartbeats through RTDB; default: true)
+  - DM_COORDINATION_RUNTIME_FULL_SYNC_SECONDS (full RTDB runtime mirror inventory cadence; default: 300)
   - DM_AGENT_WAITING_DEPS_EVENT_SECONDS (waiting_dependencies event cadence; default: 60)
   - DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS (dependency readiness poll while waiting; default: 0.5)
   - DM_AGENT_PROGRESS_EVENT_SECONDS (execution_progress event cadence; default: 60)
@@ -120,7 +121,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.7"
+AGENT_VERSION = "dm-agent-py/0.10.8"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3084,6 +3085,10 @@ class DependencyAgent:
             15.0,
             min(600.0, _env_float("DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS", 60.0)),
         )
+        self.coordination_runtime_full_sync_seconds = max(
+            60.0,
+            min(3600.0, _env_float("DM_COORDINATION_RUNTIME_FULL_SYNC_SECONDS", 300.0)),
+        )
         self.agent_full_capacity_poll_seconds = max(5.0, min(300.0, _env_float("DM_AGENT_FULL_CAPACITY_POLL_SECONDS", 30.0)))
         self.agent_waiting_deps_event_ms = int(max(15.0, _env_float("DM_AGENT_WAITING_DEPS_EVENT_SECONDS", 60.0)) * 1000)
         self.agent_dependency_wait_poll_seconds = max(0.1, min(5.0, _env_float("DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS", 0.5)))
@@ -3175,6 +3180,10 @@ class DependencyAgent:
         self._coordination_agent_http_checkpoint_due_ms = 0
         self._coordination_agent_direct_empty_probe_ms = 0
         self._coordination_dependency_direct_empty_probe_ms = 0
+        self._last_dependency_runtime_full_sync_ms = 0
+        self._last_dependency_runtime_signature = ""
+        self._last_agent_runtime_full_sync_ms = 0
+        self._last_agent_runtime_signature = ""
         self._last_agent_http_transition_signature = ""
 
         # Best-effort local reconciliation (no API calls).
@@ -4311,7 +4320,43 @@ class DependencyAgent:
             return True
         return False
 
-    def _collect_dependency_runtime_payload(self, queue_depth: Optional[int] = None) -> Dict[str, Any]:
+    def _coordination_runtime_full_sync_due(self, last_full_sync_ms: int, now_ms: Optional[int] = None) -> bool:
+        if int(last_full_sync_ms or 0) <= 0:
+            return True
+        at_ms = int(now_ms if isinstance(now_ms, int) else _now_ms())
+        interval_ms = int(max(60.0, float(self.coordination_runtime_full_sync_seconds or 300.0)) * 1000)
+        return at_ms - int(last_full_sync_ms) >= interval_ms
+
+    def _runtime_payload_signature(self, payload: Dict[str, Any]) -> str:
+        return _sha256_hex_bytes(_canonical_json_bytes(payload))
+
+    def _dependency_runtime_transition_signature(self, queue_depth: Optional[int] = None) -> str:
+        with self._lock:
+            self._reconcile_lru_locked()
+            if isinstance(queue_depth, int):
+                self._last_dependency_queue_depth = max(0, int(queue_depth))
+            active_downloads = self._serialize_download_activity_locked()
+            active_download_signature = [
+                {
+                    "depId": row.get("depId"),
+                    "stage": row.get("stage"),
+                    "destRelativePath": row.get("destRelativePath"),
+                    "expectedBytes": row.get("expectedBytes"),
+                }
+                for row in active_downloads
+                if isinstance(row, dict)
+            ]
+            payload = {
+                "installedStatic": sorted(self._state.installed_static),
+                "installedDynamic": sorted(self._state.installed_dynamic),
+                "failed": sorted(self._state.failed),
+                "downloading": sorted(self._downloading),
+                "activeDownloads": active_download_signature,
+                "dynamicBytesUsed": int(self._dynamic_bytes_used),
+            }
+        return self._runtime_payload_signature(payload)
+
+    def _collect_dependency_runtime_payload(self, queue_depth: Optional[int] = None, full: bool = True) -> Dict[str, Any]:
         with self._lock:
             self._reconcile_lru_locked()
             installed_static = sorted(self._state.installed_static)
@@ -4325,17 +4370,22 @@ class DependencyAgent:
             queue_depth_value = int(self._last_dependency_queue_depth)
 
         now_ms = _now_ms()
-        stats = disk_stats(self.comfyui_dir)
-        diagnostics = self._disk_diagnostics_payload()
-        return {
-            "dependencyManager": {
+        manager: Dict[str, Any] = {
+            "queueDepth": queue_depth_value,
+            "lastHeartbeatAtMs": now_ms,
+        }
+        if active_downloads:
+            manager["activeDownloads"] = active_downloads
+            manager["downloadingDepIds"] = downloading
+        if full:
+            stats = disk_stats(self.comfyui_dir)
+            manager.update({
                 "installedDepIdsStatic": installed_static,
                 "installedDepIdsDynamic": installed_dynamic,
                 "downloadingDepIds": downloading,
                 "activeDownloads": active_downloads,
                 "failedDepIds": failed,
                 "inventoryTruncated": False,
-                "queueDepth": queue_depth_value,
                 "dynamicBytesUsed": dynamic_bytes_used,
                 "disk": {
                     "totalBytes": int(stats.get("totalBytes", 0)),
@@ -4347,14 +4397,28 @@ class DependencyAgent:
                     "resolvedPath": stats.get("resolvedPath"),
                     "mount": stats.get("mount"),
                 },
-                "diskDiagnostics": diagnostics,
-                "lastHeartbeatAtMs": now_ms,
-            },
+                "diskDiagnostics": self._disk_diagnostics_payload(),
+            })
+        return {
+            "dependencyManager": manager,
             "updatedAtMs": now_ms,
         }
 
     def _write_dependency_runtime_mirror(self, queue_depth: Optional[int] = None) -> bool:
-        return self._coordination_patch_runtime(self._collect_dependency_runtime_payload(queue_depth=queue_depth))
+        now_ms = _now_ms()
+        signature = self._dependency_runtime_transition_signature(queue_depth=queue_depth)
+        full = (
+            signature != self._last_dependency_runtime_signature
+            or self._coordination_runtime_full_sync_due(self._last_dependency_runtime_full_sync_ms, now_ms)
+        )
+        ok = self._coordination_patch_runtime(
+            self._collect_dependency_runtime_payload(queue_depth=queue_depth, full=full)
+        )
+        if ok:
+            self._last_dependency_runtime_signature = signature
+            if full:
+                self._last_dependency_runtime_full_sync_ms = now_ms
+        return ok
 
     def _disk_diagnostics_payload(self) -> Dict[str, Any]:
         paths: List[Tuple[str, Path]] = [
@@ -4396,17 +4460,15 @@ class DependencyAgent:
             "deletedOpenFiles": deleted_open,
         }
 
-    def _collect_agent_runtime_payload(self) -> Dict[str, Any]:
-        held_leases = self._collect_active_leases()
-        local_comfy = True if self.mining_only else self._local_comfy_reachable()
-        readiness_present = True if self.mining_only else self._local_readiness_file_present()
-        queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
-        input_cache_inventory = self._collect_input_cache_inventory()
-        stage_counts = self._agent_stage_counts_payload()
-        now_ms = _now_ms()
-        return {
-            "agentControl": {
-                "lastHeartbeatAtMs": now_ms,
+    def _collect_agent_runtime_payload(self, full: bool = True, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if body is None:
+            held_leases = self._collect_active_leases()
+            local_comfy = True if self.mining_only else self._local_comfy_reachable()
+            readiness_present = True if self.mining_only else self._local_readiness_file_present()
+            queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
+            input_cache_inventory = self._collect_input_cache_inventory()
+            stage_counts = self._agent_stage_counts_payload()
+            body = {
                 "localComfyReachable": bool(local_comfy),
                 "localReadinessFilePresent": bool(readiness_present),
                 "localReadinessFile": self.agent_local_readiness_file,
@@ -4433,12 +4495,77 @@ class DependencyAgent:
                     "idlePrlMining": True,
                     "miningOnly": bool(self.mining_only),
                 },
-            },
+            }
+        now_ms = _now_ms()
+        agent_control: Dict[str, Any] = {
+            "lastHeartbeatAtMs": now_ms,
+            "localComfyReachable": body.get("localComfyReachable") is True,
+            "localReadinessFilePresent": body.get("localReadinessFilePresent") is True,
+            "queueDepth": int(body.get("queueDepth") or 0),
+            "stageCounts": body.get("stageCounts") if isinstance(body.get("stageCounts"), dict) else {},
+            "heldLeases": body.get("heldLeases") if isinstance(body.get("heldLeases"), list) else [],
+            "runningItemIds": body.get("runningItemIds") if isinstance(body.get("runningItemIds"), list) else [],
+            "maxConcurrentExecuteJobs": int(body.get("maxConcurrentExecuteJobs") or 0),
+            "maxPrefetchJobs": int(body.get("maxPrefetchJobs") or 0),
+            "maxUploadJobs": int(body.get("maxUploadJobs") or 0),
+        }
+        queue_summary = body.get("queueSummary")
+        if isinstance(queue_summary, dict) and queue_summary:
+            agent_control["queueSummary"] = queue_summary
+        if full:
+            capabilities = {
+                "dependencyChannel": True,
+                "agentPullExecution": not self.mining_only,
+                "hybridOutputUploadsV1": True,
+                "dependencyDeleteFiles": True,
+                "idlePrlMining": True,
+                "miningOnly": bool(self.mining_only),
+            }
+            body_capabilities = body.get("capabilities")
+            if isinstance(body_capabilities, dict):
+                capabilities.update(body_capabilities)
+            agent_control.update({
+                "localReadinessFile": body.get("localReadinessFile") or self.agent_local_readiness_file,
+                "inputCacheKeys": body.get("inputCacheKeys", []),
+                "inputCacheKeyCount": int(body.get("inputCacheKeyCount") or 0),
+                "inputCacheBytesUsed": int(body.get("inputCacheBytesUsed") or 0),
+                "inputCacheMaxBytes": int(body.get("inputCacheMaxBytes") or 0),
+                "inputCacheInventoryTruncated": body.get("inputCacheInventoryTruncated") is True,
+                "idleMining": body.get("idleMining") if isinstance(body.get("idleMining"), dict) else {},
+                "agentVersion": body.get("agentVersion") or AGENT_VERSION,
+                "capabilities": capabilities,
+            })
+        return {
+            "agentControl": agent_control,
             "updatedAtMs": now_ms,
         }
 
-    def _write_agent_runtime_mirror(self) -> bool:
-        return self._coordination_patch_runtime(self._collect_agent_runtime_payload(), timeout_seconds=10.0)
+    def _write_agent_runtime_mirror(
+        self,
+        body: Optional[Dict[str, Any]] = None,
+        transition_signature: Optional[str] = None,
+        force_full: bool = False,
+    ) -> bool:
+        now_ms = _now_ms()
+        signature = transition_signature if isinstance(transition_signature, str) else (
+            self._agent_runtime_transition_signature(body) if isinstance(body, dict) else ""
+        )
+        full = bool(force_full or not isinstance(body, dict))
+        if isinstance(body, dict):
+            full = full or (
+                signature != self._last_agent_runtime_signature
+                or self._coordination_runtime_full_sync_due(self._last_agent_runtime_full_sync_ms, now_ms)
+            )
+        ok = self._coordination_patch_runtime(
+            self._collect_agent_runtime_payload(full=full, body=body),
+            timeout_seconds=10.0,
+        )
+        if ok:
+            if signature:
+                self._last_agent_runtime_signature = signature
+            if full:
+                self._last_agent_runtime_full_sync_ms = now_ms
+        return ok
 
     def _force_idle_prl_runtime_refresh(self, reason: str) -> None:
         try:
@@ -4446,6 +4573,7 @@ class DependencyAgent:
         except Exception as exc:
             logging.debug("Idle PRL runtime mirror refresh failed after %s: %s", reason or "unknown", exc)
         self._last_agent_http_transition_signature = ""
+        self._last_agent_runtime_signature = ""
         self._last_agent_heartbeat_ms = 0
         self._request_agent_queue_poll()
 
@@ -4489,6 +4617,12 @@ class DependencyAgent:
             )
             if key in idle_raw
         }
+        input_cache_keys_raw = body.get("inputCacheKeys")
+        input_cache_keys = sorted({
+            str(value)
+            for value in input_cache_keys_raw
+            if isinstance(value, str) and value
+        }) if isinstance(input_cache_keys_raw, list) else []
         payload = {
             "localComfyReachable": body.get("localComfyReachable") is True,
             "localReadinessFilePresent": body.get("localReadinessFilePresent") is True,
@@ -4496,6 +4630,7 @@ class DependencyAgent:
             "queueDepth": int(body.get("queueDepth") or 0),
             "runningItemIds": sorted([str(v) for v in body.get("runningItemIds", []) if isinstance(v, str)]),
             "stageCounts": stage_counts,
+            "inputCacheKeysHash": _sha256_hex_bytes(_canonical_json_bytes(input_cache_keys)),
             "inputCacheKeyCount": int(body.get("inputCacheKeyCount") or 0),
             "inputCacheBytesUsed": int(body.get("inputCacheBytesUsed") or 0),
             "inputCacheMaxBytes": int(body.get("inputCacheMaxBytes") or 0),
@@ -6304,7 +6439,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         has_active_agent_work = len(held_leases) > 0
         rtdb_ok = True
         if self._coordination:
-            rtdb_ok = self._write_agent_runtime_mirror()
+            rtdb_ok = self._write_agent_runtime_mirror(body=body, transition_signature=transition_signature)
             if rtdb_ok and has_active_agent_work:
                 self._coordination_check_active_lease_cancels(held_leases)
         rtdb_lease_heartbeat = self._coordination_feature_enabled("agentLeaseHeartbeatV1")
