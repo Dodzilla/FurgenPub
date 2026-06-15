@@ -120,13 +120,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.6"
+AGENT_VERSION = "dm-agent-py/0.10.7"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
 PRL_MINER_PAUSE_MODES = {"stop_start", "suspend_resume", "keep_running"}
 DEFAULT_PRL_MINER_PAUSE_MODE = "stop_start"
+AGENT_GPU_BLOCKING_STAGES = {"preparing_prompt", "executing"}
 PRL_MINER_SHARE_SIGNAL_RE = re.compile(
     r"\b(accepted|rejected|share submission returned error|stratum error response|dropped reason=|action=drop_share|action=reconnect_drop_ambiguous_share)\b",
     re.IGNORECASE,
@@ -3378,9 +3379,13 @@ class DependencyAgent:
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
-                active_agent_work_count = len(self._active_exec_by_item)
+                gpu_blocking_work_count = sum(
+                    1
+                    for lease in self._active_exec_by_item.values()
+                    if str(getattr(lease, "stage", "") or "") in AGENT_GPU_BLOCKING_STAGES
+                )
                 maintenance_count = len(self._agent_maintenance_inflight)
-            if active_agent_work_count > 0 or maintenance_count > 0:
+            if gpu_blocking_work_count > 0 or maintenance_count > 0:
                 return
             if self._pending_self_update is not None:
                 return
