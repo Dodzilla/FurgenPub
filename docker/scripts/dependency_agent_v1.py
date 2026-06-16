@@ -121,7 +121,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.8"
+AGENT_VERSION = "dm-agent-py/0.10.9"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3813,7 +3813,12 @@ class DependencyAgent:
         except Exception:
             return self._exchange_coordination_custom_token()
 
-    def _coordination_rtdb_url(self, node_path: str, id_token: Optional[str] = None) -> str:
+    def _coordination_rtdb_url(
+        self,
+        node_path: str,
+        id_token: Optional[str] = None,
+        query: Optional[Dict[str, str]] = None,
+    ) -> str:
         coord = self._coordination
         if not coord:
             raise RuntimeError("RTDB coordination is not configured")
@@ -3826,6 +3831,8 @@ class DependencyAgent:
         clean_node = self._normalize_coordination_path(node_path) or "/"
         target_path = f"{base_path}{clean_node}.json"
         query_items = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if query:
+            query_items.extend((str(key), str(value)) for key, value in query.items())
         if id_token:
             query_items.append(("auth", id_token))
         return urllib.parse.urlunparse(
@@ -4005,7 +4012,11 @@ class DependencyAgent:
             return False
 
         def _attempt(id_token: str) -> bool:
-            url = self._coordination_rtdb_url(self._coordination["paths"]["runtimeRoot"], id_token=id_token)
+            url = self._coordination_rtdb_url(
+                self._coordination["paths"]["runtimeRoot"],
+                id_token=id_token,
+                query={"print": "silent"},
+            )
             status, resp = api_json("PATCH", url, body=patch, timeout_seconds=timeout_seconds)
             if status not in (200, 204):
                 raise RuntimeError(f"Unexpected RTDB runtime patch response: {status} {resp}")
@@ -4118,7 +4129,7 @@ class DependencyAgent:
         if not etag:
             return False
         id_token = self._ensure_coordination_id_token()
-        url = self._coordination_rtdb_url(node_path, id_token=id_token)
+        url = self._coordination_rtdb_url(node_path, id_token=id_token, query={"print": "silent"})
         payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             url,
