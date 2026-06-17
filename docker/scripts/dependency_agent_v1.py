@@ -121,7 +121,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.9"
+AGENT_VERSION = "dm-agent-py/0.10.10"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -4940,6 +4940,13 @@ class DependencyAgent:
         candidates: List[Path] = []
         if self.asset_gen_v5_script:
             candidates.append(Path(self.asset_gen_v5_script))
+        if (self.server_type or "").strip() == "asset_gen_v5_lite":
+            candidates.extend([
+                self.workspace / "asset_gen_v5_lite.sh",
+                Path("/workspace/asset_gen_v5_lite.sh"),
+                Path("/opt/FurgenPub/docker/support/asset_gen_v5_lite.sh"),
+                Path("/workspace/FurgenPub/docker/support/asset_gen_v5_lite.sh"),
+            ])
         candidates.extend([
             self.workspace / "asset_gen_v5.sh",
             Path("/workspace/asset_gen_v5.sh"),
@@ -7145,15 +7152,17 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         self._remove_local_readiness_file()
 
         try:
-            if (self.server_type or "").strip() == "asset_gen_v5" and bundle_specs:
+            server_type = (self.server_type or "").strip()
+            asset_gen_v5_server_types = ("asset_gen_v5", "asset_gen_v5_lite")
+            if server_type in asset_gen_v5_server_types and bundle_specs:
                 for bundle_id in bundle_ids:
                     spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
                     if not self._install_node_bundle_from_spec(bundle_id, spec if isinstance(spec, dict) else {}):
-                        raise RuntimeError(f"No Firestore install spec available for asset_gen_v5 bundle {bundle_id}")
-            elif (self.server_type or "").strip() == "asset_gen_v5":
+                        raise RuntimeError(f"No Firestore install spec available for {server_type} bundle {bundle_id}")
+            elif server_type in asset_gen_v5_server_types:
                 script_path = self._resolve_asset_gen_v5_script()
                 if script_path is None:
-                    raise RuntimeError("Unable to locate asset_gen_v5.sh on this instance.")
+                    raise RuntimeError(f"Unable to locate asset_gen_v5.sh on {server_type} instance.")
                 subprocess.run(
                     ["bash", str(script_path), "install-bundles", *bundle_ids],
                     cwd=str(self.workspace),
