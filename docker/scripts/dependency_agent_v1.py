@@ -121,7 +121,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.10"
+AGENT_VERSION = "dm-agent-py/0.10.11"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -4932,9 +4932,16 @@ class DependencyAgent:
             return summary
         except Exception as exc:
             logging.debug("Local Comfy queue summary failed: %s", exc)
-            if cached and cached_at_ms > 0:
-                return dict(cached)
-            return {}
+            summary = {
+                "runningCount": 0,
+                "pendingCount": 0,
+                "totalCount": 0,
+                "checkedAtMs": int(now_ms),
+                "source": "agent_queue_unreachable",
+            }
+            self._last_comfy_queue_summary = dict(summary)
+            self._last_comfy_queue_summary_at_ms = now_ms
+            return summary
 
     def _resolve_asset_gen_v5_script(self) -> Optional[Path]:
         candidates: List[Path] = []
