@@ -867,7 +867,7 @@ agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
 if [[ -z "$agent_url" ]]; then
     agent_url="${DEPENDENCY_AGENT_UPDATE_URL:-${DEPENDENCY_AGENT_PUBLIC_URL:-}}"
 fi
-target_version="${DEPENDENCY_AGENT_TARGET_VERSION:-${DEPENDENCY_AGENT_RELEASE_VERSION:-dm-agent-py/0.10.13}}"
+target_version="${DEPENDENCY_AGENT_TARGET_VERSION:-${DEPENDENCY_AGENT_RELEASE_VERSION:-dm-agent-py/0.10.15}}"
 target_sha256="${DEPENDENCY_AGENT_UPDATE_SHA256:-${DEPENDENCY_AGENT_RELEASE_SHA256:-}}"
 fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
 

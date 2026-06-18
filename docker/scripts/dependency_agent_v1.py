@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.14"
+AGENT_VERSION = "dm-agent-py/0.10.15"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -150,6 +150,11 @@ PRL_MINER_POOL_ACTIVITY_RE = re.compile(
 )
 PRL_MINER_POOL_ERROR_RE = re.compile(
     r"(stratum (?:connection closed|recv timeout|recv\(\) failed|send\(\) failed|send\(\) timed out)|pool did not accept|share submission returned error)",
+    re.IGNORECASE,
+)
+PRL_MINER_SHARE_COUNTER_RE = re.compile(
+    r"\b(?P<name>accepted|accepts?|submitted|submits?|rejected|rejects?|invalid|stale|errors?|share_errors?)"
+    r"(?:[_\s-]*shares?)?\s*[=:]\s*(?P<value>\d+)\b",
     re.IGNORECASE,
 )
 PRL_SINKHOLE_IPS = {"146.112.61.110", "::ffff:146.112.61.110"}
@@ -197,12 +202,41 @@ def _parse_latest_hashrate_from_text(text: str) -> Tuple[Optional[float], str]:
 
 def _parse_prl_miner_log_signals(text: str) -> Dict[str, Any]:
     lower = (text or "").lower()
-    accepted = len(re.findall(r"\baccepted\b", lower))
-    submitted = len(re.findall(r"\bshare\s+submitted\b", lower))
-    rejected = len(re.findall(r"\brejected\b", lower))
+    accepted_events = len(re.findall(r"\baccepted\b", lower))
+    submitted_events = len(re.findall(r"\bshare\s+submitted\b", lower))
+    rejected_events = len(re.findall(r"\brejected\b", lower))
     share_errors = len(PRL_MINER_POOL_ERROR_RE.findall(text or ""))
     share_signals = len(PRL_MINER_SHARE_SIGNAL_RE.findall(text or ""))
     pool_activity = len(PRL_MINER_POOL_ACTIVITY_RE.findall(text or ""))
+    counter_values = {
+        "accepted": None,
+        "submitted": None,
+        "rejected": None,
+        "shareErrors": None,
+    }
+    for match in PRL_MINER_SHARE_COUNTER_RE.finditer(text or ""):
+        name = match.group("name").lower().replace("-", "_")
+        try:
+            value = int(match.group("value"))
+        except Exception:
+            continue
+        if name.startswith("accept"):
+            counter_values["accepted"] = value
+        elif name.startswith("submit"):
+            counter_values["submitted"] = value
+        elif name.startswith("reject") or name in ("invalid", "stale"):
+            counter_values["rejected"] = value
+        else:
+            counter_values["shareErrors"] = value
+    submitted = int(counter_values["submitted"]) if counter_values["submitted"] is not None else submitted_events
+    rejected = int(counter_values["rejected"]) if counter_values["rejected"] is not None else rejected_events + share_errors
+    if counter_values["shareErrors"] is not None:
+        share_errors = int(counter_values["shareErrors"])
+        rejected = max(rejected, share_errors)
+    if counter_values["accepted"] is not None:
+        accepted = int(counter_values["accepted"])
+    else:
+        accepted = max(accepted_events, max(0, submitted - rejected))
     return {
         "accepted": accepted,
         "submitted": submitted,
