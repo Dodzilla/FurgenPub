@@ -6,7 +6,7 @@ This is a single-file agent intended to run on each ComfyUI instance.
 It polls the backend for dependency queue items and downloads missing artifacts
 into the ComfyUI workspace, reporting status + inventory back to the backend.
 
-Backend endpoints used (relative to FCS_API_BASE_URL, which should end with /api):
+Backend endpoints used (relative to FCS_API_BASE_URL, usually the skinny coordinationApi endpoint):
   Legacy dependency channel (still supported for backwards compatibility):
   - POST   /dependencies/register
   - GET    /dependencies/queue?instanceId=...&limit=...
@@ -22,7 +22,7 @@ Backend endpoints used (relative to FCS_API_BASE_URL, which should end with /api
   - POST   /agent/url-refresh
 
 Required environment variables on the instance:
-  - FCS_API_BASE_URL   e.g. https://us-central1-<projectId>.cloudfunctions.net/api
+  - FCS_API_BASE_URL   e.g. https://us-central1-<projectId>.cloudfunctions.net/coordinationApi
   - SERVER_TYPE        e.g. furry-standard-v8
 
 Recommended (for auth):
@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.13"
+AGENT_VERSION = "dm-agent-py/0.10.14"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -1008,6 +1008,19 @@ def _json_loads_or_none(text: str) -> Optional[Any]:
         return json.loads(text)
     except Exception:
         return None
+
+
+def _strip_none(value: Any) -> Any:
+    if isinstance(value, dict):
+        out = {}
+        for key, nested in value.items():
+            stripped = _strip_none(nested)
+            if stripped is not None:
+                out[key] = stripped
+        return out
+    if isinstance(value, list):
+        return [_strip_none(item) for item in value if item is not None]
+    return value
 
 
 def _http_status_codes_from_error(err: Exception) -> List[int]:
@@ -4058,8 +4071,23 @@ class DependencyAgent:
     def _is_coordination_runtime_retryable_api_status(self, status: int) -> bool:
         return int(status) in (408, 409, 429, 500, 502, 503, 504)
 
+    def _flatten_rtdb_patch(self, value: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for key, nested in (value or {}).items():
+            if nested is None:
+                continue
+            path = f"{prefix}/{key}" if prefix else str(key)
+            if isinstance(nested, dict):
+                out.update(self._flatten_rtdb_patch(nested, path))
+            else:
+                out[path] = nested
+        return out
+
     def _coordination_patch_runtime(self, patch: Dict[str, Any], timeout_seconds: float = 15.0) -> bool:
         if not self._coordination:
+            return False
+        flattened_patch = self._flatten_rtdb_patch(patch)
+        if not flattened_patch:
             return False
 
         def _attempt(id_token: str) -> bool:
@@ -4068,7 +4096,7 @@ class DependencyAgent:
                 id_token=id_token,
                 query={"print": "silent"},
             )
-            status, resp = api_json("PATCH", url, body=patch, timeout_seconds=timeout_seconds)
+            status, resp = api_json("PATCH", url, body=flattened_patch, timeout_seconds=timeout_seconds)
             if status not in (200, 204):
                 raise RuntimeError(f"Unexpected RTDB runtime patch response: {status} {resp}")
             return True
@@ -4125,11 +4153,16 @@ class DependencyAgent:
             return enabled and bool(self.agent_rtdb_lease_heartbeat_enabled)
         return enabled
 
-    def _coordination_get_json(self, node_path: str, timeout_seconds: float = 10.0) -> Optional[Any]:
+    def _coordination_get_json(
+        self,
+        node_path: str,
+        timeout_seconds: float = 10.0,
+        query: Optional[Dict[str, str]] = None,
+    ) -> Optional[Any]:
         id_token = self._ensure_coordination_id_token()
         status, resp = api_json(
             "GET",
-            self._coordination_rtdb_url(node_path, id_token=id_token),
+            self._coordination_rtdb_url(node_path, id_token=id_token, query=query),
             timeout_seconds=timeout_seconds,
         )
         if status == 200:
@@ -4214,6 +4247,12 @@ class DependencyAgent:
             raise RuntimeError("RTDB queue item path is unavailable")
         return f"{root}/{key}"
 
+    def _coordination_queue_item_key(self, item_id: str) -> str:
+        normalized = str(item_id or "").strip()
+        if not normalized:
+            return "default"
+        return base64.urlsafe_b64encode(normalized.encode("utf-8")).decode("utf-8").rstrip("=") or "default"
+
     def _coordination_candidate_sort_key(self, item: Dict[str, Any]) -> Tuple[float, int, str]:
         priority = item.get("priority")
         created = item.get("createdAtMs")
@@ -4240,7 +4279,14 @@ class DependencyAgent:
         if not isinstance(root_path, str) or not root_path:
             return None
         try:
-            raw = self._coordination_get_json(root_path, timeout_seconds=10.0)
+            raw = self._coordination_get_json(
+                root_path,
+                timeout_seconds=10.0,
+                query={
+                    "orderBy": json.dumps("state"),
+                    "equalTo": json.dumps("queued"),
+                },
+            )
         except Exception as e:
             logging.warning("RTDB queue read failed for %s: %s", queue_path_key, e)
             return None
@@ -4352,17 +4398,6 @@ class DependencyAgent:
         root_path = paths.get("agentQueueItems")
         if not isinstance(root_path, str) or not root_path:
             return
-        try:
-            root = self._coordination_get_json(root_path, timeout_seconds=10.0)
-        except Exception as e:
-            logging.warning("RTDB active lease cancel check failed: %s", e)
-            return
-        if not isinstance(root, dict):
-            return
-        by_item_id: Dict[str, Tuple[str, Dict[str, Any]]] = {}
-        for encoded_key, value in root.items():
-            if isinstance(value, dict) and isinstance(value.get("itemId"), str):
-                by_item_id[value["itemId"]] = (str(encoded_key), value)
         now_ms = self._server_now_ms()
         lease_duration_sec = float(self._coordination.get("leaseDurationSeconds") or 90.0)
         lease_duration_ms = int(max(10.0, lease_duration_sec) * 1000)
@@ -4372,13 +4407,17 @@ class DependencyAgent:
             lease_id = lease.get("leaseId")
             if not isinstance(item_id, str) or not isinstance(lease_id, str):
                 continue
-            found = by_item_id.get(item_id)
-            if not found:
+            item_path = self._coordination_queue_item_path(root_path, self._coordination_queue_item_key(item_id))
+            try:
+                row = self._coordination_get_json(item_path, timeout_seconds=10.0)
+            except Exception as e:
+                logging.warning("RTDB active lease cancel check failed for %s: %s", item_id, e)
                 continue
-            encoded_key, row = found
             if not isinstance(row, dict):
                 continue
             if row.get("leaseId") != lease_id:
+                continue
+            if row.get("itemId") not in (None, item_id):
                 continue
             state = str(row.get("state") or "")
             if state == "cancel_requested":
@@ -4397,7 +4436,6 @@ class DependencyAgent:
             lease_expires_at_ms = int(row.get("leaseExpiresAtMs") or 0) if isinstance(row.get("leaseExpiresAtMs"), (int, float)) else 0
             if lease_expires_at_ms > now_ms + refresh_window_ms:
                 continue
-            item_path = self._coordination_queue_item_path(root_path, encoded_key)
             try:
                 current, etag = self._coordination_get_json_with_etag(item_path, timeout_seconds=10.0)
                 if (
@@ -4513,10 +4551,23 @@ class DependencyAgent:
                     "resolvedPath": stats.get("resolvedPath"),
                     "mount": stats.get("mount"),
                 },
-                "diskDiagnostics": self._disk_diagnostics_payload(),
             })
+        hot_manager: Dict[str, Any] = {
+            "queueDepth": queue_depth_value,
+            "lastHeartbeatAtMs": now_ms,
+            "activeDownloadCount": len(active_downloads),
+            "downloadingDepIdsCount": len(downloading),
+            "failedDepIdsCount": len(failed),
+            "dynamicBytesUsed": dynamic_bytes_used,
+        }
+        if full and "disk" in manager:
+            hot_manager["disk"] = manager["disk"]
         return {
             "dependencyManager": manager,
+            "hot": {
+                "dependencyManager": hot_manager,
+                "updatedAtMs": now_ms,
+            },
             "updatedAtMs": now_ms,
         }
 
@@ -4651,10 +4702,68 @@ class DependencyAgent:
                 "agentVersion": body.get("agentVersion") or AGENT_VERSION,
                 "capabilities": capabilities,
             })
+        hot_agent_control: Dict[str, Any] = {
+            "lastHeartbeatAtMs": now_ms,
+            "localComfyReachable": agent_control.get("localComfyReachable"),
+            "localReadinessFilePresent": agent_control.get("localReadinessFilePresent"),
+            "queueDepth": agent_control.get("queueDepth"),
+            "stageCounts": agent_control.get("stageCounts"),
+            "heldLeases": agent_control.get("heldLeases"),
+            "heldLeaseCount": len(agent_control.get("heldLeases") or []),
+            "runningItemIds": agent_control.get("runningItemIds"),
+            "maxConcurrentExecuteJobs": agent_control.get("maxConcurrentExecuteJobs"),
+            "maxPrefetchJobs": agent_control.get("maxPrefetchJobs"),
+            "maxUploadJobs": agent_control.get("maxUploadJobs"),
+        }
+        if "queueSummary" in agent_control:
+            hot_agent_control["queueSummary"] = agent_control.get("queueSummary")
+        if full:
+            hot_agent_control.update({
+                "localReadinessFile": agent_control.get("localReadinessFile"),
+                "inputCacheKeyCount": agent_control.get("inputCacheKeyCount"),
+                "inputCacheBytesUsed": agent_control.get("inputCacheBytesUsed"),
+                "inputCacheMaxBytes": agent_control.get("inputCacheMaxBytes"),
+                "inputCacheInventoryTruncated": agent_control.get("inputCacheInventoryTruncated"),
+                "idleMining": self._compact_idle_mining_runtime_hot(agent_control.get("idleMining")),
+                "agentVersion": agent_control.get("agentVersion"),
+                "capabilities": agent_control.get("capabilities"),
+            })
         return {
             "agentControl": agent_control,
+            "hot": {
+                "agentControl": hot_agent_control,
+                "updatedAtMs": now_ms,
+            },
             "updatedAtMs": now_ms,
         }
+
+    def _compact_idle_mining_runtime_hot(self, raw: Any) -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        watch = raw.get("watch") if isinstance(raw.get("watch"), dict) else {}
+        out = {
+            "state": raw.get("state"),
+            "desiredState": raw.get("desiredState"),
+            "pid": raw.get("pid"),
+            "worker": raw.get("worker"),
+            "minerProcessCount": raw.get("minerProcessCount"),
+            "autoRestartCount": raw.get("autoRestartCount"),
+            "lastAutoRestartAttemptAtMs": raw.get("lastAutoRestartAttemptAtMs"),
+            "lastAutoRestartReason": raw.get("lastAutoRestartReason"),
+            "watch": {
+                "minerAlive": watch.get("minerAlive"),
+                "minerProcessCount": watch.get("minerProcessCount"),
+                "gpuUtilizationPct": watch.get("gpuUtilizationPct"),
+                "gpuPowerDrawW": watch.get("gpuPowerDrawW"),
+                "localHashrateHps": watch.get("localHashrateHps"),
+                "localHashrateText": watch.get("localHashrateText"),
+                "poolConnected": watch.get("poolConnected"),
+                "lastShareLikeLogAtMs": watch.get("lastShareLikeLogAtMs"),
+                "lastTelemetryAtMs": watch.get("lastTelemetryAtMs"),
+                "telemetryError": watch.get("telemetryError"),
+            },
+        }
+        return _strip_none(out)
 
     def _write_agent_runtime_mirror(
         self,
