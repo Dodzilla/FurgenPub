@@ -97,6 +97,7 @@ import hashlib
 import http.client
 import json
 import logging
+import math
 import mimetypes
 import os
 import random
@@ -121,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.12"
+AGENT_VERSION = "dm-agent-py/0.10.13"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -253,6 +254,18 @@ def _clean_prl_payload_string(value: Any, max_length: int) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()[:max_length]
+
+
+def _normalize_prl_payload_float(value: Any, minimum: float, maximum: float) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
+        return None
+    return round(parsed, 3)
 
 
 def _host_from_url(raw_url: str) -> str:
@@ -2356,6 +2369,10 @@ class PrlMinerController:
         self._static_difficulty = ""
         self._static_difficulty_source = ""
         self._static_difficulty_matched_gpu_name = ""
+        self._static_difficulty_experiment_id = ""
+        self._static_difficulty_experiment_variant = ""
+        self._static_difficulty_experiment_bucket: Optional[float] = None
+        self._static_difficulty_experiment_allocation_pct: Optional[float] = None
         self._pause_mode = DEFAULT_PRL_MINER_PAUSE_MODE
         self._last_start_payload: Dict[str, Any] = {}
         self._paused_start_payload: Optional[Dict[str, Any]] = None
@@ -2433,6 +2450,14 @@ class PrlMinerController:
                 out["staticDifficultySource"] = self._static_difficulty_source
             if self._static_difficulty_matched_gpu_name:
                 out["staticDifficultyMatchedGpuName"] = self._static_difficulty_matched_gpu_name
+            if self._static_difficulty_experiment_id:
+                out["staticDifficultyExperimentId"] = self._static_difficulty_experiment_id
+            if self._static_difficulty_experiment_variant:
+                out["staticDifficultyExperimentVariant"] = self._static_difficulty_experiment_variant
+            if self._static_difficulty_experiment_bucket is not None:
+                out["staticDifficultyExperimentBucket"] = float(self._static_difficulty_experiment_bucket)
+            if self._static_difficulty_experiment_allocation_pct is not None:
+                out["staticDifficultyExperimentAllocationPct"] = float(self._static_difficulty_experiment_allocation_pct)
             if self._started_at_ms > 0:
                 out["startedAtMs"] = int(self._started_at_ms)
             if self._stopped_at_ms > 0:
@@ -2679,6 +2704,14 @@ class PrlMinerController:
         static_difficulty = _normalize_prl_static_difficulty(payload.get("staticDifficulty"))
         static_difficulty_source = _clean_prl_payload_string(payload.get("staticDifficultySource"), 80)
         static_difficulty_matched_gpu_name = _clean_prl_payload_string(payload.get("staticDifficultyMatchedGpuName"), 160)
+        static_difficulty_experiment_id = _clean_prl_payload_string(payload.get("staticDifficultyExperimentId"), 120)
+        static_difficulty_experiment_variant = _clean_prl_payload_string(payload.get("staticDifficultyExperimentVariant"), 80)
+        static_difficulty_experiment_bucket = _normalize_prl_payload_float(payload.get("staticDifficultyExperimentBucket"), 0.0, 100.0)
+        static_difficulty_experiment_allocation_pct = _normalize_prl_payload_float(
+            payload.get("staticDifficultyExperimentAllocationPct"),
+            0.0,
+            100.0,
+        )
         pause_mode = _normalize_prl_pause_mode(payload.get("pauseMode"))
         stop_timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
         force_restart = payload.get("forceRestart") is True
@@ -2720,6 +2753,10 @@ class PrlMinerController:
                 self._static_difficulty = static_difficulty
                 self._static_difficulty_source = static_difficulty_source
                 self._static_difficulty_matched_gpu_name = static_difficulty_matched_gpu_name
+                self._static_difficulty_experiment_id = static_difficulty_experiment_id
+                self._static_difficulty_experiment_variant = static_difficulty_experiment_variant
+                self._static_difficulty_experiment_bucket = static_difficulty_experiment_bucket
+                self._static_difficulty_experiment_allocation_pct = static_difficulty_experiment_allocation_pct
                 self._pause_mode = pause_mode
                 self._last_start_payload = dict(payload)
                 current_pid = self._proc.pid if self._proc is not None else None
@@ -2786,6 +2823,10 @@ class PrlMinerController:
             self._static_difficulty = static_difficulty
             self._static_difficulty_source = static_difficulty_source
             self._static_difficulty_matched_gpu_name = static_difficulty_matched_gpu_name
+            self._static_difficulty_experiment_id = static_difficulty_experiment_id
+            self._static_difficulty_experiment_variant = static_difficulty_experiment_variant
+            self._static_difficulty_experiment_bucket = static_difficulty_experiment_bucket
+            self._static_difficulty_experiment_allocation_pct = static_difficulty_experiment_allocation_pct
             self._pause_mode = pause_mode
             self._started_at_ms = _now_ms()
             self._stopped_at_ms = 0

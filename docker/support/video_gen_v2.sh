@@ -820,6 +820,12 @@ function dependency_manager_persist_agent_env() {
         DM_AGENT_PID_PATH \
         DM_AGENT_URL \
         AGENT_URL \
+        DEPENDENCY_AGENT_TARGET_VERSION \
+        DEPENDENCY_AGENT_RELEASE_VERSION \
+        DEPENDENCY_AGENT_UPDATE_URL \
+        DEPENDENCY_AGENT_PUBLIC_URL \
+        DEPENDENCY_AGENT_UPDATE_SHA256 \
+        DEPENDENCY_AGENT_RELEASE_SHA256 \
         DM_AGENT_WATCHDOG_PATH \
         DM_AGENT_WATCHDOG_LOG_PATH \
         DM_AGENT_WATCHDOG_PID_PATH \
@@ -858,6 +864,11 @@ log_path="${DM_AGENT_LOG_PATH:-${WORKSPACE}/dependency_agent.log}"
 pid_path="${DM_AGENT_PID_PATH:-${WORKSPACE}/dependency_agent.pid}"
 watchdog_pid_path="${DM_AGENT_WATCHDOG_PID_PATH:-${WORKSPACE}/dependency_agent_watchdog.pid}"
 agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
+if [[ -z "$agent_url" ]]; then
+    agent_url="${DEPENDENCY_AGENT_UPDATE_URL:-${DEPENDENCY_AGENT_PUBLIC_URL:-}}"
+fi
+target_version="${DEPENDENCY_AGENT_TARGET_VERSION:-${DEPENDENCY_AGENT_RELEASE_VERSION:-dm-agent-py/0.10.13}}"
+target_sha256="${DEPENDENCY_AGENT_UPDATE_SHA256:-${DEPENDENCY_AGENT_RELEASE_SHA256:-}}"
 fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
 
 dependency_manager_is_disabled() {
@@ -880,6 +891,104 @@ dependency_manager_agent_running() {
     fi
 
     return 1
+}
+
+dependency_manager_python_bin() {
+    local python_bin
+    python_bin="$(command -v python3 || true)"
+    if [[ -z "$python_bin" && -x /venv/main/bin/python ]]; then
+        python_bin="/venv/main/bin/python"
+    fi
+    printf '%s' "$python_bin"
+}
+
+dependency_manager_agent_version() {
+    local path="$1" python_bin
+    python_bin="$(dependency_manager_python_bin)"
+    if [[ -z "$python_bin" || ! -s "$path" ]]; then
+        return 1
+    fi
+    "$python_bin" - "$path" <<'PY'
+import pathlib
+import re
+import sys
+
+try:
+    text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+except Exception:
+    sys.exit(1)
+match = re.search(r'^\s*AGENT_VERSION\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+if not match:
+    sys.exit(1)
+print(match.group(1).strip())
+PY
+}
+
+dependency_manager_agent_sha256() {
+    local path="$1" python_bin
+    python_bin="$(dependency_manager_python_bin)"
+    if [[ -z "$python_bin" || ! -s "$path" ]]; then
+        return 1
+    fi
+    "$python_bin" - "$path" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+try:
+    print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+except Exception:
+    sys.exit(1)
+PY
+}
+
+dependency_manager_agent_is_stale() {
+    if [[ ! -s "$agent_path" ]]; then
+        return 0
+    fi
+    if [[ -n "$target_version" ]]; then
+        local current_version
+        current_version="$(dependency_manager_agent_version "$agent_path" 2>/dev/null || true)"
+        if [[ "$current_version" != "$target_version" ]]; then
+            echo "Dependency manager: agent version stale current=${current_version:-unknown} target=$target_version."
+            return 0
+        fi
+    fi
+    if [[ "$target_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        local current_sha
+        current_sha="$(dependency_manager_agent_sha256 "$agent_path" 2>/dev/null || true)"
+        if [[ "${current_sha,,}" != "${target_sha256,,}" ]]; then
+            echo "Dependency manager: agent SHA stale current=${current_sha:-unknown} target=${target_sha256,,}."
+            return 0
+        fi
+    fi
+    return 1
+}
+
+dependency_manager_stop_agent() {
+    local pid
+    if [[ -f "$pid_path" ]]; then
+        pid="$(cat "$pid_path" 2>/dev/null || true)"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    fi
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$agent_path" 2>/dev/null | while read -r pid; do
+            if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                kill "$pid" 2>/dev/null || true
+            fi
+        done
+    fi
+    sleep 2
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$agent_path" 2>/dev/null | while read -r pid; do
+            if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+    fi
+    rm -f "$pid_path" || true
 }
 
 dependency_manager_download_agent_url() {
@@ -914,9 +1023,13 @@ dependency_manager_install_agent_if_missing() {
     mkdir -p "$(dirname "$agent_path")" || true
     mkdir -p "${DM_COMFYUI_DIR}" || true
 
-    if [[ -s "$agent_path" ]]; then
+    if [[ -s "$agent_path" ]] && ! dependency_manager_agent_is_stale; then
         chmod +x "$agent_path" || true
         return 0
+    fi
+
+    if [[ -s "$agent_path" ]]; then
+        echo "Dependency manager: watchdog repairing stale agent at $agent_path."
     fi
 
     if [[ -n "$agent_url" ]]; then
@@ -938,7 +1051,13 @@ dependency_manager_install_agent_if_missing() {
 
 dependency_manager_start_agent_once() {
     if dependency_manager_agent_running; then
-        return 0
+        if dependency_manager_agent_is_stale; then
+            dependency_manager_install_agent_if_missing || return 0
+            echo "Dependency manager: watchdog restarting stale dependency agent."
+            dependency_manager_stop_agent
+        else
+            return 0
+        fi
     fi
 
     dependency_manager_install_agent_if_missing || return 0
