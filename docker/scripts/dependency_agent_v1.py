@@ -121,10 +121,20 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.11"
+AGENT_VERSION = "dm-agent-py/0.10.12"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
+RTDB_AGENT_NON_TERMINAL_QUEUE_STATES = {
+    "queued",
+    "leased",
+    "ready",
+    "waiting_dependencies",
+    "running",
+    "uploading",
+    "cancel_requested",
+    "retrying",
+}
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
 PRL_MINER_PAUSE_MODES = {"stop_start", "suspend_resume", "keep_running"}
 DEFAULT_PRL_MINER_PAUSE_MODE = "stop_start"
@@ -4178,6 +4188,7 @@ class DependencyAgent:
         feature_name: str,
         target_state: str,
         limit: int,
+        skip_execute_jobs: bool = False,
     ) -> Optional[List[Dict[str, Any]]]:
         if not self._coordination or not self._coordination_stream_healthy:
             return None
@@ -4208,6 +4219,8 @@ class DependencyAgent:
                 continue
             item["itemId"] = item_id
             if str(item.get("state") or "") != "queued":
+                continue
+            if skip_execute_jobs and str(item.get("type") or "") == "execute_job":
                 continue
             if queue_path_key == "dependencyQueueItems":
                 op = item.get("op")
@@ -4257,12 +4270,25 @@ class DependencyAgent:
         return claimed
 
     def _coordination_fetch_agent_queue(self, limit: int) -> Optional[List[Dict[str, Any]]]:
+        skip_execute_jobs = bool(self.mining_only)
+        if not skip_execute_jobs:
+            try:
+                skip_execute_jobs = not (
+                    self._local_comfy_reachable(timeout_seconds=2.0)
+                    and self._local_readiness_file_present()
+                )
+            except Exception as e:
+                logging.debug("Skipping direct RTDB execute_job claims while local readiness probe fails: %s", e)
+                skip_execute_jobs = True
         items = self._coordination_claim_queue_items(
             "agentQueueItems",
             "agentQueueClaimV1",
             "leased",
             limit,
+            skip_execute_jobs=skip_execute_jobs,
         )
+        if items == [] and skip_execute_jobs:
+            return []
         if items == [] and self._coordination_direct_empty_probe_due("agent"):
             return None
         return items
@@ -4292,19 +4318,29 @@ class DependencyAgent:
             return
         if not isinstance(root, dict):
             return
-        by_item_id: Dict[str, Dict[str, Any]] = {}
-        for value in root.values():
+        by_item_id: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+        for encoded_key, value in root.items():
             if isinstance(value, dict) and isinstance(value.get("itemId"), str):
-                by_item_id[value["itemId"]] = value
+                by_item_id[value["itemId"]] = (str(encoded_key), value)
+        now_ms = self._server_now_ms()
+        lease_duration_sec = float(self._coordination.get("leaseDurationSeconds") or 90.0)
+        lease_duration_ms = int(max(10.0, lease_duration_sec) * 1000)
+        refresh_window_ms = max(5_000, min(max(1_000, lease_duration_ms - 1_000), int(lease_duration_ms * 0.6)))
         for lease in held_leases:
             item_id = lease.get("itemId")
             lease_id = lease.get("leaseId")
             if not isinstance(item_id, str) or not isinstance(lease_id, str):
                 continue
-            row = by_item_id.get(item_id)
+            found = by_item_id.get(item_id)
+            if not found:
+                continue
+            encoded_key, row = found
             if not isinstance(row, dict):
                 continue
-            if row.get("leaseId") == lease_id and row.get("state") == "cancel_requested":
+            if row.get("leaseId") != lease_id:
+                continue
+            state = str(row.get("state") or "")
+            if state == "cancel_requested":
                 self._mark_cancel_signal(
                     {
                         "jobId": lease.get("jobId"),
@@ -4314,6 +4350,34 @@ class DependencyAgent:
                         "reason": row.get("cancelReason") if isinstance(row.get("cancelReason"), str) else "cancel_requested",
                     }
                 )
+                continue
+            if state not in RTDB_AGENT_NON_TERMINAL_QUEUE_STATES:
+                continue
+            lease_expires_at_ms = int(row.get("leaseExpiresAtMs") or 0) if isinstance(row.get("leaseExpiresAtMs"), (int, float)) else 0
+            if lease_expires_at_ms > now_ms + refresh_window_ms:
+                continue
+            item_path = self._coordination_queue_item_path(root_path, encoded_key)
+            try:
+                current, etag = self._coordination_get_json_with_etag(item_path, timeout_seconds=10.0)
+                if (
+                    not isinstance(current, dict)
+                    or current.get("itemId") != item_id
+                    or current.get("leaseId") != lease_id
+                    or str(current.get("state") or "") not in RTDB_AGENT_NON_TERMINAL_QUEUE_STATES
+                ):
+                    continue
+                next_expires_at_ms = self._server_now_ms() + lease_duration_ms
+                next_value = dict(current)
+                next_value.update(
+                    {
+                        "leaseExpiresAtMs": next_expires_at_ms,
+                        "leaseExpiresAt": _ms_to_iso(next_expires_at_ms),
+                        "updatedAtMs": self._server_now_ms(),
+                    }
+                )
+                self._coordination_put_json_if_match(item_path, next_value, etag, timeout_seconds=10.0)
+            except Exception as e:
+                logging.debug("RTDB active lease heartbeat failed for %s/%s: %s", item_id, lease_id, e)
 
     def _coordination_direct_empty_probe_due(self, channel: str) -> bool:
         if not self._coordination:
