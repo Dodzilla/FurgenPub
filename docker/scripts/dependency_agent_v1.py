@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.15"
+AGENT_VERSION = "dm-agent-py/0.10.16"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -4781,6 +4781,10 @@ class DependencyAgent:
             "pid": raw.get("pid"),
             "worker": raw.get("worker"),
             "minerProcessCount": raw.get("minerProcessCount"),
+            "recentAcceptedShares": raw.get("recentAcceptedShares"),
+            "recentSubmittedShares": raw.get("recentSubmittedShares"),
+            "recentRejectedShares": raw.get("recentRejectedShares"),
+            "recentShareErrors": raw.get("recentShareErrors"),
             "autoRestartCount": raw.get("autoRestartCount"),
             "lastAutoRestartAttemptAtMs": raw.get("lastAutoRestartAttemptAtMs"),
             "lastAutoRestartReason": raw.get("lastAutoRestartReason"),
