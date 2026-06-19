@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.18"
+AGENT_VERSION = "dm-agent-py/0.10.19"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -7553,11 +7553,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             self._agent_ack(item_id, lease_id, "command_ignored_stale")
             return
 
-        self._stop_idle_prl_mining_for_work("install_node_bundles")
-
         if self._local_comfy_has_all_class_types(verify_class_types):
             compat_changed = self._ensure_node_bundle_runtime_compatibility(bundle_ids)
             if compat_changed:
+                self._stop_idle_prl_mining_for_work("install_node_bundles_comfy_restart")
                 self._remove_local_readiness_file()
                 self._restart_local_comfy(prefer_process_restart=True)
                 self._wait_for_local_comfy_restart(
@@ -7599,6 +7598,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             else:
                 raise RuntimeError(f"install_node_bundles is not supported on server_type={self.server_type}")
             self._ensure_node_bundle_runtime_compatibility(bundle_ids)
+            self._stop_idle_prl_mining_for_work("install_node_bundles_comfy_restart")
             self._remove_local_readiness_file()
             comfy_restart_attempted = True
             self._restart_local_comfy()
