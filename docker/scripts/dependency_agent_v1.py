@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.16"
+AGENT_VERSION = "dm-agent-py/0.10.17"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -2397,6 +2397,7 @@ class PrlMinerController:
         self.root = Path(workspace) / ".fcs" / "prl"
         self.binary_path = self.root / "prl_gpu_miner"
         self.log_path = self.root / "prl_miner.log"
+        self.agent_update_resume_path = self.root / "resume_after_agent_update.json"
         self.download_timeout_seconds = max(30.0, float(download_timeout_seconds))
         self.download_chunk_size = max(1024 * 1024, int(download_chunk_size))
         self._lock = threading.Lock()
@@ -2435,6 +2436,7 @@ class PrlMinerController:
         self._last_auto_restart_attempt_ms = 0
         self._last_auto_restart_reason = ""
         self._auto_restart_count = 0
+        self._last_agent_update_resume_attempt_ms = 0
 
     def _reap_locked(self) -> None:
         if self._proc is None:
@@ -2472,6 +2474,96 @@ class PrlMinerController:
 
     def _set_failure_category(self, category: str) -> None:
         self._last_failure_category = str(category or "").strip()[:80]
+
+    def save_agent_update_resume_marker(self, reason: str) -> bool:
+        with self._lock:
+            self._reap_locked()
+            payload = dict(self._last_start_payload) if self._last_start_payload else {}
+            should_resume = bool(payload) and (
+                self._proc is not None or
+                self._state in ("running", "starting", "paused") or
+                self._desired_state in ("running", "starting")
+            )
+        if not should_resume:
+            try:
+                self.agent_update_resume_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+        data = {
+            "schemaVersion": 1,
+            "createdAtMs": _now_ms(),
+            "reason": str(reason or "agent_update")[:80],
+            "payload": payload,
+        }
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            tmp = self.agent_update_resume_path.with_name(
+                f".{self.agent_update_resume_path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            tmp.write_text(json.dumps(data, sort_keys=True), "utf-8")
+            os.replace(str(tmp), str(self.agent_update_resume_path))
+            logging.info("Saved idle PRL miner resume marker before dependency agent update.")
+            return True
+        except Exception as exc:
+            logging.warning("Failed saving idle PRL miner resume marker before dependency agent update: %s", exc)
+            return False
+
+    def resume_after_agent_update_if_requested(self, reason: str) -> bool:
+        now_ms = _now_ms()
+        if now_ms - int(self._last_agent_update_resume_attempt_ms or 0) < 30_000:
+            return False
+        if not self.agent_update_resume_path.exists():
+            return False
+
+        with self._lock:
+            if self._is_running_locked():
+                try:
+                    self.agent_update_resume_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return False
+
+        try:
+            data = json.loads(self.agent_update_resume_path.read_text("utf-8"))
+        except Exception as exc:
+            logging.warning("Dropping unreadable idle PRL miner agent-update resume marker: %s", exc)
+            try:
+                self.agent_update_resume_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+        created_at_ms = int(data.get("createdAtMs") or 0) if isinstance(data, dict) else 0
+        if created_at_ms <= 0 or now_ms - created_at_ms > 24 * 60 * 60 * 1000:
+            logging.info("Dropping stale idle PRL miner agent-update resume marker.")
+            try:
+                self.agent_update_resume_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+        payload = data.get("payload") if isinstance(data, dict) else None
+        if not isinstance(payload, dict) or not payload:
+            try:
+                self.agent_update_resume_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+        self._last_agent_update_resume_attempt_ms = now_ms
+        try:
+            logging.info("Resuming idle PRL miner from agent-update marker after %s.", reason or "agent_start")
+            self.start(dict(payload))
+            try:
+                self.agent_update_resume_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            logging.warning("Failed resuming idle PRL miner from agent-update marker: %s", exc)
+            return False
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -3508,10 +3600,11 @@ class DependencyAgent:
                 self._free_local_comfy_for_idle_prl_mining(reason)
             resumed = self._idle_prl_miner.resume_if_paused(reason)
             restarted = False if resumed else self._idle_prl_miner.restart_if_desired(reason)
-            if resumed or restarted:
+            resumed_after_update = False if (resumed or restarted) else self._idle_prl_miner.resume_after_agent_update_if_requested(reason)
+            if resumed or restarted or resumed_after_update:
                 logging.info(
                     "%s idle PRL miner after %s",
-                    "Resumed" if resumed else "Restarted failed",
+                    "Resumed" if resumed else ("Restarted failed" if restarted else "Restored"),
                     reason,
                 )
                 self._force_idle_prl_runtime_refresh(reason)
@@ -5023,6 +5116,17 @@ class DependencyAgent:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"Provisioning completed at {_now_iso()}\n", encoding="utf-8")
 
+    def _restore_local_readiness_file_after_pre_restart_failure(self, reason: str) -> bool:
+        try:
+            if not self._local_comfy_reachable(timeout_seconds=10.0):
+                return False
+            self._write_local_readiness_file()
+            logging.warning("Restored readiness marker after pre-restart failure: %s", reason)
+            return True
+        except Exception as exc:
+            logging.warning("Failed restoring readiness marker after pre-restart failure: %s", exc)
+            return False
+
     def _local_readiness_file_present(self) -> bool:
         try:
             return self._local_readiness_file_path().exists()
@@ -6127,7 +6231,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         current_sha = self._current_script_sha256()
 
         try:
-            self._stop_idle_prl_mining_for_work("self_update")
             self.self_script_path.parent.mkdir(parents=True, exist_ok=True)
             http_download_to_file(
                 release.download_url,
@@ -6159,6 +6262,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 self._clear_pending_self_update()
                 return
 
+            if self._idle_prl_miner.save_agent_update_resume_marker("self_update"):
+                logging.info("Dependency agent self-update will restore idle PRL miner after restart.")
+            self._stop_idle_prl_mining_for_work("self_update")
+
             try:
                 if self.self_script_path.exists():
                     mode = self.self_script_path.stat().st_mode & 0o777
@@ -6178,6 +6285,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             os.execv(sys.executable, [sys.executable, str(self.self_script_path), *sys.argv[1:]])
         except Exception as e:
             self._self_update_retry_at_ms = _now_ms() + int(self.self_update_retry_seconds * 1000)
+            try:
+                self._idle_prl_miner.resume_after_agent_update_if_requested("self_update_failed")
+            except Exception as resume_exc:
+                logging.warning("Failed restoring idle PRL miner after self-update failure: %s", resume_exc)
             logging.warning(
                 "Dependency agent self-update failed: current=%s target=%s source=%s retryIn=%.0fs err=%s",
                 AGENT_VERSION,
@@ -7408,6 +7519,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             self._agent_ack(item_id, lease_id, "command_succeeded")
             return
 
+        had_readiness_marker_before_install = self._local_readiness_file_present()
+        comfy_restart_attempted = False
         self._remove_local_readiness_file()
 
         try:
@@ -7438,6 +7551,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 raise RuntimeError(f"install_node_bundles is not supported on server_type={self.server_type}")
             self._ensure_node_bundle_runtime_compatibility(bundle_ids)
             self._remove_local_readiness_file()
+            comfy_restart_attempted = True
             self._restart_local_comfy()
             self._wait_for_local_comfy_restart(
                 verify_class_types,
@@ -7447,6 +7561,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             self._agent_ack(item_id, lease_id, "command_succeeded")
         except Exception as exc:
             self._remove_local_readiness_file()
+            if had_readiness_marker_before_install and not comfy_restart_attempted:
+                self._restore_local_readiness_file_after_pre_restart_failure(str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS])
             self._agent_ack(
                 item_id,
                 lease_id,
