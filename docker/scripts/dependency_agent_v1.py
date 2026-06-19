@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.20"
+AGENT_VERSION = "dm-agent-py/0.10.21"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -4474,10 +4474,24 @@ class DependencyAgent:
                         "updatedAtMs": self._server_now_ms(),
                     }
                 )
-                if not self._coordination_put_json_if_match(item_path, next_value, etag, timeout_seconds=10.0):
-                    continue
                 claimed_item = dict(next_value)
                 claimed_item["itemId"] = str(current.get("itemId") or item.get("itemId") or encoded_key)
+                write_value = dict(next_value)
+                if queue_path_key == "agentQueueItems":
+                    payload = current.get("payload")
+                    if isinstance(payload, dict):
+                        if isinstance(payload.get("jobId"), str):
+                            write_value.setdefault("requestedByJobId", payload.get("jobId"))
+                        if isinstance(payload.get("executionAttempt"), (int, float)):
+                            write_value.setdefault("executionAttempt", int(payload.get("executionAttempt")))
+                        if isinstance(payload.get("attemptEpoch"), (int, float)):
+                            write_value.setdefault("attemptEpoch", int(payload.get("attemptEpoch")))
+                    # The agent has the payload in claimed_item; keeping it in the
+                    # leased RTDB mirror makes every heartbeat/event reconciliation
+                    # reread the full command body.
+                    write_value.pop("payload", None)
+                if not self._coordination_put_json_if_match(item_path, write_value, etag, timeout_seconds=10.0):
+                    continue
                 claimed.append(claimed_item)
             except Exception as e:
                 logging.warning("RTDB queue claim failed for %s/%s: %s", queue_path_key, item.get("itemId"), e)
