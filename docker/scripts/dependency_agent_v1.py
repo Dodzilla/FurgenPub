@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.17"
+AGENT_VERSION = "dm-agent-py/0.10.18"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -5355,13 +5355,62 @@ class DependencyAgent:
                 stderr=subprocess.PIPE,
                 timeout=30,
             )
-            subprocess.run(
-                [git, "-C", str(target), "pull", "--ff-only"],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=180,
-            )
+            try:
+                subprocess.run(
+                    [git, "-C", str(target), "pull", "--ff-only"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=180,
+                )
+            except subprocess.CalledProcessError as exc:
+                logging.warning(
+                    "git pull --ff-only failed for custom node %s; resetting checkout before retry: %s",
+                    node_dir,
+                    str(exc)[:500],
+                )
+                subprocess.run(
+                    [git, "-C", str(target), "fetch", "--all", "--prune"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=300,
+                )
+                branch_proc = subprocess.run(
+                    [git, "-C", str(target), "rev-parse", "--abbrev-ref", "HEAD"],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=30,
+                )
+                branch = branch_proc.stdout.strip() if branch_proc.returncode == 0 else ""
+                if not branch or branch == "HEAD":
+                    origin_head_proc = subprocess.run(
+                        [git, "-C", str(target), "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=30,
+                    )
+                    origin_head = origin_head_proc.stdout.strip()
+                    branch = origin_head.removeprefix("origin/") if origin_head.startswith("origin/") else ""
+                reset_target = git_ref or (f"origin/{branch}" if branch else "origin/main")
+                subprocess.run(
+                    [git, "-C", str(target), "reset", "--hard", reset_target],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=300,
+                )
+                subprocess.run(
+                    [git, "-C", str(target), "clean", "-fd"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=180,
+                )
         else:
             subprocess.run(
                 [git, "clone", repo_url, str(target), "--recursive"],
