@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.22"
+AGENT_VERSION = "dm-agent-py/0.10.23"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -4533,6 +4533,19 @@ class DependencyAgent:
                     write_value.pop("payload", None)
                 if not self._coordination_put_json_if_match(item_path, write_value, etag, timeout_seconds=10.0):
                     continue
+                if queue_path_key == "agentQueueItems" and not isinstance(claimed_item.get("payload"), dict):
+                    fetched_item = self._agent_fetch_queue_item(claimed_item["itemId"], lease_id)
+                    if isinstance(fetched_item, dict) and isinstance(fetched_item.get("payload"), dict):
+                        claimed_item.update(fetched_item)
+                        claimed_item["leaseId"] = lease_id
+                        claimed_item["leaseExpiresAt"] = _ms_to_iso(lease_expires_at_ms)
+                    else:
+                        logging.warning(
+                            "RTDB agent queue claim %s/%s had no payload and queue-item fetch returned no payload; lease will expire.",
+                            queue_path_key,
+                            claimed_item.get("itemId"),
+                        )
+                        continue
                 claimed.append(claimed_item)
             except Exception as e:
                 logging.warning("RTDB queue claim failed for %s/%s: %s", queue_path_key, item.get("itemId"), e)
@@ -6719,6 +6732,27 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             if isinstance(item, dict):
                 out.append(item)
         return out
+
+    def _agent_fetch_queue_item(self, item_id: str, lease_id: str) -> Optional[Dict[str, Any]]:
+        if not self._resolved_instance_id or not self._agent_access_token:
+            return None
+        if not item_id or not lease_id:
+            return None
+        resp = self._agent_api(
+            "GET",
+            "/agent/queue-item",
+            query={
+                "instanceId": self._resolved_instance_id,
+                "itemId": item_id,
+                "leaseId": lease_id,
+            },
+            timeout_seconds=30.0,
+            use_token=True,
+            include_secret=False,
+        )
+        data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+        item = data.get("item")
+        return item if isinstance(item, dict) else None
 
     def _agent_ack(
         self,
