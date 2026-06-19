@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.21"
+AGENT_VERSION = "dm-agent-py/0.10.22"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -4390,34 +4390,12 @@ class DependencyAgent:
             str(item.get("itemId") or ""),
         )
 
-    def _coordination_claim_queue_items(
+    def _coordination_collect_queue_candidates(
         self,
         queue_path_key: str,
-        feature_name: str,
-        target_state: str,
-        limit: int,
-        skip_execute_jobs: bool = False,
-    ) -> Optional[List[Dict[str, Any]]]:
-        if not self._coordination or not self._coordination_stream_healthy:
-            return None
-        if not self._coordination_feature_enabled(feature_name):
-            return None
-        paths = self._coordination.get("paths") if isinstance(self._coordination.get("paths"), dict) else {}
-        root_path = paths.get(queue_path_key)
-        if not isinstance(root_path, str) or not root_path:
-            return None
-        try:
-            raw = self._coordination_get_json(
-                root_path,
-                timeout_seconds=10.0,
-                query={
-                    "orderBy": json.dumps("state"),
-                    "equalTo": json.dumps("queued"),
-                },
-            )
-        except Exception as e:
-            logging.warning("RTDB queue read failed for %s: %s", queue_path_key, e)
-            return None
+        raw: Optional[Any],
+        skip_execute_jobs: bool,
+    ) -> Optional[List[Tuple[str, Dict[str, Any]]]]:
         if raw is None or raw == "null":
             return []
         if not isinstance(raw, dict):
@@ -4444,6 +4422,69 @@ class DependencyAgent:
                     logging.info("RTDB dependency queue item %s lacks resolved payload; falling back to HTTP.", item_id)
                     return None
             candidates.append((encoded_key, item))
+        return candidates
+
+    def _coordination_claim_queue_items(
+        self,
+        queue_path_key: str,
+        feature_name: str,
+        target_state: str,
+        limit: int,
+        skip_execute_jobs: bool = False,
+    ) -> Optional[List[Dict[str, Any]]]:
+        if not self._coordination or not self._coordination_stream_healthy:
+            return None
+        if not self._coordination_feature_enabled(feature_name):
+            return None
+        paths = self._coordination.get("paths") if isinstance(self._coordination.get("paths"), dict) else {}
+        root_path = paths.get(queue_path_key)
+        if not isinstance(root_path, str) or not root_path:
+            return None
+
+        query_attempts: List[Tuple[str, Dict[str, str]]] = []
+        if queue_path_key == "agentQueueItems":
+            claim_window = max(4, min(40, max(1, int(limit)) * 4))
+            query_attempts.append(
+                (
+                    "claimOrderKey",
+                    {
+                        "orderBy": json.dumps("claimOrderKey"),
+                        "startAt": json.dumps("queued|"),
+                        "endAt": json.dumps("queued|\uf8ff"),
+                        "limitToFirst": str(claim_window),
+                    },
+                )
+            )
+        query_attempts.append(
+            (
+                "state",
+                {
+                    "orderBy": json.dumps("state"),
+                    "equalTo": json.dumps("queued"),
+                },
+            )
+        )
+
+        candidates: Optional[List[Tuple[str, Dict[str, Any]]]] = None
+        for query_name, query in query_attempts:
+            try:
+                raw = self._coordination_get_json(
+                    root_path,
+                    timeout_seconds=10.0,
+                    query=query,
+                )
+            except Exception as e:
+                logging.warning("RTDB queue read failed for %s via %s: %s", queue_path_key, query_name, e)
+                return None
+            parsed = self._coordination_collect_queue_candidates(queue_path_key, raw, skip_execute_jobs)
+            if parsed is None:
+                return None
+            if parsed or query_name == "state":
+                candidates = parsed
+                break
+
+        if candidates is None:
+            return None
 
         if not candidates:
             return []
