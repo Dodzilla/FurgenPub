@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.19"
+AGENT_VERSION = "dm-agent-py/0.10.20"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3342,6 +3342,7 @@ class DependencyAgent:
         self._agent_max_concurrent_execute_jobs = 1
         self._agent_max_prefetch_jobs = 0
         self._active_exec_by_item: Dict[str, AgentExecuteLease] = {}
+        self._active_maintenance_by_item: Dict[str, Dict[str, Any]] = {}
         self._ready_agent_item_ids: deque[str] = deque()
         self._agent_lease_order = 0
         self._input_cache_downloading: Set[str] = set()
@@ -6782,6 +6783,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     def _collect_active_leases(self) -> List[Dict[str, Any]]:
         with self._lock:
             active = list(self._active_exec_by_item.values())
+            maintenance = list(self._active_maintenance_by_item.values())
         out: List[Dict[str, Any]] = []
         for lease in active:
             out.append(
@@ -6794,6 +6796,21 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     "stage": lease.stage,
                     **({"readyAgeMs": max(0, _now_ms() - int(lease.ready_at_ms))} if int(lease.ready_at_ms or 0) > 0 and lease.stage == "ready" else {}),
                     **({"uploadWorkerQueueMs": max(0, _now_ms() - int(lease.upload_enqueued_at_ms))} if int(lease.upload_enqueued_at_ms or 0) > 0 and lease.stage == "uploading" else {}),
+                }
+            )
+        for lease in maintenance:
+            item_id = lease.get("itemId")
+            lease_id = lease.get("leaseId")
+            if not isinstance(item_id, str) or not item_id or not isinstance(lease_id, str) or not lease_id:
+                continue
+            out.append(
+                {
+                    "itemId": item_id,
+                    "leaseId": lease_id,
+                    "jobId": "",
+                    "executionAttempt": None,
+                    "attemptEpoch": None,
+                    "stage": lease.get("stage") if isinstance(lease.get("stage"), str) else "maintenance",
                 }
             )
         return out
@@ -9031,12 +9048,32 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         if self._agent_maintenance_executor is None:
             raise RuntimeError("Agent maintenance executor is not initialized")
         item_type = item.get("type")
-        if item_type == "restart_comfy":
-            future = self._agent_maintenance_executor.submit(self._agent_handle_restart_comfy_command, item)
-        elif item_type == "prl_miner":
-            future = self._agent_maintenance_executor.submit(self._agent_handle_prl_miner_command, item)
-        else:
-            future = self._agent_maintenance_executor.submit(self._process_install_node_bundles_item, item)
+        item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
+        lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
+        if item_id and lease_id:
+            with self._lock:
+                self._active_maintenance_by_item[item_id] = {
+                    "itemId": item_id,
+                    "leaseId": lease_id,
+                    "stage": f"maintenance:{item_type}" if isinstance(item_type, str) and item_type else "maintenance",
+                }
+
+        def _run() -> None:
+            try:
+                if item_type == "restart_comfy":
+                    self._agent_handle_restart_comfy_command(item)
+                elif item_type == "prl_miner":
+                    self._agent_handle_prl_miner_command(item)
+                else:
+                    self._process_install_node_bundles_item(item)
+            finally:
+                if item_id:
+                    with self._lock:
+                        active = self._active_maintenance_by_item.get(item_id)
+                        if isinstance(active, dict) and active.get("leaseId") == lease_id:
+                            self._active_maintenance_by_item.pop(item_id, None)
+
+        future = self._agent_maintenance_executor.submit(_run)
         with self._lock:
             self._agent_maintenance_inflight.add(future)
         self._request_agent_queue_poll()
