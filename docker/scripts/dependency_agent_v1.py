@@ -55,7 +55,8 @@ Optional knobs:
   - DM_AGENT_CONTROL_ENABLED      (enable /agent/* control channel; default: true)
   - DM_INSTANCE_BOOTSTRAP_TOKEN   (instance bootstrap token for /agent/register when required)
   - DM_AGENT_POLL_SECONDS         (poll cadence for /agent/queue; default: 2)
-  - DM_AGENT_HEARTBEAT_SECONDS    (heartbeat cadence for /agent/heartbeat; default: 8)
+  - DM_AGENT_HEARTBEAT_SECONDS    (active heartbeat cadence for /agent/heartbeat; default: 8)
+  - DM_AGENT_IDLE_HEARTBEAT_SECONDS (idle heartbeat cadence when RTDB signal wait is healthy; default: active cadence)
   - DM_AGENT_QUEUE_WAIT_SEC       (long-poll waitSec for /agent/queue; default: 2)
   - DM_AGENT_RTDB_SIGNAL_WAIT_ENABLED (when RTDB coordination is healthy, wait locally for queue signals; default: true)
   - DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS (minimum fallback /agent/queue probe when signal stream is healthy; default: 60)
@@ -122,7 +123,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.23"
+AGENT_VERSION = "dm-agent-py/0.10.24"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3265,8 +3266,13 @@ class DependencyAgent:
         self.agent_runtime_config_overrides_env = _env_bool("DM_AGENT_RUNTIME_CONFIG_OVERRIDES_ENV", True)
         self._agent_poll_seconds_env = _env_str("DM_AGENT_POLL_SECONDS") is not None
         self._agent_heartbeat_seconds_env = _env_str("DM_AGENT_HEARTBEAT_SECONDS") is not None
+        self._agent_idle_heartbeat_seconds_env = _env_str("DM_AGENT_IDLE_HEARTBEAT_SECONDS") is not None
         self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 2.0))
         self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 8.0))
+        self.agent_idle_heartbeat_seconds = max(
+            self.agent_heartbeat_seconds,
+            min(300.0, _env_float("DM_AGENT_IDLE_HEARTBEAT_SECONDS", self.agent_heartbeat_seconds)),
+        )
         self.agent_queue_wait_sec = max(0, min(20, _env_int("DM_AGENT_QUEUE_WAIT_SEC", 2)))
         self.agent_rtdb_signal_wait_enabled = _env_bool("DM_AGENT_RTDB_SIGNAL_WAIT_ENABLED", True)
         self.agent_rtdb_queue_claim_enabled = _env_bool("DM_AGENT_RTDB_QUEUE_CLAIM_ENABLED", True)
@@ -4130,13 +4136,24 @@ class DependencyAgent:
             return
 
         changes: List[str] = []
-        heartbeat_seconds = self._runtime_config_seconds(raw.get("agentHeartbeatSec"), 2.0, 30.0)
+        heartbeat_seconds = self._runtime_config_seconds(raw.get("activeAgentHeartbeatSec", raw.get("agentHeartbeatSec")), 2.0, 30.0)
         if heartbeat_seconds is not None and (
             self.agent_runtime_config_overrides_env or not self._agent_heartbeat_seconds_env
         ):
             if abs(float(self.agent_heartbeat_seconds) - heartbeat_seconds) >= 0.1:
                 self.agent_heartbeat_seconds = heartbeat_seconds
-                changes.append(f"heartbeat={heartbeat_seconds:.1f}s")
+                if self.agent_idle_heartbeat_seconds < self.agent_heartbeat_seconds:
+                    self.agent_idle_heartbeat_seconds = self.agent_heartbeat_seconds
+                changes.append(f"activeHeartbeat={heartbeat_seconds:.1f}s")
+
+        idle_heartbeat_seconds = self._runtime_config_seconds(raw.get("idleAgentHeartbeatSec"), 2.0, 300.0)
+        if idle_heartbeat_seconds is not None and (
+            self.agent_runtime_config_overrides_env or not self._agent_idle_heartbeat_seconds_env
+        ):
+            idle_heartbeat_seconds = max(float(self.agent_heartbeat_seconds), idle_heartbeat_seconds)
+            if abs(float(self.agent_idle_heartbeat_seconds) - idle_heartbeat_seconds) >= 0.1:
+                self.agent_idle_heartbeat_seconds = idle_heartbeat_seconds
+                changes.append(f"idleHeartbeat={idle_heartbeat_seconds:.1f}s")
 
         poll_seconds = self._runtime_config_seconds(raw.get("agentPollSec"), 0.5, 30.0)
         if poll_seconds is not None and (
@@ -4151,6 +4168,27 @@ class DependencyAgent:
 
     def _coordination_should_use_safety_polls(self) -> bool:
         return bool(self._coordination and self._coordination_stream_healthy and self.agent_rtdb_signal_wait_enabled)
+
+    def _has_active_agent_or_dependency_work_for_heartbeat(self) -> bool:
+        with self._lock:
+            return bool(
+                self._active_exec_by_item
+                or self._active_maintenance_by_item
+                or self._downloading
+                or self._input_cache_downloading
+                or self._agent_prefetch_inflight
+                or self._agent_execute_inflight
+                or self._agent_upload_inflight
+                or self._agent_maintenance_inflight
+            )
+
+    def _agent_heartbeat_interval_seconds(self) -> float:
+        if (
+            self._coordination_should_use_safety_polls()
+            and not self._has_active_agent_or_dependency_work_for_heartbeat()
+        ):
+            return max(float(self.agent_heartbeat_seconds), float(self.agent_idle_heartbeat_seconds))
+        return float(self.agent_heartbeat_seconds)
 
     def _coordination_dependency_poll_seconds(self) -> float:
         if self._coordination_should_use_safety_polls():
@@ -9766,10 +9804,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs heartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
+            self.agent_idle_heartbeat_seconds,
             int(self.agent_queue_wait_sec),
             "yes" if self.agent_rtdb_signal_wait_enabled else "no",
             float(self.agent_rtdb_signal_safety_min_seconds),
@@ -9877,7 +9916,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
                 self._maybe_register_agent_control()
                 if self.agent_control_enabled and self._agent_channel_supported and self._agent_access_token:
-                    if now - self._last_agent_heartbeat_ms >= int(self.agent_heartbeat_seconds * 1000):
+                    agent_heartbeat_interval_seconds = self._agent_heartbeat_interval_seconds()
+                    if now - self._last_agent_heartbeat_ms >= int(agent_heartbeat_interval_seconds * 1000):
                         try:
                             self._agent_heartbeat()
                         except ApiError as e:
