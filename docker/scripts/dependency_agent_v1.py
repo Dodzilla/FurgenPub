@@ -123,7 +123,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.27"
+AGENT_VERSION = "dm-agent-py/0.10.28"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -5618,6 +5618,9 @@ class DependencyAgent:
                 pip_args=[arg for arg in pip_args if isinstance(arg, str)] if isinstance(pip_args, list) else None,
             )
             return True
+        if spec_type == "furgen_asset_gen_runtime_helpers":
+            self._install_furgen_asset_gen_runtime_helpers()
+            return True
         if spec_type == "git_custom_nodes":
             repositories = spec.get("repositories")
             if not isinstance(repositories, list) or not repositories:
@@ -5782,6 +5785,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 ''',
             encoding="utf-8",
         )
+
+    def _install_furgen_asset_gen_runtime_helpers(self) -> None:
+        self._install_git_custom_node(
+            "https://github.com/Dodzilla/easy-comfy-nodes-async",
+            verify_dir_name="easy-comfy-nodes-async",
+            git_ref="a7d58d21de8a47fc42537c204650f9c03066f22a",
+            install_requirements=True,
+        )
+        self._install_furgen_video_compat_nodes()
 
     def _install_video_gen_v2_node_bundle(self, bundle_id: str) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
