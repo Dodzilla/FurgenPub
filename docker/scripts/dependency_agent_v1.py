@@ -123,7 +123,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.26"
+AGENT_VERSION = "dm-agent-py/0.10.27"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -7723,22 +7723,26 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         try:
             server_type = (self.server_type or "").strip()
             asset_gen_v5_server_types = ("asset_gen_v5", "asset_gen_v5_lite", "asset_gen_v6_lite")
-            if server_type in asset_gen_v5_server_types and bundle_specs:
+            if server_type in asset_gen_v5_server_types:
+                script_bundle_ids: List[str] = []
                 for bundle_id in bundle_ids:
                     spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
-                    if not self._install_node_bundle_from_spec(bundle_id, spec if isinstance(spec, dict) else {}):
-                        raise RuntimeError(f"No Firestore install spec available for {server_type} bundle {bundle_id}")
-            elif server_type in asset_gen_v5_server_types:
-                script_path = self._resolve_asset_gen_v5_script()
-                if script_path is None:
-                    raise RuntimeError(f"Unable to locate asset_gen_v5.sh on {server_type} instance.")
-                subprocess.run(
-                    ["bash", str(script_path), "install-bundles", *bundle_ids],
-                    cwd=str(self.workspace),
-                    env=os.environ.copy(),
-                    check=True,
-                    timeout=max(1800, 300 * max(1, len(bundle_ids))),
-                )
+                    if isinstance(spec, dict) and spec:
+                        if not self._install_node_bundle_from_spec(bundle_id, spec):
+                            raise RuntimeError(f"Unsupported Firestore install spec for {server_type} bundle {bundle_id}")
+                    else:
+                        script_bundle_ids.append(bundle_id)
+                if script_bundle_ids:
+                    script_path = self._resolve_asset_gen_v5_script()
+                    if script_path is None:
+                        raise RuntimeError(f"Unable to locate asset_gen_v5.sh on {server_type} instance.")
+                    subprocess.run(
+                        ["bash", str(script_path), "install-bundles", *script_bundle_ids],
+                        cwd=str(self.workspace),
+                        env=os.environ.copy(),
+                        check=True,
+                        timeout=max(1800, 300 * max(1, len(script_bundle_ids))),
+                    )
             elif (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad"):
                 for bundle_id in bundle_ids:
                     spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
