@@ -123,7 +123,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.24"
+AGENT_VERSION = "dm-agent-py/0.10.25"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -4569,6 +4569,7 @@ class DependencyAgent:
                     # leased RTDB mirror makes every heartbeat/event reconciliation
                     # reread the full command body.
                     write_value.pop("payload", None)
+                    write_value.pop("claimOrderKey", None)
                 if not self._coordination_put_json_if_match(item_path, write_value, etag, timeout_seconds=10.0):
                     continue
                 if queue_path_key == "agentQueueItems" and not isinstance(claimed_item.get("payload"), dict):
