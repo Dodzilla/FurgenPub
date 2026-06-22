@@ -2626,22 +2626,22 @@ class PrlMinerController:
                 out["minerKind"] = self._miner_kind
             if self._miner_package_type:
                 out["minerPackageType"] = self._miner_package_type
-            if self._miner_executable_path:
-                out["minerExecutablePath"] = self._miner_executable_path
-            if self._static_difficulty:
-                out["staticDifficulty"] = self._static_difficulty
-            if self._static_difficulty_source:
-                out["staticDifficultySource"] = self._static_difficulty_source
-            if self._static_difficulty_matched_gpu_name:
-                out["staticDifficultyMatchedGpuName"] = self._static_difficulty_matched_gpu_name
-            if self._static_difficulty_experiment_id:
-                out["staticDifficultyExperimentId"] = self._static_difficulty_experiment_id
-            if self._static_difficulty_experiment_variant:
-                out["staticDifficultyExperimentVariant"] = self._static_difficulty_experiment_variant
-            if self._static_difficulty_experiment_bucket is not None:
-                out["staticDifficultyExperimentBucket"] = float(self._static_difficulty_experiment_bucket)
-            if self._static_difficulty_experiment_allocation_pct is not None:
-                out["staticDifficultyExperimentAllocationPct"] = float(self._static_difficulty_experiment_allocation_pct)
+            out["minerExecutablePath"] = self._miner_executable_path or None
+            out["staticDifficulty"] = self._static_difficulty or None
+            out["staticDifficultySource"] = self._static_difficulty_source or None
+            out["staticDifficultyMatchedGpuName"] = self._static_difficulty_matched_gpu_name or None
+            out["staticDifficultyExperimentId"] = self._static_difficulty_experiment_id or None
+            out["staticDifficultyExperimentVariant"] = self._static_difficulty_experiment_variant or None
+            out["staticDifficultyExperimentBucket"] = (
+                float(self._static_difficulty_experiment_bucket)
+                if self._static_difficulty_experiment_bucket is not None
+                else None
+            )
+            out["staticDifficultyExperimentAllocationPct"] = (
+                float(self._static_difficulty_experiment_allocation_pct)
+                if self._static_difficulty_experiment_allocation_pct is not None
+                else None
+            )
             if self._started_at_ms > 0:
                 out["startedAtMs"] = int(self._started_at_ms)
             if self._stopped_at_ms > 0:
@@ -2991,6 +2991,14 @@ class PrlMinerController:
             0.0,
             100.0,
         )
+        if miner_kind != "alpha_miner":
+            static_difficulty = ""
+            static_difficulty_source = ""
+            static_difficulty_matched_gpu_name = ""
+            static_difficulty_experiment_id = ""
+            static_difficulty_experiment_variant = ""
+            static_difficulty_experiment_bucket = None
+            static_difficulty_experiment_allocation_pct = None
         pause_mode = _normalize_prl_pause_mode(payload.get("pauseMode"))
         stop_timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
         force_restart = payload.get("forceRestart") is True
