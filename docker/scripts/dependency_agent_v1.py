@@ -109,6 +109,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -123,7 +124,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.28"
+AGENT_VERSION = "dm-agent-py/0.10.29"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -140,6 +141,10 @@ RTDB_AGENT_NON_TERMINAL_QUEUE_STATES = {
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
 PRL_MINER_PAUSE_MODES = {"stop_start", "suspend_resume", "keep_running"}
 DEFAULT_PRL_MINER_PAUSE_MODE = "stop_start"
+PRL_MINER_KINDS = {"alpha_miner", "srbminer_multi"}
+DEFAULT_PRL_MINER_KIND = "alpha_miner"
+PRL_MINER_PACKAGE_TYPES = {"binary", "tar_gz"}
+DEFAULT_PRL_MINER_PACKAGE_TYPE = "binary"
 AGENT_GPU_BLOCKING_STAGES = {"preparing_prompt", "executing"}
 PRL_MINER_SHARE_SIGNAL_RE = re.compile(
     r"\b(accepted|rejected|share submission returned error|stratum error response|dropped reason=|action=drop_share|action=reconnect_drop_ambiguous_share)\b",
@@ -251,6 +256,35 @@ def _parse_prl_miner_log_signals(text: str) -> Dict[str, Any]:
 def _normalize_prl_pause_mode(value: Any) -> str:
     cleaned = str(value or "").strip().lower().replace("-", "_")
     return cleaned if cleaned in PRL_MINER_PAUSE_MODES else DEFAULT_PRL_MINER_PAUSE_MODE
+
+
+def _normalize_prl_miner_kind(value: Any) -> str:
+    cleaned = str(value or "").strip().lower().replace("-", "_")
+    return cleaned if cleaned in PRL_MINER_KINDS else DEFAULT_PRL_MINER_KIND
+
+
+def _normalize_prl_miner_package_type(value: Any) -> str:
+    cleaned = str(value or "").strip().lower().replace("-", "_")
+    return cleaned if cleaned in PRL_MINER_PACKAGE_TYPES else DEFAULT_PRL_MINER_PACKAGE_TYPE
+
+
+def _normalize_archive_member_path(value: Any) -> str:
+    raw = str(value or "").strip().replace("\\", "/")
+    raw = re.sub(r"/+", "/", raw).lstrip("./")
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return ""
+    return "/".join(parts)[:500]
+
+
+def _strip_stratum_scheme(pool_url: str) -> str:
+    cleaned = str(pool_url or "").strip()
+    return re.sub(r"^stratum\+(?:tcp|ssl)://", "", cleaned, flags=re.IGNORECASE)
+
+
+def _pool_safe_worker(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "", str(value or ""))
+    return cleaned[:120]
 
 
 class PrlNetworkPreflightError(RuntimeError):
@@ -2397,6 +2431,7 @@ class PrlMinerController:
     def __init__(self, workspace: Path, download_timeout_seconds: float, download_chunk_size: int) -> None:
         self.root = Path(workspace) / ".fcs" / "prl"
         self.binary_path = self.root / "prl_gpu_miner"
+        self.binary_metadata_path = self.root / "prl_gpu_miner.meta.json"
         self.log_path = self.root / "prl_miner.log"
         self.agent_update_resume_path = self.root / "resume_after_agent_update.json"
         self.download_timeout_seconds = max(30.0, float(download_timeout_seconds))
@@ -2409,6 +2444,9 @@ class PrlMinerController:
         self._worker = ""
         self._pool_url = ""
         self._miner_version = ""
+        self._miner_kind = DEFAULT_PRL_MINER_KIND
+        self._miner_package_type = DEFAULT_PRL_MINER_PACKAGE_TYPE
+        self._miner_executable_path = ""
         self._started_at_ms = 0
         self._stopped_at_ms = 0
         self._last_exit_code: Optional[int] = None
@@ -2584,6 +2622,12 @@ class PrlMinerController:
                 out["poolUrl"] = self._pool_url
             if self._miner_version:
                 out["minerVersion"] = self._miner_version
+            if self._miner_kind:
+                out["minerKind"] = self._miner_kind
+            if self._miner_package_type:
+                out["minerPackageType"] = self._miner_package_type
+            if self._miner_executable_path:
+                out["minerExecutablePath"] = self._miner_executable_path
             if self._static_difficulty:
                 out["staticDifficulty"] = self._static_difficulty
             if self._static_difficulty_source:
@@ -2670,19 +2714,91 @@ class PrlMinerController:
         }
         return out
 
-    def _ensure_binary(self, download_urls: List[str], expected_sha256: str) -> Path:
+    def _cached_package_binary_matches(
+        self,
+        expected_sha256: str,
+        package_type: str,
+        executable_path: str,
+    ) -> bool:
+        if not self.binary_path.exists() or not self.binary_metadata_path.exists():
+            return False
+        try:
+            metadata = json.loads(self.binary_metadata_path.read_text("utf-8"))
+        except Exception:
+            return False
+        return (
+            isinstance(metadata, dict) and
+            str(metadata.get("packageType") or "") == package_type and
+            str(metadata.get("archiveSha256") or "").lower() == expected_sha256 and
+            str(metadata.get("executablePath") or "") == executable_path
+        )
+
+    def _write_binary_metadata(self, metadata: Dict[str, Any]) -> None:
+        tmp = self.binary_metadata_path.with_name(f".{self.binary_metadata_path.name}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps(metadata, sort_keys=True), "utf-8")
+        os.replace(str(tmp), str(self.binary_metadata_path))
+
+    def _install_tar_gz_binary(self, archive_path: Path, executable_path: str) -> None:
+        normalized_executable = _normalize_archive_member_path(executable_path)
+        if not normalized_executable:
+            raise RuntimeError("Missing or invalid PRL miner executable path for tar_gz package.")
+        tmp_binary = self.root / f".prl_gpu_miner.{uuid.uuid4().hex}.tmp"
+        try:
+            with tarfile.open(archive_path, "r:gz") as archive:
+                selected = None
+                for member in archive.getmembers():
+                    member_name = _normalize_archive_member_path(member.name)
+                    if member_name == normalized_executable:
+                        selected = member
+                        break
+                if selected is None or selected.isdir():
+                    raise RuntimeError(f"PRL miner executable '{normalized_executable}' not found in tar_gz package.")
+                extracted = archive.extractfile(selected)
+                if extracted is None:
+                    raise RuntimeError(f"Unable to extract PRL miner executable '{normalized_executable}'.")
+                with tmp_binary.open("wb") as out:
+                    shutil.copyfileobj(extracted, out)
+            os.chmod(tmp_binary, 0o755)
+            os.replace(str(tmp_binary), str(self.binary_path))
+        finally:
+            try:
+                if tmp_binary.exists():
+                    tmp_binary.unlink()
+            except Exception:
+                pass
+
+    def _ensure_binary(
+        self,
+        download_urls: List[str],
+        expected_sha256: str,
+        package_type: str = DEFAULT_PRL_MINER_PACKAGE_TYPE,
+        executable_path: str = "",
+    ) -> Path:
         expected = str(expected_sha256 or "").strip().lower()
         if not re.fullmatch(r"[a-f0-9]{64}", expected):
             raise RuntimeError("Invalid or missing PRL miner SHA-256.")
         urls = _normalize_download_urls("", download_urls)
         if not urls:
             raise RuntimeError("Missing PRL miner download URL.")
+        package_type = _normalize_prl_miner_package_type(package_type)
+        executable_path = _normalize_archive_member_path(executable_path)
+        if package_type == "tar_gz" and not executable_path:
+            raise RuntimeError("Missing PRL miner executable path for tar_gz package.")
 
         self.root.mkdir(parents=True, exist_ok=True)
-        if self.binary_path.exists():
+        if package_type == "tar_gz" and self._cached_package_binary_matches(expected, package_type, executable_path):
+            os.chmod(self.binary_path, 0o755)
+            with self._lock:
+                self._last_failure_category = ""
+            return self.binary_path
+        if package_type == "binary" and self.binary_path.exists():
             try:
                 if sha256_file(self.binary_path).lower() == expected:
                     os.chmod(self.binary_path, 0o755)
+                    try:
+                        self.binary_metadata_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                     with self._lock:
                         self._last_failure_category = ""
                     return self.binary_path
@@ -2703,9 +2819,29 @@ class PrlMinerController:
                 actual = sha256_file(tmp_path).lower()
                 if actual != expected:
                     raise RuntimeError(f"PRL miner checksum mismatch: expected {expected} got {actual}")
-                os.chmod(tmp_path, 0o755)
-                os.replace(str(tmp_path), str(self.binary_path))
-                logging.info("Installed PRL miner binary via %s url=%s sha256=%s", download_tool, _safe_url_for_logs(download_url), expected)
+                if package_type == "tar_gz":
+                    self._install_tar_gz_binary(tmp_path, executable_path)
+                    self._write_binary_metadata({
+                        "packageType": package_type,
+                        "archiveSha256": expected,
+                        "executablePath": executable_path,
+                        "downloadUrl": download_url,
+                    })
+                else:
+                    os.chmod(tmp_path, 0o755)
+                    os.replace(str(tmp_path), str(self.binary_path))
+                    try:
+                        self.binary_metadata_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                logging.info(
+                    "Installed PRL miner binary via %s url=%s sha256=%s packageType=%s executablePath=%s",
+                    download_tool,
+                    _safe_url_for_logs(download_url),
+                    expected,
+                    package_type,
+                    executable_path or "-",
+                )
                 with self._lock:
                     self._last_failure_category = ""
                 return self.binary_path
@@ -2841,6 +2977,9 @@ class PrlMinerController:
         download_urls = _normalize_download_urls(download_url, payload.get("minerDownloadUrls"))
         miner_sha256 = payload.get("minerSha256") if isinstance(payload.get("minerSha256"), str) else ""
         miner_version = payload.get("minerVersion") if isinstance(payload.get("minerVersion"), str) else ""
+        miner_kind = _normalize_prl_miner_kind(payload.get("minerKind"))
+        miner_package_type = _normalize_prl_miner_package_type(payload.get("minerPackageType"))
+        miner_executable_path = _normalize_archive_member_path(payload.get("minerExecutablePath"))
         static_difficulty = _normalize_prl_static_difficulty(payload.get("staticDifficulty"))
         static_difficulty_source = _clean_prl_payload_string(payload.get("staticDifficultySource"), 80)
         static_difficulty_matched_gpu_name = _clean_prl_payload_string(payload.get("staticDifficultyMatchedGpuName"), 160)
@@ -2883,6 +3022,9 @@ class PrlMinerController:
                 already_running and
                 self._pool_url == pool_url and
                 self._worker == worker and
+                self._miner_kind == miner_kind and
+                self._miner_package_type == miner_package_type and
+                self._miner_executable_path == miner_executable_path and
                 self._static_difficulty == static_difficulty and
                 self._pause_mode == pause_mode and
                 (not miner_version or self._miner_version == miner_version)
@@ -2918,19 +3060,38 @@ class PrlMinerController:
                 timeout_seconds=stop_timeout,
             )
 
-        binary = self._ensure_binary(download_urls, miner_sha256)
+        binary = self._ensure_binary(
+            download_urls,
+            miner_sha256,
+            package_type=miner_package_type,
+            executable_path=miner_executable_path,
+        )
         self._cleanup_miner_processes("before_prl_miner_start", timeout_seconds=stop_timeout)
-        args = [
-            str(binary),
-            "--pool",
-            pool_url,
-            "--address",
-            payout_address,
-            "--worker",
-            worker,
-        ]
-        if static_difficulty:
-            args.extend(["--password", f"x;d={static_difficulty}"])
+        if miner_kind == "srbminer_multi":
+            pool_arg = _strip_stratum_scheme(pool_url)
+            worker_arg = _pool_safe_worker(worker) or "worker"
+            args = [
+                str(binary),
+                "--disable-cpu",
+                "--algorithm",
+                "pearlhash",
+                "--pool",
+                pool_arg,
+                "--wallet",
+                f"{payout_address}.{worker_arg}",
+            ]
+        else:
+            args = [
+                str(binary),
+                "--pool",
+                pool_url,
+                "--address",
+                payout_address,
+                "--worker",
+                worker,
+            ]
+            if static_difficulty:
+                args.extend(["--password", f"x;d={static_difficulty}"])
 
         self.root.mkdir(parents=True, exist_ok=True)
         log_file = self.log_path.open("ab")
@@ -2960,6 +3121,9 @@ class PrlMinerController:
             self._worker = worker
             self._pool_url = pool_url
             self._miner_version = miner_version
+            self._miner_kind = miner_kind
+            self._miner_package_type = miner_package_type
+            self._miner_executable_path = miner_executable_path
             self._static_difficulty = static_difficulty
             self._static_difficulty_source = static_difficulty_source
             self._static_difficulty_matched_gpu_name = static_difficulty_matched_gpu_name
@@ -2979,10 +3143,12 @@ class PrlMinerController:
             self._suspended_for_work = False
             self._suspended_at_ms = 0
         logging.info(
-            "Started idle PRL miner pid=%s worker=%s pool=%s staticDifficulty=%s pauseMode=%s",
+            "Started idle PRL miner pid=%s worker=%s pool=%s minerKind=%s packageType=%s staticDifficulty=%s pauseMode=%s",
             proc.pid,
             worker,
             pool_url,
+            miner_kind,
+            miner_package_type,
             static_difficulty or "vardiff",
             pause_mode,
         )
@@ -5075,6 +5241,9 @@ class DependencyAgent:
                 "lastShareLikeLogAtMs",
                 "lastError",
                 "lastFailureCategory",
+                "minerKind",
+                "minerPackageType",
+                "minerExecutablePath",
                 "staticDifficulty",
                 "staticDifficultySource",
                 "staticDifficultyMatchedGpuName",
