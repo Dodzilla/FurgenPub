@@ -4414,9 +4414,10 @@ class DependencyAgent:
     def _flatten_rtdb_patch(self, value: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         for key, nested in (value or {}).items():
-            if nested is None:
-                continue
             path = f"{prefix}/{key}" if prefix else str(key)
+            if nested is None:
+                out[path] = None
+                continue
             if isinstance(nested, dict):
                 out.update(self._flatten_rtdb_patch(nested, path))
             else:
