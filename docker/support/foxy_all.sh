@@ -2,6 +2,7 @@
 
 export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$WORKSPACE/ComfyUI}"
+FOXY_ALL_SCRIPT_PATH="${FOXY_ALL_SCRIPT_PATH:-${WORKSPACE}/foxy_all.sh}"
 
 if [[ -z "$DM_INSTANCE_ID" && -n "$VAST_CONTAINERLABEL" ]]; then
     DM_INSTANCE_ID="${VAST_CONTAINERLABEL#C.}"
@@ -10,11 +11,59 @@ fi
 
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
-export DM_ASSET_GEN_V5_SCRIPT="${DM_ASSET_GEN_V5_SCRIPT:-$(readlink -f "${BASH_SOURCE[0]}")}"
-export DM_ASSET_GEN_V5_LITE_SCRIPT="${DM_ASSET_GEN_V5_LITE_SCRIPT:-$(readlink -f "${BASH_SOURCE[0]}")}"
+
+function foxy_all_current_script_path() {
+    local source_path resolved_path
+    source_path="${BASH_SOURCE[0]:-}"
+    if [[ -z "$source_path" ]]; then
+        return 1
+    fi
+    resolved_path="$(readlink -f "$source_path" 2>/dev/null || true)"
+    if [[ -n "$resolved_path" && -f "$resolved_path" ]]; then
+        printf "%s" "$resolved_path"
+        return 0
+    fi
+    return 1
+}
+
+function foxy_all_materialize_script() {
+    local target_path current_path
+    target_path="${FOXY_ALL_SCRIPT_PATH}"
+    current_path="$(foxy_all_current_script_path || true)"
+
+    if [[ -f "$target_path" ]]; then
+        chmod +x "$target_path" 2>/dev/null || true
+        printf "%s" "$target_path"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$target_path")" || true
+    if [[ -n "$current_path" ]]; then
+        cp -f "$current_path" "$target_path" 2>/dev/null || true
+    elif [[ -n "${PROVISIONING_SCRIPT:-}" ]]; then
+        curl -fsSL "$PROVISIONING_SCRIPT" -o "$target_path" 2>/dev/null || true
+    fi
+
+    if [[ -f "$target_path" ]]; then
+        chmod +x "$target_path" 2>/dev/null || true
+        printf "%s" "$target_path"
+        return 0
+    fi
+
+    if [[ -n "$current_path" ]]; then
+        printf "%s" "$current_path"
+        return 0
+    fi
+
+    printf "%s" "$target_path"
+}
+
+FOXY_ALL_LOCAL_SCRIPT="$(foxy_all_materialize_script)"
+export DM_FOXY_ALL_SCRIPT="${DM_FOXY_ALL_SCRIPT:-${FOXY_ALL_LOCAL_SCRIPT}}"
+export DM_ASSET_GEN_V5_SCRIPT="${DM_ASSET_GEN_V5_SCRIPT:-${DM_FOXY_ALL_SCRIPT}}"
+export DM_ASSET_GEN_V5_LITE_SCRIPT="${DM_ASSET_GEN_V5_LITE_SCRIPT:-${DM_FOXY_ALL_SCRIPT}}"
 # foxy_all templates should default to the matching server type while still
 # allowing template/runtime override when explicitly required.
-export DM_FOXY_ALL_SCRIPT="${DM_FOXY_ALL_SCRIPT:-$(readlink -f "${BASH_SOURCE[0]}")}"
 export SERVER_TYPE="${SERVER_TYPE:-foxy_all}"
 COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-v0.25.1}"
 ASSET_GEN_V5_INSTALL_MODE="${ASSET_GEN_V5_INSTALL_MODE:-bundle_manager_v1}"
@@ -57,10 +106,14 @@ OMNIVOICE_PACKAGE_VERSION="${OMNIVOICE_PACKAGE_VERSION:-0.1.3}"
 OMNIVOICE_TRANSFORMERS_VERSION="${OMNIVOICE_TRANSFORMERS_VERSION:-5.3.0}"
 OMNIVOICE_SOXR_VERSION="${OMNIVOICE_SOXR_VERSION:-1.0.0}"
 OMNIVOICE_PYDUB_VERSION="${OMNIVOICE_PYDUB_VERSION:-0.25.1}"
+OMNIVOICE_PREWARM_MODEL="${OMNIVOICE_PREWARM_MODEL:-true}"
+OMNIVOICE_MODEL_REPO="${OMNIVOICE_MODEL_REPO:-k2-fsa/OmniVoice}"
+OMNIVOICE_MODEL_DIR="${OMNIVOICE_MODEL_DIR:-${COMFYUI_DIR}/models/omnivoice/OmniVoice}"
 export PIP_PREFER_BINARY="${PIP_PREFER_BINARY:-1}"
 # Several selected Comfy/node requirements can request OpenCV. Source tarballs
 # are ~90MB and painful on some Vast routes, so require manylinux wheels here.
 export PIP_ONLY_BINARY="${PIP_ONLY_BINARY:-opencv-python,opencv-python-headless,opencv-contrib-python,opencv-contrib-python-headless}"
+FOXY_ALL_SKIP_COMFY_REQUIREMENT_REGEX="${FOXY_ALL_SKIP_COMFY_REQUIREMENT_REGEX:-^[[:space:]]*comfyui-workflow-templates([<=>!~ ]|$)}"
 
 # If flash-attn install fails, we automatically fall back to xformers.
 TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
@@ -102,6 +155,7 @@ ALL_NODES=(
     "https://github.com/kijai/ComfyUI-KJNodes"
     "https://github.com/gseth/ControlAltAI-Nodes"
     "https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI"
+    "https://github.com/ClownsharkBatwing/RES4LYF"
 )
 NODES=()
 SELECTED_NODE_BUNDLE_IDS=()
@@ -149,6 +203,7 @@ NODE_PINS[ComfyUI-LTXVideo]="531512f7286963dc7aff1fd8bf5556e95eae03af"
 NODE_PINS[ComfyUI-VideoHelperSuite]="449839959f0153fb8a57211a9364c55163935ca9"
 NODE_PINS[ComfyUI-MelBandRoFormer]="92c86854e6654f4aacc97484471af95c98ea16d4"
 NODE_PINS[ComfyUI-KJNodes]="7519171dd6b6ccea43091c6b73e42443bba11f5b"
+NODE_PINS[RES4LYF]="419de2d7c78f415dde9aa352a7231820ebfc17a4"
 
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
@@ -274,9 +329,11 @@ function append_bundle_repos() {
             append_unique_node_repo "https://github.com/TenStrip/10S-Comfy-nodes"
             append_unique_node_repo "https://github.com/evanspearman/ComfyMath"
             append_unique_node_repo "https://github.com/GACLove/ComfyUI-VFI"
+            append_unique_node_repo "https://github.com/ClownsharkBatwing/RES4LYF"
             ;;
         asset_gen_v5_10s_ltx_tiled_nodes)
             append_unique_node_repo "https://github.com/TenStrip/10S-Comfy-nodes"
+            append_unique_node_repo "https://github.com/ClownsharkBatwing/RES4LYF"
             ;;
         asset_gen_v5_kj_ltx_tiled_nodes)
             append_unique_node_repo "https://github.com/kijai/ComfyUI-KJNodes"
@@ -409,6 +466,7 @@ function provisioning_install_selected_node_bundles() {
     if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_omnivoice"; then
         provisioning_install_omnivoice_requirements || return 1
         provisioning_verify_omnivoice_node || return 1
+        provisioning_ensure_omnivoice_model || return 1
     fi
 
     if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_moss"; then
@@ -546,7 +604,18 @@ function provisioning_update_comfyui() {
         fi
         if [ -f "${COMFYUI_DIR}/requirements.txt" ]; then
             printf "Installing ComfyUI requirements...\n"
-            pip install --no-cache-dir -r "${COMFYUI_DIR}/requirements.txt"
+            local comfy_requirements_path="${COMFYUI_DIR}/requirements.txt"
+            local filtered_requirements_path=""
+            if [[ -n "${FOXY_ALL_SKIP_COMFY_REQUIREMENT_REGEX}" ]]; then
+                filtered_requirements_path="$(mktemp /tmp/foxy-comfy-requirements.XXXXXX.txt)"
+                grep -Eiv "${FOXY_ALL_SKIP_COMFY_REQUIREMENT_REGEX}" "${COMFYUI_DIR}/requirements.txt" > "${filtered_requirements_path}"
+                if ! cmp -s "${COMFYUI_DIR}/requirements.txt" "${filtered_requirements_path}"; then
+                    printf "Filtered optional ComfyUI requirements matching: %s\n" "${FOXY_ALL_SKIP_COMFY_REQUIREMENT_REGEX}"
+                    comfy_requirements_path="${filtered_requirements_path}"
+                fi
+            fi
+            pip install --no-cache-dir -r "${comfy_requirements_path}"
+            [[ -n "${filtered_requirements_path}" ]] && rm -f "${filtered_requirements_path}"
         else
             echo "DEBUG: requirements.txt not found in ${COMFYUI_DIR}"
         fi
@@ -1143,6 +1212,46 @@ function provisioning_install_omnivoice_requirements() {
         printf "ERROR: Failed to install OmniVoice package without dependencies.\n"
         return 1
     }
+}
+
+function provisioning_ensure_omnivoice_model() {
+    if [[ "${OMNIVOICE_PREWARM_MODEL,,}" != "true" ]]; then
+        printf "Skipping OmniVoice model prewarm for foxy_all.\n"
+        return 0
+    fi
+
+    printf "Ensuring OmniVoice model files are present in %s...\n" "${OMNIVOICE_MODEL_DIR}"
+    /venv/main/bin/python - "${OMNIVOICE_MODEL_DIR}" "${OMNIVOICE_MODEL_REPO}" <<'PY'
+import os
+import sys
+from huggingface_hub import hf_hub_download
+
+local_dir = sys.argv[1]
+repo_id = sys.argv[2]
+
+required_files = [
+    ".gitattributes",
+    "README.md",
+    "chat_template.jinja",
+    "config.json",
+    "model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "audio_tokenizer/.gitattributes",
+    "audio_tokenizer/LICENSE",
+    "audio_tokenizer/README.md",
+    "audio_tokenizer/config.json",
+    "audio_tokenizer/model.safetensors",
+    "audio_tokenizer/preprocessor_config.json",
+]
+
+for rel_path in required_files:
+    abs_path = os.path.join(local_dir, rel_path)
+    if os.path.exists(abs_path) and os.path.getsize(abs_path) > 0:
+        continue
+    print(f"Downloading missing OmniVoice file: {rel_path}", flush=True)
+    hf_hub_download(repo_id=repo_id, filename=rel_path, local_dir=local_dir)
+PY
 }
 
 function provisioning_verify_omnivoice_node() {
@@ -2772,6 +2881,9 @@ function dependency_manager_persist_agent_env() {
         DM_AGENT_LOG_PATH \
         DM_AGENT_PID_PATH \
         DM_AGENT_URL \
+        DM_ASSET_GEN_V5_SCRIPT \
+        DM_ASSET_GEN_V5_LITE_SCRIPT \
+        DM_FOXY_ALL_SCRIPT \
         AGENT_URL \
         DEPENDENCY_AGENT_TARGET_VERSION \
         DEPENDENCY_AGENT_RELEASE_VERSION \
@@ -2787,6 +2899,11 @@ function dependency_manager_persist_agent_env() {
         CIVITAI_TOKEN \
         COMFYUI_ARGS \
         COMFY_NODE_PINS \
+        FOXY_ALL_SCRIPT_PATH \
+        OMNIVOICE_MODEL_DIR \
+        OMNIVOICE_MODEL_REPO \
+        OMNIVOICE_PREWARM_MODEL \
+        PROVISIONING_SCRIPT \
         COMFYUI_PIN_COMMIT
     do
         if [[ "${!key+x}" == "x" ]]; then
