@@ -124,7 +124,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.29"
+AGENT_VERSION = "dm-agent-py/0.10.30"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -5589,7 +5589,7 @@ class DependencyAgent:
         candidates: List[Path] = []
         if self.asset_gen_v5_script:
             candidates.append(Path(self.asset_gen_v5_script))
-        if (self.server_type or "").strip() in ("asset_gen_v5_lite", "asset_gen_v6_lite"):
+        if (self.server_type or "").strip() in ("asset_gen_v5_lite", "asset_gen_v6_lite", "foxy_all"):
             candidates.extend([
                 self.workspace / f"{(self.server_type or '').strip()}.sh",
                 Path(f"/workspace/{(self.server_type or '').strip()}.sh"),
@@ -7912,7 +7912,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
         try:
             server_type = (self.server_type or "").strip()
-            asset_gen_v5_server_types = ("asset_gen_v5", "asset_gen_v5_lite", "asset_gen_v6_lite")
+            asset_gen_v5_server_types = ("asset_gen_v5", "asset_gen_v5_lite", "asset_gen_v6_lite", "foxy_all")
             if server_type in asset_gen_v5_server_types:
                 script_bundle_ids: List[str] = []
                 for bundle_id in bundle_ids:
