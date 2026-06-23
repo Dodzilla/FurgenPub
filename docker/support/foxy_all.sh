@@ -57,6 +57,10 @@ OMNIVOICE_PACKAGE_VERSION="${OMNIVOICE_PACKAGE_VERSION:-0.1.3}"
 OMNIVOICE_TRANSFORMERS_VERSION="${OMNIVOICE_TRANSFORMERS_VERSION:-5.3.0}"
 OMNIVOICE_SOXR_VERSION="${OMNIVOICE_SOXR_VERSION:-1.0.0}"
 OMNIVOICE_PYDUB_VERSION="${OMNIVOICE_PYDUB_VERSION:-0.25.1}"
+export PIP_PREFER_BINARY="${PIP_PREFER_BINARY:-1}"
+# Several selected Comfy/node requirements can request OpenCV. Source tarballs
+# are ~90MB and painful on some Vast routes, so require manylinux wheels here.
+export PIP_ONLY_BINARY="${PIP_ONLY_BINARY:-opencv-python,opencv-python-headless,opencv-contrib-python,opencv-contrib-python-headless}"
 
 # If flash-attn install fails, we automatically fall back to xformers.
 TRELLIS2_RESOLVED_ATTN_BACKEND="${TRELLIS2_ATTN_BACKEND}"
