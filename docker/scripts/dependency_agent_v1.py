@@ -59,10 +59,10 @@ Optional knobs:
   - DM_AGENT_IDLE_HEARTBEAT_SECONDS (idle heartbeat cadence when RTDB signal wait is healthy; default: active cadence)
   - DM_AGENT_QUEUE_WAIT_SEC       (long-poll waitSec for /agent/queue; default: 2)
   - DM_AGENT_RTDB_SIGNAL_WAIT_ENABLED (when RTDB coordination is healthy, wait locally for queue signals; default: true)
-  - DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS (minimum fallback /agent/queue probe when signal stream is healthy; default: 60)
+  - DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS (minimum fallback /agent/queue probe when signal stream is healthy; default: 900)
   - DM_AGENT_RTDB_QUEUE_CLAIM_ENABLED (allow server-gated direct RTDB queue claims; default: true)
   - DM_AGENT_RTDB_LEASE_HEARTBEAT_ENABLED (allow server-gated active lease heartbeats through RTDB; default: true)
-  - DM_COORDINATION_RUNTIME_FULL_SYNC_SECONDS (full RTDB runtime mirror inventory cadence; default: 300)
+  - DM_COORDINATION_RUNTIME_FULL_SYNC_SECONDS (full RTDB runtime mirror inventory cadence; default: 900)
   - DM_AGENT_WAITING_DEPS_EVENT_SECONDS (waiting_dependencies event cadence; default: 60)
   - DM_AGENT_DEPENDENCY_WAIT_POLL_SECONDS (dependency readiness poll while waiting; default: 0.5)
   - DM_AGENT_PROGRESS_EVENT_SECONDS (execution_progress event cadence; default: 60)
@@ -3453,11 +3453,11 @@ class DependencyAgent:
         self.agent_rtdb_lease_heartbeat_enabled = _env_bool("DM_AGENT_RTDB_LEASE_HEARTBEAT_ENABLED", True)
         self.agent_rtdb_signal_safety_min_seconds = max(
             15.0,
-            min(600.0, _env_float("DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS", 60.0)),
+            min(1800.0, _env_float("DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS", 900.0)),
         )
         self.coordination_runtime_full_sync_seconds = max(
             60.0,
-            min(3600.0, _env_float("DM_COORDINATION_RUNTIME_FULL_SYNC_SECONDS", 300.0)),
+            min(3600.0, _env_float("DM_COORDINATION_RUNTIME_FULL_SYNC_SECONDS", 900.0)),
         )
         self.agent_full_capacity_poll_seconds = max(5.0, min(300.0, _env_float("DM_AGENT_FULL_CAPACITY_POLL_SECONDS", 30.0)))
         self.agent_waiting_deps_event_ms = int(max(15.0, _env_float("DM_AGENT_WAITING_DEPS_EVENT_SECONDS", 60.0)) * 1000)
@@ -3485,7 +3485,7 @@ class DependencyAgent:
         self._last_comfy_queue_summary_at_ms = 0
         self.input_cache_dir = Path(_env_str("DM_INPUT_CACHE_DIR") or str(self.workspace / ".dm_input_cache"))
         self.input_cache_max_bytes = max(0, int(_parse_bytes(_env_str("DM_INPUT_CACHE_MAX_BYTES")) or 20 * 1024 * 1024 * 1024))
-        self.input_cache_heartbeat_max_keys = max(0, min(1000, _env_int("DM_INPUT_CACHE_HEARTBEAT_MAX_KEYS", 200)))
+        self.input_cache_heartbeat_max_keys = max(0, min(1000, _env_int("DM_INPUT_CACHE_HEARTBEAT_MAX_KEYS", 50)))
         self.self_update_enabled = _env_bool("DM_AGENT_SELF_UPDATE_ENABLED", True)
         self.self_update_allow_downgrade = _env_bool("DM_AGENT_SELF_UPDATE_ALLOW_DOWNGRADE", False)
         self.self_update_retry_seconds = max(30.0, _env_float("DM_AGENT_SELF_UPDATE_RETRY_SECONDS", 300.0))
@@ -4631,7 +4631,8 @@ class DependencyAgent:
             if queue_path_key == "dependencyQueueItems":
                 op = item.get("op")
                 resolved = item.get("resolved")
-                if op in ("download", "touch", "delete") and not isinstance(resolved, dict):
+                payload_source = str(item.get("payloadSource") or "")
+                if op in ("download", "touch", "delete") and not isinstance(resolved, dict) and payload_source != "firestore":
                     logging.info("RTDB dependency queue item %s lacks resolved payload; falling back to HTTP.", item_id)
                     return None
             candidates.append((encoded_key, item))
@@ -4745,6 +4746,9 @@ class DependencyAgent:
                     # reread the full command body.
                     write_value.pop("payload", None)
                     write_value.pop("claimOrderKey", None)
+                elif queue_path_key == "dependencyQueueItems":
+                    write_value.pop("payload", None)
+                    write_value.pop("resolved", None)
                 if not self._coordination_put_json_if_match(item_path, write_value, etag, timeout_seconds=10.0):
                     continue
                 if queue_path_key == "agentQueueItems" and not isinstance(claimed_item.get("payload"), dict):
@@ -4760,6 +4764,21 @@ class DependencyAgent:
                             claimed_item.get("itemId"),
                         )
                         continue
+                if queue_path_key == "dependencyQueueItems":
+                    op = claimed_item.get("op")
+                    if op in ("download", "touch", "delete") and not isinstance(claimed_item.get("resolved"), dict):
+                        fetched_item = self._fetch_queue_item(claimed_item["itemId"])
+                        if isinstance(fetched_item, dict) and isinstance(fetched_item.get("resolved"), dict):
+                            claimed_item.update(fetched_item)
+                            claimed_item["leaseId"] = lease_id
+                            claimed_item["leaseExpiresAt"] = _ms_to_iso(lease_expires_at_ms)
+                        else:
+                            logging.warning(
+                                "RTDB dependency queue claim %s/%s had no resolved payload and queue-item fetch returned no resolved payload; lease will expire.",
+                                queue_path_key,
+                                claimed_item.get("itemId"),
+                            )
+                            continue
                 claimed.append(claimed_item)
             except Exception as e:
                 logging.warning("RTDB queue claim failed for %s/%s: %s", queue_path_key, item.get("itemId"), e)
@@ -4937,6 +4956,10 @@ class DependencyAgent:
         manager: Dict[str, Any] = {
             "queueDepth": queue_depth_value,
             "lastHeartbeatAtMs": now_ms,
+            "installedDepIdsStaticHash": _sha256_hex_bytes(_canonical_json_bytes(installed_static)),
+            "installedDepIdsDynamicHash": _sha256_hex_bytes(_canonical_json_bytes(installed_dynamic)),
+            "downloadingDepIdsHash": _sha256_hex_bytes(_canonical_json_bytes(downloading)),
+            "failedDepIdsHash": _sha256_hex_bytes(_canonical_json_bytes(failed)),
         }
         if active_downloads:
             manager["activeDownloads"] = active_downloads
@@ -4968,6 +4991,10 @@ class DependencyAgent:
             "activeDownloadCount": len(active_downloads),
             "downloadingDepIdsCount": len(downloading),
             "failedDepIdsCount": len(failed),
+            "installedDepIdsStaticHash": manager["installedDepIdsStaticHash"],
+            "installedDepIdsDynamicHash": manager["installedDepIdsDynamicHash"],
+            "downloadingDepIdsHash": manager["downloadingDepIdsHash"],
+            "failedDepIdsHash": manager["failedDepIdsHash"],
             "dynamicBytesUsed": dynamic_bytes_used,
         }
         if full and "disk" in manager:
@@ -5074,6 +5101,12 @@ class DependencyAgent:
                 },
             }
         now_ms = _now_ms()
+        input_cache_keys = sorted({
+            str(value)
+            for value in body.get("inputCacheKeys", [])
+            if isinstance(value, str) and value
+        }) if isinstance(body.get("inputCacheKeys"), list) else []
+        input_cache_keys_hash = _sha256_hex_bytes(_canonical_json_bytes(input_cache_keys))
         agent_control: Dict[str, Any] = {
             "lastHeartbeatAtMs": now_ms,
             "localComfyReachable": body.get("localComfyReachable") is True,
@@ -5082,9 +5115,11 @@ class DependencyAgent:
             "stageCounts": body.get("stageCounts") if isinstance(body.get("stageCounts"), dict) else {},
             "heldLeases": body.get("heldLeases") if isinstance(body.get("heldLeases"), list) else [],
             "runningItemIds": body.get("runningItemIds") if isinstance(body.get("runningItemIds"), list) else [],
+            "heldLeaseCount": len(body.get("heldLeases") if isinstance(body.get("heldLeases"), list) else []),
             "maxConcurrentExecuteJobs": int(body.get("maxConcurrentExecuteJobs") or 0),
             "maxPrefetchJobs": int(body.get("maxPrefetchJobs") or 0),
             "maxUploadJobs": int(body.get("maxUploadJobs") or 0),
+            "inputCacheKeysHash": input_cache_keys_hash,
         }
         queue_summary = body.get("queueSummary")
         if isinstance(queue_summary, dict) and queue_summary:
@@ -5104,6 +5139,7 @@ class DependencyAgent:
             agent_control.update({
                 "localReadinessFile": body.get("localReadinessFile") or self.agent_local_readiness_file,
                 "inputCacheKeys": body.get("inputCacheKeys", []),
+                "inputCacheKeysHash": input_cache_keys_hash,
                 "inputCacheKeyCount": int(body.get("inputCacheKeyCount") or 0),
                 "inputCacheBytesUsed": int(body.get("inputCacheBytesUsed") or 0),
                 "inputCacheMaxBytes": int(body.get("inputCacheMaxBytes") or 0),
@@ -5118,12 +5154,12 @@ class DependencyAgent:
             "localReadinessFilePresent": agent_control.get("localReadinessFilePresent"),
             "queueDepth": agent_control.get("queueDepth"),
             "stageCounts": agent_control.get("stageCounts"),
-            "heldLeases": agent_control.get("heldLeases"),
-            "heldLeaseCount": len(agent_control.get("heldLeases") or []),
+            "heldLeaseCount": agent_control.get("heldLeaseCount"),
             "runningItemIds": agent_control.get("runningItemIds"),
             "maxConcurrentExecuteJobs": agent_control.get("maxConcurrentExecuteJobs"),
             "maxPrefetchJobs": agent_control.get("maxPrefetchJobs"),
             "maxUploadJobs": agent_control.get("maxUploadJobs"),
+            "inputCacheKeysHash": agent_control.get("inputCacheKeysHash"),
         }
         if "queueSummary" in agent_control:
             hot_agent_control["queueSummary"] = agent_control.get("queueSummary")
