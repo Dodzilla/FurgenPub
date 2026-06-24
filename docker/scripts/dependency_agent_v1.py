@@ -124,7 +124,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.30"
+AGENT_VERSION = "dm-agent-py/0.10.31"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3441,6 +3441,8 @@ class DependencyAgent:
         self._agent_poll_seconds_env = _env_str("DM_AGENT_POLL_SECONDS") is not None
         self._agent_heartbeat_seconds_env = _env_str("DM_AGENT_HEARTBEAT_SECONDS") is not None
         self._agent_idle_heartbeat_seconds_env = _env_str("DM_AGENT_IDLE_HEARTBEAT_SECONDS") is not None
+        self._agent_waiting_deps_event_seconds_env = _env_str("DM_AGENT_WAITING_DEPS_EVENT_SECONDS") is not None
+        self._agent_progress_event_seconds_env = _env_str("DM_AGENT_PROGRESS_EVENT_SECONDS") is not None
         self.agent_poll_seconds = max(0.5, _env_float("DM_AGENT_POLL_SECONDS", 2.0))
         self.agent_heartbeat_seconds = max(2.0, _env_float("DM_AGENT_HEARTBEAT_SECONDS", 8.0))
         self.agent_idle_heartbeat_seconds = max(
@@ -4336,6 +4338,20 @@ class DependencyAgent:
             if abs(float(self.agent_poll_seconds) - poll_seconds) >= 0.1:
                 self.agent_poll_seconds = poll_seconds
                 changes.append(f"poll={poll_seconds:.1f}s")
+
+        progress_event_seconds = self._runtime_config_seconds(raw.get("progressEventSec"), 60.0, 600.0)
+        if progress_event_seconds is not None and not self._agent_progress_event_seconds_env:
+            progress_event_ms = int(progress_event_seconds * 1000)
+            if abs(float(self.agent_progress_event_ms) - progress_event_ms) >= 100:
+                self.agent_progress_event_ms = progress_event_ms
+                changes.append(f"progressEvent={progress_event_seconds:.1f}s")
+
+        waiting_deps_event_seconds = self._runtime_config_seconds(raw.get("waitingDepsEventSec"), 60.0, 600.0)
+        if waiting_deps_event_seconds is not None and not self._agent_waiting_deps_event_seconds_env:
+            waiting_deps_event_ms = int(waiting_deps_event_seconds * 1000)
+            if abs(float(self.agent_waiting_deps_event_ms) - waiting_deps_event_ms) >= 100:
+                self.agent_waiting_deps_event_ms = waiting_deps_event_ms
+                changes.append(f"waitingDepsEvent={waiting_deps_event_seconds:.1f}s")
 
         if changes:
             logging.info("Applied agent runtime config from %s: %s", source, ", ".join(changes))
