@@ -5,6 +5,7 @@ set -x
 export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$WORKSPACE/ComfyUI}"
 export SERVER_TYPE="${SERVER_TYPE:-video_gen_v2}"
+FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support}"
 
 mkdir -p "${WORKSPACE}" "${DM_COMFYUI_DIR}" || true
 
@@ -188,6 +189,7 @@ function provisioning_start() {
         printf "WARN: Provisioning step 'provisioning_get_nodes' failed with exit code %s; continuing.\n" "$?"
         soft_failures=1
     }
+    provisioning_install_furgen_video_tools_node || return 1
     # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
     provisioning_ensure_node_requirements
     provisioning_get_pip_packages || {
@@ -392,6 +394,36 @@ function provisioning_fix_python_compatibility() {
 from kornia.geometry.transform.pyramid import pad
 print("Verified kornia pyramid.pad import for ComfyUI-LTXVideo")
 PY
+}
+
+function provisioning_install_furgen_video_tools_node() {
+    local script_dir src_dir dest_dir remote_base
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    src_dir="${script_dir}/custom_nodes/FurgenVideoTools"
+    dest_dir="${COMFYUI_DIR}/custom_nodes/FurgenVideoTools"
+    remote_base="${FURGENPUB_RAW_BASE_URL%/}/custom_nodes/FurgenVideoTools"
+
+    mkdir -p "${COMFYUI_DIR}/custom_nodes"
+    rm -rf "${dest_dir}"
+    mkdir -p "${dest_dir}"
+
+    if [[ -d "${src_dir}" ]]; then
+        cp -R "${src_dir}/." "${dest_dir}/"
+        printf "Installed managed custom node: FurgenVideoTools (local copy)\n"
+        return 0
+    fi
+
+    printf "Local FurgenVideoTools source missing; downloading managed custom node from %s\n" "${remote_base}"
+    curl -fsSL "${remote_base}/__init__.py" -o "${dest_dir}/__init__.py" || {
+        printf "ERROR: Failed to download FurgenVideoTools __init__.py from %s\n" "${remote_base}"
+        return 1
+    }
+    curl -fsSL "${remote_base}/furgen_video_tools.py" -o "${dest_dir}/furgen_video_tools.py" || {
+        printf "ERROR: Failed to download FurgenVideoTools implementation from %s\n" "${remote_base}"
+        return 1
+    }
+
+    printf "Installed managed custom node: FurgenVideoTools (downloaded)\n"
 }
 
 function provisioning_install_furgen_compat_nodes() {

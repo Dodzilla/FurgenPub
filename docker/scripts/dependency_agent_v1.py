@@ -124,7 +124,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.31"
+AGENT_VERSION = "dm-agent-py/0.10.32"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3480,6 +3480,10 @@ class DependencyAgent:
         default_upload_workers = max(4, int(self.agent_max_execute_workers) * 2)
         self.agent_max_upload_workers = 0 if self.mining_only else max(1, min(16, _env_int("DM_AGENT_MAX_UPLOAD_WORKERS", default_upload_workers)))
         self.asset_gen_v5_script = _env_str("DM_ASSET_GEN_V5_SCRIPT")
+        self.furgenpub_raw_base_url = (
+            _env_str("FURGENPUB_RAW_BASE_URL")
+            or "https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support"
+        ).rstrip("/")
         self._resolved_local_comfy_base_url = self.agent_local_comfy_base_url
         self._last_local_comfy_discovery_ms = 0
         self._comfy_queue_summary_ttl_ms = max(1000, min(10000, int(_env_float("DM_COMFY_QUEUE_SUMMARY_TTL_SECONDS", 2.0) * 1000)))
@@ -5851,6 +5855,9 @@ class DependencyAgent:
         if spec_type == "furgen_asset_gen_runtime_helpers":
             self._install_furgen_asset_gen_runtime_helpers()
             return True
+        if spec_type == "furgen_video_tools":
+            self._install_furgen_video_tools_node()
+            return True
         if spec_type == "git_custom_nodes":
             repositories = spec.get("repositories")
             if not isinstance(repositories, list) or not repositories:
@@ -6016,6 +6023,66 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             encoding="utf-8",
         )
 
+    def _furgen_video_tools_source_candidates(self) -> List[Path]:
+        candidates: List[Path] = []
+        script_path = self.self_script_path
+        for base in (
+            script_path.parent.parent / "support",
+            script_path.parent / "docker" / "support",
+            self.workspace / "FurgenPub" / "docker" / "support",
+            Path("/opt/FurgenPub/docker/support"),
+            Path("/workspace/FurgenPub/docker/support"),
+        ):
+            candidates.append(base / "custom_nodes" / "FurgenVideoTools")
+        deduped: List[Path] = []
+        seen: Set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(candidate)
+        return deduped
+
+    def _install_furgen_video_tools_node(self) -> None:
+        custom_nodes_dir = self.comfyui_dir / "custom_nodes"
+        dest_dir = custom_nodes_dir / "FurgenVideoTools"
+        custom_nodes_dir.mkdir(parents=True, exist_ok=True)
+
+        for src_dir in self._furgen_video_tools_source_candidates():
+            try:
+                if (src_dir / "__init__.py").exists() and (src_dir / "furgen_video_tools.py").exists():
+                    temp_dir = dest_dir.with_name(f".{dest_dir.name}.tmp-{uuid.uuid4().hex}")
+                    if temp_dir.exists():
+                        shutil.rmtree(temp_dir)
+                    shutil.copytree(src_dir, temp_dir, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                    if dest_dir.exists():
+                        shutil.rmtree(dest_dir)
+                    os.replace(str(temp_dir), str(dest_dir))
+                    logging.info("Installed managed custom node FurgenVideoTools from local source: %s", src_dir)
+                    return
+            except Exception as exc:
+                logging.warning("Failed local FurgenVideoTools install from %s: %s", src_dir, str(exc)[:500])
+
+        remote_base = f"{self.furgenpub_raw_base_url}/custom_nodes/FurgenVideoTools"
+        temp_dir = dest_dir.with_name(f".{dest_dir.name}.tmp-{uuid.uuid4().hex}")
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            for filename in ("__init__.py", "furgen_video_tools.py"):
+                url = f"{remote_base}/{filename}"
+                request = urllib.request.Request(url, headers={"User-Agent": "furgen-dependency-agent/1.0"})
+                with urllib.request.urlopen(request, timeout=60.0) as resp:
+                    data = resp.read()
+                (temp_dir / filename).write_bytes(data)
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
+            os.replace(str(temp_dir), str(dest_dir))
+            logging.info("Installed managed custom node FurgenVideoTools from raw source: %s", remote_base)
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+
     def _install_furgen_asset_gen_runtime_helpers(self) -> None:
         self._install_git_custom_node(
             "https://github.com/Dodzilla/easy-comfy-nodes-async",
@@ -6048,6 +6115,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             )
             self._install_furgen_video_compat_nodes()
             return
+        if bundle_id == "video_gen_v2_furgen_color_nodes":
+            self._install_furgen_video_tools_node()
+            return
         if bundle_id == "asset_gen_v5_ltx23_fp8":
             self._install_git_custom_node(
                 "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
@@ -6072,6 +6142,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 "LTXVImgToVideoConditionOnly",
                 "LTXAddVideoICLoRAGuide",
                 "RIFEInterpolation",
+            ]
+        if bundle_id == "video_gen_v2_furgen_color_nodes":
+            return [
+                "FurgenExposureAdjust",
+                "FurgenReferenceColorMatch",
             ]
         if bundle_id == "asset_gen_v5_ltx23_fp8":
             return [
