@@ -3,11 +3,11 @@
 ## Branch And Status
 
 - Branch: `main`
-- Current commit: `c1b6d59f77cc9486ea5e5a5cf2f44f15e7b5573d`
+- Base commit before implementation: `c1b6d59f77cc9486ea5e5a5cf2f44f15e7b5573d`
+- Publication implementation commit SHA: `bebbf9c52093b84d68004332523ecf657f411e42`
 - Starting working tree status: clean, `## main...origin/main`
-- Current working tree status: uncommitted local changes in the files listed below.
+- Current working tree status: clean after publication commits.
 - Note: no local or remote `dev` branch exists in this checkout; implementation stayed in the provided checkout and did not create a worktree.
-- Publication commit SHA: pending push.
 
 ## Exact Files Changed
 
