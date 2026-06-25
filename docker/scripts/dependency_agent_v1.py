@@ -124,7 +124,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.34"
+AGENT_VERSION = "dm-agent-py/0.10.35"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3019,6 +3019,14 @@ class PrlMinerController:
             static_difficulty_experiment_variant = ""
             static_difficulty_experiment_bucket = None
             static_difficulty_experiment_allocation_pct = None
+        if miner_kind == "srbminer_multi" and cpu_mining_enabled:
+            logging.warning(
+                "Ignoring SRBMiner CPU mining request for PearlHash: current PRL mining config is GPU-only; keeping --disable-cpu."
+            )
+            cpu_mining_enabled = False
+        if not cpu_mining_enabled:
+            cpu_threads_reduce = 0
+            cpu_threads_priority = 2
         if miner_kind != "srbminer_multi":
             cpu_mining_enabled = False
             cpu_threads_reduce = 0
@@ -3108,31 +3116,16 @@ class PrlMinerController:
         if miner_kind == "srbminer_multi":
             pool_arg = _strip_stratum_scheme(pool_url)
             worker_arg = _pool_safe_worker(worker) or "worker"
-            if cpu_mining_enabled:
-                args = [
-                    str(binary),
-                    "--algorithm",
-                    "pearlhash",
-                    "--cpu-threads-reduce",
-                    str(cpu_threads_reduce),
-                    "--cpu-threads-priority",
-                    str(cpu_threads_priority),
-                    "--pool",
-                    pool_arg,
-                    "--wallet",
-                    f"{payout_address}.{worker_arg}",
-                ]
-            else:
-                args = [
-                    str(binary),
-                    "--disable-cpu",
-                    "--algorithm",
-                    "pearlhash",
-                    "--pool",
-                    pool_arg,
-                    "--wallet",
-                    f"{payout_address}.{worker_arg}",
-                ]
+            args = [
+                str(binary),
+                "--disable-cpu",
+                "--algorithm",
+                "pearlhash",
+                "--pool",
+                pool_arg,
+                "--wallet",
+                f"{payout_address}.{worker_arg}",
+            ]
         else:
             args = [
                 str(binary),
