@@ -117,6 +117,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -124,7 +125,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.39"
+AGENT_VERSION = "dm-agent-py/0.10.40"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -138,6 +139,13 @@ RTDB_AGENT_NON_TERMINAL_QUEUE_STATES = {
     "cancel_requested",
     "retrying",
 }
+RIFE_VFI_ZIP_URLS = [
+    "https://huggingface.co/hzwer/RIFE/resolve/main/RIFEv4.26_0921.zip",
+    "https://hf-mirror.com/hzwer/RIFE/resolve/main/RIFEv4.26_0921.zip",
+]
+RIFE_VFI_ZIP_SIZE_BYTES = 22869906
+RIFE_VFI_ZIP_SHA256 = "1fa9b9cda3d9b8c3e301359e2595960902f97bf926c08598b0e9957a3f3f760e"
+RIFE_VFI_FLOWNET_SIZE_BYTES = 24636301
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
 PRL_MINER_PAUSE_MODES = {"stop_start", "suspend_resume", "keep_running"}
 DEFAULT_PRL_MINER_PAUSE_MODE = "stop_start"
@@ -5922,41 +5930,99 @@ class DependencyAgent:
 
     def _ensure_comfyui_vfi_rife_model(self) -> bool:
         vfi_dir = self.comfyui_dir / "custom_nodes" / "ComfyUI-VFI"
-        download_script = vfi_dir / "rife" / "download_rife.py"
+        rife_dir = vfi_dir / "rife"
         target_dir = vfi_dir / "rife" / "train_log"
         target = target_dir / "flownet.pkl"
 
         try:
-            if target.exists() and int(target.stat().st_size) > 0:
+            if target.exists() and int(target.stat().st_size) == RIFE_VFI_FLOWNET_SIZE_BYTES:
                 return False
         except Exception:
             pass
 
-        if not download_script.exists():
-            raise RuntimeError(f"ComfyUI-VFI RIFE download script not found: {download_script}")
+        if not rife_dir.exists():
+            raise RuntimeError(f"ComfyUI-VFI RIFE directory not found: {rife_dir}")
 
         target_dir.mkdir(parents=True, exist_ok=True)
-        logging.info("Preseeding ComfyUI-VFI RIFE model: %s", target)
-        proc = subprocess.run(
-            [sys.executable, str(download_script), str(target_dir)],
-            cwd=str(vfi_dir),
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=600,
-        )
-        if proc.returncode != 0:
-            stdout = (proc.stdout or "").strip()[-1500:]
-            stderr = (proc.stderr or "").strip()[-1500:]
-            raise RuntimeError(
-                "ComfyUI-VFI RIFE model download failed "
-                f"(exit={proc.returncode}) stdout={stdout!r} stderr={stderr!r}"
-            )
-        if not target.exists() or int(target.stat().st_size) <= 0:
-            raise RuntimeError(f"ComfyUI-VFI RIFE model download completed but {target} is missing or empty")
-        logging.info("Preseeded ComfyUI-VFI RIFE model: %s (%d bytes)", target, int(target.stat().st_size))
-        return True
+        temp_dir = rife_dir / "_furgen_rife_download"
+        zip_path = temp_dir / "RIFEv4.26_0921.zip"
+        temp_target = target.with_name(f".{target.name}.tmp-{uuid.uuid4().hex}")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        download_errors: List[str] = []
+        try:
+            for url in RIFE_VFI_ZIP_URLS:
+                try:
+                    logging.info("Downloading ComfyUI-VFI RIFE model archive: %s", _safe_url_for_logs(url))
+                    tool = download_file_with_tool_fallback(
+                        url,
+                        zip_path,
+                        timeout_seconds=max(60.0, min(float(self.download_timeout_seconds), 180.0)),
+                        chunk_size=int(self.download_chunk_size),
+                        user_agent=f"{AGENT_VERSION} rife-vfi-model",
+                        tools=["curl", "aria2", "wget", "python"],
+                    )
+                    actual_zip_size = int(zip_path.stat().st_size) if zip_path.exists() else 0
+                    if actual_zip_size != RIFE_VFI_ZIP_SIZE_BYTES:
+                        raise RuntimeError(
+                            f"RIFE model archive size mismatch: expected {RIFE_VFI_ZIP_SIZE_BYTES}, got {actual_zip_size}"
+                        )
+                    actual_zip_sha = sha256_file(zip_path).lower()
+                    if actual_zip_sha != RIFE_VFI_ZIP_SHA256:
+                        raise RuntimeError(
+                            f"RIFE model archive checksum mismatch: expected {RIFE_VFI_ZIP_SHA256}, got {actual_zip_sha}"
+                        )
+
+                    with zipfile.ZipFile(zip_path, "r") as archive:
+                        candidates = [
+                            name for name in archive.namelist()
+                            if name.rstrip("/").split("/")[-1] == "flownet.pkl"
+                        ]
+                        if not candidates:
+                            raise RuntimeError("RIFE model archive does not contain flownet.pkl")
+                        member = candidates[0]
+                        info = archive.getinfo(member)
+                        if int(info.file_size) != RIFE_VFI_FLOWNET_SIZE_BYTES:
+                            raise RuntimeError(
+                                f"flownet.pkl size mismatch in archive: expected {RIFE_VFI_FLOWNET_SIZE_BYTES}, got {int(info.file_size)}"
+                            )
+                        with archive.open(member, "r") as src, temp_target.open("wb") as out:
+                            shutil.copyfileobj(src, out, length=1024 * 1024)
+
+                    actual_model_size = int(temp_target.stat().st_size) if temp_target.exists() else 0
+                    if actual_model_size != RIFE_VFI_FLOWNET_SIZE_BYTES:
+                        raise RuntimeError(
+                            f"extracted flownet.pkl size mismatch: expected {RIFE_VFI_FLOWNET_SIZE_BYTES}, got {actual_model_size}"
+                        )
+                    os.replace(str(temp_target), str(target))
+                    logging.info(
+                        "Installed ComfyUI-VFI RIFE model via %s: %s (%d bytes)",
+                        tool,
+                        target,
+                        actual_model_size,
+                    )
+                    return True
+                except Exception as exc:
+                    download_errors.append(f"{_safe_url_for_logs(url)}: {exc}")
+                    logging.warning("ComfyUI-VFI RIFE model download failed from %s: %s", _safe_url_for_logs(url), exc)
+                    try:
+                        if zip_path.exists():
+                            zip_path.unlink()
+                    except Exception:
+                        pass
+                    try:
+                        if temp_target.exists():
+                            temp_target.unlink()
+                    except Exception:
+                        pass
+            raise RuntimeError(f"ComfyUI-VFI RIFE model download failed from all sources: {'; '.join(download_errors)}")
+        finally:
+            try:
+                if temp_target.exists():
+                    temp_target.unlink()
+            except Exception:
+                pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _ensure_node_bundle_runtime_compatibility(self, bundle_ids: List[str]) -> bool:
         changed = False
@@ -5967,7 +6033,6 @@ class DependencyAgent:
             # while the next restart will fail to import the node pack. Enforce the pin
             # immediately before any bundle readiness marker is written.
             changed = self._ensure_python_package_constraint("kornia<0.8", "kornia") or changed
-            self._ensure_comfyui_vfi_rife_model()
         if "video_gen_v2_image_filters_nodes" in bundle_id_set:
             changed = self._ensure_video_gen_v2_image_filters_opencv() or changed
         return changed
