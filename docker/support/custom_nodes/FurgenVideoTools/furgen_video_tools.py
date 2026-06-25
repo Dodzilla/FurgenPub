@@ -12,7 +12,7 @@ FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 
 
 RGB_LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
-V2_FRAME_CHUNK_SIZE = 4
+V2_FRAME_CHUNK_SIZE = 2
 V2_STAT_SAMPLE_PIXELS = 65536
 
 
@@ -337,15 +337,24 @@ def _first_reference_rgb(reference: torch.Tensor, images: torch.Tensor) -> torch
     return _image_rgb(reference[:1]).to(device=images.device, dtype=images.dtype)
 
 
-def _chunked_frames(images: torch.Tensor, chunk_size: int = V2_FRAME_CHUNK_SIZE):
+def _chunked_frames(images: torch.Tensor, chunk_size=None):
+    for start, end in _chunked_frame_ranges(images, chunk_size=chunk_size):
+        yield images[start:end]
+
+
+def _chunked_frame_ranges(images: torch.Tensor, chunk_size=None):
     batch = int(images.shape[0])
+    if chunk_size is None:
+        chunk_size = V2_FRAME_CHUNK_SIZE
     step = max(1, int(chunk_size))
     for start in range(0, batch, step):
-        yield images[start : start + step]
+        yield start, min(batch, start + step)
 
 
-def _sample_pixels_channel_last(values: torch.Tensor, max_pixels: int = V2_STAT_SAMPLE_PIXELS) -> torch.Tensor:
+def _sample_pixels_channel_last(values: torch.Tensor, max_pixels=None) -> torch.Tensor:
     flat = values.reshape(-1, values.shape[-1])
+    if max_pixels is None:
+        max_pixels = V2_STAT_SAMPLE_PIXELS
     limit = max(1, int(max_pixels))
     if flat.shape[0] <= limit:
         return flat
@@ -353,14 +362,14 @@ def _sample_pixels_channel_last(values: torch.Tensor, max_pixels: int = V2_STAT_
     return flat.index_select(0, index)
 
 
-def _mean_std_stats_single(values: torch.Tensor, max_pixels: int = V2_STAT_SAMPLE_PIXELS) -> tuple[torch.Tensor, torch.Tensor]:
+def _mean_std_stats_single(values: torch.Tensor, max_pixels=None) -> tuple[torch.Tensor, torch.Tensor]:
     sample = _sample_pixels_channel_last(values, max_pixels=max_pixels)
     mean = sample.mean(dim=0).view(1, 1, 1, values.shape[-1])
     std = sample.std(dim=0, unbiased=False).view(1, 1, 1, values.shape[-1])
     return mean, std
 
 
-def _mean_std_stats_frames(values: torch.Tensor, max_pixels: int = V2_STAT_SAMPLE_PIXELS) -> tuple[torch.Tensor, torch.Tensor]:
+def _mean_std_stats_frames(values: torch.Tensor, max_pixels=None) -> tuple[torch.Tensor, torch.Tensor]:
     means = []
     stds = []
     for index in range(values.shape[0]):
@@ -391,7 +400,7 @@ def _robust_luma_mean_single(
     luma: torch.Tensor,
     black_percentile: float,
     white_percentile: float,
-    max_pixels: int = V2_STAT_SAMPLE_PIXELS,
+    max_pixels=None,
 ) -> torch.Tensor:
     sample = _sample_pixels_channel_last(luma, max_pixels=max_pixels).reshape(-1)
     lo_p = max(0.0, min(1.0, float(black_percentile)))
@@ -407,7 +416,7 @@ def _robust_luma_mean_frames(
     luma: torch.Tensor,
     black_percentile: float,
     white_percentile: float,
-    max_pixels: int = V2_STAT_SAMPLE_PIXELS,
+    max_pixels=None,
 ) -> torch.Tensor:
     means = [
         _robust_luma_mean_single(luma[index : index + 1], black_percentile, white_percentile, max_pixels=max_pixels)
@@ -657,10 +666,11 @@ class FurgenAdaptiveExposureMatch:
                 )
                 lo = min(float(gain_min), float(gain_max))
                 hi = max(float(gain_min), float(gain_max))
-                out_chunks = []
+                output = torch.empty_like(images)
 
-                for chunk in _chunked_frames(images):
+                for start, end in _chunked_frame_ranges(images):
                     phase = "frame_chunk"
+                    chunk = images[start:end]
                     rgb = _image_rgb(chunk)
                     src_mean = _robust_luma_mean_frames(
                         _luma(rgb),
@@ -669,10 +679,9 @@ class FurgenAdaptiveExposureMatch:
                     ).clamp_min(_eps_for(rgb))
                     gain = (ref_mean / src_mean).clamp(lo, hi)
                     corrected = _apply_highlight_protection(rgb, rgb * gain, preserve_highlights)
-                    out_chunks.append(_blend_and_restore_channels(chunk, corrected, strength))
+                    output[start:end] = _blend_and_restore_channels(chunk, corrected, strength)
 
-                phase = "concat"
-                return (torch.cat(out_chunks, dim=0),)
+                return (output,)
         except Exception as exc:
             raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
 
@@ -750,7 +759,7 @@ class FurgenColorTransferMatch:
                 ref_rgb = _first_reference_rgb(reference, images)
                 lo = min(float(std_min), float(std_max))
                 hi = max(float(std_min), float(std_max))
-                out_chunks = []
+                output = torch.empty_like(images)
 
                 if mode == "rgb_mean_std":
                     phase = "reference_stats_rgb"
@@ -762,8 +771,9 @@ class FurgenColorTransferMatch:
                         dtype=images.dtype,
                         device=images.device,
                     )
-                    for chunk in _chunked_frames(images):
+                    for start, end in _chunked_frame_ranges(images):
                         phase = "frame_chunk_rgb"
+                        chunk = images[start:end]
                         rgb = _image_rgb(chunk)
                         corrected = _mean_std_transfer_with_stats(
                             rgb,
@@ -775,7 +785,7 @@ class FurgenColorTransferMatch:
                             hi,
                         )
                         corrected = _apply_highlight_protection(rgb, corrected, preserve_highlights)
-                        out_chunks.append(_blend_and_restore_channels(chunk, corrected, strength))
+                        output[start:end] = _blend_and_restore_channels(chunk, corrected, strength)
                 elif mode == "ycbcr_mean_std":
                     phase = "reference_stats_ycbcr"
                     ref_ycbcr = _rgb_to_ycbcr(ref_rgb)
@@ -785,8 +795,9 @@ class FurgenColorTransferMatch:
                         dtype=images.dtype,
                         device=images.device,
                     ).view(1, 1, 1, 3).clamp(0.0, 1.0)
-                    for chunk in _chunked_frames(images):
+                    for start, end in _chunked_frame_ranges(images):
                         phase = "frame_chunk_ycbcr"
+                        chunk = images[start:end]
                         rgb = _image_rgb(chunk)
                         ycbcr = _rgb_to_ycbcr(rgb)
                         corrected = _ycbcr_to_rgb(
@@ -801,12 +812,11 @@ class FurgenColorTransferMatch:
                             )
                         )
                         corrected = _apply_highlight_protection(rgb, corrected, preserve_highlights)
-                        out_chunks.append(_blend_and_restore_channels(chunk, corrected, strength))
+                        output[start:end] = _blend_and_restore_channels(chunk, corrected, strength)
                 else:
                     raise ValueError(f"unsupported color transfer mode: {mode}")
 
-                phase = "concat"
-                return (torch.cat(out_chunks, dim=0),)
+                return (output,)
         except Exception as exc:
             raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
 
@@ -870,7 +880,7 @@ class FurgenTemporalToneSmooth:
                 smooth_chroma = None
                 previous_gain = None
                 previous_chroma_offset = None
-                corrected_frames = []
+                output = torch.empty_like(images)
 
                 for index in range(images.shape[0]):
                     phase = "frame"
@@ -898,17 +908,16 @@ class FurgenTemporalToneSmooth:
                     limited_chroma_offset = previous_chroma_offset + chroma_delta
 
                     if index == 0 and bool(preserve_first_frame):
-                        corrected_frames.append(image_frame)
+                        output[index : index + 1] = image_frame
                     else:
                         adjusted = ycbcr.clone()
                         adjusted[..., 0:1] = ycbcr[..., 0:1] * (1.0 + (limited_gain - 1.0) * global_strength)
                         adjusted[..., 1:3] = ycbcr[..., 1:3] + limited_chroma_offset * global_strength
-                        corrected_frames.append(_restore_channels(image_frame, _ycbcr_to_rgb(adjusted)))
+                        output[index : index + 1] = _restore_channels(image_frame, _ycbcr_to_rgb(adjusted))
                     previous_gain = limited_gain
                     previous_chroma_offset = limited_chroma_offset
 
-                phase = "concat"
-                return (torch.cat(corrected_frames, dim=0),)
+                return (output,)
         except Exception as exc:
             raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
 
