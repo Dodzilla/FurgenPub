@@ -5,6 +5,7 @@ from pathlib import Path
 
 import folder_paths
 import torch
+import torch.nn.functional as F
 
 
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
@@ -394,6 +395,39 @@ def _mean_std_transfer_with_stats(
     ratio = (ref_std / src_std).clamp(float(std_min), float(std_max))
     ratio = torch.ones_like(ratio).lerp(ratio, max(0.0, min(1.0, float(std_strength))))
     return (source - src_mean) * ratio + src_mean + (ref_mean - src_mean) * mean_strengths
+
+
+def _gaussian_kernel1d(radius: float, *, dtype: torch.dtype, device: torch.device, max_pad: int) -> torch.Tensor:
+    pad = min(max_pad, max(1, int(round(float(radius) * 2.0))))
+    coords = torch.arange(-pad, pad + 1, dtype=dtype, device=device)
+    sigma = max(0.25, float(radius))
+    kernel = torch.exp(-(coords * coords) / (2.0 * sigma * sigma))
+    return kernel / kernel.sum().clamp_min(torch.finfo(dtype).eps if dtype.is_floating_point else 1e-6)
+
+
+def _gaussian_blur_channel_last(rgb: torch.Tensor, radius: float) -> torch.Tensor:
+    if rgb.ndim != 4 or rgb.shape[1] < 3 or rgb.shape[2] < 3:
+        return rgb
+    max_pad = max(1, min(int(rgb.shape[1]) - 1, int(rgb.shape[2]) - 1))
+    kernel = _gaussian_kernel1d(radius, dtype=rgb.dtype, device=rgb.device, max_pad=max_pad)
+    pad = int((kernel.numel() - 1) // 2)
+    if pad < 1:
+        return rgb
+    nchw = rgb.permute(0, 3, 1, 2).contiguous()
+    channels = int(nchw.shape[1])
+    kernel_x = kernel.view(1, 1, 1, -1).expand(channels, 1, 1, -1)
+    kernel_y = kernel.view(1, 1, -1, 1).expand(channels, 1, -1, 1)
+    blurred = F.conv2d(F.pad(nchw, (pad, pad, 0, 0), mode="reflect"), kernel_x, groups=channels)
+    blurred = F.conv2d(F.pad(blurred, (0, 0, pad, pad), mode="reflect"), kernel_y, groups=channels)
+    return blurred.permute(0, 2, 3, 1)
+
+
+def _threshold_detail(detail: torch.Tensor, threshold: float) -> torch.Tensor:
+    threshold = max(0.0, float(threshold))
+    if threshold <= 0.0:
+        return detail
+    mag = detail.abs()
+    return detail * ((mag - threshold).clamp_min(0.0) / mag.clamp_min(_eps_for(detail)))
 
 
 def _robust_luma_mean_single(
@@ -922,6 +956,79 @@ class FurgenTemporalToneSmooth:
             raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
 
 
+class FurgenTemporalUnsharpMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "amount": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01},
+                ),
+                "radius": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.25, "max": 5.0, "step": 0.25},
+                ),
+                "threshold": (
+                    "FLOAT",
+                    {"default": 0.01, "min": 0.0, "max": 0.50, "step": 0.005},
+                ),
+                "luma_only": (
+                    "BOOLEAN",
+                    {"default": True},
+                ),
+                "temporal_blend": (
+                    "FLOAT",
+                    {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "sharpen"
+    CATEGORY = "Furgen/image"
+
+    def sharpen(self, images, amount, radius, threshold, luma_only, temporal_blend):
+        if _is_neutral(amount, 0.0):
+            return (images,)
+
+        phase = "validate"
+        try:
+            with torch.no_grad():
+                rgb = _image_rgb(images)
+                correction = torch.empty_like(rgb)
+                amount_f = max(0.0, float(amount))
+                radius_f = max(0.25, float(radius))
+                threshold_f = max(0.0, float(threshold))
+
+                for start, end in _chunked_frame_ranges(images):
+                    phase = "frame_chunk"
+                    chunk_rgb = rgb[start:end]
+                    blurred = _gaussian_blur_channel_last(chunk_rgb, radius_f)
+                    detail = chunk_rgb - blurred
+                    if bool(luma_only):
+                        detail = _threshold_detail(_luma(detail), threshold_f).expand_as(chunk_rgb)
+                    else:
+                        detail = _threshold_detail(detail, threshold_f)
+                    correction[start:end] = detail * amount_f
+
+                blend = max(0.0, min(1.0, float(temporal_blend)))
+                if blend > 0.0 and correction.shape[0] > 1:
+                    phase = "temporal_blend"
+                    smooth = correction.clone()
+                    smooth[0:1] = (correction[0:1] + correction[1:2]) * 0.5
+                    smooth[-1:] = (correction[-2:-1] + correction[-1:]) * 0.5
+                    if correction.shape[0] > 2:
+                        smooth[1:-1] = (correction[:-2] + correction[1:-1] + correction[2:]) / 3.0
+                    correction = correction.lerp(smooth, blend)
+
+                return (_restore_channels(images, rgb + correction),)
+        except Exception as exc:
+            raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
+
+
 NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
     "FurgenExposureAdjust": FurgenExposureAdjust,
@@ -929,6 +1036,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenAdaptiveExposureMatch": FurgenAdaptiveExposureMatch,
     "FurgenColorTransferMatch": FurgenColorTransferMatch,
     "FurgenTemporalToneSmooth": FurgenTemporalToneSmooth,
+    "FurgenTemporalUnsharpMask": FurgenTemporalUnsharpMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -938,4 +1046,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenAdaptiveExposureMatch": "Furgen Adaptive Exposure Match",
     "FurgenColorTransferMatch": "Furgen Color Transfer Match",
     "FurgenTemporalToneSmooth": "Furgen Temporal Tone Smooth",
+    "FurgenTemporalUnsharpMask": "Furgen Temporal Unsharp Mask",
 }

@@ -6380,6 +6380,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 "FurgenAdaptiveExposureMatch",
                 "FurgenColorTransferMatch",
                 "FurgenTemporalToneSmooth",
+                "FurgenTemporalUnsharpMask",
             ]
         if bundle_id == "video_gen_v2_image_filters_nodes":
             return [
