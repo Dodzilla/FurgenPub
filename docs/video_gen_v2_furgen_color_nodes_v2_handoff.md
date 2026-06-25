@@ -1,5 +1,39 @@
 # video_gen_v2 Furgen Color Nodes v2 Handoff
 
+## v2.1 Memory-Safe Release
+
+- Branch: `main`
+- Final v2.1 implementation commit SHA: `46cd10667f2b2ebd679bb2a06cb6c7b8d008c6b8`
+- Dependency agent version: `dm-agent-py/0.10.38`
+- Public raw URL after push: `https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py`
+- `docker/scripts/dependency_agent_v1.py` SHA256: `64a03783749bafb8413a75b91893044cec827998e74be3cf83a2fde934012335`
+- v2.1 changed files:
+  - `docker/support/custom_nodes/FurgenVideoTools/furgen_video_tools.py`
+  - `docker/scripts/dependency_agent_v1.py`
+  - `docs/video_gen_v2_furgen_color_nodes_v2_handoff.md`
+- v2.1 keeps public Comfy class names and required input names unchanged:
+  - `FurgenAdaptiveExposureMatch`
+  - `FurgenColorTransferMatch`
+  - `FurgenTemporalToneSmooth`
+- v2.1 internal behavior:
+  - Computes reference stats once from `reference[:1]`; no per-frame reference expansion or repeated reference-stat recomputation.
+  - Processes adaptive exposure and color transfer in conservative frame chunks.
+  - Replaces whole-batch/full-frame percentile work with bounded sampled-pixel robust stats.
+  - Keeps color-transfer source stats frame-local while using the chunk only as a memory boundary.
+  - Iterates temporal smoothing frame by frame while carrying smoothing state; avoids whole-batch YCbCr intermediates.
+  - Wraps non-neutral v2 node math in `torch.no_grad()`.
+  - Raises concise node errors with class name, input shape, dtype, device, phase, and original exception type/message.
+  - Leaves existing v1 node classes unchanged.
+- v2.1 tests run:
+  - `bash -n docker/support/video_gen_v2.sh`
+  - `python3 -m py_compile docker/support/custom_nodes/FurgenVideoTools/furgen_video_tools.py docker/scripts/dependency_agent_v1.py`
+  - Local import/smoke with stub `folder_paths`; verified mappings include all v1 and v2 classes.
+  - Local non-neutral adaptive/color/smooth smoke on `121 x 256 x 256 x 3` tensor plus single reference; asserted shape preservation, dtype/device preservation, clamp range `[0, 1]`, and exact first-frame preservation for temporal smoothing.
+  - Local chunk/sampled-stat stress smoke with `V2_FRAME_CHUNK_SIZE=3`, `V2_STAT_SAMPLE_PIXELS=257`, and `17 x 300 x 300 x 3` tensors.
+  - `git diff --check`
+- v2.1 smoke output: `furgen color v2.1 smoke ok: FCSConcatVideos, FurgenAdaptiveExposureMatch, FurgenColorTransferMatch, FurgenExposureAdjust, FurgenReferenceColorMatch, FurgenTemporalToneSmooth`
+- v2.1 readiness: `READY_FOR_CONTENTSERVER=true`
+
 ## Branch And Status
 
 - Branch: `main`
