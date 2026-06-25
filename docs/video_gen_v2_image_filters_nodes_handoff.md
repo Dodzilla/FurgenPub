@@ -5,9 +5,9 @@
 - Branch: `main`
 - Base commit before implementation: `6db3c0274ba4b90c207f796e9716088190883592`
 - Implementation commit SHA: `f2ec41125157efa3fd3b07e44a5aab6bd7ae5d10`
-- Handoff/publication commit SHA: pending until this document is committed.
+- Handoff publication commit SHA: `ba7120dc4fcd16a65355b24cba3a118114be8af6`
 - Starting working tree status: clean, `## main...origin/main`
-- Current working tree status before publication: ahead of `origin/main` with the implementation commit and this pending handoff document.
+- Current publication status: pushed to `origin/main`; final readiness marker update is this document's latest commit.
 - Note: implementation stayed in the provided checkout on `main`; no new worktree or rollout branch was created.
 
 ## Exact Files Changed
@@ -87,7 +87,7 @@
 
 ## Readiness
 
-READY_FOR_CONTENTSERVER=false
+READY_FOR_CONTENTSERVER=true
 
 ## Boundaries
 
