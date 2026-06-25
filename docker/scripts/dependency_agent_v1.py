@@ -124,7 +124,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.36"
+AGENT_VERSION = "dm-agent-py/0.10.37"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -5920,6 +5920,44 @@ class DependencyAgent:
             logging.info("Adjusted OpenCV packages for video_gen_v2 Image-Filters bundle: %s -> %s", before, after)
         return changed
 
+    def _ensure_comfyui_vfi_rife_model(self) -> bool:
+        vfi_dir = self.comfyui_dir / "custom_nodes" / "ComfyUI-VFI"
+        download_script = vfi_dir / "rife" / "download_rife.py"
+        target_dir = vfi_dir / "rife" / "train_log"
+        target = target_dir / "flownet.pkl"
+
+        try:
+            if target.exists() and int(target.stat().st_size) > 0:
+                return False
+        except Exception:
+            pass
+
+        if not download_script.exists():
+            raise RuntimeError(f"ComfyUI-VFI RIFE download script not found: {download_script}")
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        logging.info("Preseeding ComfyUI-VFI RIFE model: %s", target)
+        proc = subprocess.run(
+            [sys.executable, str(download_script), str(target_dir)],
+            cwd=str(vfi_dir),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=600,
+        )
+        if proc.returncode != 0:
+            stdout = (proc.stdout or "").strip()[-1500:]
+            stderr = (proc.stderr or "").strip()[-1500:]
+            raise RuntimeError(
+                "ComfyUI-VFI RIFE model download failed "
+                f"(exit={proc.returncode}) stdout={stdout!r} stderr={stderr!r}"
+            )
+        if not target.exists() or int(target.stat().st_size) <= 0:
+            raise RuntimeError(f"ComfyUI-VFI RIFE model download completed but {target} is missing or empty")
+        logging.info("Preseeded ComfyUI-VFI RIFE model: %s (%d bytes)", target, int(target.stat().st_size))
+        return True
+
     def _ensure_node_bundle_runtime_compatibility(self, bundle_ids: List[str]) -> bool:
         changed = False
         bundle_id_set = set(bundle_ids)
@@ -5929,6 +5967,7 @@ class DependencyAgent:
             # while the next restart will fail to import the node pack. Enforce the pin
             # immediately before any bundle readiness marker is written.
             changed = self._ensure_python_package_constraint("kornia<0.8", "kornia") or changed
+            self._ensure_comfyui_vfi_rife_model()
         if "video_gen_v2_image_filters_nodes" in bundle_id_set:
             changed = self._ensure_video_gen_v2_image_filters_opencv() or changed
         return changed
@@ -7760,6 +7799,21 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             raise RuntimeError("downloaded workflow is not a JSON object")
         raise RuntimeError(f"Unsupported workflowRef.mode: {mode}")
 
+    def _workflow_uses_class_type(self, workflow: Dict[str, Any], class_type: str) -> bool:
+        wanted = str(class_type or "").strip()
+        if not wanted:
+            return False
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            if node.get("class_type") == wanted:
+                return True
+        return False
+
+    def _ensure_runtime_assets_for_workflow(self, workflow: Dict[str, Any]) -> None:
+        if self._workflow_uses_class_type(workflow, "RIFEInterpolation"):
+            self._ensure_comfyui_vfi_rife_model()
+
     def _input_cache_expected_size_bytes(self, row: Dict[str, Any]) -> int:
         for key in ("expectedSizeBytes", "sizeBytes", "bytes"):
             value = row.get(key)
@@ -9406,6 +9460,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 return
 
             workflow = self._parse_workflow_from_payload(payload)
+            self._ensure_runtime_assets_for_workflow(workflow)
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 if active:
@@ -9826,6 +9881,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 self._copy_input_to_comfy(Path(cache_path), input_name)
 
             workflow = self._parse_workflow_from_payload(lease.payload)
+            self._ensure_runtime_assets_for_workflow(workflow)
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 execute_started_at_ms = _now_ms()
