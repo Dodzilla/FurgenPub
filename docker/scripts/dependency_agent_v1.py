@@ -124,7 +124,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.35"
+AGENT_VERSION = "dm-agent-py/0.10.36"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -5966,7 +5966,7 @@ class DependencyAgent:
         if spec_type == "furgen_asset_gen_runtime_helpers":
             self._install_furgen_asset_gen_runtime_helpers()
             return True
-        if spec_type == "furgen_video_tools":
+        if spec_type in ("furgen_video_tools", "furgen_video_tools_v2"):
             self._install_furgen_video_tools_node()
             return True
         if spec_type == "git_custom_nodes":
@@ -6229,6 +6229,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         if bundle_id == "video_gen_v2_furgen_color_nodes":
             self._install_furgen_video_tools_node()
             return
+        if bundle_id == "video_gen_v2_furgen_color_nodes_v2":
+            self._install_furgen_video_tools_node()
+            return
         if bundle_id == "video_gen_v2_image_filters_nodes":
             self._install_git_custom_node(
                 "https://github.com/spacepxl/ComfyUI-Image-Filters",
@@ -6267,6 +6270,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             return [
                 "FurgenExposureAdjust",
                 "FurgenReferenceColorMatch",
+            ]
+        if bundle_id == "video_gen_v2_furgen_color_nodes_v2":
+            return [
+                "FurgenAdaptiveExposureMatch",
+                "FurgenColorTransferMatch",
+                "FurgenTemporalToneSmooth",
             ]
         if bundle_id == "video_gen_v2_image_filters_nodes":
             return [

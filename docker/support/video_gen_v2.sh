@@ -590,6 +590,9 @@ function provisioning_install_requested_bundles() {
             video_gen_v2_furgen_color_nodes)
                 provisioning_install_furgen_video_tools_node || return 1
                 ;;
+            video_gen_v2_furgen_color_nodes_v2)
+                provisioning_install_furgen_video_tools_node || return 1
+                ;;
             *)
                 printf "ERROR: Unknown video_gen_v2 bundle id '%s'.\n" "${bundle_id}"
                 return 1

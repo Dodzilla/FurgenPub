@@ -297,6 +297,86 @@ def _blend_and_restore_channels(
     return out.clamp(0.0, 1.0)
 
 
+def _restore_channels(images: torch.Tensor, corrected_rgb: torch.Tensor) -> torch.Tensor:
+    if images.shape[-1] == corrected_rgb.shape[-1]:
+        out = corrected_rgb
+    else:
+        out = torch.cat((corrected_rgb, images[..., corrected_rgb.shape[-1] :]), dim=-1)
+    return out.clamp(0.0, 1.0)
+
+
+def _broadcast_reference_rgb(images: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    rgb = _image_rgb(images)
+    ref_rgb = _image_rgb(reference).to(device=images.device, dtype=images.dtype)
+    if ref_rgb.shape[0] == 1 and rgb.shape[0] != 1:
+        return ref_rgb.expand(rgb.shape[0], -1, -1, -1)
+    if ref_rgb.shape[0] != rgb.shape[0]:
+        return ref_rgb[:1].expand(rgb.shape[0], -1, -1, -1)
+    return ref_rgb
+
+
+def _eps_for(tensor: torch.Tensor) -> float:
+    return torch.finfo(tensor.dtype).eps if tensor.dtype.is_floating_point else 1e-6
+
+
+def _robust_luma_mean(luma: torch.Tensor, black_percentile: float, white_percentile: float) -> torch.Tensor:
+    flat = luma.reshape(luma.shape[0], -1)
+    lo_p = max(0.0, min(1.0, float(black_percentile)))
+    hi_p = max(0.0, min(1.0, float(white_percentile)))
+    if hi_p <= lo_p:
+        return flat.mean(dim=1).view(-1, 1, 1, 1)
+    lo = torch.quantile(flat, lo_p, dim=1, keepdim=True)
+    hi = torch.quantile(flat, hi_p, dim=1, keepdim=True)
+    return flat.clamp(lo, hi).mean(dim=1).view(-1, 1, 1, 1)
+
+
+def _apply_highlight_protection(
+    original_rgb: torch.Tensor,
+    corrected_rgb: torch.Tensor,
+    preserve_highlights: float,
+) -> torch.Tensor:
+    preserve = max(0.0, min(1.0, float(preserve_highlights)))
+    if preserve <= 0.0:
+        return corrected_rgb
+    highlight = ((_luma(original_rgb).clamp(0.0, 1.0) - 0.70) / 0.30).clamp(0.0, 1.0)
+    return corrected_rgb.lerp(original_rgb, highlight * preserve)
+
+
+def _rgb_to_ycbcr(rgb: torch.Tensor) -> torch.Tensor:
+    y = _luma(rgb)
+    cb = (rgb[..., 2:3] - y) / 1.8556
+    cr = (rgb[..., 0:1] - y) / 1.5748
+    return torch.cat((y, cb, cr), dim=-1)
+
+
+def _ycbcr_to_rgb(ycbcr: torch.Tensor) -> torch.Tensor:
+    y = ycbcr[..., 0:1]
+    cb = ycbcr[..., 1:2]
+    cr = ycbcr[..., 2:3]
+    r = y + 1.5748 * cr
+    b = y + 1.8556 * cb
+    g = (y - 0.2126 * r - 0.0722 * b) / 0.7152
+    return torch.cat((r, g, b), dim=-1)
+
+
+def _mean_std_transfer(
+    source: torch.Tensor,
+    reference: torch.Tensor,
+    mean_strengths: torch.Tensor,
+    std_strength: float,
+    std_min: float,
+    std_max: float,
+) -> torch.Tensor:
+    eps = _eps_for(source)
+    src_mean = source.mean(dim=(1, 2), keepdim=True)
+    ref_mean = reference.mean(dim=(1, 2), keepdim=True)
+    src_std = source.std(dim=(1, 2), keepdim=True, unbiased=False).clamp_min(eps)
+    ref_std = reference.std(dim=(1, 2), keepdim=True, unbiased=False)
+    ratio = (ref_std / src_std).clamp(float(std_min), float(std_max))
+    ratio = torch.ones_like(ratio).lerp(ratio, max(0.0, min(1.0, float(std_strength))))
+    return (source - src_mean) * ratio + src_mean + (ref_mean - src_mean) * mean_strengths
+
+
 class FurgenExposureAdjust:
     @classmethod
     def INPUT_TYPES(cls):
@@ -414,14 +494,265 @@ class FurgenReferenceColorMatch:
         return (_blend_and_restore_channels(images, corrected, strength),)
 
 
+class FurgenAdaptiveExposureMatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "strength": (
+                    "FLOAT",
+                    {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "gain_min": (
+                    "FLOAT",
+                    {"default": 0.85, "min": 0.10, "max": 4.0, "step": 0.01},
+                ),
+                "gain_max": (
+                    "FLOAT",
+                    {"default": 1.18, "min": 0.10, "max": 4.0, "step": 0.01},
+                ),
+                "black_percentile": (
+                    "FLOAT",
+                    {"default": 0.02, "min": 0.0, "max": 0.49, "step": 0.01},
+                ),
+                "white_percentile": (
+                    "FLOAT",
+                    {"default": 0.98, "min": 0.51, "max": 1.0, "step": 0.01},
+                ),
+                "preserve_highlights": (
+                    "FLOAT",
+                    {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "match"
+    CATEGORY = "Furgen/image"
+
+    def match(
+        self,
+        images,
+        reference,
+        strength,
+        gain_min,
+        gain_max,
+        black_percentile,
+        white_percentile,
+        preserve_highlights,
+    ):
+        if _is_neutral(strength, 0.0):
+            return (images,)
+
+        rgb = _image_rgb(images)
+        ref_rgb = _broadcast_reference_rgb(images, reference)
+        src_mean = _robust_luma_mean(_luma(rgb), black_percentile, white_percentile).clamp_min(_eps_for(rgb))
+        ref_mean = _robust_luma_mean(_luma(ref_rgb), black_percentile, white_percentile)
+        lo = min(float(gain_min), float(gain_max))
+        hi = max(float(gain_min), float(gain_max))
+        gain = (ref_mean / src_mean).clamp(lo, hi)
+        corrected = _apply_highlight_protection(rgb, rgb * gain, preserve_highlights)
+        return (_blend_and_restore_channels(images, corrected, strength),)
+
+
+class FurgenColorTransferMatch:
+    MODES = ("rgb_mean_std", "ycbcr_mean_std")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "mode": (list(cls.MODES), {"default": "ycbcr_mean_std"}),
+                "strength": (
+                    "FLOAT",
+                    {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "luma_strength": (
+                    "FLOAT",
+                    {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "chroma_strength": (
+                    "FLOAT",
+                    {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "std_strength": (
+                    "FLOAT",
+                    {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "std_min": (
+                    "FLOAT",
+                    {"default": 0.50, "min": 0.05, "max": 4.0, "step": 0.01},
+                ),
+                "std_max": (
+                    "FLOAT",
+                    {"default": 1.50, "min": 0.05, "max": 4.0, "step": 0.01},
+                ),
+                "preserve_highlights": (
+                    "FLOAT",
+                    {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "match"
+    CATEGORY = "Furgen/image"
+
+    def match(
+        self,
+        images,
+        reference,
+        mode,
+        strength,
+        luma_strength,
+        chroma_strength,
+        std_strength,
+        std_min,
+        std_max,
+        preserve_highlights,
+    ):
+        if _is_neutral(strength, 0.0) or (
+            _is_neutral(luma_strength, 0.0)
+            and _is_neutral(chroma_strength, 0.0)
+            and _is_neutral(std_strength, 0.0)
+        ):
+            return (images,)
+
+        rgb = _image_rgb(images)
+        ref_rgb = _broadcast_reference_rgb(images, reference)
+        lo = min(float(std_min), float(std_max))
+        hi = max(float(std_min), float(std_max))
+
+        if mode == "rgb_mean_std":
+            mean_strength = max(0.0, min(1.0, max(float(luma_strength), float(chroma_strength))))
+            mean_strengths = torch.full((1, 1, 1, rgb.shape[-1]), mean_strength, dtype=rgb.dtype, device=rgb.device)
+            corrected = _mean_std_transfer(rgb, ref_rgb, mean_strengths, std_strength, lo, hi)
+        elif mode == "ycbcr_mean_std":
+            ycbcr = _rgb_to_ycbcr(rgb)
+            ref_ycbcr = _rgb_to_ycbcr(ref_rgb)
+            mean_strengths = torch.tensor(
+                [float(luma_strength), float(chroma_strength), float(chroma_strength)],
+                dtype=rgb.dtype,
+                device=rgb.device,
+            ).view(1, 1, 1, 3).clamp(0.0, 1.0)
+            corrected = _ycbcr_to_rgb(_mean_std_transfer(ycbcr, ref_ycbcr, mean_strengths, std_strength, lo, hi))
+        else:
+            raise ValueError(f"unsupported color transfer mode: {mode}")
+
+        corrected = _apply_highlight_protection(rgb, corrected, preserve_highlights)
+        return (_blend_and_restore_channels(images, corrected, strength),)
+
+
+class FurgenTemporalToneSmooth:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "strength": (
+                    "FLOAT",
+                    {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "luma_smoothing": (
+                    "FLOAT",
+                    {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "chroma_smoothing": (
+                    "FLOAT",
+                    {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "max_frame_gain_delta": (
+                    "FLOAT",
+                    {"default": 0.035, "min": 0.0, "max": 0.50, "step": 0.001},
+                ),
+                "preserve_first_frame": (
+                    "BOOLEAN",
+                    {"default": True},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "smooth"
+    CATEGORY = "Furgen/image"
+
+    def smooth(
+        self,
+        images,
+        strength,
+        luma_smoothing,
+        chroma_smoothing,
+        max_frame_gain_delta,
+        preserve_first_frame,
+    ):
+        if _is_neutral(strength, 0.0) or images.shape[0] <= 1:
+            return (images,)
+
+        rgb = _image_rgb(images)
+        ycbcr = _rgb_to_ycbcr(rgb)
+        means = ycbcr.mean(dim=(1, 2), keepdim=True)
+        eps = _eps_for(rgb)
+        luma_keep = max(0.0, min(1.0, float(luma_smoothing)))
+        chroma_keep = max(0.0, min(1.0, float(chroma_smoothing)))
+        max_delta = max(0.0, float(max_frame_gain_delta))
+        global_strength = max(0.0, min(1.0, float(strength)))
+
+        smooth_y = means[0:1, ..., 0:1]
+        smooth_chroma = means[0:1, ..., 1:3]
+        previous_gain = torch.ones_like(smooth_y)
+        previous_chroma_offset = torch.zeros_like(smooth_chroma)
+        corrected_frames = []
+
+        for index in range(ycbcr.shape[0]):
+            frame = ycbcr[index : index + 1]
+            current_y = means[index : index + 1, ..., 0:1]
+            current_chroma = means[index : index + 1, ..., 1:3]
+
+            if index > 0:
+                smooth_y = smooth_y * luma_keep + current_y * (1.0 - luma_keep)
+                smooth_chroma = smooth_chroma * chroma_keep + current_chroma * (1.0 - chroma_keep)
+
+            raw_gain = (smooth_y / current_y.clamp_min(eps)).clamp(0.25, 4.0)
+            gain_delta = (raw_gain - previous_gain).clamp(-max_delta, max_delta)
+            limited_gain = previous_gain + gain_delta
+            raw_chroma_offset = smooth_chroma - current_chroma
+            chroma_delta = (raw_chroma_offset - previous_chroma_offset).clamp(-max_delta, max_delta)
+            limited_chroma_offset = previous_chroma_offset + chroma_delta
+
+            adjusted = frame.clone()
+            adjusted[..., 0:1] = frame[..., 0:1] * (1.0 + (limited_gain - 1.0) * global_strength)
+            adjusted[..., 1:3] = frame[..., 1:3] + limited_chroma_offset * global_strength
+            if index == 0 and bool(preserve_first_frame):
+                adjusted = frame
+            corrected_frames.append(adjusted)
+            previous_gain = limited_gain
+            previous_chroma_offset = limited_chroma_offset
+
+        corrected = _ycbcr_to_rgb(torch.cat(corrected_frames, dim=0))
+        return (_restore_channels(images, corrected),)
+
+
 NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
     "FurgenExposureAdjust": FurgenExposureAdjust,
     "FurgenReferenceColorMatch": FurgenReferenceColorMatch,
+    "FurgenAdaptiveExposureMatch": FurgenAdaptiveExposureMatch,
+    "FurgenColorTransferMatch": FurgenColorTransferMatch,
+    "FurgenTemporalToneSmooth": FurgenTemporalToneSmooth,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FCSConcatVideos": "Furgen Concat Videos",
     "FurgenExposureAdjust": "Furgen Exposure Adjust",
     "FurgenReferenceColorMatch": "Furgen Reference Color Match",
+    "FurgenAdaptiveExposureMatch": "Furgen Adaptive Exposure Match",
+    "FurgenColorTransferMatch": "Furgen Color Transfer Match",
+    "FurgenTemporalToneSmooth": "Furgen Temporal Tone Smooth",
 }
