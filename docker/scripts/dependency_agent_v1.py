@@ -124,7 +124,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.32"
+AGENT_VERSION = "dm-agent-py/0.10.33"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -5812,14 +5812,75 @@ class DependencyAgent:
             )
         return changed
 
+    def _ensure_video_gen_v2_image_filters_opencv(self) -> bool:
+        before = {
+            package_name: self._python_package_version(package_name)
+            for package_name in (
+                "opencv-contrib-python",
+                "opencv-contrib-python-headless",
+                "opencv-python",
+                "opencv-python-headless",
+            )
+        }
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "uninstall",
+                "-y",
+                "opencv-python",
+                "opencv-python-headless",
+                "opencv-contrib-python-headless",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=600,
+        )
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir", "opencv-contrib-python==4.10.0.84"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=600,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import cv2; from cv2.ximgproc import guidedFilter; print(cv2.__version__)",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        after = {
+            package_name: self._python_package_version(package_name)
+            for package_name in (
+                "opencv-contrib-python",
+                "opencv-contrib-python-headless",
+                "opencv-python",
+                "opencv-python-headless",
+            )
+        }
+        changed = before != after
+        if changed:
+            logging.info("Adjusted OpenCV packages for video_gen_v2 Image-Filters bundle: %s -> %s", before, after)
+        return changed
+
     def _ensure_node_bundle_runtime_compatibility(self, bundle_ids: List[str]) -> bool:
         changed = False
-        if "video_gen_v2_10s_ltx_nodes" in set(bundle_ids):
+        bundle_id_set = set(bundle_ids)
+        if "video_gen_v2_10s_ltx_nodes" in bundle_id_set:
             # ComfyUI-LTXVideo currently imports `pad` from kornia's pyramid module.
             # kornia 0.8 removed that symbol, so a live Comfy process can appear ready
             # while the next restart will fail to import the node pack. Enforce the pin
             # immediately before any bundle readiness marker is written.
             changed = self._ensure_python_package_constraint("kornia<0.8", "kornia") or changed
+        if "video_gen_v2_image_filters_nodes" in bundle_id_set:
+            changed = self._ensure_video_gen_v2_image_filters_opencv() or changed
         return changed
 
     def _install_node_bundle_from_spec(self, bundle_id: str, spec: Dict[str, Any]) -> bool:
@@ -6118,6 +6179,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         if bundle_id == "video_gen_v2_furgen_color_nodes":
             self._install_furgen_video_tools_node()
             return
+        if bundle_id == "video_gen_v2_image_filters_nodes":
+            self._install_git_custom_node(
+                "https://github.com/spacepxl/ComfyUI-Image-Filters",
+                verify_dir_name="ComfyUI-Image-Filters",
+                git_ref="bbb3fb0045461adf3602faeedaf40af57090d4e2",
+                install_requirements=False,
+            )
+            self._ensure_video_gen_v2_image_filters_opencv()
+            return
         if bundle_id == "asset_gen_v5_ltx23_fp8":
             self._install_git_custom_node(
                 "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
@@ -6147,6 +6217,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             return [
                 "FurgenExposureAdjust",
                 "FurgenReferenceColorMatch",
+            ]
+        if bundle_id == "video_gen_v2_image_filters_nodes":
+            return [
+                "AdainImage",
+                "BatchNormalizeImage",
+                "ColorMatchImage",
+                "ExposureAdjust",
+                "RemapRange",
             ]
         if bundle_id == "asset_gen_v5_ltx23_fp8":
             return [

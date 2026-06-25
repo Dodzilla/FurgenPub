@@ -6,6 +6,9 @@ export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$WORKSPACE/ComfyUI}"
 export SERVER_TYPE="${SERVER_TYPE:-video_gen_v2}"
 FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support}"
+VIDEO_GEN_V2_IMAGE_FILTERS_REPO="${VIDEO_GEN_V2_IMAGE_FILTERS_REPO:-https://github.com/spacepxl/ComfyUI-Image-Filters}"
+VIDEO_GEN_V2_IMAGE_FILTERS_PIN="${VIDEO_GEN_V2_IMAGE_FILTERS_PIN:-bbb3fb0045461adf3602faeedaf40af57090d4e2}"
+VIDEO_GEN_V2_IMAGE_FILTERS_OPENCV_REQUIREMENT="${VIDEO_GEN_V2_IMAGE_FILTERS_OPENCV_REQUIREMENT:-opencv-contrib-python==4.10.0.84}"
 
 mkdir -p "${WORKSPACE}" "${DM_COMFYUI_DIR}" || true
 
@@ -524,6 +527,74 @@ function provisioning_get_nodes() {
                 pip install --no-cache-dir -r "${requirements}"
             fi
         fi
+    done
+}
+
+function provisioning_install_image_filters_opencv() {
+    printf "Installing deterministic OpenCV package for ComfyUI-Image-Filters: %s\n" "${VIDEO_GEN_V2_IMAGE_FILTERS_OPENCV_REQUIREMENT}"
+    if [[ "$(printf '%s' "${VIDEO_GEN_V2_IMAGE_FILTERS_UNINSTALL_CONFLICTING_OPENCV_VARIANTS:-true}" | tr '[:upper:]' '[:lower:]')" != "false" ]]; then
+        pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python-headless || true
+    fi
+    pip install --no-cache-dir "${VIDEO_GEN_V2_IMAGE_FILTERS_OPENCV_REQUIREMENT}" || return 1
+    python - <<'PY' || return 1
+import cv2
+from cv2.ximgproc import guidedFilter
+
+print(f"Verified cv2 ximgproc.guidedFilter import for ComfyUI-Image-Filters (cv2={cv2.__version__})")
+PY
+}
+
+function provisioning_install_image_filters_nodes() {
+    local repo dir path requirements
+    repo="${VIDEO_GEN_V2_IMAGE_FILTERS_REPO}"
+    dir="ComfyUI-Image-Filters"
+    path="${COMFYUI_DIR}/custom_nodes/${dir}"
+    requirements="${path}/requirements.txt"
+
+    mkdir -p "${COMFYUI_DIR}/custom_nodes"
+    if [[ -d "${path}" ]]; then
+        printf "Updating node bundle: %s...\n" "${repo}"
+        (
+            cd "${path}" && \
+            git config --global --add safe.directory "$(pwd)" && \
+            git fetch --all --tags --prune
+        ) || return 1
+    else
+        printf "Downloading node bundle: %s...\n" "${repo}"
+        git clone "${repo}" "${path}" --recursive || return 1
+    fi
+
+    printf "Pinning %s to %s...\n" "${dir}" "${VIDEO_GEN_V2_IMAGE_FILTERS_PIN}"
+    (
+        cd "${path}" && git checkout --force "${VIDEO_GEN_V2_IMAGE_FILTERS_PIN}"
+    ) || return 1
+
+    if [[ -e "${requirements}" ]]; then
+        printf "Skipping upstream %s; installing managed OpenCV dependency instead.\n" "${requirements}"
+    fi
+    provisioning_install_image_filters_opencv || return 1
+}
+
+function provisioning_install_requested_bundles() {
+    if [[ "$#" -eq 0 ]]; then
+        printf "ERROR: No bundle ids provided to install-bundles.\n"
+        return 1
+    fi
+
+    local bundle_id
+    for bundle_id in "$@"; do
+        case "${bundle_id}" in
+            video_gen_v2_image_filters_nodes)
+                provisioning_install_image_filters_nodes || return 1
+                ;;
+            video_gen_v2_furgen_color_nodes)
+                provisioning_install_furgen_video_tools_node || return 1
+                ;;
+            *)
+                printf "ERROR: Unknown video_gen_v2 bundle id '%s'.\n" "${bundle_id}"
+                return 1
+                ;;
+        esac
     done
 }
 
@@ -1227,6 +1298,17 @@ function dependency_manager_start_agent() {
     echo "Dependency manager: starting agent watchdog; log=$watchdog_log_path"
     nohup "$watchdog_path" >> "$watchdog_log_path" 2>&1 &
 }
+
+case "${1:-}" in
+    install-bundles)
+        shift
+        provisioning_install_requested_bundles "$@" || {
+            echo "ERROR: video_gen_v2 bundle installation failed."
+            exit 1
+        }
+        exit 0
+        ;;
+esac
 
 # Best-effort aria2 install before the agent starts so model downloads can use
 # multi-connection transfers (the agent falls back to wget when aria2c is absent).
