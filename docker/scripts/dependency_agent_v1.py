@@ -124,7 +124,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.33"
+AGENT_VERSION = "dm-agent-py/0.10.34"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -335,6 +335,16 @@ def _normalize_prl_payload_float(value: Any, minimum: float, maximum: float) -> 
     if not math.isfinite(parsed) or parsed < minimum or parsed > maximum:
         return None
     return round(parsed, 3)
+
+
+def _normalize_prl_payload_int(value: Any, fallback: int, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        return fallback
+    try:
+        parsed = int(value)
+    except Exception:
+        return fallback
+    return max(minimum, min(maximum, parsed))
 
 
 def _host_from_url(raw_url: str) -> str:
@@ -2447,6 +2457,9 @@ class PrlMinerController:
         self._miner_kind = DEFAULT_PRL_MINER_KIND
         self._miner_package_type = DEFAULT_PRL_MINER_PACKAGE_TYPE
         self._miner_executable_path = ""
+        self._cpu_mining_enabled = False
+        self._cpu_threads_reduce = 0
+        self._cpu_threads_priority = 2
         self._started_at_ms = 0
         self._stopped_at_ms = 0
         self._last_exit_code: Optional[int] = None
@@ -2627,6 +2640,10 @@ class PrlMinerController:
             if self._miner_package_type:
                 out["minerPackageType"] = self._miner_package_type
             out["minerExecutablePath"] = self._miner_executable_path or None
+            if self._miner_kind == "srbminer_multi":
+                out["cpuMiningEnabled"] = bool(self._cpu_mining_enabled)
+                out["cpuThreadsReduce"] = int(self._cpu_threads_reduce)
+                out["cpuThreadsPriority"] = int(self._cpu_threads_priority)
             out["staticDifficulty"] = self._static_difficulty or None
             out["staticDifficultySource"] = self._static_difficulty_source or None
             out["staticDifficultyMatchedGpuName"] = self._static_difficulty_matched_gpu_name or None
@@ -2980,6 +2997,9 @@ class PrlMinerController:
         miner_kind = _normalize_prl_miner_kind(payload.get("minerKind"))
         miner_package_type = _normalize_prl_miner_package_type(payload.get("minerPackageType"))
         miner_executable_path = _normalize_archive_member_path(payload.get("minerExecutablePath"))
+        cpu_mining_enabled = payload.get("cpuMiningEnabled") is True
+        cpu_threads_reduce = _normalize_prl_payload_int(payload.get("cpuThreadsReduce"), 0, 0, 1024)
+        cpu_threads_priority = _normalize_prl_payload_int(payload.get("cpuThreadsPriority"), 2, 1, 5)
         static_difficulty = _normalize_prl_static_difficulty(payload.get("staticDifficulty"))
         static_difficulty_source = _clean_prl_payload_string(payload.get("staticDifficultySource"), 80)
         static_difficulty_matched_gpu_name = _clean_prl_payload_string(payload.get("staticDifficultyMatchedGpuName"), 160)
@@ -2999,6 +3019,10 @@ class PrlMinerController:
             static_difficulty_experiment_variant = ""
             static_difficulty_experiment_bucket = None
             static_difficulty_experiment_allocation_pct = None
+        if miner_kind != "srbminer_multi":
+            cpu_mining_enabled = False
+            cpu_threads_reduce = 0
+            cpu_threads_priority = 2
         pause_mode = _normalize_prl_pause_mode(payload.get("pauseMode"))
         stop_timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
         force_restart = payload.get("forceRestart") is True
@@ -3033,6 +3057,9 @@ class PrlMinerController:
                 self._miner_kind == miner_kind and
                 self._miner_package_type == miner_package_type and
                 self._miner_executable_path == miner_executable_path and
+                self._cpu_mining_enabled == cpu_mining_enabled and
+                self._cpu_threads_reduce == cpu_threads_reduce and
+                self._cpu_threads_priority == cpu_threads_priority and
                 self._static_difficulty == static_difficulty and
                 self._pause_mode == pause_mode and
                 (not miner_version or self._miner_version == miner_version)
@@ -3047,6 +3074,9 @@ class PrlMinerController:
                 self._static_difficulty_experiment_variant = static_difficulty_experiment_variant
                 self._static_difficulty_experiment_bucket = static_difficulty_experiment_bucket
                 self._static_difficulty_experiment_allocation_pct = static_difficulty_experiment_allocation_pct
+                self._cpu_mining_enabled = cpu_mining_enabled
+                self._cpu_threads_reduce = cpu_threads_reduce
+                self._cpu_threads_priority = cpu_threads_priority
                 self._pause_mode = pause_mode
                 self._last_start_payload = dict(payload)
                 current_pid = self._proc.pid if self._proc is not None else None
@@ -3078,16 +3108,31 @@ class PrlMinerController:
         if miner_kind == "srbminer_multi":
             pool_arg = _strip_stratum_scheme(pool_url)
             worker_arg = _pool_safe_worker(worker) or "worker"
-            args = [
-                str(binary),
-                "--disable-cpu",
-                "--algorithm",
-                "pearlhash",
-                "--pool",
-                pool_arg,
-                "--wallet",
-                f"{payout_address}.{worker_arg}",
-            ]
+            if cpu_mining_enabled:
+                args = [
+                    str(binary),
+                    "--algorithm",
+                    "pearlhash",
+                    "--cpu-threads-reduce",
+                    str(cpu_threads_reduce),
+                    "--cpu-threads-priority",
+                    str(cpu_threads_priority),
+                    "--pool",
+                    pool_arg,
+                    "--wallet",
+                    f"{payout_address}.{worker_arg}",
+                ]
+            else:
+                args = [
+                    str(binary),
+                    "--disable-cpu",
+                    "--algorithm",
+                    "pearlhash",
+                    "--pool",
+                    pool_arg,
+                    "--wallet",
+                    f"{payout_address}.{worker_arg}",
+                ]
         else:
             args = [
                 str(binary),
@@ -3132,6 +3177,9 @@ class PrlMinerController:
             self._miner_kind = miner_kind
             self._miner_package_type = miner_package_type
             self._miner_executable_path = miner_executable_path
+            self._cpu_mining_enabled = cpu_mining_enabled
+            self._cpu_threads_reduce = cpu_threads_reduce
+            self._cpu_threads_priority = cpu_threads_priority
             self._static_difficulty = static_difficulty
             self._static_difficulty_source = static_difficulty_source
             self._static_difficulty_matched_gpu_name = static_difficulty_matched_gpu_name
@@ -3151,7 +3199,10 @@ class PrlMinerController:
             self._suspended_for_work = False
             self._suspended_at_ms = 0
         logging.info(
-            "Started idle PRL miner pid=%s worker=%s pool=%s minerKind=%s packageType=%s staticDifficulty=%s pauseMode=%s",
+            (
+                "Started idle PRL miner pid=%s worker=%s pool=%s minerKind=%s packageType=%s "
+                "staticDifficulty=%s pauseMode=%s cpuMiningEnabled=%s cpuThreadsReduce=%s cpuThreadsPriority=%s"
+            ),
             proc.pid,
             worker,
             pool_url,
@@ -3159,6 +3210,9 @@ class PrlMinerController:
             miner_package_type,
             static_difficulty or "vardiff",
             pause_mode,
+            cpu_mining_enabled,
+            cpu_threads_reduce,
+            cpu_threads_priority,
         )
         return self.snapshot()
 
@@ -5309,6 +5363,9 @@ class DependencyAgent:
                 "minerKind",
                 "minerPackageType",
                 "minerExecutablePath",
+                "cpuMiningEnabled",
+                "cpuThreadsReduce",
+                "cpuThreadsPriority",
                 "staticDifficulty",
                 "staticDifficultySource",
                 "staticDifficultyMatchedGpuName",
