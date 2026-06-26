@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.45"
+AGENT_VERSION = "dm-agent-py/0.10.46"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "0da8c1ba23bdc3396516181feb59ae1a79e6adba"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3792,6 +3792,37 @@ class DependencyAgent:
             out.append(item)
         return out
 
+    def _dependency_runtime_snapshot_locked(self) -> Tuple[List[str], List[str], List[str], List[str], List[Dict[str, Any]]]:
+        self._reconcile_lru_locked()
+        installed_static = sorted(self._state.installed_static)
+        installed_dynamic = sorted(self._state.installed_dynamic)
+        installed = set(installed_static) | set(installed_dynamic)
+
+        stale_failed = self._state.failed & installed
+        stale_downloading = self._downloading & installed
+        stale_activity = set(self._download_activity.keys()) & installed
+        if stale_failed or stale_downloading or stale_activity:
+            stale = stale_failed | stale_downloading | stale_activity
+            for dep_id in stale:
+                self._state.failed.discard(dep_id)
+                self._downloading.discard(dep_id)
+                self._download_activity.pop(dep_id, None)
+                self._state.retry.pop(dep_id, None)
+            self._save_state()
+            logging.info(
+                "Pruned installed deps from transient dependency state: %s",
+                ", ".join(sorted(stale)[:20]),
+            )
+
+        failed = sorted(dep_id for dep_id in self._state.failed if dep_id not in installed)
+        downloading = sorted(dep_id for dep_id in self._downloading if dep_id not in installed)
+        active_downloads = [
+            row
+            for row in self._serialize_download_activity_locked()
+            if isinstance(row.get("depId"), str) and row.get("depId") not in installed
+        ]
+        return installed_static, installed_dynamic, failed, downloading, active_downloads
+
     def stop(self) -> None:
         self._stop.set()
         self._coordination_stream_stop.set()
@@ -5019,10 +5050,9 @@ class DependencyAgent:
 
     def _dependency_runtime_transition_signature(self, queue_depth: Optional[int] = None) -> str:
         with self._lock:
-            self._reconcile_lru_locked()
             if isinstance(queue_depth, int):
                 self._last_dependency_queue_depth = max(0, int(queue_depth))
-            active_downloads = self._serialize_download_activity_locked()
+            installed_static, installed_dynamic, failed, downloading, active_downloads = self._dependency_runtime_snapshot_locked()
             active_download_signature = [
                 {
                     "depId": row.get("depId"),
@@ -5034,10 +5064,10 @@ class DependencyAgent:
                 if isinstance(row, dict)
             ]
             payload = {
-                "installedStatic": sorted(self._state.installed_static),
-                "installedDynamic": sorted(self._state.installed_dynamic),
-                "failed": sorted(self._state.failed),
-                "downloading": sorted(self._downloading),
+                "installedStatic": installed_static,
+                "installedDynamic": installed_dynamic,
+                "failed": failed,
+                "downloading": downloading,
                 "activeDownloads": active_download_signature,
                 "dynamicBytesUsed": int(self._dynamic_bytes_used),
             }
@@ -5045,12 +5075,7 @@ class DependencyAgent:
 
     def _collect_dependency_runtime_payload(self, queue_depth: Optional[int] = None, full: bool = True) -> Dict[str, Any]:
         with self._lock:
-            self._reconcile_lru_locked()
-            installed_static = sorted(self._state.installed_static)
-            installed_dynamic = sorted(self._state.installed_dynamic)
-            failed = sorted(self._state.failed)
-            downloading = sorted(self._downloading)
-            active_downloads = self._serialize_download_activity_locked()
+            installed_static, installed_dynamic, failed, downloading, active_downloads = self._dependency_runtime_snapshot_locked()
             dynamic_bytes_used = int(self._dynamic_bytes_used)
             if isinstance(queue_depth, int):
                 self._last_dependency_queue_depth = max(0, int(queue_depth))
@@ -7376,7 +7401,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         url = f"{self.api_base_url}/dependencies/status"
         with self._lock:
             dynamic_bytes_used = int(self._dynamic_bytes_used)
-            active_downloads = self._serialize_download_activity_locked()
+            _, _, _, _, active_downloads = self._dependency_runtime_snapshot_locked()
         body: Dict[str, Any] = {
             "instanceId": self._resolved_instance_id,
             "itemId": item.get("itemId") or item.get("depId"),
@@ -7397,7 +7422,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             return
         now_ms = _now_ms()
         with self._lock:
-            active_downloads = self._serialize_download_activity_locked()
+            _, _, _, _, active_downloads = self._dependency_runtime_snapshot_locked()
         rtdb_ok = True
         if self._coordination:
             rtdb_ok = self._write_dependency_runtime_mirror(queue_depth=queue_depth)
@@ -7407,12 +7432,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
         url = f"{self.api_base_url}/dependencies/heartbeat"
         with self._lock:
-            self._reconcile_lru_locked()
-            installed_static = sorted(self._state.installed_static)
-            installed_dynamic = sorted(self._state.installed_dynamic)
-            failed = sorted(self._state.failed)
-            downloading = sorted(self._downloading)
-            active_downloads = self._serialize_download_activity_locked()
+            installed_static, installed_dynamic, failed, downloading, active_downloads = self._dependency_runtime_snapshot_locked()
             dynamic_bytes_used = int(self._dynamic_bytes_used)
 
         body: Dict[str, Any] = {
