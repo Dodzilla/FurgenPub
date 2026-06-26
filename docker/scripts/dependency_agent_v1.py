@@ -127,7 +127,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
 AGENT_VERSION = "dm-agent-py/0.10.50"
-VIDEO_GEN_V2_FURGENPUB_COMMIT = "4c8e544b060aeb5ae5b624449bb471de41b29f10"
+VIDEO_GEN_V2_FURGENPUB_COMMIT = "4c8e54430de92e3d924fc95e26409d12a91d8524"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
