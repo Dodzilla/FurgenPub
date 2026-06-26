@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.59"
+AGENT_VERSION = "dm-agent-py/0.10.60"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "6b355478d75e6035e4b877624bf6534b29d7e6fe"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -7735,7 +7735,12 @@ class DependencyAgent:
         last_error: Optional[Exception] = None
         for attempt_idx in range(attempts):
             try:
-                return self._agent_event(lease, event_version, event_type, payload=payload)
+                result = self._agent_event(lease, event_version, event_type, payload=payload)
+                if result.get("accepted") is not True:
+                    raise RuntimeError(
+                        f"Durable agent event {event_type} was not accepted: {result.get('reason') or result}"
+                    )
+                return result
             except Exception as e:
                 last_error = e
                 if attempt_idx >= attempts - 1 or not self._is_retryable_agent_control_error(e):
@@ -9709,7 +9714,12 @@ class DependencyAgent:
             last_error: Optional[Exception] = None
             for attempt_idx in range(attempts):
                 try:
-                    return self._agent_event(lease, durable_version, event_type, payload=extra)
+                    result = self._agent_event(lease, durable_version, event_type, payload=extra)
+                    if result.get("accepted") is not True:
+                        raise RuntimeError(
+                            f"Durable agent event {event_type} was not accepted: {result.get('reason') or result}"
+                        )
+                    return result
                 except Exception as e:
                     last_error = e
                     if attempt_idx >= attempts - 1 or not self._is_retryable_agent_control_error(e):
