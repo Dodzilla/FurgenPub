@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.61"
+AGENT_VERSION = "dm-agent-py/0.10.62"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "c5ea815f58fdcc956b796b5bd8372fc045f285ec"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -10369,6 +10369,10 @@ class DependencyAgent:
                     active.execute_started_at_ms = execute_started_at_ms
                 lease.execute_started_at_ms = execute_started_at_ms
             self._stop_idle_prl_mining_for_work("execute_job")
+            if not self._local_comfy_reachable(timeout_seconds=5.0):
+                logging.warning("Local ComfyUI is not reachable before prompt submit; restarting before jobId=%s", lease.job_id)
+                self._restart_local_comfy(prefer_process_restart=True)
+                self._wait_for_local_comfy_ready(timeout_seconds=300.0)
             prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{lease.job_id}-{uuid.uuid4().hex[:12]}")
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
