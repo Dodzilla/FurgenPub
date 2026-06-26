@@ -1473,6 +1473,9 @@ export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
 export COMFYUI_ARGS="--disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header"
 export COMFYUI_ARGS
+export COMFYUI_LOG_PATH="${COMFYUI_LOG_PATH:-${WORKSPACE}/comfyui_direct_start.log}"
+mkdir -p "$(dirname "${COMFYUI_LOG_PATH}")" || true
+exec > >(tee -a "${COMFYUI_LOG_PATH}" >/proc/1/fd/1) 2>&1
 cd "${DM_COMFYUI_DIR}"
 if [[ -f /venv/main/bin/activate ]]; then
     source /venv/main/bin/activate
@@ -1481,7 +1484,22 @@ exec env LD_PRELOAD="${LD_PRELOAD:-libtcmalloc_minimal.so.4}" python main.py ${C
 EOF
     chmod +x "${direct_script}" || true
     echo "Starting ComfyUI directly: ${direct_script}"
-    nohup "${direct_script}" >> "${log_path}" 2>&1 &
+    COMFYUI_LOG_PATH="${log_path}" nohup "${direct_script}" >/dev/null 2>&1 &
+}
+
+function provisioning_start_comfyui_logged_launch_script() {
+    local launch_script log_path
+    launch_script="$1"
+    log_path="$2"
+
+    nohup bash -lc '
+set -o pipefail
+launch_script="$1"
+log_path="$2"
+mkdir -p "$(dirname "$log_path")" || true
+export SERVERLESS="${SERVERLESS:-true}"
+bash "$launch_script" 2>&1 | tee -a "$log_path" >/proc/1/fd/1
+' _ "$launch_script" "$log_path" >/dev/null 2>&1 &
 }
 
 function provisioning_wait_for_local_comfyui() {
@@ -1525,7 +1543,7 @@ function provisioning_start_comfyui_after_bootstrap() {
 
     if [[ -x "$launch_script" || -f "$launch_script" ]]; then
         echo "Starting ComfyUI launch script directly: $launch_script"
-        SERVERLESS=true nohup bash "$launch_script" >> "${WORKSPACE}/comfyui_manual_start.log" 2>&1 &
+        provisioning_start_comfyui_logged_launch_script "$launch_script" "${WORKSPACE}/comfyui_manual_start.log"
         if provisioning_wait_for_local_comfyui 45; then
             echo "ComfyUI became locally reachable after launch script start."
             return 0

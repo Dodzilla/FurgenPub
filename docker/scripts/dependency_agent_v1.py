@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.52"
+AGENT_VERSION = "dm-agent-py/0.10.53"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "4c8e54430de92e3d924fc95e26409d12a91d8524"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6662,19 +6662,25 @@ class DependencyAgent:
         else:
             env.setdefault("COMFYUI_ARGS", "--disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header")
         log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
-        opened_log_fh: Any = None
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            opened_log_fh = open(log_path, "ab")
-            log_fh = opened_log_fh
-        except Exception:
-            log_fh = subprocess.DEVNULL  # type: ignore[assignment]
-        try:
             subprocess.Popen(
-                ["bash", str(launch_script)],
+                [
+                    "bash",
+                    "-lc",
+                    (
+                        "set -o pipefail; "
+                        "dashboard_fd=\"${DM_COMFYUI_DASHBOARD_LOG_FD:-/proc/1/fd/1}\"; "
+                        "[[ -w \"$dashboard_fd\" ]] || dashboard_fd=/dev/stdout; "
+                        "bash \"$1\" 2>&1 | tee -a \"$2\" > \"$dashboard_fd\""
+                    ),
+                    "_",
+                    str(launch_script),
+                    str(log_path),
+                ],
                 cwd=str(self.workspace),
                 env=env,
-                stdout=log_fh,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
@@ -6683,12 +6689,6 @@ class DependencyAgent:
         except Exception as exc:
             logging.warning("ComfyUI launch-script restart failed (%s): %s", launch_script, exc)
             return False
-        finally:
-            if opened_log_fh is not None:
-                try:
-                    opened_log_fh.close()
-                except Exception:
-                    pass
 
     def _restart_local_comfy(self, prefer_process_restart: bool = False) -> None:
         if prefer_process_restart and self._restart_local_comfy_with_supervisor():
