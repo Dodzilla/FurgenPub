@@ -92,6 +92,7 @@ Queue item expectations:
 
 from __future__ import annotations
 
+import ast
 import base64
 from collections import deque
 import hashlib
@@ -6079,11 +6080,17 @@ class DependencyAgent:
             return True
         if spec_type in ("furgen_video_tools", "furgen_video_tools_v2"):
             install_required_class_types = required_class_types
-            if install_required_class_types is None and bundle_id in (
-                "video_gen_v2_furgen_color_nodes",
-                "video_gen_v2_furgen_color_nodes_v2",
-            ):
-                install_required_class_types = self._video_gen_v2_bundle_verify_class_types(bundle_id)
+            if install_required_class_types is None:
+                if bundle_id in ("video_gen_v2_furgen_color_nodes", "video_gen_v2_furgen_color_nodes_v2"):
+                    install_required_class_types = self._video_gen_v2_bundle_verify_class_types(bundle_id)
+                elif spec_type == "furgen_video_tools_v2":
+                    install_required_class_types = self._video_gen_v2_bundle_verify_class_types(
+                        "video_gen_v2_furgen_color_nodes_v2"
+                    )
+                elif spec_type == "furgen_video_tools":
+                    install_required_class_types = self._video_gen_v2_bundle_verify_class_types(
+                        "video_gen_v2_furgen_color_nodes"
+                    )
             self._install_furgen_video_tools_node(required_class_types=install_required_class_types)
             return True
         if spec_type == "git_custom_nodes":
@@ -6278,6 +6285,36 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 out.append(class_type)
         return out
 
+    def _furgen_video_tools_missing_class_types(
+        self,
+        src_dir: Path,
+        required_class_types: Optional[Iterable[str]],
+    ) -> List[str]:
+        required = self._normalize_required_class_types(required_class_types)
+        if not required:
+            return []
+        impl_path = src_dir / "furgen_video_tools.py"
+        try:
+            impl = impl_path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(impl, filename=str(impl_path))
+        except Exception as exc:
+            logging.warning("Unable to inspect FurgenVideoTools source %s: %s", impl_path, exc)
+            return required
+
+        class_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+        mapping_names: Set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(target, ast.Name) and target.id == "NODE_CLASS_MAPPINGS" for target in node.targets):
+                continue
+            if not isinstance(node.value, ast.Dict):
+                continue
+            for key in node.value.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    mapping_names.add(key.value)
+        return [class_type for class_type in required if class_type not in class_names or class_type not in mapping_names]
+
     def _furgen_video_tools_source_is_usable(
         self,
         src_dir: Path,
@@ -6291,12 +6328,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         required = self._normalize_required_class_types(required_class_types)
         if not required:
             return True
-        try:
-            impl = impl_path.read_text(encoding="utf-8", errors="replace")
-        except Exception as exc:
-            logging.warning("Unable to inspect FurgenVideoTools source %s: %s", impl_path, exc)
-            return False
-        missing = [class_type for class_type in required if class_type not in impl]
+        missing = self._furgen_video_tools_missing_class_types(src_dir, required)
         if missing:
             if log_skip:
                 preview = ", ".join(missing[:12])
