@@ -1069,6 +1069,28 @@ target_version="${DEPENDENCY_AGENT_TARGET_VERSION:-${DEPENDENCY_AGENT_RELEASE_VE
 target_sha256="${DEPENDENCY_AGENT_UPDATE_SHA256:-${DEPENDENCY_AGENT_RELEASE_SHA256:-}}"
 fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
 
+dependency_manager_reload_env() {
+    dm_agent_env_path="${DM_AGENT_ENV_PATH:-${WORKSPACE}/dependency_agent.env}"
+    if [[ -r "$dm_agent_env_path" ]]; then
+        set -a
+        source "$dm_agent_env_path"
+        set +a
+    fi
+
+    WORKSPACE="${WORKSPACE:-/workspace}"
+    DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
+    agent_path="${DM_AGENT_PATH:-${WORKSPACE}/dependency_agent_v1.py}"
+    log_path="${DM_AGENT_LOG_PATH:-${WORKSPACE}/dependency_agent.log}"
+    pid_path="${DM_AGENT_PID_PATH:-${WORKSPACE}/dependency_agent.pid}"
+    watchdog_pid_path="${DM_AGENT_WATCHDOG_PID_PATH:-${WORKSPACE}/dependency_agent_watchdog.pid}"
+    agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
+    if [[ -z "$agent_url" ]]; then
+        agent_url="${DEPENDENCY_AGENT_UPDATE_URL:-${DEPENDENCY_AGENT_PUBLIC_URL:-}}"
+    fi
+    target_version="${DEPENDENCY_AGENT_TARGET_VERSION:-${DEPENDENCY_AGENT_RELEASE_VERSION:-dm-agent-py/0.10.15}}"
+    target_sha256="${DEPENDENCY_AGENT_UPDATE_SHA256:-${DEPENDENCY_AGENT_RELEASE_SHA256:-}}"
+}
+
 dependency_manager_is_disabled() {
     local dm_agent_disable
     dm_agent_disable="$(printf '%s' "${DM_AGENT_DISABLE:-}" | tr '[:upper:]' '[:lower:]')"
@@ -1286,14 +1308,51 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+dependency_manager_reload_env
 dependency_manager_start_agent_once
 while true; do
     sleep "${DM_AGENT_WATCHDOG_SECONDS:-15}"
+    dependency_manager_reload_env
     dependency_manager_start_agent_once
 done
 EOF
 
     chmod +x "$watchdog_path" || true
+}
+
+function dependency_manager_stop_stale_watchdogs() {
+    local watchdog_path current_target current_url pid proc_target proc_url
+    watchdog_path="$1"
+    current_target="${DEPENDENCY_AGENT_TARGET_VERSION:-${DEPENDENCY_AGENT_RELEASE_VERSION:-}}"
+    current_url="${DM_AGENT_URL:-${AGENT_URL:-${DEPENDENCY_AGENT_UPDATE_URL:-${DEPENDENCY_AGENT_PUBLIC_URL:-}}}}"
+
+    if ! command -v pgrep >/dev/null 2>&1; then
+        return 0
+    fi
+
+    pgrep -f "$watchdog_path" 2>/dev/null | while read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [[ "$pid" == "$$" ]] && continue
+
+        proc_target=""
+        proc_url=""
+        if [[ -r "/proc/$pid/environ" ]]; then
+            proc_target="$(tr '\0' '\n' < "/proc/$pid/environ" | awk -F= '$1=="DEPENDENCY_AGENT_TARGET_VERSION" || $1=="DEPENDENCY_AGENT_RELEASE_VERSION" {print $2; exit}' || true)"
+            proc_url="$(tr '\0' '\n' < "/proc/$pid/environ" | awk -F= '$1=="DM_AGENT_URL" || $1=="AGENT_URL" || $1=="DEPENDENCY_AGENT_UPDATE_URL" || $1=="DEPENDENCY_AGENT_PUBLIC_URL" {print $2; exit}' || true)"
+        fi
+
+        if [[ -n "$current_target" && "$proc_target" != "$current_target" ]]; then
+            echo "Dependency manager: stopping stale watchdog pid=$pid target=${proc_target:-unknown} expected=$current_target."
+            kill "$pid" 2>/dev/null || true
+            continue
+        fi
+        if [[ -n "$current_url" && "$proc_url" != "$current_url" ]]; then
+            echo "Dependency manager: stopping stale watchdog pid=$pid url=${proc_url:-unknown}."
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+
+    sleep 1
 }
 
 function dependency_manager_configure_supervisor_watchdog() {
@@ -1382,6 +1441,8 @@ function dependency_manager_start_agent() {
 
     watchdog_path="${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE}/dependency_agent_watchdog.sh}"
     watchdog_log_path="${DM_AGENT_WATCHDOG_LOG_PATH:-${WORKSPACE}/dependency_agent_watchdog.log}"
+
+    dependency_manager_stop_stale_watchdogs "$watchdog_path"
 
     if command -v pgrep >/dev/null 2>&1; then
         if pgrep -f "$watchdog_path" >/dev/null 2>&1; then
