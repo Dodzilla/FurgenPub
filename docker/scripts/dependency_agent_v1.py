@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.57"
+AGENT_VERSION = "dm-agent-py/0.10.58"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "6b355478d75e6035e4b877624bf6534b29d7e6fe"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -8028,12 +8028,21 @@ class DependencyAgent:
         base_url = self._resolve_local_comfy_base_url(force_refresh=False, timeout_seconds=min(5.0, timeout_seconds))
         try:
             return api_json(method, f"{base_url}{ep}", body=body, timeout_seconds=timeout_seconds)
-        except Exception:
-            # For non-mutating calls, retry once with a forced base-url refresh.
-            if method.upper() in ("GET", "HEAD"):
-                refreshed = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=min(5.0, timeout_seconds))
+        except Exception as first_error:
+            refreshed = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=min(5.0, timeout_seconds))
+            if refreshed == base_url:
+                raise
+            logging.info(
+                "Retrying ComfyUI %s %s after local base URL refresh: %s -> %s",
+                method.upper(),
+                ep,
+                base_url,
+                refreshed,
+            )
+            try:
                 return api_json(method, f"{refreshed}{ep}", body=body, timeout_seconds=timeout_seconds)
-            raise
+            except Exception:
+                raise first_error
 
     def _comfy_submit_prompt(self, workflow: Dict[str, Any], client_id: str) -> str:
         status, resp = self._comfy_api_json(
