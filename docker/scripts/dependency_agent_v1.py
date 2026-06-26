@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.44"
+AGENT_VERSION = "dm-agent-py/0.10.45"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "0da8c1ba23bdc3396516181feb59ae1a79e6adba"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -151,7 +151,7 @@ RIFE_VFI_ZIP_URLS = [
 RIFE_VFI_ZIP_SIZE_BYTES = 22869906
 RIFE_VFI_ZIP_SHA256 = "1fa9b9cda3d9b8c3e301359e2595960902f97bf926c08598b0e9957a3f3f760e"
 RIFE_VFI_FLOWNET_SIZE_BYTES = 24636301
-PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job", "active_jobs"}
+PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job"}
 PRL_MINER_PAUSE_MODES = {"stop_start", "suspend_resume", "keep_running"}
 DEFAULT_PRL_MINER_PAUSE_MODE = "stop_start"
 PRL_MINER_KINDS = {"alpha_miner", "srbminer_multi"}
@@ -9358,6 +9358,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         try:
             self._touch_item(item)
             self._post_status(item, "succeeded")
+            try:
+                self._heartbeat(queue_depth=None)
+            except Exception:
+                pass
         except Exception as e:
             self._post_status(item, "failed", error=str(e))
 
