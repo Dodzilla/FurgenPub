@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.43"
+AGENT_VERSION = "dm-agent-py/0.10.44"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "0da8c1ba23bdc3396516181feb59ae1a79e6adba"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -9177,6 +9177,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             is_dynamic = (isinstance(kind, str) and kind.lower() == "dynamic") or (dep_id in self._state.installed_dynamic)
             if is_dynamic:
                 self._touch_dynamic_locked(dep_id, dest_rel if isinstance(dest_rel, str) else None)
+            else:
+                self._state.installed_static.add(dep_id)
+                self._state.installed_dynamic.discard(dep_id)
+                self._state.lru.pop(dep_id, None)
+            self._state.retry.pop(dep_id, None)
             self._save_state()
 
     def _delete_item(self, item: Dict[str, Any]) -> None:
