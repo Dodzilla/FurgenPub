@@ -1146,6 +1146,26 @@ print(match.group(1).strip())
 PY
 }
 
+dependency_manager_version_is_downgrade() {
+    local target="$1" current="$2" python_bin
+    python_bin="$(dependency_manager_python_bin)"
+    if [[ -z "$target" || -z "$current" || -z "$python_bin" ]]; then
+        return 1
+    fi
+    "$python_bin" - "$target" "$current" <<'PY'
+import re
+import sys
+
+def parse(value):
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value or "")
+    return tuple(int(part) for part in match.groups()) if match else None
+
+target = parse(sys.argv[1])
+current = parse(sys.argv[2])
+sys.exit(0 if target is not None and current is not None and target < current else 1)
+PY
+}
+
 dependency_manager_agent_sha256() {
     local path="$1" python_bin
     python_bin="$(dependency_manager_python_bin)"
@@ -1172,6 +1192,12 @@ dependency_manager_agent_is_stale() {
         local current_version
         current_version="$(dependency_manager_agent_version "$agent_path" 2>/dev/null || true)"
         if [[ "$current_version" != "$target_version" ]]; then
+            local allow_downgrade
+            allow_downgrade="$(printf '%s' "${DM_AGENT_SELF_UPDATE_ALLOW_DOWNGRADE:-}" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$allow_downgrade" != "1" && "$allow_downgrade" != "true" ]] && dependency_manager_version_is_downgrade "$target_version" "$current_version"; then
+                echo "Dependency manager: watchdog refusing stale target downgrade current=${current_version:-unknown} target=$target_version."
+                return 1
+            fi
             echo "Dependency manager: agent version stale current=${current_version:-unknown} target=$target_version."
             return 0
         fi
@@ -1201,6 +1227,13 @@ dependency_manager_running_agent_matches_target() {
     expected="$(dependency_manager_expected_launch_marker)"
     actual="$(cat "$marker_path" 2>/dev/null || true)"
     if [[ "$actual" != "$expected" ]]; then
+        local current_version allow_downgrade
+        current_version="$(dependency_manager_agent_version "$agent_path" 2>/dev/null || true)"
+        allow_downgrade="$(printf '%s' "${DM_AGENT_SELF_UPDATE_ALLOW_DOWNGRADE:-}" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$allow_downgrade" != "1" && "$allow_downgrade" != "true" ]] && dependency_manager_version_is_downgrade "$target_version" "$current_version"; then
+            echo "Dependency manager: running agent marker differs, but watchdog refuses stale target downgrade current=${current_version:-unknown} target=$target_version."
+            return 0
+        fi
         echo "Dependency manager: running agent launch marker stale; restarting to enforce target=$target_version."
         return 1
     fi

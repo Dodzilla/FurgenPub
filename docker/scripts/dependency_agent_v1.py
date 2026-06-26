@@ -104,6 +104,7 @@ import mimetypes
 import os
 import random
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -126,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.60"
+AGENT_VERSION = "dm-agent-py/0.10.61"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "6b355478d75e6035e4b877624bf6534b29d7e6fe"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -2450,6 +2451,17 @@ class AgentSelfUpdateRelease:
     sha256: Optional[str] = None
 
 
+WATCHDOG_RELEASE_ENV_KEYS = {
+    "DM_AGENT_URL",
+    "DEPENDENCY_AGENT_TARGET_VERSION",
+    "DEPENDENCY_AGENT_UPDATE_URL",
+    "DEPENDENCY_AGENT_UPDATE_SHA256",
+    "DEPENDENCY_AGENT_RELEASE_VERSION",
+    "DEPENDENCY_AGENT_RELEASE_SHA256",
+    "DM_AGENT_ENV_PATH",
+}
+
+
 class PrlMinerController:
     def __init__(self, workspace: Path, download_timeout_seconds: float, download_chunk_size: int) -> None:
         self.root = Path(workspace) / ".fcs" / "prl"
@@ -3554,6 +3566,10 @@ class DependencyAgent:
         self.self_update_allow_downgrade = _env_bool("DM_AGENT_SELF_UPDATE_ALLOW_DOWNGRADE", False)
         self.self_update_retry_seconds = max(30.0, _env_float("DM_AGENT_SELF_UPDATE_RETRY_SECONDS", 300.0))
         self.self_script_path = Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__))
+        self.self_env_path = Path(_env_str("DM_AGENT_ENV_PATH") or str(self.workspace / "dependency_agent.env"))
+        self.self_marker_path = Path(
+            _env_str("DM_AGENT_MARKER_PATH") or f"{_env_str('DM_AGENT_PID_PATH') or str(self.workspace / 'dependency_agent.pid')}.launch"
+        )
 
         allowed = _split_csv(_env_str("DM_ALLOWED_DOMAINS")) or ["huggingface.co", "hf.co", "civitai.red", "civitai.com"]
         self.allowed_domains = {d.lower() for d in allowed if d}
@@ -7153,6 +7169,81 @@ class DependencyAgent:
             return current_sha is None or current_sha != release.sha256
         return False
 
+    def _persist_self_update_release_for_watchdog(self, release: AgentSelfUpdateRelease, sha256: str) -> None:
+        sha256_norm = (release.sha256 or sha256 or "").strip().lower()
+        updates = {
+            "DM_AGENT_URL": release.download_url,
+            "DEPENDENCY_AGENT_TARGET_VERSION": release.target_version,
+            "DEPENDENCY_AGENT_UPDATE_URL": release.download_url,
+            "DEPENDENCY_AGENT_UPDATE_SHA256": sha256_norm,
+            "DEPENDENCY_AGENT_RELEASE_VERSION": release.target_version,
+            "DEPENDENCY_AGENT_RELEASE_SHA256": sha256_norm,
+            "DM_AGENT_ENV_PATH": str(self.self_env_path),
+        }
+        for key, value in updates.items():
+            if value:
+                os.environ[key] = value
+
+        if str(self.self_env_path):
+            existing: List[str] = []
+            try:
+                if self.self_env_path.exists():
+                    existing = self.self_env_path.read_text("utf-8", errors="replace").splitlines()
+            except Exception as exc:
+                logging.warning("Failed reading dependency agent env for self-update persistence: %s", exc)
+                existing = []
+
+            kept = []
+            export_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
+            for line in existing:
+                match = export_re.match(line)
+                if match and match.group(1) in WATCHDOG_RELEASE_ENV_KEYS:
+                    continue
+                kept.append(line)
+
+            for key in sorted(updates):
+                value = updates[key]
+                if value:
+                    kept.append(f"export {key}={shlex.quote(str(value))}")
+
+            try:
+                self.self_env_path.parent.mkdir(parents=True, exist_ok=True)
+                next_text = "\n".join(kept).rstrip() + "\n"
+                current_text = None
+                try:
+                    if self.self_env_path.exists():
+                        current_text = self.self_env_path.read_text("utf-8", errors="replace")
+                except Exception:
+                    current_text = None
+                if current_text != next_text:
+                    tmp_env = self.self_env_path.parent / f".{self.self_env_path.name}.{uuid.uuid4().hex}.tmp"
+                    tmp_env.write_text(next_text, "utf-8")
+                    try:
+                        os.chmod(tmp_env, 0o600)
+                    except Exception:
+                        pass
+                    os.replace(str(tmp_env), str(self.self_env_path))
+            except Exception as exc:
+                logging.warning("Failed persisting dependency agent release env for watchdog: %s", exc)
+
+        try:
+            self.self_marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_text = f"{release.target_version}\n{sha256_norm}\n{release.download_url}\n"
+            current_marker = None
+            try:
+                if self.self_marker_path.exists():
+                    current_marker = self.self_marker_path.read_text("utf-8", errors="replace")
+            except Exception:
+                current_marker = None
+            if current_marker != marker_text:
+                self.self_marker_path.write_text(marker_text, "utf-8")
+                try:
+                    os.chmod(self.self_marker_path, 0o600)
+                except Exception:
+                    pass
+        except Exception as exc:
+            logging.warning("Failed persisting dependency agent launch marker for watchdog: %s", exc)
+
     def _maybe_queue_self_update(self, raw: Any, source: str) -> None:
         if not self.self_update_enabled:
             return
@@ -7173,6 +7264,9 @@ class DependencyAgent:
             return
 
         if not self._self_update_required(release):
+            current_sha = self._current_script_sha256()
+            if current_sha:
+                self._persist_self_update_release_for_watchdog(release, current_sha)
             if self._pending_self_update == release:
                 self._clear_pending_self_update()
             return
@@ -7275,6 +7369,7 @@ class DependencyAgent:
                 pass
 
             os.replace(str(tmp_path), str(self.self_script_path))
+            self._persist_self_update_release_for_watchdog(release, downloaded_sha)
             logging.info(
                 "Restarting dependency agent into updated script: old=%s new=%s path=%s",
                 AGENT_VERSION,
