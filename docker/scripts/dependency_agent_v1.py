@@ -127,8 +127,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.64"
-VIDEO_GEN_V2_FURGENPUB_COMMIT = "c5ea815f58fdcc956b796b5bd8372fc045f285ec"
+AGENT_VERSION = "dm-agent-py/0.10.65"
+VIDEO_GEN_V2_FURGENPUB_COMMIT = "aee64497ce006d201012b7c4e0491b0b79f39fce"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
@@ -3678,6 +3678,115 @@ class DependencyAgent:
             raise SystemExit("Missing required env var: FCS_API_BASE_URL")
         if not self.server_type:
             raise SystemExit("Missing required env var: SERVER_TYPE")
+
+    def _repair_video_gen_v2_agent_env_launch_args(self) -> bool:
+        env_path = Path(_env_str("DM_AGENT_ENV_PATH") or str(self.workspace / "dependency_agent.env"))
+        try:
+            if not env_path.exists():
+                return False
+            original = env_path.read_text(encoding="utf-8")
+            lines = original.splitlines()
+            repaired = [
+                line for line in lines
+                if not re.match(r"^\s*(?:export\s+)?COMFYUI_ARGS=", line)
+            ]
+            if not any(re.match(r"^\s*(?:export\s+)?DM_LOCAL_COMFY_ALLOW_DISCOVERY=", line) for line in repaired):
+                repaired.append("export DM_LOCAL_COMFY_ALLOW_DISCOVERY=false")
+            next_text = "\n".join(repaired) + ("\n" if repaired else "")
+            if next_text == original:
+                return False
+            env_path.write_text(next_text, encoding="utf-8")
+            try:
+                env_path.chmod(0o600)
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            logging.warning("Failed to repair video_gen_v2 dependency agent env launch args: %s", exc)
+            return False
+
+    def _repair_video_gen_v2_supervisor_launch_script(self) -> bool:
+        launch_script = Path("/opt/supervisor-scripts/comfyui.sh")
+        try:
+            if not launch_script.exists() or not launch_script.is_file():
+                return False
+            source = launch_script.read_text(encoding="utf-8")
+            block = (
+                "# FURGEN dependency agent watchdog bootstrap\n"
+                "dm_agent_env_path=\"${DM_AGENT_ENV_PATH:-${WORKSPACE:-/workspace}/dependency_agent.env}\"\n"
+                "furgen_saved_comfyui_args=\"${COMFYUI_ARGS-}\"\n"
+                "furgen_had_comfyui_args=0\n"
+                "if [[ \"${COMFYUI_ARGS+x}\" == \"x\" ]]; then furgen_had_comfyui_args=1; fi\n"
+                "if [[ -r \"${dm_agent_env_path}\" ]]; then\n"
+                "    set -a\n"
+                "    source \"${dm_agent_env_path}\"\n"
+                "    set +a\n"
+                "fi\n"
+                "if [[ \"${furgen_had_comfyui_args}\" == \"1\" ]]; then\n"
+                "    COMFYUI_ARGS=\"${furgen_saved_comfyui_args}\"\n"
+                "else\n"
+                "    unset COMFYUI_ARGS\n"
+                "fi\n"
+                "unset furgen_saved_comfyui_args furgen_had_comfyui_args\n"
+                "dm_agent_disable=\"$(printf '%s' \"${DM_AGENT_DISABLE:-}\" | tr '[:upper:]' '[:lower:]')\"\n"
+                "if [[ \"${dm_agent_disable}\" != \"1\" && \"${dm_agent_disable}\" != \"true\" ]]; then\n"
+                "    watchdog_path=\"${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.sh}\"\n"
+                "    watchdog_log_path=\"${DM_AGENT_WATCHDOG_LOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.log}\"\n"
+                "    if [[ -x \"${watchdog_path}\" ]]; then\n"
+                "        if ! command -v pgrep >/dev/null 2>&1 || ! pgrep -f \"${watchdog_path}\" >/dev/null 2>&1; then\n"
+                "            nohup \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+                "        fi\n"
+                "    fi\n"
+                "fi\n"
+                "unset dm_agent_disable\n"
+                "# /FURGEN dependency agent watchdog bootstrap\n"
+            )
+            pattern = re.compile(
+                r"# FURGEN dependency agent watchdog bootstrap\n(?:.*?\n)# /FURGEN dependency agent watchdog bootstrap\n",
+                re.DOTALL,
+            )
+            if pattern.search(source):
+                next_source = pattern.sub(block, source)
+            else:
+                marker = "python main.py ${COMFYUI_ARGS}"
+                idx = source.find(marker)
+                if idx < 0:
+                    logging.warning("Unable to locate ComfyUI launch command while repairing %s", launch_script)
+                    return False
+                line_start = source.rfind("\n", 0, idx) + 1
+                next_source = source[:line_start] + block + source[line_start:]
+            if next_source == source:
+                return False
+            launch_script.write_text(next_source, encoding="utf-8")
+            try:
+                launch_script.chmod(0o755)
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            logging.warning("Failed to repair video_gen_v2 ComfyUI launch script: %s", exc)
+            return False
+
+    def _repair_video_gen_v2_comfy_launch_contract(self, restart_if_unreachable: bool = False) -> None:
+        if (self.server_type or "").strip() != "video_gen_v2":
+            return
+        env_changed = self._repair_video_gen_v2_agent_env_launch_args()
+        launch_changed = self._repair_video_gen_v2_supervisor_launch_script()
+        if env_changed or launch_changed:
+            logging.warning(
+                "Repaired video_gen_v2 ComfyUI launch contract: envChanged=%s launchScriptChanged=%s",
+                env_changed,
+                launch_changed,
+            )
+        if not restart_if_unreachable or self.mining_only:
+            return
+        configured = self._normalize_local_comfy_base_url(self.agent_local_comfy_base_url) or "http://127.0.0.1:8188"
+        if self._probe_local_comfy_base_url(configured, timeout_seconds=2.0):
+            self._resolved_local_comfy_base_url = configured
+            return
+        logging.warning("Configured video_gen_v2 ComfyUI endpoint %s is unreachable; restarting via launch script.", configured)
+        if self._restart_local_comfy_with_launch_script():
+            self._wait_for_local_comfy_restart([], timeout_seconds=180.0)
 
     def _resolve_download_tool(self) -> str:
         tool = (self.download_tool or "auto").strip().lower()
@@ -10856,6 +10965,8 @@ class DependencyAgent:
             )
         else:
             logging.info("Dynamic eviction disabled (set profile.dynamicPolicy.enabled or DM_DYNAMIC_EVICTION_ENABLED=1)")
+
+        self._repair_video_gen_v2_comfy_launch_contract(restart_if_unreachable=True)
 
         dep_executor = ThreadPoolExecutor(max_workers=self.max_parallel)
         dep_inflight: Set[Future[None]] = set()
