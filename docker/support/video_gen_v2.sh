@@ -1060,6 +1060,7 @@ DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
 agent_path="${DM_AGENT_PATH:-${WORKSPACE}/dependency_agent_v1.py}"
 log_path="${DM_AGENT_LOG_PATH:-${WORKSPACE}/dependency_agent.log}"
 pid_path="${DM_AGENT_PID_PATH:-${WORKSPACE}/dependency_agent.pid}"
+marker_path="${DM_AGENT_MARKER_PATH:-${pid_path}.launch}"
 watchdog_pid_path="${DM_AGENT_WATCHDOG_PID_PATH:-${WORKSPACE}/dependency_agent_watchdog.pid}"
 agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
 if [[ -z "$agent_url" ]]; then
@@ -1082,6 +1083,7 @@ dependency_manager_reload_env() {
     agent_path="${DM_AGENT_PATH:-${WORKSPACE}/dependency_agent_v1.py}"
     log_path="${DM_AGENT_LOG_PATH:-${WORKSPACE}/dependency_agent.log}"
     pid_path="${DM_AGENT_PID_PATH:-${WORKSPACE}/dependency_agent.pid}"
+    marker_path="${DM_AGENT_MARKER_PATH:-${pid_path}.launch}"
     watchdog_pid_path="${DM_AGENT_WATCHDOG_PID_PATH:-${WORKSPACE}/dependency_agent_watchdog.pid}"
     agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
     if [[ -z "$agent_url" ]]; then
@@ -1185,6 +1187,27 @@ dependency_manager_agent_is_stale() {
     return 1
 }
 
+dependency_manager_expected_launch_marker() {
+    printf '%s\n%s\n%s\n' "${target_version:-}" "${target_sha256:-}" "${agent_url:-}"
+}
+
+dependency_manager_running_agent_matches_target() {
+    if [[ ! -f "$marker_path" ]]; then
+        echo "Dependency manager: running agent has no launch marker; restarting to enforce target=$target_version."
+        return 1
+    fi
+
+    local expected actual
+    expected="$(dependency_manager_expected_launch_marker)"
+    actual="$(cat "$marker_path" 2>/dev/null || true)"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Dependency manager: running agent launch marker stale; restarting to enforce target=$target_version."
+        return 1
+    fi
+
+    return 0
+}
+
 dependency_manager_stop_agent() {
     local pid
     if [[ -f "$pid_path" ]]; then
@@ -1208,7 +1231,7 @@ dependency_manager_stop_agent() {
             fi
         done
     fi
-    rm -f "$pid_path" || true
+    rm -f "$pid_path" "$marker_path" || true
 }
 
 dependency_manager_download_agent_url() {
@@ -1271,7 +1294,7 @@ dependency_manager_install_agent_if_missing() {
 
 dependency_manager_start_agent_once() {
     if dependency_manager_agent_running; then
-        if dependency_manager_agent_is_stale; then
+        if dependency_manager_agent_is_stale || ! dependency_manager_running_agent_matches_target; then
             dependency_manager_install_agent_if_missing || return 0
             echo "Dependency manager: watchdog restarting stale dependency agent."
             dependency_manager_stop_agent
@@ -1285,6 +1308,8 @@ dependency_manager_start_agent_once() {
     echo "Dependency manager: watchdog starting agent; log=$log_path"
     nohup bash -lc "dm_agent_env_path=\"\${DM_AGENT_ENV_PATH:-${WORKSPACE}/dependency_agent.env}\"; if [[ -r \"\$dm_agent_env_path\" ]]; then set -a; source \"\$dm_agent_env_path\"; set +a; fi; if [[ -f /venv/main/bin/activate ]]; then source /venv/main/bin/activate; fi; exec python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
     echo $! > "$pid_path"
+    dependency_manager_expected_launch_marker > "$marker_path" || true
+    chmod 600 "$marker_path" || true
 }
 
 if dependency_manager_is_disabled; then
