@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.55"
+AGENT_VERSION = "dm-agent-py/0.10.56"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "6b355478d75e6035e4b877624bf6534b29d7e6fe"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -7208,6 +7208,22 @@ class DependencyAgent:
                 self._pending_self_update_source or "-",
             )
             self._clear_pending_self_update()
+            return
+
+        with self._lock:
+            active_exec_count = len(self._active_exec_by_item)
+            active_maintenance_count = len(self._active_maintenance_by_item)
+        if active_exec_count > 0 or active_maintenance_count > 0:
+            self._self_update_retry_at_ms = _now_ms() + int(self.self_update_retry_seconds * 1000)
+            logging.info(
+                "Deferring dependency agent self-update until active leases finish: "
+                "current=%s target=%s activeExec=%d activeMaintenance=%d retryIn=%.0fs",
+                AGENT_VERSION,
+                release.target_version,
+                active_exec_count,
+                active_maintenance_count,
+                float(self.self_update_retry_seconds),
+            )
             return
 
         tmp_path = self.self_script_path.parent / f".{self.self_script_path.name}.{uuid.uuid4().hex}.tmp"
