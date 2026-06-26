@@ -126,7 +126,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.42"
+AGENT_VERSION = "dm-agent-py/0.10.43"
+VIDEO_GEN_V2_FURGENPUB_COMMIT = "0da8c1ba23bdc3396516181feb59ae1a79e6adba"
+VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
+    f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
+)
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3536,10 +3540,7 @@ class DependencyAgent:
         default_upload_workers = max(4, int(self.agent_max_execute_workers) * 2)
         self.agent_max_upload_workers = 0 if self.mining_only else max(1, min(16, _env_int("DM_AGENT_MAX_UPLOAD_WORKERS", default_upload_workers)))
         self.asset_gen_v5_script = _env_str("DM_ASSET_GEN_V5_SCRIPT")
-        self.furgenpub_raw_base_url = (
-            _env_str("FURGENPUB_RAW_BASE_URL")
-            or "https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support"
-        ).rstrip("/")
+        self.furgenpub_raw_base_url = self._resolve_furgenpub_raw_base_url()
         self._resolved_local_comfy_base_url = self.agent_local_comfy_base_url
         self._last_local_comfy_discovery_ms = 0
         self._comfy_queue_summary_ttl_ms = max(1000, min(10000, int(_env_float("DM_COMFY_QUEUE_SUMMARY_TTL_SECONDS", 2.0) * 1000)))
@@ -3626,6 +3627,31 @@ class DependencyAgent:
             self._reconcile_lru_locked()
 
         self.input_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _resolve_furgenpub_raw_base_url(self) -> str:
+        raw = (
+            _env_str("FURGENPUB_RAW_BASE_URL")
+            or "https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support"
+        ).rstrip("/")
+        if self.server_type != "video_gen_v2":
+            return raw
+
+        pinned = VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL.rstrip("/")
+        normalized = raw.rstrip("/")
+        if not normalized:
+            return pinned
+
+        furgenpub_marker = "raw.githubusercontent.com/Dodzilla/FurgenPub/"
+        pinned_marker = f"/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/"
+        allow_unpinned = _env_bool("DM_VIDEO_GEN_V2_ALLOW_UNPINNED_FURGENPUB_RAW_BASE", False)
+        if furgenpub_marker in normalized and pinned_marker not in normalized and not allow_unpinned:
+            logging.warning(
+                "Ignoring stale or unpinned FURGENPUB_RAW_BASE_URL for video_gen_v2: %s; using %s",
+                normalized,
+                pinned,
+            )
+            return pinned
+        return normalized
 
     def validate_env(self) -> None:
         if not self.api_base_url:
