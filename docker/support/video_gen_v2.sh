@@ -1313,8 +1313,13 @@ case "${1:-}" in
         ;;
 esac
 
-# Best-effort aria2 install before the agent starts so model downloads can use
-# multi-connection transfers (the agent falls back to wget when aria2c is absent).
+# Start the dependency manager agent before package/provisioning work. The agent
+# resolves its downloader at use time, so a later aria2 install is still picked
+# up before queued dependency downloads begin.
+dependency_manager_start_agent
+
+# Best-effort aria2 install so model downloads can use multi-connection
+# transfers (the agent falls back to wget when aria2c is absent).
 if ! command -v aria2c >/dev/null 2>&1; then
     echo "Installing aria2 for multi-connection downloads..."
     apt_runner=""
@@ -1323,9 +1328,6 @@ if ! command -v aria2c >/dev/null 2>&1; then
         $apt_runner apt-get install -y -qq aria2 >/dev/null 2>&1 || \
         echo "WARN: aria2 install failed; dependency agent will fall back to wget."
 fi
-
-# Start the dependency manager agent (best-effort; safe if required env vars are missing).
-dependency_manager_start_agent
 
 # Allow user to disable provisioning if they started with a script they didn't want
 if [[ ! -f /.noprovisioning ]]; then

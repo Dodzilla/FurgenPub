@@ -125,7 +125,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.40"
+AGENT_VERSION = "dm-agent-py/0.10.41"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -3594,10 +3594,12 @@ class DependencyAgent:
         self._agent_execute_executor: Optional[ThreadPoolExecutor] = None
         self._agent_upload_executor: Optional[ThreadPoolExecutor] = None
         self._agent_maintenance_executor: Optional[ThreadPoolExecutor] = None
+        self._agent_prl_miner_executor: Optional[ThreadPoolExecutor] = None
         self._agent_prefetch_inflight: Set[Future[None]] = set()
         self._agent_execute_inflight: Set[Future[None]] = set()
         self._agent_upload_inflight: Set[Future[None]] = set()
         self._agent_maintenance_inflight: Set[Future[None]] = set()
+        self._agent_prl_miner_inflight: Set[Future[None]] = set()
         self._pending_self_update: Optional[AgentSelfUpdateRelease] = None
         self._pending_self_update_source = ""
         self._self_update_retry_at_ms = 0
@@ -9756,9 +9758,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             self._agent_upload_inflight.add(future)
 
     def _submit_agent_maintenance_item(self, item: Dict[str, Any]) -> None:
-        if self._agent_maintenance_executor is None:
-            raise RuntimeError("Agent maintenance executor is not initialized")
         item_type = item.get("type")
+        is_prl_miner = item_type == "prl_miner"
+        executor = self._agent_prl_miner_executor if is_prl_miner else self._agent_maintenance_executor
+        if executor is None:
+            raise RuntimeError("Agent PRL miner executor is not initialized" if is_prl_miner else "Agent maintenance executor is not initialized")
         item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
         lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
         if item_id and lease_id:
@@ -9784,9 +9788,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                         if isinstance(active, dict) and active.get("leaseId") == lease_id:
                             self._active_maintenance_by_item.pop(item_id, None)
 
-        future = self._agent_maintenance_executor.submit(_run)
+        future = executor.submit(_run)
         with self._lock:
-            self._agent_maintenance_inflight.add(future)
+            if is_prl_miner:
+                self._agent_prl_miner_inflight.add(future)
+            else:
+                self._agent_maintenance_inflight.add(future)
         self._request_agent_queue_poll()
 
     def _prefetch_agent_execute_lease(self, lease: AgentExecuteLease) -> None:
@@ -10432,11 +10439,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         self._agent_execute_executor = ThreadPoolExecutor(max_workers=max(1, int(self.agent_max_execute_workers)))
         self._agent_upload_executor = ThreadPoolExecutor(max_workers=max(1, int(self.agent_max_upload_workers)))
         self._agent_maintenance_executor = ThreadPoolExecutor(max_workers=1)
+        self._agent_prl_miner_executor = ThreadPoolExecutor(max_workers=1)
         with self._lock:
             self._agent_prefetch_inflight.clear()
             self._agent_execute_inflight.clear()
             self._agent_upload_inflight.clear()
             self._agent_maintenance_inflight.clear()
+            self._agent_prl_miner_inflight.clear()
 
         next_dep_poll_at_ms = 0
         next_agent_poll_at_ms = 0
@@ -10470,6 +10479,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     ("_agent_execute_inflight", "execute"),
                     ("_agent_upload_inflight", "upload"),
                     ("_agent_maintenance_inflight", "maintenance"),
+                    ("_agent_prl_miner_inflight", "prl_miner"),
                 ):
                     with self._lock:
                         inflight = getattr(self, inflight_name)
@@ -10529,9 +10539,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     active_leases = list(self._active_exec_by_item.values())
                     downloading_count = len(self._downloading)
                     maintenance_count = len(self._agent_maintenance_inflight)
+                    prl_miner_command_count = len(self._agent_prl_miner_inflight)
                 pending_self_update = self._pending_self_update is not None
 
-                if pending_self_update and not active_leases and len(dep_inflight) == 0 and downloading_count == 0 and maintenance_count == 0:
+                if pending_self_update and not active_leases and len(dep_inflight) == 0 and downloading_count == 0 and maintenance_count == 0 and prl_miner_command_count == 0:
                     # A failed or backoff-delayed self-update must not stall queue intake.
                     # Keep the process working unless _perform_pending_self_update() actually
                     # execs into the new script.
@@ -10732,6 +10743,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             self._agent_upload_executor.shutdown(wait=False, cancel_futures=True)
         if self._agent_maintenance_executor is not None:
             self._agent_maintenance_executor.shutdown(wait=False, cancel_futures=True)
+        if self._agent_prl_miner_executor is not None:
+            self._agent_prl_miner_executor.shutdown(wait=False, cancel_futures=True)
         logging.info("Dependency agent stopped.")
 
 
