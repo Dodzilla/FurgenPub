@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.63"
+AGENT_VERSION = "dm-agent-py/0.10.64"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "c5ea815f58fdcc956b796b5bd8372fc045f285ec"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3546,6 +3546,7 @@ class DependencyAgent:
         self.agent_terminal_event_retry_attempts = max(1, min(20, _env_int("DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS", 8)))
         self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
+        self.local_comfy_allow_discovery = _env_bool("DM_LOCAL_COMFY_ALLOW_DISCOVERY", self.server_type != "video_gen_v2")
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         default_readiness_file = "provisioned_furry_all.txt" if (self.server_type or "").strip() == "video_gen_v2" else "provisioning_complete.txt"
         self.agent_local_readiness_file = self._agent_local_readiness_file_env or default_readiness_file
@@ -5687,17 +5688,18 @@ class DependencyAgent:
         # Honor explicit env var first.
         _add(self.agent_local_comfy_base_url)
 
-        # Optionally pick up runtime-discovered GUI URL from local logs.
-        now = _now_ms()
-        if (now - int(self._last_local_comfy_discovery_ms)) >= 30_000:
-            discovered = self._extract_local_comfy_base_url_from_logs()
-            if discovered:
-                _add(discovered)
-            self._last_local_comfy_discovery_ms = now
+        if self.local_comfy_allow_discovery:
+            # Optionally pick up runtime-discovered GUI URL from local logs.
+            now = _now_ms()
+            if (now - int(self._last_local_comfy_discovery_ms)) >= 30_000:
+                discovered = self._extract_local_comfy_base_url_from_logs()
+                if discovered:
+                    _add(discovered)
+                self._last_local_comfy_discovery_ms = now
 
-        # Known common local ports across templates.
-        _add("http://127.0.0.1:8188")
-        _add("http://127.0.0.1:18188")
+            # Known common local ports across templates.
+            _add("http://127.0.0.1:8188")
+            _add("http://127.0.0.1:18188")
         return out
 
     def _probe_local_comfy_base_url(self, base_url: str, timeout_seconds: float = 5.0) -> bool:
@@ -6672,13 +6674,16 @@ class DependencyAgent:
         env = os.environ.copy()
         env.setdefault("WORKSPACE", str(self.workspace))
         env.setdefault("DM_COMFYUI_DIR", str(self.comfyui_dir))
+        env["DM_LOCAL_COMFY_BASE_URL"] = self.agent_local_comfy_base_url
+        if self.server_type == "video_gen_v2":
+            env["DM_LOCAL_COMFY_ALLOW_DISCOVERY"] = "false"
         # The Vast Comfy image portal wrapper can block forever waiting for
         # /etc/portal.yaml when launched outside its original supervisor path.
         env["SERVERLESS"] = "true"
-        if ":8188" in self.agent_local_comfy_base_url or "--port 18188" in env.get("COMFYUI_ARGS", ""):
-            env["COMFYUI_ARGS"] = "--disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header"
-        else:
-            env.setdefault("COMFYUI_ARGS", "--disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header")
+        configured = self._normalize_local_comfy_base_url(self.agent_local_comfy_base_url) or "http://127.0.0.1:8188"
+        parsed = urllib.parse.urlparse(configured)
+        launch_port = parsed.port or 8188
+        env["COMFYUI_ARGS"] = f"--disable-auto-launch --listen 0.0.0.0 --port {launch_port} --enable-cors-header"
         log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)

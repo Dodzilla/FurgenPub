@@ -1019,7 +1019,6 @@ function dependency_manager_persist_agent_env() {
         DM_AGENT_WATCHDOG_SECONDS \
         HF_TOKEN \
         CIVITAI_TOKEN \
-        COMFYUI_ARGS \
         DM_LOCAL_COMFY_BASE_URL \
         DM_LOCAL_READINESS_FILE \
         COMFY_NODE_PINS \
@@ -1441,11 +1440,20 @@ source = path.read_text(encoding="utf-8")
 block = (
     "# FURGEN dependency agent watchdog bootstrap\n"
     "dm_agent_env_path=\"${DM_AGENT_ENV_PATH:-${WORKSPACE:-/workspace}/dependency_agent.env}\"\n"
+    "furgen_saved_comfyui_args=\"${COMFYUI_ARGS-}\"\n"
+    "furgen_had_comfyui_args=0\n"
+    "if [[ \"${COMFYUI_ARGS+x}\" == \"x\" ]]; then furgen_had_comfyui_args=1; fi\n"
     "if [[ -r \"${dm_agent_env_path}\" ]]; then\n"
     "    set -a\n"
     "    source \"${dm_agent_env_path}\"\n"
     "    set +a\n"
     "fi\n"
+    "if [[ \"${furgen_had_comfyui_args}\" == \"1\" ]]; then\n"
+    "    COMFYUI_ARGS=\"${furgen_saved_comfyui_args}\"\n"
+    "else\n"
+    "    unset COMFYUI_ARGS\n"
+    "fi\n"
+    "unset furgen_saved_comfyui_args furgen_had_comfyui_args\n"
     "dm_agent_disable=\"$(printf '%s' \"${DM_AGENT_DISABLE:-}\" | tr '[:upper:]' '[:lower:]')\"\n"
     "if [[ \"${dm_agent_disable}\" != \"1\" && \"${dm_agent_disable}\" != \"true\" ]]; then\n"
     "    watchdog_path=\"${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.sh}\"\n"
