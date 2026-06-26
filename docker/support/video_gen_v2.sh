@@ -325,6 +325,12 @@ legacy_args_pattern = re.compile(
     re.MULTILINE,
 )
 source = legacy_args_pattern.sub("", source)
+source = re.sub(
+    r'^COMFYUI_ARGS=\$\{COMFYUI_ARGS:---disable-auto-launch --port 18188 --enable-cors-header\}\n',
+    "",
+    source,
+    flags=re.MULTILINE,
+)
 
 block = (
     "# FURGEN ComfyUI launch args normalization\n"
