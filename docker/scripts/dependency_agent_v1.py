@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.58"
+AGENT_VERSION = "dm-agent-py/0.10.59"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "6b355478d75e6035e4b877624bf6534b29d7e6fe"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -4690,7 +4690,7 @@ class DependencyAgent:
         if not etag:
             return False
         id_token = self._ensure_coordination_id_token()
-        url = self._coordination_rtdb_url(node_path, id_token=id_token, query={"print": "silent"})
+        url = self._coordination_rtdb_url(node_path, id_token=id_token)
         payload = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             url,
