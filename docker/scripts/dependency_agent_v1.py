@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.62"
+AGENT_VERSION = "dm-agent-py/0.10.63"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "c5ea815f58fdcc956b796b5bd8372fc045f285ec"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3565,6 +3565,7 @@ class DependencyAgent:
         self.self_update_enabled = _env_bool("DM_AGENT_SELF_UPDATE_ENABLED", True)
         self.self_update_allow_downgrade = _env_bool("DM_AGENT_SELF_UPDATE_ALLOW_DOWNGRADE", False)
         self.self_update_retry_seconds = max(30.0, _env_float("DM_AGENT_SELF_UPDATE_RETRY_SECONDS", 300.0))
+        self.agent_update_check_seconds = max(30.0, _env_float("DM_AGENT_UPDATE_CHECK_SECONDS", 60.0))
         self.self_script_path = Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__))
         self.self_env_path = Path(_env_str("DM_AGENT_ENV_PATH") or str(self.workspace / "dependency_agent.env"))
         self.self_marker_path = Path(
@@ -3599,6 +3600,7 @@ class DependencyAgent:
         self._agent_channel_supported = self.agent_control_enabled
         self._next_agent_register_attempt_ms = 0
         self._last_agent_heartbeat_ms = 0
+        self._last_agent_update_check_ms = _now_ms()
         self._agent_max_concurrent_execute_jobs = 1
         self._agent_max_prefetch_jobs = 0
         self._active_exec_by_item: Dict[str, AgentExecuteLease] = {}
@@ -7638,6 +7640,7 @@ class DependencyAgent:
         self._set_coordination_from_response(data, "/agent/register")
         self._apply_agent_runtime_config(data.get("agentRuntimeConfig"), "/agent/register")
         self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/register")
+        self._last_agent_update_check_ms = _now_ms()
         logging.info(
             "Registered agent control channel: instanceId=%s maxConcurrentExecuteJobs=%d maxPrefetchJobs=%d tokenExpiresAt=%s",
             self._resolved_instance_id,
@@ -7962,10 +7965,14 @@ class DependencyAgent:
             if rtdb_ok and has_active_agent_work:
                 self._coordination_check_active_lease_cancels(held_leases)
         rtdb_lease_heartbeat = self._coordination_feature_enabled("agentLeaseHeartbeatV1")
+        agent_update_check_due = (
+            now_ms - int(self._last_agent_update_check_ms) >= int(self.agent_update_check_seconds * 1000)
+        )
         if (
             self._coordination
             and rtdb_ok
             and (not has_active_agent_work or rtdb_lease_heartbeat)
+            and not agent_update_check_due
             and not self._coordination_http_checkpoint_due(now_ms, channel="agentControl")
             and transition_signature == self._last_agent_http_transition_signature
         ):
@@ -7979,6 +7986,7 @@ class DependencyAgent:
         self._coordination_note_http_checkpoint(now_ms, channel="agentControl")
         self._last_agent_http_transition_signature = transition_signature
         self._last_agent_heartbeat_ms = _now_ms()
+        self._last_agent_update_check_ms = self._last_agent_heartbeat_ms
 
         lease_results = data.get("leases")
         if isinstance(lease_results, list):
