@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.46"
+AGENT_VERSION = "dm-agent-py/0.10.47"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "0da8c1ba23bdc3396516181feb59ae1a79e6adba"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3535,7 +3535,8 @@ class DependencyAgent:
         self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
-        self.agent_local_readiness_file = self._agent_local_readiness_file_env or "provisioning_complete.txt"
+        default_readiness_file = "provisioned_furry_all.txt" if (self.server_type or "").strip() == "video_gen_v2" else "provisioning_complete.txt"
+        self.agent_local_readiness_file = self._agent_local_readiness_file_env or default_readiness_file
         self.agent_max_execute_workers = 0 if self.mining_only else max(1, min(8, _env_int("DM_AGENT_MAX_EXEC_WORKERS", 2)))
         default_upload_workers = max(4, int(self.agent_max_execute_workers) * 2)
         self.agent_max_upload_workers = 0 if self.mining_only else max(1, min(16, _env_int("DM_AGENT_MAX_UPLOAD_WORKERS", default_upload_workers)))
@@ -6082,6 +6083,8 @@ class DependencyAgent:
         changed = False
         bundle_id_set = set(bundle_ids)
         if "video_gen_v2_10s_ltx_nodes" in bundle_id_set:
+            self._install_furgen_video_compat_nodes()
+            changed = True
             # ComfyUI-LTXVideo currently imports `pad` from kornia's pyramid module.
             # kornia 0.8 removed that symbol, so a live Comfy process can appear ready
             # while the next restart will fail to import the node pack. Enforce the pin
@@ -8601,11 +8604,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 for bundle_id in bundle_ids:
                     spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
                     if isinstance(spec, dict) and spec:
-                        if not self._install_node_bundle_from_spec(
-                            bundle_id,
-                            spec,
-                            required_class_types=furgen_video_tools_required_class_types,
-                        ):
+                        if not self._install_node_bundle_from_spec(bundle_id, spec):
                             raise RuntimeError(f"Unsupported Firestore install spec for {server_type} bundle {bundle_id}")
                     else:
                         script_bundle_ids.append(bundle_id)

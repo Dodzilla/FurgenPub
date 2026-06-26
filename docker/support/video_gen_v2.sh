@@ -1064,6 +1064,7 @@ function dependency_manager_persist_agent_env() {
         CIVITAI_TOKEN \
         COMFYUI_ARGS \
         DM_LOCAL_COMFY_BASE_URL \
+        DM_LOCAL_READINESS_FILE \
         COMFY_NODE_PINS \
         COMFYUI_PIN_COMMIT
     do
