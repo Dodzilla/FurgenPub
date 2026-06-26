@@ -575,6 +575,91 @@ class FurgenExposureAdjust:
         return (out.clamp(0.0, 1.0),)
 
 
+class FurgenGetImageRangeFromBatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "start_index": ("INT", {"default": 0, "min": -1000000, "max": 1000000, "step": 1}),
+                "num_frames": ("INT", {"default": 1, "min": 1, "max": 1000000, "step": 1}),
+            },
+            "optional": {
+                "masks": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("images", "masks")
+    FUNCTION = "slice"
+    CATEGORY = "Furgen/video"
+
+    @staticmethod
+    def _slice_tensor(batch, start_index, num_frames):
+        if batch is None:
+            return None
+        total = int(batch.shape[0])
+        count = max(1, int(num_frames or 1))
+        start = int(start_index or 0)
+        if start < 0:
+            start = max(0, total - count)
+        start = max(0, min(start, max(0, total - 1)))
+        end = max(start + 1, min(total, start + count))
+        return batch[start:end]
+
+    def slice(self, images, start_index, num_frames, masks=None):
+        sliced_images = self._slice_tensor(images, start_index, num_frames)
+        if sliced_images is None:
+            raise ValueError("images batch is required")
+        sliced_masks = self._slice_tensor(masks, start_index, num_frames) if masks is not None else None
+        return (sliced_images, sliced_masks)
+
+
+class FurgenTrimAudioDuration:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "start_index": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.001}),
+                "duration": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.001}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "trim"
+    CATEGORY = "Furgen/audio"
+
+    def trim(self, audio, start_index, duration):
+        if not isinstance(audio, dict):
+            return (audio,)
+        waveform = audio.get("waveform")
+        sample_rate = int(audio.get("sample_rate") or 0)
+        if waveform is None or sample_rate <= 0 or not hasattr(waveform, "shape"):
+            return (audio,)
+
+        start_sample = max(0, int(round(float(start_index or 0.0) * sample_rate)))
+        duration_seconds = float(duration or 0.0)
+        end_sample = None
+        if duration_seconds > 0:
+            end_sample = start_sample + max(1, int(round(duration_seconds * sample_rate)))
+
+        try:
+            total_samples = int(waveform.shape[-1])
+            start_sample = min(start_sample, total_samples)
+            if end_sample is None:
+                trimmed_waveform = waveform[..., start_sample:]
+            else:
+                trimmed_waveform = waveform[..., start_sample:min(end_sample, total_samples)]
+        except Exception:
+            return (audio,)
+
+        next_audio = dict(audio)
+        next_audio["waveform"] = trimmed_waveform
+        return (next_audio,)
+
+
 class FurgenReferenceColorMatch:
     MODES = ("luma_mean_std", "rgb_mean_std", "rgb_mean_only")
 
@@ -1032,6 +1117,8 @@ class FurgenTemporalUnsharpMask:
 NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
     "FurgenExposureAdjust": FurgenExposureAdjust,
+    "FurgenGetImageRangeFromBatch": FurgenGetImageRangeFromBatch,
+    "FurgenTrimAudioDuration": FurgenTrimAudioDuration,
     "FurgenReferenceColorMatch": FurgenReferenceColorMatch,
     "FurgenAdaptiveExposureMatch": FurgenAdaptiveExposureMatch,
     "FurgenColorTransferMatch": FurgenColorTransferMatch,
@@ -1042,6 +1129,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FCSConcatVideos": "Furgen Concat Videos",
     "FurgenExposureAdjust": "Furgen Exposure Adjust",
+    "FurgenGetImageRangeFromBatch": "Furgen Get Image Range From Batch",
+    "FurgenTrimAudioDuration": "Furgen Trim Audio Duration",
     "FurgenReferenceColorMatch": "Furgen Reference Color Match",
     "FurgenAdaptiveExposureMatch": "Furgen Adaptive Exposure Match",
     "FurgenColorTransferMatch": "Furgen Color Transfer Match",

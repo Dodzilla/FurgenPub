@@ -6628,10 +6628,14 @@ class DependencyAgent:
         if bundle_id == "video_gen_v2_furgen_color_nodes":
             return [
                 "FurgenExposureAdjust",
+                "FurgenGetImageRangeFromBatch",
+                "FurgenTrimAudioDuration",
                 "FurgenReferenceColorMatch",
             ]
         if bundle_id == "video_gen_v2_furgen_color_nodes_v2":
             return [
+                "FurgenGetImageRangeFromBatch",
+                "FurgenTrimAudioDuration",
                 "FurgenAdaptiveExposureMatch",
                 "FurgenColorTransferMatch",
                 "FurgenTemporalToneSmooth",

@@ -1,5 +1,10 @@
 import ast
+import importlib.util
+import sys
+import types
 from pathlib import Path
+
+import torch
 
 
 FORBIDDEN_GENERATION_SHIMS = {
@@ -28,3 +33,39 @@ def test_video_compat_nodes_do_not_shadow_generation_nodes():
                 mapped.add(key.value)
 
     assert not (mapped & FORBIDDEN_GENERATION_SHIMS)
+
+
+def _load_furgen_video_tools():
+    support_dir = Path(__file__).parents[1]
+    package_dir = support_dir / "custom_nodes" / "FurgenVideoTools"
+    folder_paths = types.ModuleType("folder_paths")
+    folder_paths.get_annotated_filepath = lambda value: value
+    folder_paths.get_output_directory = lambda: "/tmp"
+    folder_paths.get_temp_directory = lambda: "/tmp"
+    folder_paths.get_save_image_path = lambda prefix, output_dir: (output_dir, prefix, 0, "", prefix)
+    sys.modules["folder_paths"] = folder_paths
+    spec = importlib.util.spec_from_file_location("furgen_video_tools_test", package_dir / "furgen_video_tools.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_furgen_video_tools_registers_tail_context_utility_nodes():
+    module = _load_furgen_video_tools()
+
+    assert "FurgenGetImageRangeFromBatch" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenTrimAudioDuration" in module.NODE_CLASS_MAPPINGS
+
+
+def test_furgen_tail_context_utility_nodes_slice_images_and_audio():
+    module = _load_furgen_video_tools()
+
+    images = torch.arange(12, dtype=torch.float32).view(12, 1, 1, 1)
+    sliced, _mask = module.FurgenGetImageRangeFromBatch().slice(images, -1, 8)
+    assert sliced.flatten().tolist() == list(range(4, 12))
+
+    audio = {"waveform": torch.arange(24, dtype=torch.float32).view(1, 1, 24), "sample_rate": 24}
+    trimmed, = module.FurgenTrimAudioDuration().trim(audio, 8 / 24, 5 / 24)
+    assert trimmed["sample_rate"] == 24
+    assert trimmed["waveform"].flatten().tolist() == [8, 9, 10, 11, 12]
