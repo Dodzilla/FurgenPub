@@ -410,13 +410,15 @@ function provisioning_install_furgen_video_tools_node() {
     rm -rf "${dest_dir}"
     mkdir -p "${dest_dir}"
 
-    if [[ -d "${src_dir}" ]]; then
+    if [[ -d "${src_dir}" && -f "${src_dir}/furgen_video_tools.py" ]] && grep -q "FurgenTemporalUnsharpMask" "${src_dir}/furgen_video_tools.py"; then
         cp -R "${src_dir}/." "${dest_dir}/"
         printf "Installed managed custom node: FurgenVideoTools (local copy)\n"
         return 0
+    elif [[ -d "${src_dir}" ]]; then
+        printf "WARN: Local FurgenVideoTools source is missing FurgenTemporalUnsharpMask; using pinned remote copy.\n"
     fi
 
-    printf "Local FurgenVideoTools source missing; downloading managed custom node from %s\n" "${remote_base}"
+    printf "Downloading managed custom node from %s\n" "${remote_base}"
     curl -fsSL "${remote_base}/__init__.py" -o "${dest_dir}/__init__.py" || {
         printf "ERROR: Failed to download FurgenVideoTools __init__.py from %s\n" "${remote_base}"
         return 1
@@ -425,6 +427,10 @@ function provisioning_install_furgen_video_tools_node() {
         printf "ERROR: Failed to download FurgenVideoTools implementation from %s\n" "${remote_base}"
         return 1
     }
+    if ! grep -q "FurgenTemporalUnsharpMask" "${dest_dir}/furgen_video_tools.py"; then
+        printf "ERROR: Downloaded FurgenVideoTools implementation is missing FurgenTemporalUnsharpMask from %s\n" "${remote_base}"
+        return 1
+    fi
 
     printf "Installed managed custom node: FurgenVideoTools (downloaded)\n"
 }

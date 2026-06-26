@@ -125,7 +125,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.41"
+AGENT_VERSION = "dm-agent-py/0.10.42"
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
@@ -6039,7 +6039,12 @@ class DependencyAgent:
             changed = self._ensure_video_gen_v2_image_filters_opencv() or changed
         return changed
 
-    def _install_node_bundle_from_spec(self, bundle_id: str, spec: Dict[str, Any]) -> bool:
+    def _install_node_bundle_from_spec(
+        self,
+        bundle_id: str,
+        spec: Dict[str, Any],
+        required_class_types: Optional[Iterable[str]] = None,
+    ) -> bool:
         if not isinstance(spec, dict):
             return False
         spec_type = spec.get("type")
@@ -6073,7 +6078,13 @@ class DependencyAgent:
             self._install_furgen_asset_gen_runtime_helpers()
             return True
         if spec_type in ("furgen_video_tools", "furgen_video_tools_v2"):
-            self._install_furgen_video_tools_node()
+            install_required_class_types = required_class_types
+            if install_required_class_types is None and bundle_id in (
+                "video_gen_v2_furgen_color_nodes",
+                "video_gen_v2_furgen_color_nodes_v2",
+            ):
+                install_required_class_types = self._video_gen_v2_bundle_verify_class_types(bundle_id)
+            self._install_furgen_video_tools_node(required_class_types=install_required_class_types)
             return True
         if spec_type == "git_custom_nodes":
             repositories = spec.get("repositories")
@@ -6260,14 +6271,79 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 deduped.append(candidate)
         return deduped
 
-    def _install_furgen_video_tools_node(self) -> None:
+    def _normalize_required_class_types(self, required_class_types: Optional[Iterable[str]]) -> List[str]:
+        out: List[str] = []
+        for class_type in required_class_types or []:
+            if isinstance(class_type, str) and class_type and class_type not in out:
+                out.append(class_type)
+        return out
+
+    def _furgen_video_tools_source_is_usable(
+        self,
+        src_dir: Path,
+        required_class_types: Optional[Iterable[str]] = None,
+        log_skip: bool = False,
+    ) -> bool:
+        init_path = src_dir / "__init__.py"
+        impl_path = src_dir / "furgen_video_tools.py"
+        if not init_path.exists() or not impl_path.exists():
+            return False
+        required = self._normalize_required_class_types(required_class_types)
+        if not required:
+            return True
+        try:
+            impl = impl_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            logging.warning("Unable to inspect FurgenVideoTools source %s: %s", impl_path, exc)
+            return False
+        missing = [class_type for class_type in required if class_type not in impl]
+        if missing:
+            if log_skip:
+                preview = ", ".join(missing[:12])
+                suffix = "" if len(missing) <= 12 else f", +{len(missing) - 12} more"
+                logging.warning(
+                    "Skipping FurgenVideoTools source missing required class types (%s%s): %s",
+                    preview,
+                    suffix,
+                    src_dir,
+                )
+            return False
+        return True
+
+    def _furgen_video_tools_required_class_types_for_install(
+        self,
+        bundle_ids: Iterable[str],
+        verify_class_types: Iterable[str],
+    ) -> List[str]:
+        known: List[str] = []
+        for bundle_id in bundle_ids:
+            if bundle_id not in ("video_gen_v2_furgen_color_nodes", "video_gen_v2_furgen_color_nodes_v2"):
+                continue
+            for class_type in self._video_gen_v2_bundle_verify_class_types(bundle_id):
+                if class_type not in known:
+                    known.append(class_type)
+        if not known:
+            return []
+
+        verify_set = set(self._normalize_required_class_types(verify_class_types))
+        if verify_set:
+            filtered = [class_type for class_type in known if class_type in verify_set]
+            if filtered:
+                return filtered
+        return known
+
+    def _install_furgen_video_tools_node(
+        self,
+        required_class_types: Optional[Iterable[str]] = None,
+    ) -> None:
+        required = self._normalize_required_class_types(required_class_types)
         custom_nodes_dir = self.comfyui_dir / "custom_nodes"
         dest_dir = custom_nodes_dir / "FurgenVideoTools"
         custom_nodes_dir.mkdir(parents=True, exist_ok=True)
 
         for src_dir in self._furgen_video_tools_source_candidates():
             try:
-                if (src_dir / "__init__.py").exists() and (src_dir / "furgen_video_tools.py").exists():
+                if self._furgen_video_tools_source_is_usable(src_dir, required_class_types=required, log_skip=True):
                     temp_dir = dest_dir.with_name(f".{dest_dir.name}.tmp-{uuid.uuid4().hex}")
                     if temp_dir.exists():
                         shutil.rmtree(temp_dir)
@@ -6292,6 +6368,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 with urllib.request.urlopen(request, timeout=60.0) as resp:
                     data = resp.read()
                 (temp_dir / filename).write_bytes(data)
+            if required and not self._furgen_video_tools_source_is_usable(temp_dir, required_class_types=required):
+                raise RuntimeError(
+                    "Downloaded FurgenVideoTools source is missing required class types "
+                    f"for install: {', '.join(required)} ({remote_base})"
+                )
             if dest_dir.exists():
                 shutil.rmtree(dest_dir)
             os.replace(str(temp_dir), str(dest_dir))
@@ -6309,7 +6390,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         )
         self._install_furgen_video_compat_nodes()
 
-    def _install_video_gen_v2_node_bundle(self, bundle_id: str) -> None:
+    def _install_video_gen_v2_node_bundle(
+        self,
+        bundle_id: str,
+        required_class_types: Optional[Iterable[str]] = None,
+    ) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
             self._install_git_custom_node(
                 "https://github.com/Lightricks/ComfyUI-LTXVideo",
@@ -6333,10 +6418,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             self._install_furgen_video_compat_nodes()
             return
         if bundle_id == "video_gen_v2_furgen_color_nodes":
-            self._install_furgen_video_tools_node()
+            self._install_furgen_video_tools_node(
+                required_class_types=required_class_types or self._video_gen_v2_bundle_verify_class_types(bundle_id)
+            )
             return
         if bundle_id == "video_gen_v2_furgen_color_nodes_v2":
-            self._install_furgen_video_tools_node()
+            self._install_furgen_video_tools_node(
+                required_class_types=required_class_types or self._video_gen_v2_bundle_verify_class_types(bundle_id)
+            )
             return
         if bundle_id == "video_gen_v2_image_filters_nodes":
             self._install_git_custom_node(
@@ -6435,6 +6524,130 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         logging.warning("Supervisor ComfyUI restart failed: %s", " | ".join(errors)[-2000:])
         return False
 
+    def _comfy_launch_script_candidates(self) -> List[Path]:
+        candidates: List[Path] = []
+        explicit = _env_str("DM_COMFYUI_LAUNCH_SCRIPT")
+        if explicit:
+            candidates.append(Path(explicit))
+        candidates.extend([
+            Path("/opt/supervisor-scripts/comfyui.sh"),
+            self.workspace / "comfyui.sh",
+            self.workspace / "start_comfyui.sh",
+        ])
+        deduped: List[Path] = []
+        seen: Set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(candidate)
+        return deduped
+
+    def _find_local_comfy_processes(self) -> List[int]:
+        proc_dir = Path("/proc")
+        if not proc_dir.exists():
+            return []
+        pids: List[int] = []
+        comfy_dir = self.comfyui_dir.resolve()
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == os.getpid():
+                continue
+            try:
+                raw = (entry / "cmdline").read_bytes()
+                cmdline = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            lower_cmdline = cmdline.lower()
+            if "main.py" not in lower_cmdline and "comfyui" not in lower_cmdline:
+                continue
+            cwd_matches = False
+            try:
+                cwd = Path(os.readlink(entry / "cwd")).resolve()
+                cwd_matches = cwd == comfy_dir or comfy_dir in cwd.parents
+            except Exception:
+                cwd_matches = False
+            cmd_matches = str(comfy_dir) in cmdline or "comfyui" in lower_cmdline
+            if cwd_matches or cmd_matches:
+                pids.append(pid)
+        return sorted(set(pids))
+
+    def _wait_for_pids_to_exit(self, pids: List[int], timeout_seconds: float) -> bool:
+        deadline = time.time() + max(0.0, timeout_seconds)
+        remaining = set(int(pid) for pid in pids if isinstance(pid, int) and pid > 0)
+        while remaining and time.time() < deadline:
+            for pid in list(remaining):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    remaining.discard(pid)
+                except PermissionError:
+                    pass
+            if remaining:
+                time.sleep(0.5)
+        return not remaining
+
+    def _restart_local_comfy_with_launch_script(self) -> bool:
+        launch_script: Optional[Path] = None
+        for candidate in self._comfy_launch_script_candidates():
+            if candidate.exists() and candidate.is_file():
+                launch_script = candidate
+                break
+        if launch_script is None:
+            return False
+
+        pids = self._find_local_comfy_processes()
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except Exception as exc:
+                logging.warning("Failed to terminate ComfyUI pid %s before launch-script restart: %s", pid, exc)
+        if pids and not self._wait_for_pids_to_exit(pids, timeout_seconds=20.0):
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    continue
+                except Exception as exc:
+                    logging.warning("Failed to kill ComfyUI pid %s before launch-script restart: %s", pid, exc)
+            self._wait_for_pids_to_exit(pids, timeout_seconds=5.0)
+
+        env = os.environ.copy()
+        env.setdefault("WORKSPACE", str(self.workspace))
+        env.setdefault("DM_COMFYUI_DIR", str(self.comfyui_dir))
+        log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
+        opened_log_fh: Any = None
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            opened_log_fh = open(log_path, "ab")
+            log_fh = opened_log_fh
+        except Exception:
+            log_fh = subprocess.DEVNULL  # type: ignore[assignment]
+        try:
+            subprocess.Popen(
+                ["bash", str(launch_script)],
+                cwd=str(self.workspace),
+                env=env,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            logging.info("Restarted ComfyUI via launch script: %s", launch_script)
+            return True
+        except Exception as exc:
+            logging.warning("ComfyUI launch-script restart failed (%s): %s", launch_script, exc)
+            return False
+        finally:
+            if opened_log_fh is not None:
+                try:
+                    opened_log_fh.close()
+                except Exception:
+                    pass
+
     def _restart_local_comfy(self, prefer_process_restart: bool = False) -> None:
         if prefer_process_restart and self._restart_local_comfy_with_supervisor():
             return
@@ -6456,6 +6669,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                     return
 
         if not prefer_process_restart and self._restart_local_comfy_with_supervisor():
+            return
+        if self._restart_local_comfy_with_launch_script():
             return
 
         raise RuntimeError("All local ComfyUI restart endpoints failed or are unavailable.")
@@ -8277,6 +8492,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
         if not bundle_ids:
             self._agent_ack(item_id, lease_id, "command_ignored_stale")
             return
+        furgen_video_tools_required_class_types = self._furgen_video_tools_required_class_types_for_install(
+            bundle_ids,
+            verify_class_types,
+        )
 
         if self._local_comfy_has_all_class_types(verify_class_types):
             compat_changed = self._ensure_node_bundle_runtime_compatibility(bundle_ids)
@@ -8304,7 +8523,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
                 for bundle_id in bundle_ids:
                     spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
                     if isinstance(spec, dict) and spec:
-                        if not self._install_node_bundle_from_spec(bundle_id, spec):
+                        if not self._install_node_bundle_from_spec(
+                            bundle_id,
+                            spec,
+                            required_class_types=furgen_video_tools_required_class_types,
+                        ):
                             raise RuntimeError(f"Unsupported Firestore install spec for {server_type} bundle {bundle_id}")
                     else:
                         script_bundle_ids.append(bundle_id)
@@ -8322,8 +8545,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
             elif (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad"):
                 for bundle_id in bundle_ids:
                     spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
-                    if not self._install_node_bundle_from_spec(bundle_id, spec if isinstance(spec, dict) else {}):
-                        self._install_video_gen_v2_node_bundle(bundle_id)
+                    if not self._install_node_bundle_from_spec(
+                        bundle_id,
+                        spec if isinstance(spec, dict) else {},
+                        required_class_types=furgen_video_tools_required_class_types,
+                    ):
+                        self._install_video_gen_v2_node_bundle(
+                            bundle_id,
+                            required_class_types=furgen_video_tools_required_class_types,
+                        )
             else:
                 raise RuntimeError(f"install_node_bundles is not supported on server_type={self.server_type}")
             self._ensure_node_bundle_runtime_compatibility(bundle_ids)
