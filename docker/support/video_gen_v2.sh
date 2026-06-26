@@ -1394,6 +1394,52 @@ function dependency_manager_start_agent() {
     nohup "$watchdog_path" >> "$watchdog_log_path" 2>&1 &
 }
 
+function provisioning_start_comfyui_direct() {
+    local comfy_dir direct_script log_path
+    comfy_dir="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
+    direct_script="${WORKSPACE}/start_comfy_direct.sh"
+    log_path="${WORKSPACE}/comfyui_direct_start.log"
+
+    if [[ ! -f "${comfy_dir}/main.py" ]]; then
+        echo "WARN: Direct ComfyUI start skipped; main.py not found in ${comfy_dir}"
+        return 1
+    fi
+
+    cat > "${direct_script}" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+export WORKSPACE="${WORKSPACE:-/workspace}"
+export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
+export COMFYUI_ARGS="--disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header"
+export COMFYUI_ARGS
+cd "${DM_COMFYUI_DIR}"
+if [[ -f /venv/main/bin/activate ]]; then
+    source /venv/main/bin/activate
+fi
+exec env LD_PRELOAD="${LD_PRELOAD:-libtcmalloc_minimal.so.4}" python main.py ${COMFYUI_ARGS}
+EOF
+    chmod +x "${direct_script}" || true
+    echo "Starting ComfyUI directly: ${direct_script}"
+    nohup "${direct_script}" >> "${log_path}" 2>&1 &
+}
+
+function provisioning_wait_for_local_comfyui() {
+    local attempts readiness_file ready_port
+    attempts="${1:-90}"
+    ready_port="${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}"
+    readiness_file="${WORKSPACE}/ComfyUI/input/${DM_LOCAL_READINESS_FILE:-provisioned_furry_all.txt}"
+
+    for _ in $(seq 1 "${attempts}"); do
+        if curl -fsS --max-time 2 "${ready_port%/}/queue" >/dev/null 2>&1; then
+            mkdir -p "$(dirname "${readiness_file}")" || true
+            echo "Provisioning completed and ComfyUI ready at $(date)" > "${readiness_file}" || true
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 function provisioning_start_comfyui_after_bootstrap() {
     local launch_script service_name
     launch_script="/opt/supervisor-scripts/comfyui.sh"
@@ -1418,11 +1464,20 @@ function provisioning_start_comfyui_after_bootstrap() {
 
     if [[ -x "$launch_script" || -f "$launch_script" ]]; then
         echo "Starting ComfyUI launch script directly: $launch_script"
-        nohup bash "$launch_script" >> "${WORKSPACE}/comfyui_manual_start.log" 2>&1 &
+        SERVERLESS=true nohup bash "$launch_script" >> "${WORKSPACE}/comfyui_manual_start.log" 2>&1 &
+        if provisioning_wait_for_local_comfyui 45; then
+            echo "ComfyUI became locally reachable after launch script start."
+            return 0
+        fi
+        echo "WARN: ComfyUI launch script did not become reachable; trying direct start."
+        provisioning_start_comfyui_direct || true
+        provisioning_wait_for_local_comfyui 90 || true
         return 0
     fi
 
-    echo "WARN: Unable to start ComfyUI after provisioning; launch script not found: $launch_script"
+    echo "WARN: ComfyUI launch script not found; trying direct start: $launch_script"
+    provisioning_start_comfyui_direct || true
+    provisioning_wait_for_local_comfyui 90 || true
     return 0
 }
 

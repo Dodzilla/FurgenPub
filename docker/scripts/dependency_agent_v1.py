@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.51"
+AGENT_VERSION = "dm-agent-py/0.10.52"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "4c8e54430de92e3d924fc95e26409d12a91d8524"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6654,6 +6654,13 @@ class DependencyAgent:
         env = os.environ.copy()
         env.setdefault("WORKSPACE", str(self.workspace))
         env.setdefault("DM_COMFYUI_DIR", str(self.comfyui_dir))
+        # The Vast Comfy image portal wrapper can block forever waiting for
+        # /etc/portal.yaml when launched outside its original supervisor path.
+        env["SERVERLESS"] = "true"
+        if ":8188" in self.agent_local_comfy_base_url or "--port 18188" in env.get("COMFYUI_ARGS", ""):
+            env["COMFYUI_ARGS"] = "--disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header"
+        else:
+            env.setdefault("COMFYUI_ARGS", "--disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header")
         log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
         opened_log_fh: Any = None
         try:
