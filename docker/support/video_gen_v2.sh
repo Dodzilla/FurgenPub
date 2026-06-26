@@ -85,6 +85,92 @@ NODES=(
 #
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
 
+function provisioning_restore_comfyui_checkout() {
+    local src
+    if [[ -f "${COMFYUI_DIR}/main.py" ]]; then
+        return 0
+    fi
+
+    for src in \
+        "/opt/workspace-internal/ComfyUI" \
+        "/workspace-internal/ComfyUI" \
+        "/opt/ComfyUI" \
+        "/ComfyUI"
+    do
+        if [[ -f "${src}/main.py" ]]; then
+            printf "Restoring bundled ComfyUI checkout from %s to %s\n" "${src}" "${COMFYUI_DIR}"
+            mkdir -p "${COMFYUI_DIR}" || true
+            if command -v rsync >/dev/null 2>&1; then
+                rsync -a --ignore-existing "${src}/" "${COMFYUI_DIR}/" || true
+            else
+                cp -an "${src}/." "${COMFYUI_DIR}/" || true
+            fi
+            break
+        fi
+    done
+
+    if [[ ! -f "${COMFYUI_DIR}/main.py" ]]; then
+        printf "WARN: ComfyUI main.py is still missing at %s; supervisor start may fail until image checkout is restored.\n" "${COMFYUI_DIR}"
+    fi
+}
+
+function provisioning_stop_wrong_port_comfyui() {
+    /venv/main/bin/python - <<'PY' || true
+import os
+import signal
+import time
+
+target_port = "8188"
+own_pids = {os.getpid(), os.getppid()}
+killed = []
+
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    pid = int(name)
+    if pid in own_pids:
+        continue
+    try:
+        raw = open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        continue
+    parts = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+    if not parts or not any(part.endswith("main.py") or part == "main.py" for part in parts):
+        continue
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = ""
+    if not ("ComfyUI" in cwd or any("ComfyUI" in part for part in parts)):
+        continue
+
+    port = ""
+    for idx, part in enumerate(parts):
+        if part == "--port" and idx + 1 < len(parts):
+            port = parts[idx + 1]
+        elif part.startswith("--port="):
+            port = part.split("=", 1)[1]
+    if port in ("", target_port):
+        continue
+
+    print(f"Terminating ComfyUI running on stale port {port}: pid={pid}", flush=True)
+    try:
+        os.kill(pid, signal.SIGTERM)
+        killed.append(pid)
+    except ProcessLookupError:
+        pass
+
+if killed:
+    time.sleep(2)
+    for pid in killed:
+        if os.path.exists(f"/proc/{pid}"):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+PY
+}
+
 # Modular pinning for custom nodes
 # Map: folder name -> commit/tag. Extend/override via COMFY_NODE_PINS env var.
 # Example: COMFY_NODE_PINS="ComfyUI-Impact-Pack=61bd8397a18e7e7668e6a24e95168967768c2bed,ComfyUI-Manager=v2.22"
@@ -184,7 +270,9 @@ function provisioning_start() {
     local soft_failures=0
 
     provisioning_print_header
+    provisioning_restore_comfyui_checkout || true
     provisioning_configure_comfyui_launch_args || true
+    provisioning_stop_wrong_port_comfyui || true
     provisioning_update_comfyui
     provisioning_get_apt_packages
     load_node_pins_from_env
@@ -908,11 +996,18 @@ function dependency_manager_install_agent_artifact() {
 }
 
 function dependency_manager_persist_agent_env() {
-    local env_path key value
+    local env_path key value xtrace_was_on
     env_path="${DM_AGENT_ENV_PATH:-${WORKSPACE}/dependency_agent.env}"
 
     mkdir -p "$(dirname "$env_path")" || true
+
+    xtrace_was_on=0
+    case "$-" in
+        *x*) xtrace_was_on=1; set +x ;;
+    esac
+
     : > "$env_path" || {
+        [[ "$xtrace_was_on" -eq 1 ]] && set -x
         echo "WARN: Dependency manager: failed to write env file at $env_path"
         return 0
     }
@@ -930,6 +1025,7 @@ function dependency_manager_persist_agent_env() {
         DM_AGENT_PATH \
         DM_AGENT_LOG_PATH \
         DM_AGENT_PID_PATH \
+        DM_AGENT_ENV_PATH \
         DM_AGENT_URL \
         AGENT_URL \
         DEPENDENCY_AGENT_TARGET_VERSION \
@@ -945,6 +1041,7 @@ function dependency_manager_persist_agent_env() {
         HF_TOKEN \
         CIVITAI_TOKEN \
         COMFYUI_ARGS \
+        DM_LOCAL_COMFY_BASE_URL \
         COMFY_NODE_PINS \
         COMFYUI_PIN_COMMIT
     do
@@ -956,6 +1053,7 @@ function dependency_manager_persist_agent_env() {
 
     printf 'export DM_AGENT_ENV_PATH=%q\n' "$env_path" >> "$env_path" || true
     chmod 600 "$env_path" || true
+    [[ "$xtrace_was_on" -eq 1 ]] && set -x
 }
 
 function dependency_manager_render_watchdog() {
@@ -968,6 +1066,14 @@ function dependency_manager_render_watchdog() {
 #!/bin/bash
 
 set -u
+
+WORKSPACE="${WORKSPACE:-/workspace}"
+dm_agent_env_path="${DM_AGENT_ENV_PATH:-${WORKSPACE}/dependency_agent.env}"
+if [[ -r "$dm_agent_env_path" ]]; then
+    set -a
+    source "$dm_agent_env_path"
+    set +a
+fi
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
@@ -1175,7 +1281,7 @@ dependency_manager_start_agent_once() {
     dependency_manager_install_agent_if_missing || return 0
 
     echo "Dependency manager: watchdog starting agent; log=$log_path"
-    nohup bash -lc "if [[ -f /venv/main/bin/activate ]]; then source /venv/main/bin/activate; fi; python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
+    nohup bash -lc "dm_agent_env_path=\"\${DM_AGENT_ENV_PATH:-${WORKSPACE}/dependency_agent.env}\"; if [[ -r \"\$dm_agent_env_path\" ]]; then set -a; source \"\$dm_agent_env_path\"; set +a; fi; if [[ -f /venv/main/bin/activate ]]; then source /venv/main/bin/activate; fi; exec python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
     echo $! > "$pid_path"
 }
 
