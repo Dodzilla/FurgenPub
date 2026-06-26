@@ -411,11 +411,26 @@ block = (
     "                pass\n"
     "PY\n"
     "fi\n"
-    "unset furgen_comfyui_port\n"
+    "furgen_readiness_file=\"${WORKSPACE:-/workspace}/ComfyUI/input/provisioned_furry_all.txt\"\n"
+    "rm -f \"${furgen_readiness_file}\" || true\n"
+    "(\n"
+    "    furgen_ready_port=\"${furgen_comfyui_port}\"\n"
+    "    furgen_ready_file=\"${furgen_readiness_file}\"\n"
+    "    for furgen_ready_attempt in $(seq 1 300); do\n"
+    "        if curl -fsS --max-time 2 \"http://127.0.0.1:${furgen_ready_port}/queue\" >/dev/null 2>&1; then\n"
+    "            mkdir -p \"$(dirname \"${furgen_ready_file}\")\"\n"
+    "            echo \"Provisioning completed and ComfyUI ready at $(date)\" > \"${furgen_ready_file}\"\n"
+    "            exit 0\n"
+    "        fi\n"
+    "        sleep 2\n"
+    "    done\n"
+    "    echo \"WARN: ComfyUI did not become locally reachable on port ${furgen_ready_port}; readiness marker not written.\" >&2\n"
+    ") &\n"
     "# Bypass Vast's unbuffer-based pty wrapper for Comfy. The wrapper can exit\n"
     "# cleanly while long GPU jobs are still running, causing supervisor to\n"
     "# restart Comfy and strand queued_on_comfy jobs.\n"
     "export DISABLE_PTY=\"${DISABLE_PTY:-true}\"\n"
+    "unset furgen_comfyui_port furgen_readiness_file\n"
     "# /FURGEN ComfyUI launch args normalization\n"
 )
 
@@ -734,12 +749,13 @@ function provisioning_print_header() {
 }
 
 function provisioning_print_end() {
-    # Create provisioning completion marker
-    echo "Creating provisioning completion marker..."
+    # The ComfyUI launch script writes this marker only after local Comfy
+    # responds. Remove stale markers here so a failed launch cannot look ready.
+    echo "Clearing stale provisioning completion marker..."
     mkdir -p "${WORKSPACE}/ComfyUI/input"
-    echo "Provisioning completed at $(date)" > "${WORKSPACE}/ComfyUI/input/provisioned_furry_all.txt"
+    rm -f "${WORKSPACE}/ComfyUI/input/provisioned_furry_all.txt"
 
-    printf "\nProvisioning complete:  Application will start now\n\n"
+    printf "\nProvisioning complete: Application will start now; readiness marker will be written after ComfyUI responds locally.\n\n"
 }
 
 function provisioning_has_valid_hf_token() {
