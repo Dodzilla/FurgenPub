@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.50"
+AGENT_VERSION = "dm-agent-py/0.10.51"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "4c8e54430de92e3d924fc95e26409d12a91d8524"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6687,6 +6687,7 @@ class DependencyAgent:
         if prefer_process_restart and self._restart_local_comfy_with_supervisor():
             return
 
+        comfy_was_reachable = self._local_comfy_reachable(timeout_seconds=2.0)
         restart_endpoints = [
             "/manager/reboot",
             "/api/manager/reboot",
@@ -6700,7 +6701,10 @@ class DependencyAgent:
                 return
             except Exception as exc:
                 msg = str(exc).lower()
-                if "connection reset" in msg or "ecconnreset" in msg or "timeout" in msg:
+                if (
+                    comfy_was_reachable
+                    and ("connection reset" in msg or "ecconnreset" in msg or "timeout" in msg)
+                ):
                     return
 
         if not prefer_process_restart and self._restart_local_comfy_with_supervisor():

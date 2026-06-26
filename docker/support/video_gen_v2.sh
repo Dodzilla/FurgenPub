@@ -1394,6 +1394,38 @@ function dependency_manager_start_agent() {
     nohup "$watchdog_path" >> "$watchdog_log_path" 2>&1 &
 }
 
+function provisioning_start_comfyui_after_bootstrap() {
+    local launch_script service_name
+    launch_script="/opt/supervisor-scripts/comfyui.sh"
+
+    if curl -fsS --max-time 2 "http://127.0.0.1:8188/queue" >/dev/null 2>&1; then
+        echo "ComfyUI is already locally reachable after provisioning."
+        return 0
+    fi
+
+    if command -v supervisorctl >/dev/null 2>&1; then
+        for service_name in comfyui comfy comfyui-server; do
+            if supervisorctl restart "$service_name"; then
+                echo "Requested ComfyUI supervisor restart for service: $service_name"
+                return 0
+            fi
+            if supervisorctl start "$service_name"; then
+                echo "Requested ComfyUI supervisor start for service: $service_name"
+                return 0
+            fi
+        done
+    fi
+
+    if [[ -x "$launch_script" || -f "$launch_script" ]]; then
+        echo "Starting ComfyUI launch script directly: $launch_script"
+        nohup bash "$launch_script" >> "${WORKSPACE}/comfyui_manual_start.log" 2>&1 &
+        return 0
+    fi
+
+    echo "WARN: Unable to start ComfyUI after provisioning; launch script not found: $launch_script"
+    return 0
+}
+
 case "${1:-}" in
     install-bundles)
         shift
@@ -1429,3 +1461,4 @@ fi
 # Re-apply the watchdog bootstrap after provisioning in case image startup scripts
 # were regenerated while ComfyUI or custom nodes were updated.
 dependency_manager_start_agent
+provisioning_start_comfyui_after_bootstrap
