@@ -126,7 +126,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.54"
+AGENT_VERSION = "dm-agent-py/0.10.55"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "6b355478d75e6035e4b877624bf6534b29d7e6fe"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -10325,6 +10325,8 @@ class DependencyAgent:
                     active.stage = "uploading"
                     active.history_entry = history_entry
                     active.prompt_id = prompt_id
+            lease.history_entry = history_entry
+            lease.prompt_id = prompt_id
             self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
             self._emit_agent_event_durable(lease, "output_commit_started", {"promptId": prompt_id})
 
