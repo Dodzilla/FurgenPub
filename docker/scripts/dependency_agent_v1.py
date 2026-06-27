@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.66"
+AGENT_VERSION = "dm-agent-py/0.10.67"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "7e849abedcba7c2f8dd26dc293f91af9e7451caf"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6621,7 +6621,10 @@ class DependencyAgent:
                 "ImpactExecutionOrderController",
                 "LatentMotionSharpener",
                 "LatentTemporalInpainter",
+                "LTXVAddLatentGuide",
                 "LTXVImgToVideoConditionOnly",
+                "LTXVImgToVideoInplace",
+                "LTXVPreprocess",
                 "LTXAddVideoICLoRAGuide",
                 "RIFEInterpolation",
             ]
