@@ -5,6 +5,7 @@ set -x
 export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-$WORKSPACE/ComfyUI}"
 export SERVER_TYPE="${SERVER_TYPE:-video_gen_v2}"
+export FURGEN_COMFYUI_START_ALLOWED_FILE="${FURGEN_COMFYUI_START_ALLOWED_FILE:-${WORKSPACE}/.furgen_comfyui_start_allowed}"
 FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support}"
 VIDEO_GEN_V2_IMAGE_FILTERS_REPO="${VIDEO_GEN_V2_IMAGE_FILTERS_REPO:-https://github.com/spacepxl/ComfyUI-Image-Filters}"
 VIDEO_GEN_V2_IMAGE_FILTERS_PIN="${VIDEO_GEN_V2_IMAGE_FILTERS_PIN:-bbb3fb0045461adf3602faeedaf40af57090d4e2}"
@@ -270,6 +271,7 @@ function provisioning_start() {
     local soft_failures=0
 
     provisioning_print_header
+    provisioning_hold_comfyui_start_gate || true
     provisioning_restore_comfyui_checkout || true
     provisioning_configure_comfyui_launch_args || true
     provisioning_stop_wrong_port_comfyui || true
@@ -280,6 +282,7 @@ function provisioning_start() {
         printf "WARN: Provisioning step 'provisioning_get_nodes' failed with exit code %s; continuing.\n" "$?"
         soft_failures=1
     }
+    provisioning_fix_python_compatibility || return 1
     provisioning_install_furgen_video_tools_node || return 1
     # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
     provisioning_ensure_node_requirements
@@ -413,6 +416,26 @@ block = (
     "fi\n"
     "furgen_readiness_file=\"${WORKSPACE:-/workspace}/ComfyUI/input/provisioned_furry_all.txt\"\n"
     "rm -f \"${furgen_readiness_file}\" || true\n"
+    "furgen_start_gate_enabled=\"$(printf '%s' \"${FURGEN_COMFYUI_BOOTSTRAP_GATE_ENABLED:-true}\" | tr '[:upper:]' '[:lower:]')\"\n"
+    "if [[ \"${furgen_start_gate_enabled}\" != \"0\" && \"${furgen_start_gate_enabled}\" != \"false\" ]]; then\n"
+    "    furgen_start_gate_file=\"${FURGEN_COMFYUI_START_ALLOWED_FILE:-${WORKSPACE:-/workspace}/.furgen_comfyui_start_allowed}\"\n"
+    "    furgen_start_gate_timeout=\"${FURGEN_COMFYUI_BOOTSTRAP_GATE_TIMEOUT_SEC:-3600}\"\n"
+    "    furgen_start_gate_waited=0\n"
+    "    if [[ ! -f \"${furgen_start_gate_file}\" ]]; then\n"
+    "        echo \"Waiting for Furgen video_gen_v2 bootstrap gate: ${furgen_start_gate_file}\"\n"
+    "    fi\n"
+    "    while [[ ! -f \"${furgen_start_gate_file}\" ]]; do\n"
+    "        if [[ \"${furgen_start_gate_timeout}\" =~ ^[0-9]+$ && \"${furgen_start_gate_timeout}\" -gt 0 && \"${furgen_start_gate_waited}\" -ge \"${furgen_start_gate_timeout}\" ]]; then\n"
+    "            echo \"ERROR: Timed out waiting for Furgen video_gen_v2 bootstrap gate: ${furgen_start_gate_file}\" >&2\n"
+    "            exit 74\n"
+    "        fi\n"
+    "        sleep 2\n"
+    "        furgen_start_gate_waited=$((furgen_start_gate_waited + 2))\n"
+    "    done\n"
+    "    if [[ \"${furgen_start_gate_waited}\" -gt 0 ]]; then\n"
+    "        echo \"Furgen video_gen_v2 bootstrap gate released after ${furgen_start_gate_waited}s.\"\n"
+    "    fi\n"
+    "fi\n"
     "(\n"
     "    furgen_ready_port=\"${furgen_comfyui_port}\"\n"
     "    furgen_ready_file=\"${furgen_readiness_file}\"\n"
@@ -430,7 +453,7 @@ block = (
     "# cleanly while long GPU jobs are still running, causing supervisor to\n"
     "# restart Comfy and strand queued_on_comfy jobs.\n"
     "export DISABLE_PTY=\"${DISABLE_PTY:-true}\"\n"
-    "unset furgen_comfyui_port furgen_readiness_file\n"
+    "unset furgen_comfyui_port furgen_readiness_file furgen_start_gate_enabled furgen_start_gate_file furgen_start_gate_timeout furgen_start_gate_waited\n"
     "# /FURGEN ComfyUI launch args normalization\n"
 )
 
@@ -705,12 +728,33 @@ function provisioning_print_header() {
     printf "\n##############################################\n#                                            #\n#          Provisioning container            #\n#                                            #\n#         This will take some time           #\n#                                            #\n# Your container will be ready on completion #\n#                                            #\n##############################################\n\n"
 }
 
+function provisioning_bootstrap_gate_enabled() {
+    local enabled
+    enabled="$(printf '%s' "${FURGEN_COMFYUI_BOOTSTRAP_GATE_ENABLED:-true}" | tr '[:upper:]' '[:lower:]')"
+    [[ "$enabled" != "0" && "$enabled" != "false" ]]
+}
+
+function provisioning_hold_comfyui_start_gate() {
+    provisioning_bootstrap_gate_enabled || return 0
+    mkdir -p "$(dirname "${FURGEN_COMFYUI_START_ALLOWED_FILE}")" "${WORKSPACE}/ComfyUI/input" || true
+    rm -f "${FURGEN_COMFYUI_START_ALLOWED_FILE}" "${WORKSPACE}/ComfyUI/input/provisioned_furry_all.txt" || true
+    printf "Holding ComfyUI start gate until video_gen_v2 bootstrap finishes: %s\n" "${FURGEN_COMFYUI_START_ALLOWED_FILE}"
+}
+
+function provisioning_release_comfyui_start_gate() {
+    provisioning_bootstrap_gate_enabled || return 0
+    mkdir -p "$(dirname "${FURGEN_COMFYUI_START_ALLOWED_FILE}")" || true
+    touch "${FURGEN_COMFYUI_START_ALLOWED_FILE}" || return 1
+    printf "Released ComfyUI start gate: %s\n" "${FURGEN_COMFYUI_START_ALLOWED_FILE}"
+}
+
 function provisioning_print_end() {
     # The ComfyUI launch script writes this marker only after local Comfy
     # responds. Remove stale markers here so a failed launch cannot look ready.
     echo "Clearing stale provisioning completion marker..."
     mkdir -p "${WORKSPACE}/ComfyUI/input"
     rm -f "${WORKSPACE}/ComfyUI/input/provisioned_furry_all.txt"
+    provisioning_release_comfyui_start_gate || return 1
 
     printf "\nProvisioning complete: Application will start now; readiness marker will be written after ComfyUI responds locally.\n\n"
 }
@@ -1021,6 +1065,9 @@ function dependency_manager_persist_agent_env() {
         CIVITAI_TOKEN \
         DM_LOCAL_COMFY_BASE_URL \
         DM_LOCAL_READINESS_FILE \
+        FURGEN_COMFYUI_START_ALLOWED_FILE \
+        FURGEN_COMFYUI_BOOTSTRAP_GATE_ENABLED \
+        FURGEN_COMFYUI_BOOTSTRAP_GATE_TIMEOUT_SEC \
         COMFY_NODE_PINS \
         COMFYUI_PIN_COMMIT
     do
@@ -1588,6 +1635,7 @@ function provisioning_wait_for_local_comfyui() {
 function provisioning_start_comfyui_after_bootstrap() {
     local launch_script service_name
     launch_script="/opt/supervisor-scripts/comfyui.sh"
+    provisioning_release_comfyui_start_gate || true
 
     if curl -fsS --max-time 2 "http://127.0.0.1:8188/queue" >/dev/null 2>&1; then
         echo "ComfyUI is already locally reachable after provisioning."
@@ -1653,12 +1701,20 @@ if ! command -v aria2c >/dev/null 2>&1; then
         echo "WARN: aria2 install failed; dependency agent will fall back to wget."
 fi
 
-# Allow user to disable provisioning if they started with a script they didn't want
+provisioning_status=0
+
+# Allow user to disable provisioning if they started with a script they didn't want.
 if [[ ! -f /.noprovisioning ]]; then
-    provisioning_start
+    provisioning_start || provisioning_status=$?
+else
+    provisioning_release_comfyui_start_gate || true
 fi
 
 # Re-apply the watchdog bootstrap after provisioning in case image startup scripts
 # were regenerated while ComfyUI or custom nodes were updated.
 dependency_manager_start_agent
+if [[ "$provisioning_status" -ne 0 ]]; then
+    echo "ERROR: video_gen_v2 provisioning failed with exit code ${provisioning_status}; leaving ComfyUI start gate closed."
+    exit "$provisioning_status"
+fi
 provisioning_start_comfyui_after_bootstrap
