@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.67"
+AGENT_VERSION = "dm-agent-py/0.10.68"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "7e849abedcba7c2f8dd26dc293f91af9e7451caf"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6481,7 +6481,7 @@ class DependencyAgent:
     ) -> List[str]:
         known: List[str] = []
         for bundle_id in bundle_ids:
-            if bundle_id not in ("video_gen_v2_furgen_color_nodes", "video_gen_v2_furgen_color_nodes_v2"):
+            if bundle_id not in ("video_gen_v2_furgen_color_nodes", "video_gen_v2_furgen_color_nodes_v2", "video_gen_v2_fcs_concat_videos"):
                 continue
             for class_type in self._video_gen_v2_bundle_verify_class_types(bundle_id):
                 if class_type not in known:
@@ -6586,7 +6586,7 @@ class DependencyAgent:
                 required_class_types=required_class_types or self._video_gen_v2_bundle_verify_class_types(bundle_id)
             )
             return
-        if bundle_id == "video_gen_v2_furgen_color_nodes_v2":
+        if bundle_id in ("video_gen_v2_furgen_color_nodes_v2", "video_gen_v2_fcs_concat_videos"):
             self._install_furgen_video_tools_node(
                 required_class_types=required_class_types or self._video_gen_v2_bundle_verify_class_types(bundle_id)
             )
@@ -6643,6 +6643,10 @@ class DependencyAgent:
                 "FurgenColorTransferMatch",
                 "FurgenTemporalToneSmooth",
                 "FurgenTemporalUnsharpMask",
+            ]
+        if bundle_id == "video_gen_v2_fcs_concat_videos":
+            return [
+                "FCSConcatVideos",
             ]
         if bundle_id == "video_gen_v2_image_filters_nodes":
             return [
