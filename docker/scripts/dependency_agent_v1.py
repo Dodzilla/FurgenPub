@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.69"
+AGENT_VERSION = "dm-agent-py/0.10.70"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "945a50cfa58088ff1de036dfc3896e3f4edd6ab8"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3767,6 +3767,17 @@ class DependencyAgent:
             logging.warning("Failed to repair video_gen_v2 ComfyUI launch script: %s", exc)
             return False
 
+    def _video_gen_v2_bootstrap_gate_active(self) -> bool:
+        if (self.server_type or "").strip() != "video_gen_v2":
+            return False
+        if not _env_bool("FURGEN_COMFYUI_BOOTSTRAP_GATE_ENABLED", True):
+            return False
+        allowed_path = Path(
+            _env_str("FURGEN_COMFYUI_START_ALLOWED_FILE")
+            or str(self.workspace / ".furgen_comfyui_start_allowed")
+        )
+        return not allowed_path.exists()
+
     def _repair_video_gen_v2_comfy_launch_contract(self, restart_if_unreachable: bool = False) -> None:
         if (self.server_type or "").strip() != "video_gen_v2":
             return
@@ -3779,6 +3790,12 @@ class DependencyAgent:
                 launch_changed,
             )
         if not restart_if_unreachable or self.mining_only:
+            return
+        if self._video_gen_v2_bootstrap_gate_active():
+            logging.info(
+                "Skipping video_gen_v2 ComfyUI restart while bootstrap gate is active; "
+                "support provisioning has not allowed ComfyUI startup yet."
+            )
             return
         configured = self._normalize_local_comfy_base_url(self.agent_local_comfy_base_url) or "http://127.0.0.1:8188"
         if self._probe_local_comfy_base_url(configured, timeout_seconds=2.0):
@@ -6561,12 +6578,6 @@ class DependencyAgent:
     ) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
             self._install_git_custom_node(
-                "https://github.com/kijai/ComfyUI-KJNodes",
-                verify_dir_name="ComfyUI-KJNodes",
-                git_ref="bc8e4ce4254bcd0050383386ee2f9d753dbf1fa5",
-                install_requirements=True,
-            )
-            self._install_git_custom_node(
                 "https://github.com/Lightricks/ComfyUI-LTXVideo",
                 verify_dir_name="ComfyUI-LTXVideo",
                 install_requirements=True,
@@ -6628,14 +6639,10 @@ class DependencyAgent:
                 "LatentMotionSharpener",
                 "LatentTemporalInpainter",
                 "LTXVAddLatentGuide",
-                "LTXVAddGuideMulti",
-                "LTXVAudioVideoMask",
                 "LTXVImgToVideoConditionOnly",
                 "LTXVImgToVideoInplace",
-                "LTXVImgToVideoInplaceKJ",
                 "LTXVPreprocess",
                 "LTXAddVideoICLoRAGuide",
-                "ImageBatchExtendWithOverlap",
                 "RIFEInterpolation",
             ]
         if bundle_id == "video_gen_v2_furgen_color_nodes":
