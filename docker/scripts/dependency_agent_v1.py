@@ -6561,6 +6561,12 @@ class DependencyAgent:
     ) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
             self._install_git_custom_node(
+                "https://github.com/kijai/ComfyUI-KJNodes",
+                verify_dir_name="ComfyUI-KJNodes",
+                git_ref="bc8e4ce4254bcd0050383386ee2f9d753dbf1fa5",
+                install_requirements=True,
+            )
+            self._install_git_custom_node(
                 "https://github.com/Lightricks/ComfyUI-LTXVideo",
                 verify_dir_name="ComfyUI-LTXVideo",
                 install_requirements=True,
@@ -6622,10 +6628,14 @@ class DependencyAgent:
                 "LatentMotionSharpener",
                 "LatentTemporalInpainter",
                 "LTXVAddLatentGuide",
+                "LTXVAddGuideMulti",
+                "LTXVAudioVideoMask",
                 "LTXVImgToVideoConditionOnly",
                 "LTXVImgToVideoInplace",
+                "LTXVImgToVideoInplaceKJ",
                 "LTXVPreprocess",
                 "LTXAddVideoICLoRAGuide",
+                "ImageBatchExtendWithOverlap",
                 "RIFEInterpolation",
             ]
         if bundle_id == "video_gen_v2_furgen_color_nodes":
