@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.70"
+AGENT_VERSION = "dm-agent-py/0.10.71"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "945a50cfa58088ff1de036dfc3896e3f4edd6ab8"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6578,6 +6578,12 @@ class DependencyAgent:
     ) -> None:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
             self._install_git_custom_node(
+                "https://github.com/kijai/ComfyUI-KJNodes",
+                verify_dir_name="ComfyUI-KJNodes",
+                git_ref="bc8e4ce4254bcd0050383386ee2f9d753dbf1fa5",
+                install_requirements=True,
+            )
+            self._install_git_custom_node(
                 "https://github.com/Lightricks/ComfyUI-LTXVideo",
                 verify_dir_name="ComfyUI-LTXVideo",
                 install_requirements=True,
@@ -6595,6 +6601,12 @@ class DependencyAgent:
                 "https://github.com/GACLove/ComfyUI-VFI",
                 verify_dir_name="ComfyUI-VFI",
                 install_requirements=False,
+            )
+            self._install_git_custom_node(
+                "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+                verify_dir_name="ComfyUI-VideoHelperSuite",
+                git_ref="08e8df15db24da292d4b7f943c460dc2ab442b24",
+                install_requirements=True,
             )
             self._install_furgen_video_compat_nodes()
             return
@@ -6634,16 +6646,16 @@ class DependencyAgent:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
             return [
                 "CM_FloatToInt",
-                "EZLoadImgFromUrlNode",
-                "ImpactExecutionOrderController",
+                "ImageResizeKJv2",
+                "VHS_VideoCombine",
                 "LatentMotionSharpener",
                 "LatentTemporalInpainter",
-                "LTXVAddLatentGuide",
+                "LTXAVTextEncoderLoader",
+                "LTXVAudioVAELoader",
+                "LTXVConcatAVLatent",
                 "LTXVImgToVideoConditionOnly",
-                "LTXVImgToVideoInplace",
-                "LTXVPreprocess",
+                "LTXVLatentUpsampler",
                 "LTXAddVideoICLoRAGuide",
-                "RIFEInterpolation",
             ]
         if bundle_id == "video_gen_v2_furgen_color_nodes":
             return [
