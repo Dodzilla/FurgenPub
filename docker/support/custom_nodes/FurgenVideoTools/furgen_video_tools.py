@@ -1202,6 +1202,67 @@ class FurgenLatentGuideTemporalMask:
             raise RuntimeError(f"FurgenLatentGuideTemporalMask failed during {phase}; latent_shape={shape}: {exc}") from exc
 
 
+class FurgenLTXGuideAttentionAdjust:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "mode": (["set_last", "scale_last", "drop_last", "set_all", "scale_all"],),
+                "strength": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "entry_count": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": 16, "step": 1},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("positive", "negative")
+    FUNCTION = "adjust"
+    CATEGORY = "Furgen/conditioning"
+
+    @staticmethod
+    def _copy_conditioning(conditioning, mode, strength, entry_count):
+        mode = str(mode or "set_last")
+        strength = max(0.0, min(1.0, float(strength)))
+        entry_count = max(1, int(entry_count))
+        out = []
+        for item in conditioning:
+            if not isinstance(item, (list, tuple)) or len(item) < 2 or not isinstance(item[1], dict):
+                out.append(item)
+                continue
+            meta = dict(item[1])
+            entries = meta.get("guide_attention_entries")
+            if isinstance(entries, list) and entries:
+                copied = []
+                for entry in entries:
+                    copied.append(dict(entry) if isinstance(entry, dict) else entry)
+                if mode == "drop_last":
+                    copied = copied[: max(0, len(copied) - entry_count)]
+                else:
+                    start = 0 if mode.endswith("_all") else max(0, len(copied) - entry_count)
+                    for idx in range(start, len(copied)):
+                        entry = copied[idx]
+                        if not isinstance(entry, dict):
+                            continue
+                        current = float(entry.get("strength", 1.0))
+                        entry["strength"] = current * strength if mode.startswith("scale_") else strength
+                meta["guide_attention_entries"] = copied
+            out.append([item[0], meta])
+        return out
+
+    def adjust(self, positive, negative, mode, strength, entry_count):
+        return (
+            self._copy_conditioning(positive, mode, strength, entry_count),
+            self._copy_conditioning(negative, mode, strength, entry_count),
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
     "FurgenExposureAdjust": FurgenExposureAdjust,
@@ -1213,6 +1274,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenTemporalToneSmooth": FurgenTemporalToneSmooth,
     "FurgenTemporalUnsharpMask": FurgenTemporalUnsharpMask,
     "FurgenLatentGuideTemporalMask": FurgenLatentGuideTemporalMask,
+    "FurgenLTXGuideAttentionAdjust": FurgenLTXGuideAttentionAdjust,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1226,4 +1288,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenTemporalToneSmooth": "Furgen Temporal Tone Smooth",
     "FurgenTemporalUnsharpMask": "Furgen Temporal Unsharp Mask",
     "FurgenLatentGuideTemporalMask": "Furgen Latent Guide Temporal Mask",
+    "FurgenLTXGuideAttentionAdjust": "Furgen LTX Guide Attention Adjust",
 }
