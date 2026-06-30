@@ -56,6 +56,7 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
 
     assert "FurgenGetImageRangeFromBatch" in module.NODE_CLASS_MAPPINGS
     assert "FurgenTrimAudioDuration" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenLatentGuideTemporalMask" in module.NODE_CLASS_MAPPINGS
 
 
 def test_furgen_tail_context_utility_nodes_slice_images_and_audio():
@@ -69,3 +70,24 @@ def test_furgen_tail_context_utility_nodes_slice_images_and_audio():
     trimmed, = module.FurgenTrimAudioDuration().trim(audio, 8 / 24, 5 / 24)
     assert trimmed["sample_rate"] == 24
     assert trimmed["waveform"].flatten().tolist() == [8, 9, 10, 11, 12]
+
+
+def test_furgen_latent_guide_temporal_mask_adds_front_loaded_noise_mask():
+    module = _load_furgen_video_tools()
+
+    samples = torch.ones((2, 128, 5, 3, 4), dtype=torch.float32)
+    latent = {"samples": samples}
+    masked, = module.FurgenLatentGuideTemporalMask().apply(
+        latent,
+        "linear_fade",
+        1,
+        3,
+        1.0,
+        0.0,
+    )
+
+    assert masked is not latent
+    assert masked["samples"] is samples
+    assert masked["noise_mask"].shape == (2, 1, 5, 3, 4)
+    # LTX guide masks use 1-strength. Frame 0 is fully guided, then it fades off.
+    assert torch.allclose(masked["noise_mask"][0, 0, :, 0, 0], torch.tensor([0.0, 1 / 3, 2 / 3, 1.0, 1.0]))

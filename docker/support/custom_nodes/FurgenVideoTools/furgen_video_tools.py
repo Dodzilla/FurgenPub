@@ -181,21 +181,26 @@ class FCSConcatVideos:
         concat_inputs = []
         for idx, probe in enumerate(probes):
             clip_trim_seconds = overlap_seconds if idx > 0 else 0.0
+            clip_trim_frames = overlap_frames if idx > 0 else 0
             ffmpeg_inputs.extend(["-i", probe["path"]])
             video_filters = [
                 f"fps={frame_rate}",
-                f"scale={base_width}:{base_height}:flags=lanczos:force_original_aspect_ratio=decrease",
-                f"pad={base_width}:{base_height}:(ow-iw)/2:(oh-ih)/2:black",
-                f"format={pix_fmt}",
-                "setsar=1",
             ]
-            if clip_trim_seconds > 0:
+            if clip_trim_frames > 0:
                 video_filters.extend(
                     [
-                        f"trim=start={clip_trim_seconds:.6f}",
-                        "setpts=PTS-STARTPTS",
+                        f"select='gte(n,{clip_trim_frames})'",
+                        f"setpts=N/{float(frame_rate or 60.0):.6f}/TB",
                     ]
                 )
+            video_filters.extend(
+                [
+                    f"scale={base_width}:{base_height}:flags=lanczos:force_original_aspect_ratio=decrease",
+                    f"pad={base_width}:{base_height}:(ow-iw)/2:(oh-ih)/2:black",
+                    f"format={pix_fmt}",
+                    "setsar=1",
+                ]
+            )
             filter_parts.append(f"[{idx}:v]{','.join(video_filters)}[v{idx}]")
             if probe["has_audio"]:
                 audio_filters = [
@@ -1114,6 +1119,89 @@ class FurgenTemporalUnsharpMask:
             raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
 
 
+class FurgenLatentGuideTemporalMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "mode": (["hard_cut", "linear_fade", "cosine_fade"],),
+                "active_latent_frames": (
+                    "INT",
+                    {"default": 1, "min": 0, "max": 128, "step": 1},
+                ),
+                "fade_latent_frames": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 128, "step": 1},
+                ),
+                "start_strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "end_strength": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "apply"
+    CATEGORY = "Furgen/latent"
+
+    def apply(self, latent, mode, active_latent_frames, fade_latent_frames, start_strength, end_strength):
+        phase = "validate"
+        try:
+            if not isinstance(latent, dict):
+                raise ValueError("latent must be a LATENT dict")
+            samples = latent.get("samples")
+            if not isinstance(samples, torch.Tensor):
+                raise ValueError("latent.samples must be a tensor")
+            if samples.ndim != 5:
+                raise ValueError(f"expected latent.samples shape [B,C,T,H,W], got {tuple(samples.shape)}")
+
+            with torch.no_grad():
+                phase = "schedule"
+                batch, _channels, frames, height, width = samples.shape
+                active = max(0, int(active_latent_frames))
+                fade = max(0, int(fade_latent_frames))
+                start = max(0.0, min(1.0, float(start_strength)))
+                end = max(0.0, min(1.0, float(end_strength)))
+                mode = str(mode or "hard_cut")
+
+                strengths = torch.full(
+                    (int(frames),),
+                    end,
+                    dtype=samples.dtype,
+                    device=samples.device,
+                )
+                if active > 0:
+                    strengths[: min(active, int(frames))] = start
+                if fade > 0 and active < int(frames):
+                    fade_count = min(fade, int(frames) - active)
+                    positions = torch.arange(1, fade_count + 1, dtype=samples.dtype, device=samples.device) / float(fade)
+                    if mode == "cosine_fade":
+                        positions = (1.0 - torch.cos(positions * torch.pi)) * 0.5
+                    elif mode != "linear_fade":
+                        positions = torch.ones_like(positions)
+                    strengths[active : active + fade_count] = start + (end - start) * positions
+
+                phase = "mask"
+                mask_values = (1.0 - strengths).clamp(0.0, 1.0).view(1, 1, int(frames), 1, 1)
+                noise_mask = mask_values.expand(int(batch), 1, int(frames), int(height), int(width)).contiguous()
+                out = dict(latent)
+                out["noise_mask"] = noise_mask
+                return (out,)
+        except Exception as exc:
+            shape = None
+            try:
+                shape = tuple(latent.get("samples").shape) if isinstance(latent, dict) else None
+            except Exception:
+                shape = None
+            raise RuntimeError(f"FurgenLatentGuideTemporalMask failed during {phase}; latent_shape={shape}: {exc}") from exc
+
+
 NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
     "FurgenExposureAdjust": FurgenExposureAdjust,
@@ -1124,6 +1212,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenColorTransferMatch": FurgenColorTransferMatch,
     "FurgenTemporalToneSmooth": FurgenTemporalToneSmooth,
     "FurgenTemporalUnsharpMask": FurgenTemporalUnsharpMask,
+    "FurgenLatentGuideTemporalMask": FurgenLatentGuideTemporalMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1136,4 +1225,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenColorTransferMatch": "Furgen Color Transfer Match",
     "FurgenTemporalToneSmooth": "Furgen Temporal Tone Smooth",
     "FurgenTemporalUnsharpMask": "Furgen Temporal Unsharp Mask",
+    "FurgenLatentGuideTemporalMask": "Furgen Latent Guide Temporal Mask",
 }
