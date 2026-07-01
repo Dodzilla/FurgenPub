@@ -1538,6 +1538,70 @@ class FurgenLTXGuideAttentionAdjust:
         )
 
 
+def _finite_summary(tensor: torch.Tensor) -> str:
+    finite = torch.isfinite(tensor)
+    bad_count = int((~finite).sum().item())
+    total = int(tensor.numel())
+    summary = f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device} bad={bad_count}/{total}"
+    if finite.any():
+        values = tensor[finite]
+        summary += f" finite_min={float(values.min().item()):.6g} finite_max={float(values.max().item()):.6g}"
+    return summary
+
+
+class FurgenAssertFiniteImages:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "label": ("STRING", {"default": "images"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "check"
+    CATEGORY = "Furgen/debug"
+
+    def check(self, images, label):
+        if not isinstance(images, torch.Tensor):
+            raise ValueError(f"FurgenAssertFiniteImages {label}: images must be a tensor")
+        if not torch.isfinite(images).all():
+            raise ValueError(f"FurgenAssertFiniteImages {label}: non-finite IMAGE tensor {_finite_summary(images)}")
+        return (images,)
+
+
+class FurgenAssertFiniteLatent:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent": ("LATENT",),
+                "label": ("STRING", {"default": "latent"}),
+                "check_noise_mask": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latent",)
+    FUNCTION = "check"
+    CATEGORY = "Furgen/debug"
+
+    def check(self, latent, label, check_noise_mask):
+        if not isinstance(latent, dict):
+            raise ValueError(f"FurgenAssertFiniteLatent {label}: latent must be a LATENT dict")
+        samples = latent.get("samples")
+        if not isinstance(samples, torch.Tensor):
+            raise ValueError(f"FurgenAssertFiniteLatent {label}: latent.samples must be a tensor")
+        if not torch.isfinite(samples).all():
+            raise ValueError(f"FurgenAssertFiniteLatent {label}: non-finite latent.samples {_finite_summary(samples)}")
+        mask = latent.get("noise_mask")
+        if check_noise_mask and isinstance(mask, torch.Tensor) and not torch.isfinite(mask).all():
+            raise ValueError(f"FurgenAssertFiniteLatent {label}: non-finite latent.noise_mask {_finite_summary(mask)}")
+        return (latent,)
+
+
 NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
     "FurgenExposureAdjust": FurgenExposureAdjust,
@@ -1552,6 +1616,8 @@ NODE_CLASS_MAPPINGS = {
     "FurgenLatentGuideTemporalMask": FurgenLatentGuideTemporalMask,
     "FurgenLTXVAddLatentGuideTemporal": FurgenLTXVAddLatentGuideTemporal,
     "FurgenLTXGuideAttentionAdjust": FurgenLTXGuideAttentionAdjust,
+    "FurgenAssertFiniteImages": FurgenAssertFiniteImages,
+    "FurgenAssertFiniteLatent": FurgenAssertFiniteLatent,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1568,4 +1634,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenLatentGuideTemporalMask": "Furgen Latent Guide Temporal Mask",
     "FurgenLTXVAddLatentGuideTemporal": "Furgen LTXV Add Latent Guide Temporal",
     "FurgenLTXGuideAttentionAdjust": "Furgen LTX Guide Attention Adjust",
+    "FurgenAssertFiniteImages": "Furgen Assert Finite Images",
+    "FurgenAssertFiniteLatent": "Furgen Assert Finite Latent",
 }

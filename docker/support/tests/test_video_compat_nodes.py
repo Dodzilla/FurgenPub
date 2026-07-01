@@ -60,6 +60,8 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FurgenLatentGuideTemporalMask" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLTXVAddLatentGuideTemporal" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLTXGuideAttentionAdjust" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenAssertFiniteImages" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenAssertFiniteLatent" in module.NODE_CLASS_MAPPINGS
 
 
 def test_furgen_tail_context_utility_nodes_slice_images_and_audio():
@@ -153,3 +155,43 @@ def test_furgen_ltx_guide_attention_adjust_sets_or_drops_entries():
         1,
     )
     assert dropped[0][1]["guide_attention_entries"] == [{"strength": 1.0}]
+
+
+def test_furgen_assert_finite_images_fails_on_nan():
+    module = _load_furgen_video_tools()
+
+    ok = torch.zeros((2, 4, 4, 3), dtype=torch.float32)
+    returned, = module.FurgenAssertFiniteImages().check(ok, "ok")
+    assert returned is ok
+
+    bad = ok.clone()
+    bad[1, 0, 0, 0] = float("nan")
+    try:
+        module.FurgenAssertFiniteImages().check(bad, "after_decode")
+    except ValueError as exc:
+        assert "after_decode" in str(exc)
+        assert "non-finite IMAGE tensor" in str(exc)
+    else:
+        raise AssertionError("expected finite image check to fail")
+
+
+def test_furgen_assert_finite_latent_fails_on_inf_mask():
+    module = _load_furgen_video_tools()
+
+    latent = {
+        "samples": torch.zeros((1, 128, 2, 3, 4), dtype=torch.float32),
+        "noise_mask": torch.ones((1, 1, 2, 1, 1), dtype=torch.float32),
+    }
+    returned, = module.FurgenAssertFiniteLatent().check(latent, "ok", True)
+    assert returned is latent
+
+    bad = dict(latent)
+    bad["noise_mask"] = latent["noise_mask"].clone()
+    bad["noise_mask"][0, 0, 1, 0, 0] = float("inf")
+    try:
+        module.FurgenAssertFiniteLatent().check(bad, "guide_mask", True)
+    except ValueError as exc:
+        assert "guide_mask" in str(exc)
+        assert "non-finite latent.noise_mask" in str(exc)
+    else:
+        raise AssertionError("expected finite latent check to fail")
