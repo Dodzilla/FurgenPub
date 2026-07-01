@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.78"
+AGENT_VERSION = "dm-agent-py/0.10.79"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "2d6925e8f890624810e8e43f72629a80333dfca8"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6232,10 +6232,250 @@ class DependencyAgent:
                 pass
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _ensure_node_bundle_runtime_compatibility(self, bundle_ids: List[str]) -> bool:
+    def _safe_node_bundle_id(self, value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        if not re.match(r"^[A-Za-z0-9_.-]{1,128}$", candidate):
+            return None
+        return candidate
+
+    def _safe_support_script_name(self, value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        if not re.match(r"^[A-Za-z0-9_.-]{1,128}\.sh$", candidate):
+            return None
+        return candidate
+
+    def _safe_python_package_specs(self, value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        out: List[str] = []
+        for entry in value:
+            if not isinstance(entry, str):
+                continue
+            package = entry.strip()
+            if (
+                package
+                and len(package) <= 256
+                and not package.startswith("-")
+                and re.match(r"^[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%<>=-]+$", package)
+            ):
+                out.append(package)
+        return out
+
+    def _safe_python_module_name(self, value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){0,8}$", candidate):
+            return None
+        return candidate
+
+    def _safe_python_identifiers(self, value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        out: List[str] = []
+        for entry in value:
+            if isinstance(entry, str) and re.match(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$", entry.strip()):
+                name = entry.strip()
+                if name not in out:
+                    out.append(name)
+        return out
+
+    def _resolve_support_script(self, script_name: str) -> Optional[Path]:
+        safe_name = self._safe_support_script_name(script_name)
+        if not safe_name:
+            return None
+        if safe_name in ("asset_gen_v5.sh", "asset_gen_v5_lite.sh"):
+            family_script = self._resolve_asset_gen_v5_script()
+            if family_script is not None:
+                return family_script
+        candidates = [
+            self.workspace / safe_name,
+            Path(f"/workspace/{safe_name}"),
+            self.workspace / "FurgenPub" / "docker" / "support" / safe_name,
+            Path("/opt/FurgenPub/docker/support") / safe_name,
+            Path("/workspace/FurgenPub/docker/support") / safe_name,
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    def _schema_v2_steps(self, spec: Dict[str, Any], key: str = "steps") -> List[Dict[str, Any]]:
+        if not isinstance(spec, dict) or spec.get("schemaVersion") != 2:
+            return []
+        raw = spec.get(key)
+        if isinstance(raw, dict) and key == "compatibility":
+            raw = raw.get("steps")
+        if not isinstance(raw, list):
+            return []
+        return [step for step in raw if isinstance(step, dict)]
+
+    def _execute_python_import_check_step(self, step: Dict[str, Any]) -> None:
+        modules = [
+            module for module in (
+                self._safe_python_module_name(value)
+                for value in (step.get("modules") if isinstance(step.get("modules"), list) else [])
+            )
+            if module
+        ]
+        from_imports: List[Dict[str, Any]] = []
+        raw_from_imports = step.get("fromImports")
+        if isinstance(raw_from_imports, list):
+            for entry in raw_from_imports:
+                if not isinstance(entry, dict):
+                    continue
+                module = self._safe_python_module_name(entry.get("module"))
+                names = self._safe_python_identifiers(entry.get("names"))
+                if module and names:
+                    from_imports.append({"module": module, "names": names})
+        if not modules and not from_imports:
+            raise RuntimeError("python_import_check step has no valid imports")
+        script = (
+            "import importlib\n"
+            f"modules = {json.dumps(modules)}\n"
+            f"from_imports = {json.dumps(from_imports)}\n"
+            "for module in modules:\n"
+            "    importlib.import_module(module)\n"
+            "for item in from_imports:\n"
+            "    mod = importlib.import_module(item['module'])\n"
+            "    for name in item['names']:\n"
+            "        getattr(mod, name)\n"
+        )
+        subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+
+    def _execute_node_bundle_install_step(
+        self,
+        bundle_id: str,
+        step: Dict[str, Any],
+        required_class_types: Optional[Iterable[str]] = None,
+    ) -> bool:
+        step_type = step.get("type")
+        if step_type in ("git_custom_node", "git_custom_nodes", "comfy_core_update"):
+            if not self._install_node_bundle_from_spec(bundle_id, step, required_class_types=required_class_types):
+                raise RuntimeError(f"Unsupported nested install step for {bundle_id}: {step_type}")
+            return True
+        if step_type == "support_script_bundle":
+            script_name = self._safe_support_script_name(step.get("scriptName"))
+            if not script_name:
+                raise RuntimeError(f"Bundle {bundle_id} support_script_bundle step is missing a safe scriptName")
+            raw_bundle_ids = step.get("bundleIds")
+            step_bundle_ids = [
+                safe for safe in (
+                    self._safe_node_bundle_id(value)
+                    for value in (raw_bundle_ids if isinstance(raw_bundle_ids, list) else [bundle_id])
+                )
+                if safe
+            ]
+            if not step_bundle_ids:
+                raise RuntimeError(f"Bundle {bundle_id} support_script_bundle step has no valid bundleIds")
+            script_path = self._resolve_support_script(script_name)
+            if script_path is None:
+                raise RuntimeError(f"Unable to locate support script {script_name} for bundle {bundle_id}")
+            timeout = step.get("timeoutSeconds")
+            timeout_seconds = int(timeout) if isinstance(timeout, (int, float)) and timeout > 0 else max(1800, 300 * len(step_bundle_ids))
+            subprocess.run(
+                ["bash", str(script_path), "install-bundles", *step_bundle_ids],
+                cwd=str(self.workspace),
+                env=os.environ.copy(),
+                check=True,
+                timeout=min(max(timeout_seconds, 60), 7200),
+            )
+            return True
+        if step_type == "furgen_support_custom_node":
+            package_name = step.get("packageName")
+            required = self._normalize_required_class_types(step.get("requiredClassTypes"))
+            if not required:
+                required = self._normalize_required_class_types(required_class_types)
+            if package_name == "FurgenVideoTools":
+                self._install_furgen_video_tools_node(required_class_types=required)
+                return True
+            if package_name in ("furgen_video_compat_nodes.py", "FurgenVideoCompatNodes"):
+                self._install_furgen_video_compat_nodes()
+                return True
+            raise RuntimeError(f"Unsupported Furgen support custom node package for {bundle_id}: {package_name}")
+        if step_type == "pip_install":
+            packages = self._safe_python_package_specs(step.get("packages"))
+            if not packages:
+                raise RuntimeError(f"Bundle {bundle_id} pip_install step has no valid packages")
+            command = [sys.executable, "-m", "pip", "install", "--no-cache-dir"]
+            if step.get("forceReinstall") is True:
+                command.append("--force-reinstall")
+            if step.get("noDeps") is True:
+                command.append("--no-deps")
+            command.extend(packages)
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900)
+            return True
+        if step_type == "pip_uninstall":
+            packages = self._safe_python_package_specs(step.get("packages"))
+            if not packages:
+                raise RuntimeError(f"Bundle {bundle_id} pip_uninstall step has no valid packages")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", *packages],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=600,
+            )
+            return True
+        if step_type == "python_import_check":
+            self._execute_python_import_check_step(step)
+            return False
+        raise RuntimeError(f"Unsupported install step for {bundle_id}: {step_type}")
+
+    def _run_node_bundle_compatibility_steps(
+        self,
+        bundle_ids: List[str],
+        bundle_specs: Optional[Dict[str, Any]] = None,
+        required_class_types: Optional[Iterable[str]] = None,
+    ) -> bool:
         changed = False
+        specs = bundle_specs if isinstance(bundle_specs, dict) else {}
+        for bundle_id in bundle_ids:
+            spec = specs.get(bundle_id)
+            if not isinstance(spec, dict):
+                continue
+            for step in self._schema_v2_steps(spec, "compatibility"):
+                logging.info("Running node bundle compatibility step installSource=spec bundleId=%s type=%s", bundle_id, step.get("type"))
+                changed = self._execute_node_bundle_install_step(
+                    bundle_id,
+                    step,
+                    required_class_types=required_class_types,
+                ) or changed
+        return changed
+
+    def _ensure_node_bundle_runtime_compatibility(
+        self,
+        bundle_ids: List[str],
+        bundle_specs: Optional[Dict[str, Any]] = None,
+        required_class_types: Optional[Iterable[str]] = None,
+    ) -> bool:
+        changed = False
+        specs = bundle_specs if isinstance(bundle_specs, dict) else {}
+        spec_compat_bundle_ids = {
+            bundle_id
+            for bundle_id in bundle_ids
+            if isinstance(specs.get(bundle_id), dict) and self._schema_v2_steps(specs[bundle_id], "compatibility")
+        }
+        changed = self._run_node_bundle_compatibility_steps(
+            bundle_ids,
+            bundle_specs=specs,
+            required_class_types=required_class_types,
+        ) or changed
         bundle_id_set = set(bundle_ids)
-        if "video_gen_v2_10s_ltx_nodes" in bundle_id_set:
+        if "video_gen_v2_10s_ltx_nodes" in bundle_id_set and "video_gen_v2_10s_ltx_nodes" not in spec_compat_bundle_ids:
             self._install_furgen_video_compat_nodes()
             changed = True
             # ComfyUI-LTXVideo currently imports `pad` from kornia's pyramid module.
@@ -6243,7 +6483,7 @@ class DependencyAgent:
             # while the next restart will fail to import the node pack. Enforce the pin
             # immediately before any bundle readiness marker is written.
             changed = self._ensure_python_package_constraint("kornia<0.8", "kornia") or changed
-        if "video_gen_v2_image_filters_nodes" in bundle_id_set:
+        if "video_gen_v2_image_filters_nodes" in bundle_id_set and "video_gen_v2_image_filters_nodes" not in spec_compat_bundle_ids:
             changed = self._ensure_video_gen_v2_image_filters_opencv() or changed
         return changed
 
@@ -6255,6 +6495,18 @@ class DependencyAgent:
     ) -> bool:
         if not isinstance(spec, dict):
             return False
+        if spec.get("schemaVersion") == 2:
+            steps = self._schema_v2_steps(spec)
+            if not steps:
+                raise RuntimeError(f"Bundle {bundle_id} schemaVersion=2 install spec has no steps")
+            for step in steps:
+                logging.info("Installing node bundle step installSource=spec bundleId=%s type=%s", bundle_id, step.get("type"))
+                self._execute_node_bundle_install_step(
+                    bundle_id,
+                    step,
+                    required_class_types=required_class_types,
+                )
+            return True
         spec_type = spec.get("type")
         if spec_type == "comfy_core_update":
             git_ref = spec.get("ref")
@@ -8865,7 +9117,11 @@ class DependencyAgent:
         )
 
         if self._local_comfy_has_all_class_types(verify_class_types):
-            compat_changed = self._ensure_node_bundle_runtime_compatibility(bundle_ids)
+            compat_changed = self._ensure_node_bundle_runtime_compatibility(
+                bundle_ids,
+                bundle_specs=bundle_specs,
+                required_class_types=furgen_video_tools_required_class_types,
+            )
             if compat_changed:
                 self._stop_idle_prl_mining_for_work("install_node_bundles_comfy_restart")
                 self._remove_local_readiness_file()
@@ -8885,41 +9141,50 @@ class DependencyAgent:
         try:
             server_type = (self.server_type or "").strip()
             asset_gen_v5_server_types = ("asset_gen_v5", "asset_gen_v5_lite", "asset_gen_v6_lite", "foxy_all")
-            if server_type in asset_gen_v5_server_types:
-                script_bundle_ids: List[str] = []
-                for bundle_id in bundle_ids:
-                    spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
-                    if isinstance(spec, dict) and spec:
-                        if not self._install_node_bundle_from_spec(bundle_id, spec):
-                            raise RuntimeError(f"Unsupported Firestore install spec for {server_type} bundle {bundle_id}")
-                    else:
-                        script_bundle_ids.append(bundle_id)
-                if script_bundle_ids:
-                    script_path = self._resolve_asset_gen_v5_script()
-                    if script_path is None:
-                        raise RuntimeError(f"Unable to locate asset_gen_v5.sh on {server_type} instance.")
-                    subprocess.run(
-                        ["bash", str(script_path), "install-bundles", *script_bundle_ids],
-                        cwd=str(self.workspace),
-                        env=os.environ.copy(),
-                        check=True,
-                        timeout=max(1800, 300 * max(1, len(script_bundle_ids))),
-                    )
-            elif (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad"):
-                for bundle_id in bundle_ids:
-                    spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
+            legacy_bundle_ids: List[str] = []
+            for bundle_id in bundle_ids:
+                spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
+                if isinstance(spec, dict) and spec:
+                    logging.info("Installing node bundle installSource=spec serverType=%s bundleId=%s", server_type, bundle_id)
                     if not self._install_node_bundle_from_spec(
                         bundle_id,
-                        spec if isinstance(spec, dict) else {},
+                        spec,
                         required_class_types=furgen_video_tools_required_class_types,
                     ):
-                        self._install_video_gen_v2_node_bundle(
-                            bundle_id,
-                            required_class_types=furgen_video_tools_required_class_types,
-                        )
-            else:
+                        raise RuntimeError(f"Unsupported Firestore install spec for {server_type} bundle {bundle_id}")
+                else:
+                    legacy_bundle_ids.append(bundle_id)
+
+            if legacy_bundle_ids:
+                logging.warning(
+                    "Installing node bundle(s) installSource=legacyFallback serverType=%s bundleIds=%s",
+                    server_type,
+                    ",".join(legacy_bundle_ids),
+                )
+            if server_type in asset_gen_v5_server_types and legacy_bundle_ids:
+                script_path = self._resolve_asset_gen_v5_script()
+                if script_path is None:
+                    raise RuntimeError(f"Unable to locate asset_gen_v5.sh on {server_type} instance.")
+                subprocess.run(
+                    ["bash", str(script_path), "install-bundles", *legacy_bundle_ids],
+                    cwd=str(self.workspace),
+                    env=os.environ.copy(),
+                    check=True,
+                    timeout=max(1800, 300 * max(1, len(legacy_bundle_ids))),
+                )
+            elif server_type in ("video_gen_v2", "video_gen_v2_salad") and legacy_bundle_ids:
+                for bundle_id in legacy_bundle_ids:
+                    self._install_video_gen_v2_node_bundle(
+                        bundle_id,
+                        required_class_types=furgen_video_tools_required_class_types,
+                    )
+            elif legacy_bundle_ids:
                 raise RuntimeError(f"install_node_bundles is not supported on server_type={self.server_type}")
-            self._ensure_node_bundle_runtime_compatibility(bundle_ids)
+            self._ensure_node_bundle_runtime_compatibility(
+                bundle_ids,
+                bundle_specs=bundle_specs,
+                required_class_types=furgen_video_tools_required_class_types,
+            )
             self._stop_idle_prl_mining_for_work("install_node_bundles_comfy_restart")
             self._remove_local_readiness_file()
             comfy_restart_attempted = True
