@@ -1256,6 +1256,227 @@ class FurgenLatentGuideTemporalMask:
             raise RuntimeError(f"FurgenLatentGuideTemporalMask failed during {phase}; latent_shape={shape}: {exc}") from exc
 
 
+def _temporal_strengths(frames, mode, active_latent_frames, fade_latent_frames, start_strength, end_strength, *, dtype, device):
+    frame_count = max(0, int(frames))
+    active = max(0, int(active_latent_frames))
+    fade = max(0, int(fade_latent_frames))
+    start = max(0.0, min(1.0, float(start_strength)))
+    end = max(0.0, min(1.0, float(end_strength)))
+    mode = str(mode or "hard_cut")
+
+    strengths = torch.full((frame_count,), end, dtype=dtype, device=device)
+    if frame_count == 0:
+        return strengths
+    if active > 0:
+        strengths[: min(active, frame_count)] = start
+    if fade > 0 and active < frame_count:
+        fade_count = min(fade, frame_count - active)
+        positions = torch.arange(1, fade_count + 1, dtype=dtype, device=device) / float(fade)
+        if mode == "cosine_fade":
+            positions = (1.0 - torch.cos(positions * torch.pi)) * 0.5
+        elif mode != "linear_fade":
+            positions = torch.ones_like(positions)
+        strengths[active : active + fade_count] = start + (end - start) * positions
+    return strengths
+
+
+def _temporal_noise_mask(samples, base_mask, mode, active_latent_frames, fade_latent_frames, start_strength, end_strength):
+    if samples.ndim != 5:
+        raise ValueError(f"expected latent samples shape [B,C,T,H,W], got {tuple(samples.shape)}")
+    batch, _channels, frames, _height, _width = samples.shape
+    strengths = _temporal_strengths(
+        int(frames),
+        mode,
+        active_latent_frames,
+        fade_latent_frames,
+        start_strength,
+        end_strength,
+        dtype=samples.dtype,
+        device=samples.device,
+    ).view(1, 1, int(frames), 1, 1)
+    if base_mask is None:
+        base = torch.ones((int(batch), 1, int(frames), 1, 1), dtype=samples.dtype, device=samples.device)
+    else:
+        base = base_mask.to(device=samples.device, dtype=samples.dtype)
+        if base.ndim != 5:
+            raise ValueError(f"expected guide noise_mask shape [B,1,T,H,W], got {tuple(base.shape)}")
+        if int(base.shape[2]) != int(frames):
+            raise ValueError(f"guide noise_mask temporal length {base.shape[2]} != guide latent length {frames}")
+    return (base - strengths).contiguous()
+
+
+def _dilate_latent_for_ltxv(latent, horizontal_scale, vertical_scale):
+    horizontal_scale = max(1, int(horizontal_scale))
+    vertical_scale = max(1, int(vertical_scale))
+    if horizontal_scale == 1 and vertical_scale == 1:
+        return latent
+
+    samples = latent["samples"]
+    mask = latent.get("noise_mask", None)
+    dilated_shape = samples.shape[:3] + (
+        samples.shape[3] * vertical_scale,
+        samples.shape[4] * horizontal_scale,
+    )
+    dilated_samples = torch.zeros(
+        dilated_shape,
+        device=samples.device,
+        dtype=samples.dtype,
+        requires_grad=False,
+    )
+    dilated_samples[..., ::vertical_scale, ::horizontal_scale] = samples
+
+    dilated_mask = torch.full(
+        (dilated_samples.shape[0], 1, dilated_samples.shape[2], dilated_samples.shape[3], dilated_samples.shape[4]),
+        -1.0,
+        device=samples.device,
+        dtype=samples.dtype,
+        requires_grad=False,
+    )
+    if mask is None:
+        dilated_mask[..., ::vertical_scale, ::horizontal_scale] = 1.0
+    else:
+        dilated_mask[..., ::vertical_scale, ::horizontal_scale] = mask.to(device=samples.device, dtype=samples.dtype)
+    return {"samples": dilated_samples, "noise_mask": dilated_mask}
+
+
+def _append_ltxv_guide_attention_entry(conditioning, pre_filter_count, latent_shape):
+    import node_helpers
+
+    existing = []
+    for item in conditioning:
+        if isinstance(item, (list, tuple)) and len(item) > 1 and isinstance(item[1], dict):
+            entries = item[1].get("guide_attention_entries")
+            if entries is not None:
+                existing = list(entries)
+                break
+    next_entries = [
+        *existing,
+        {
+            "pre_filter_count": int(pre_filter_count),
+            "strength": 1.0,
+            "pixel_mask": None,
+            "latent_shape": list(latent_shape),
+        },
+    ]
+    return node_helpers.conditioning_set_values(conditioning, {"guide_attention_entries": next_entries})
+
+
+class FurgenLTXVAddLatentGuideTemporal:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "vae": ("VAE",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "latent": ("LATENT",),
+                "guiding_latent": ("LATENT",),
+                "latent_idx": (
+                    "INT",
+                    {"default": 0, "min": -9999, "max": 9999, "step": 1},
+                ),
+                "mode": (["hard_cut", "linear_fade", "cosine_fade"],),
+                "active_latent_frames": (
+                    "INT",
+                    {"default": 1, "min": 0, "max": 128, "step": 1},
+                ),
+                "fade_latent_frames": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 128, "step": 1},
+                ),
+                "start_strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "end_strength": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "negative", "latent")
+    FUNCTION = "generate"
+    CATEGORY = "Furgen/latent"
+
+    def generate(
+        self,
+        vae,
+        positive,
+        negative,
+        latent,
+        guiding_latent,
+        latent_idx,
+        mode,
+        active_latent_frames,
+        fade_latent_frames,
+        start_strength,
+        end_strength,
+    ):
+        phase = "validate"
+        try:
+            import comfy_extras.nodes_lt as nodes_lt
+
+            if not isinstance(latent, dict) or not isinstance(guiding_latent, dict):
+                raise ValueError("latent and guiding_latent must be LATENT dicts")
+            latent_samples = latent.get("samples")
+            guide_samples = guiding_latent.get("samples")
+            if not isinstance(latent_samples, torch.Tensor) or not isinstance(guide_samples, torch.Tensor):
+                raise ValueError("latent.samples and guiding_latent.samples must be tensors")
+            if latent_samples.ndim != 5 or guide_samples.ndim != 5:
+                raise ValueError(
+                    f"expected 5D latents, got latent={tuple(latent_samples.shape)} guide={tuple(guide_samples.shape)}"
+                )
+            if latent_samples.shape[4] % guide_samples.shape[4] != 0 or latent_samples.shape[3] % guide_samples.shape[3] != 0:
+                raise ValueError("latent and guiding_latent spatial sizes must have an integer ratio")
+
+            phase = "dilate"
+            guide_orig_shape = list(guide_samples.shape[2:])
+            dilated_guide = _dilate_latent_for_ltxv(
+                guiding_latent,
+                horizontal_scale=latent_samples.shape[4] // guide_samples.shape[4],
+                vertical_scale=latent_samples.shape[3] // guide_samples.shape[3],
+            )
+            guide = dilated_guide["samples"]
+            temporal_guide_mask = _temporal_noise_mask(
+                guide,
+                dilated_guide.get("noise_mask"),
+                mode,
+                active_latent_frames,
+                fade_latent_frames,
+                start_strength,
+                end_strength,
+            )
+
+            phase = "append"
+            scale_factors = vae.downscale_index_formula
+            if int(latent_idx) <= 0:
+                frame_idx = int(latent_idx) * scale_factors[0]
+            else:
+                frame_idx = 1 + (int(latent_idx) - 1) * scale_factors[0]
+            noise_mask = nodes_lt.get_noise_mask(latent)
+            positive, negative, latent_samples, noise_mask = nodes_lt.LTXVAddGuide.append_keyframe(
+                positive=positive,
+                negative=negative,
+                frame_idx=frame_idx,
+                latent_image=latent_samples,
+                noise_mask=noise_mask,
+                guiding_latent=guide,
+                strength=0.0,
+                scale_factors=scale_factors,
+                guide_mask=temporal_guide_mask,
+            )
+
+            phase = "attention_entry"
+            pre_filter_count = guide.shape[2] * guide.shape[3] * guide.shape[4]
+            positive = _append_ltxv_guide_attention_entry(positive, pre_filter_count, guide_orig_shape)
+            negative = _append_ltxv_guide_attention_entry(negative, pre_filter_count, guide_orig_shape)
+            return (positive, negative, {"samples": latent_samples, "noise_mask": noise_mask})
+        except Exception as exc:
+            raise RuntimeError(f"FurgenLTXVAddLatentGuideTemporal failed during {phase}: {exc}") from exc
+
+
 class FurgenLTXGuideAttentionAdjust:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1329,6 +1550,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenTemporalToneSmooth": FurgenTemporalToneSmooth,
     "FurgenTemporalUnsharpMask": FurgenTemporalUnsharpMask,
     "FurgenLatentGuideTemporalMask": FurgenLatentGuideTemporalMask,
+    "FurgenLTXVAddLatentGuideTemporal": FurgenLTXVAddLatentGuideTemporal,
     "FurgenLTXGuideAttentionAdjust": FurgenLTXGuideAttentionAdjust,
 }
 
@@ -1344,5 +1566,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenTemporalToneSmooth": "Furgen Temporal Tone Smooth",
     "FurgenTemporalUnsharpMask": "Furgen Temporal Unsharp Mask",
     "FurgenLatentGuideTemporalMask": "Furgen Latent Guide Temporal Mask",
+    "FurgenLTXVAddLatentGuideTemporal": "Furgen LTXV Add Latent Guide Temporal",
     "FurgenLTXGuideAttentionAdjust": "Furgen LTX Guide Attention Adjust",
 }

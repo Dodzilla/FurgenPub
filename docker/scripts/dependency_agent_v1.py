@@ -6692,6 +6692,7 @@ class DependencyAgent:
                 "FurgenTemporalToneSmooth",
                 "FurgenTemporalUnsharpMask",
                 "FurgenLatentGuideTemporalMask",
+                "FurgenLTXVAddLatentGuideTemporal",
                 "FurgenLTXGuideAttentionAdjust",
             ]
         if bundle_id == "video_gen_v2_fcs_concat_videos":

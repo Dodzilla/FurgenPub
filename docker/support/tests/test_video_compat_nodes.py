@@ -58,6 +58,7 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FurgenPrependImageToBatch" in module.NODE_CLASS_MAPPINGS
     assert "FurgenTrimAudioDuration" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLatentGuideTemporalMask" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenLTXVAddLatentGuideTemporal" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLTXGuideAttentionAdjust" in module.NODE_CLASS_MAPPINGS
 
 
@@ -100,6 +101,29 @@ def test_furgen_latent_guide_temporal_mask_adds_front_loaded_noise_mask():
     assert masked["noise_mask"].shape == (2, 1, 5, 3, 4)
     # LTX guide masks use 1-strength. Frame 0 is fully guided, then it fades off.
     assert torch.allclose(masked["noise_mask"][0, 0, :, 0, 0], torch.tensor([0.0, 1 / 3, 2 / 3, 1.0, 1.0]))
+
+
+def test_furgen_ltxv_add_latent_guide_temporal_schedule_collapses_for_single_latent_frame():
+    module = _load_furgen_video_tools()
+
+    samples = torch.ones((1, 128, 1, 2, 2), dtype=torch.float32)
+    hard = module._temporal_noise_mask(samples, None, "hard_cut", 1, 0, 1.0, 0.0)
+    fade = module._temporal_noise_mask(samples, None, "linear_fade", 1, 6, 1.0, 0.0)
+
+    assert torch.allclose(hard, fade)
+    assert torch.allclose(hard[:, :, :, 0, 0].flatten(), torch.tensor([0.0]))
+
+
+def test_furgen_ltxv_add_latent_guide_temporal_schedule_differs_for_multi_latent_frames():
+    module = _load_furgen_video_tools()
+
+    samples = torch.ones((1, 128, 4, 2, 2), dtype=torch.float32)
+    hard = module._temporal_noise_mask(samples, None, "hard_cut", 1, 0, 1.0, 0.0)
+    fade = module._temporal_noise_mask(samples, None, "linear_fade", 1, 3, 1.0, 0.0)
+
+    assert torch.allclose(hard[:, 0, :, 0, 0], torch.tensor([[0.0, 1.0, 1.0, 1.0]]))
+    assert torch.allclose(fade[:, 0, :, 0, 0], torch.tensor([[0.0, 1 / 3, 2 / 3, 1.0]]))
+    assert not torch.allclose(hard, fade)
 
 
 def test_furgen_ltx_guide_attention_adjust_sets_or_drops_entries():
