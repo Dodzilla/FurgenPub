@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.80"
+AGENT_VERSION = "dm-agent-py/0.10.81"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "fcd8cd604db2ae1b85c7e196ff4822dffb1c31c6"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -159,7 +159,7 @@ PRL_MINER_KINDS = {"alpha_miner", "srbminer_multi"}
 DEFAULT_PRL_MINER_KIND = "alpha_miner"
 PRL_MINER_PACKAGE_TYPES = {"binary", "tar_gz"}
 DEFAULT_PRL_MINER_PACKAGE_TYPE = "binary"
-AGENT_GPU_BLOCKING_STAGES = {"preparing_prompt", "executing"}
+AGENT_GPU_BLOCKING_STAGES = {"ready", "preparing_prompt", "executing"}
 PRL_MINER_SHARE_SIGNAL_RE = re.compile(
     r"\b(accepted|rejected|share submission returned error|stratum error response|dropped reason=|action=drop_share|action=reconnect_drop_ambiguous_share)\b",
     re.IGNORECASE,
