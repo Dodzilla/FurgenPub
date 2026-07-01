@@ -55,6 +55,7 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     module = _load_furgen_video_tools()
 
     assert "FurgenGetImageRangeFromBatch" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenPrependImageToBatch" in module.NODE_CLASS_MAPPINGS
     assert "FurgenTrimAudioDuration" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLatentGuideTemporalMask" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLTXGuideAttentionAdjust" in module.NODE_CLASS_MAPPINGS
@@ -66,6 +67,13 @@ def test_furgen_tail_context_utility_nodes_slice_images_and_audio():
     images = torch.arange(12, dtype=torch.float32).view(12, 1, 1, 1)
     sliced, _mask = module.FurgenGetImageRangeFromBatch().slice(images, -1, 8)
     assert sliced.flatten().tolist() == list(range(4, 12))
+
+    prepended, = module.FurgenPrependImageToBatch().prepend(
+        torch.full((1, 1, 1, 1), 0.25),
+        torch.arange(4, dtype=torch.float32).view(4, 1, 1, 1),
+    )
+    assert prepended.shape[0] == 5
+    assert prepended.flatten().tolist() == [0.25, 0.0, 1.0, 2.0, 3.0]
 
     audio = {"waveform": torch.arange(24, dtype=torch.float32).view(1, 1, 24), "sample_rate": 24}
     trimmed, = module.FurgenTrimAudioDuration().trim(audio, 8 / 24, 5 / 24)

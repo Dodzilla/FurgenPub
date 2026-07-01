@@ -620,6 +620,60 @@ class FurgenGetImageRangeFromBatch:
         return (sliced_images, sliced_masks)
 
 
+class FurgenPrependImageToBatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "first_image": ("IMAGE",),
+                "images": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "prepend"
+    CATEGORY = "Furgen/video"
+
+    @staticmethod
+    def _as_batch(image, name: str):
+        if image is None or not hasattr(image, "shape"):
+            raise ValueError(f"{name} image batch is required")
+        if len(image.shape) == 3:
+            image = image.unsqueeze(0)
+        if len(image.shape) != 4:
+            raise ValueError(f"{name} must be an IMAGE tensor")
+        return image
+
+    @staticmethod
+    def _match_like(frame, images):
+        target_h = int(images.shape[1])
+        target_w = int(images.shape[2])
+        target_c = int(images.shape[3])
+        frame = frame.to(device=images.device, dtype=images.dtype)
+        if int(frame.shape[1]) != target_h or int(frame.shape[2]) != target_w:
+            nchw = frame.movedim(-1, 1)
+            frame = F.interpolate(nchw, size=(target_h, target_w), mode="bilinear", align_corners=False).movedim(1, -1)
+        if int(frame.shape[3]) > target_c:
+            frame = frame[..., :target_c]
+        elif int(frame.shape[3]) < target_c:
+            pad = images[:1, ..., int(frame.shape[3]) : target_c]
+            if int(pad.shape[3]) != target_c - int(frame.shape[3]):
+                pad = torch.zeros(
+                    (1, int(frame.shape[1]), int(frame.shape[2]), target_c - int(frame.shape[3])),
+                    device=frame.device,
+                    dtype=frame.dtype,
+                )
+            frame = torch.cat((frame, pad.to(device=frame.device, dtype=frame.dtype)), dim=-1)
+        return frame.clamp(0.0, 1.0)
+
+    def prepend(self, first_image, images):
+        images = self._as_batch(images, "images")
+        first = self._as_batch(first_image, "first_image")[:1]
+        first = self._match_like(first, images)
+        return (torch.cat((first, images), dim=0),)
+
+
 class FurgenTrimAudioDuration:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1267,6 +1321,7 @@ NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
     "FurgenExposureAdjust": FurgenExposureAdjust,
     "FurgenGetImageRangeFromBatch": FurgenGetImageRangeFromBatch,
+    "FurgenPrependImageToBatch": FurgenPrependImageToBatch,
     "FurgenTrimAudioDuration": FurgenTrimAudioDuration,
     "FurgenReferenceColorMatch": FurgenReferenceColorMatch,
     "FurgenAdaptiveExposureMatch": FurgenAdaptiveExposureMatch,
@@ -1281,6 +1336,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FCSConcatVideos": "Furgen Concat Videos",
     "FurgenExposureAdjust": "Furgen Exposure Adjust",
     "FurgenGetImageRangeFromBatch": "Furgen Get Image Range From Batch",
+    "FurgenPrependImageToBatch": "Furgen Prepend Image To Batch",
     "FurgenTrimAudioDuration": "Furgen Trim Audio Duration",
     "FurgenReferenceColorMatch": "Furgen Reference Color Match",
     "FurgenAdaptiveExposureMatch": "Furgen Adaptive Exposure Match",
