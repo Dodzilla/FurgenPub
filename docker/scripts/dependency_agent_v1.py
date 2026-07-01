@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.75"
+AGENT_VERSION = "dm-agent-py/0.10.76"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "b6ac1637990cbb0a4de56d1d575c26c7f8e68626"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6081,24 +6081,31 @@ class DependencyAgent:
                 "opencv-python-headless",
             )
         }
+        opencv_packages = [
+            "opencv-python",
+            "opencv-python-headless",
+            "opencv-contrib-python",
+            "opencv-contrib-python-headless",
+        ]
+        for _ in range(2):
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", *opencv_packages],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=600,
+            )
         subprocess.run(
             [
                 sys.executable,
                 "-m",
                 "pip",
-                "uninstall",
-                "-y",
-                "opencv-python",
-                "opencv-python-headless",
-                "opencv-contrib-python-headless",
+                "install",
+                "--no-cache-dir",
+                "--force-reinstall",
+                "--no-deps",
+                "opencv-contrib-python-headless==4.10.0.84",
             ],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=600,
-        )
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-cache-dir", "opencv-contrib-python==4.10.0.84"],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
