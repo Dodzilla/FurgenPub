@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.76"
+AGENT_VERSION = "dm-agent-py/0.10.77"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "b6ac1637990cbb0a4de56d1d575c26c7f8e68626"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6774,6 +6774,7 @@ class DependencyAgent:
             return []
         pids: List[int] = []
         comfy_dir = self.comfyui_dir.resolve()
+        launch_scripts = {str(candidate) for candidate in self._comfy_launch_script_candidates()}
         for entry in proc_dir.iterdir():
             if not entry.name.isdigit():
                 continue
@@ -6782,11 +6783,23 @@ class DependencyAgent:
                 continue
             try:
                 raw = (entry / "cmdline").read_bytes()
-                cmdline = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+                args = [
+                    part.decode("utf-8", errors="replace")
+                    for part in raw.split(b"\x00")
+                    if part
+                ]
             except Exception:
                 continue
-            lower_cmdline = cmdline.lower()
-            if "main.py" not in lower_cmdline and "comfyui" not in lower_cmdline:
+            if not args:
+                continue
+            has_launch_script = any(
+                arg in launch_scripts
+                or arg.endswith("/comfyui.sh")
+                or arg.endswith("/start_comfyui.sh")
+                for arg in args
+            )
+            has_main_py = any(arg == "main.py" or arg.endswith("/main.py") for arg in args)
+            if not has_launch_script and not has_main_py:
                 continue
             cwd_matches = False
             try:
@@ -6794,8 +6807,12 @@ class DependencyAgent:
                 cwd_matches = cwd == comfy_dir or comfy_dir in cwd.parents
             except Exception:
                 cwd_matches = False
-            cmd_matches = str(comfy_dir) in cmdline or "comfyui" in lower_cmdline
-            if cwd_matches or cmd_matches:
+            main_path_matches = any(
+                arg == str(comfy_dir / "main.py")
+                or arg.endswith("/ComfyUI/main.py")
+                for arg in args
+            )
+            if has_launch_script or (has_main_py and (cwd_matches or main_path_matches)):
                 pids.append(pid)
         return sorted(set(pids))
 
