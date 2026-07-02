@@ -6938,6 +6938,7 @@ class DependencyAgent:
             return [
                 "FurgenGetImageRangeFromBatch",
                 "FurgenPrependImageToBatch",
+                "FurgenSeamScaleStabilize",
                 "FurgenTrimAudioDuration",
                 "FurgenAdaptiveExposureMatch",
                 "FurgenColorTransferMatch",

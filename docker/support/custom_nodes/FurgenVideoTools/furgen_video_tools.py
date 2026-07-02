@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 import folder_paths
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -672,6 +673,184 @@ class FurgenPrependImageToBatch:
         first = self._as_batch(first_image, "first_image")[:1]
         first = self._match_like(first, images)
         return (torch.cat((first, images), dim=0),)
+
+
+class FurgenSeamScaleStabilize:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "reference_image": ("IMAGE",),
+                "images": ("IMAGE",),
+                "full_strength_frames": ("INT", {"default": 4, "min": 0, "max": 240, "step": 1}),
+                "fade_out_frames": ("INT", {"default": 16, "min": 0, "max": 240, "step": 1}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "max_scale_delta": ("FLOAT", {"default": 0.12, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "min_inliers": ("INT", {"default": 20, "min": 0, "max": 10000, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "stabilize"
+    CATEGORY = "Furgen/video"
+
+    @staticmethod
+    def _as_batch(image, name: str):
+        if image is None or not hasattr(image, "shape"):
+            raise ValueError(f"{name} image batch is required")
+        if len(image.shape) == 3:
+            image = image.unsqueeze(0)
+        if len(image.shape) != 4:
+            raise ValueError(f"{name} must be an IMAGE tensor")
+        return image
+
+    @staticmethod
+    def _match_reference(reference, images):
+        reference = reference[:1].to(device=images.device, dtype=images.dtype)
+        if int(reference.shape[1]) != int(images.shape[1]) or int(reference.shape[2]) != int(images.shape[2]):
+            reference = F.interpolate(
+                reference.movedim(-1, 1),
+                size=(int(images.shape[1]), int(images.shape[2])),
+                mode="bilinear",
+                align_corners=False,
+            ).movedim(1, -1)
+        if int(reference.shape[3]) > int(images.shape[3]):
+            reference = reference[..., : int(images.shape[3])]
+        elif int(reference.shape[3]) < int(images.shape[3]):
+            pad = torch.zeros(
+                (
+                    1,
+                    int(reference.shape[1]),
+                    int(reference.shape[2]),
+                    int(images.shape[3]) - int(reference.shape[3]),
+                ),
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+            reference = torch.cat((reference, pad), dim=-1)
+        return reference.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _to_u8(frame):
+        return (frame.detach().float().cpu().clamp(0.0, 1.0).numpy() * 255.0 + 0.5).astype(np.uint8)
+
+    @staticmethod
+    def _to_gray(cv2, frame):
+        if frame.ndim == 2 or int(frame.shape[-1]) == 1:
+            return frame[..., 0] if frame.ndim == 3 else frame
+        if int(frame.shape[-1]) >= 3:
+            return cv2.cvtColor(frame[..., :3], cv2.COLOR_RGB2GRAY)
+        return frame
+
+    @staticmethod
+    def _estimate_reference_to_current_affine(cv2, reference_u8, current_u8, min_inliers):
+        ref_gray = FurgenSeamScaleStabilize._to_gray(cv2, reference_u8)
+        cur_gray = FurgenSeamScaleStabilize._to_gray(cv2, current_u8)
+        orb = cv2.ORB_create(nfeatures=1800, fastThreshold=5)
+        ref_kp, ref_desc = orb.detectAndCompute(ref_gray, None)
+        cur_kp, cur_desc = orb.detectAndCompute(cur_gray, None)
+        if ref_desc is None or cur_desc is None or len(ref_kp) < 8 or len(cur_kp) < 8:
+            return None, 0
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = matcher.match(ref_desc, cur_desc)
+        if len(matches) < max(8, int(min_inliers)):
+            return None, 0
+        matches = sorted(matches, key=lambda match: match.distance)[: min(len(matches), 300)]
+        ref_pts = np.float32([ref_kp[match.queryIdx].pt for match in matches]).reshape(-1, 1, 2)
+        cur_pts = np.float32([cur_kp[match.trainIdx].pt for match in matches]).reshape(-1, 1, 2)
+        affine, inliers = cv2.estimateAffinePartial2D(
+            ref_pts,
+            cur_pts,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+            confidence=0.995,
+        )
+        inlier_count = int(inliers.sum()) if inliers is not None else 0
+        if affine is None or inlier_count < int(min_inliers):
+            return None, inlier_count
+        return affine.astype(np.float32), inlier_count
+
+    @staticmethod
+    def _affine_scale(affine):
+        sx = float(np.linalg.norm(affine[:, 0]))
+        sy = float(np.linalg.norm(affine[:, 1]))
+        return (sx + sy) * 0.5
+
+    @staticmethod
+    def _frame_strength(index, full_strength_frames, fade_out_frames, strength):
+        if index == 0:
+            return 0.0
+        full = max(0, int(full_strength_frames))
+        fade = max(0, int(fade_out_frames))
+        if index <= full:
+            return float(strength)
+        if fade <= 0 or index > full + fade:
+            return 0.0
+        return float(strength) * (1.0 - ((float(index - full) - 0.5) / float(fade)))
+
+    def stabilize(
+        self,
+        reference_image,
+        images,
+        full_strength_frames,
+        fade_out_frames,
+        strength,
+        max_scale_delta,
+        min_inliers,
+    ):
+        try:
+            import cv2
+        except Exception as exc:
+            raise RuntimeError("FurgenSeamScaleStabilize requires cv2/opencv-python") from exc
+
+        images = self._as_batch(images, "images")
+        reference = self._match_reference(self._as_batch(reference_image, "reference_image"), images)
+        total = int(images.shape[0])
+        limit = min(total, max(1, int(full_strength_frames) + int(fade_out_frames) + 1))
+        if total <= 1 or float(strength) <= 0.0 or limit <= 1:
+            return (images,)
+
+        reference_u8 = self._to_u8(reference[0])
+        output = images.clone()
+        identity = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        h = int(images.shape[1])
+        w = int(images.shape[2])
+        for index in range(1, limit):
+            frame_strength = self._frame_strength(index, full_strength_frames, fade_out_frames, strength)
+            if frame_strength <= 0.0:
+                continue
+            current_u8 = self._to_u8(images[index])
+            affine, _inliers = self._estimate_reference_to_current_affine(cv2, reference_u8, current_u8, min_inliers)
+            if affine is None:
+                continue
+            scale = self._affine_scale(affine)
+            if not np.isfinite(scale) or abs(scale - 1.0) > float(max_scale_delta):
+                continue
+            inverse = cv2.invertAffineTransform(affine).astype(np.float32)
+            correction = identity + (inverse - identity) * float(frame_strength)
+            corrected = cv2.warpAffine(
+                current_u8,
+                correction,
+                (w, h),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+            if corrected.ndim == 2:
+                corrected = corrected[..., None]
+            corrected_tensor = torch.from_numpy(corrected.astype(np.float32) / 255.0).to(
+                device=images.device,
+                dtype=images.dtype,
+            )
+            if int(corrected_tensor.shape[-1]) == int(images.shape[-1]):
+                output[index] = corrected_tensor
+            else:
+                merged = output[index].clone()
+                channels = min(int(merged.shape[-1]), int(corrected_tensor.shape[-1]))
+                merged[..., :channels] = corrected_tensor[..., :channels]
+                output[index] = merged
+        return (output.clamp(0.0, 1.0),)
 
 
 class FurgenTrimAudioDuration:
@@ -1607,6 +1786,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenExposureAdjust": FurgenExposureAdjust,
     "FurgenGetImageRangeFromBatch": FurgenGetImageRangeFromBatch,
     "FurgenPrependImageToBatch": FurgenPrependImageToBatch,
+    "FurgenSeamScaleStabilize": FurgenSeamScaleStabilize,
     "FurgenTrimAudioDuration": FurgenTrimAudioDuration,
     "FurgenReferenceColorMatch": FurgenReferenceColorMatch,
     "FurgenAdaptiveExposureMatch": FurgenAdaptiveExposureMatch,
@@ -1625,6 +1805,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenExposureAdjust": "Furgen Exposure Adjust",
     "FurgenGetImageRangeFromBatch": "Furgen Get Image Range From Batch",
     "FurgenPrependImageToBatch": "Furgen Prepend Image To Batch",
+    "FurgenSeamScaleStabilize": "Furgen Seam Scale Stabilize",
     "FurgenTrimAudioDuration": "Furgen Trim Audio Duration",
     "FurgenReferenceColorMatch": "Furgen Reference Color Match",
     "FurgenAdaptiveExposureMatch": "Furgen Adaptive Exposure Match",

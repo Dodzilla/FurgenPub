@@ -4,6 +4,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -56,6 +57,7 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
 
     assert "FurgenGetImageRangeFromBatch" in module.NODE_CLASS_MAPPINGS
     assert "FurgenPrependImageToBatch" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenSeamScaleStabilize" in module.NODE_CLASS_MAPPINGS
     assert "FurgenTrimAudioDuration" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLatentGuideTemporalMask" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLTXVAddLatentGuideTemporal" in module.NODE_CLASS_MAPPINGS
@@ -103,6 +105,45 @@ def test_furgen_latent_guide_temporal_mask_adds_front_loaded_noise_mask():
     assert masked["noise_mask"].shape == (2, 1, 5, 3, 4)
     # LTX guide masks use 1-strength. Frame 0 is fully guided, then it fades off.
     assert torch.allclose(masked["noise_mask"][0, 0, :, 0, 0], torch.tensor([0.0, 1 / 3, 2 / 3, 1.0, 1.0]))
+
+
+def test_furgen_seam_scale_stabilize_reduces_early_zoom_drift():
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    module = _load_furgen_video_tools()
+
+    rng = np.random.default_rng(1234)
+    reference = np.zeros((96, 96, 3), dtype=np.uint8)
+    for _ in range(80):
+        x = int(rng.integers(6, 90))
+        y = int(rng.integers(6, 90))
+        color = tuple(int(v) for v in rng.integers(60, 255, size=3))
+        cv2.circle(reference, (x, y), int(rng.integers(2, 5)), color, -1)
+    for x in range(8, 96, 16):
+        cv2.line(reference, (x, 0), (95 - x // 2, 95), (180, 180, 180), 1)
+
+    zoom = np.array([[1.08, 0.0, -4.2], [0.0, 1.08, -3.5]], dtype=np.float32)
+    drifted = cv2.warpAffine(reference, zoom, (96, 96), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+    reference_t = torch.from_numpy(reference.astype(np.float32) / 255.0).unsqueeze(0)
+    drifted_t = torch.from_numpy(drifted.astype(np.float32) / 255.0).unsqueeze(0)
+    images = torch.cat((reference_t, drifted_t, drifted_t), dim=0)
+
+    stabilized, = module.FurgenSeamScaleStabilize().stabilize(
+        reference_t,
+        images,
+        1,
+        0,
+        1.0,
+        0.2,
+        8,
+    )
+
+    before = torch.mean((images[1] - reference_t[0]) ** 2).item()
+    after = torch.mean((stabilized[1] - reference_t[0]) ** 2).item()
+    assert after < before * 0.7
+    assert torch.allclose(stabilized[0], images[0])
+    assert torch.allclose(stabilized[2], images[2])
 
 
 def test_furgen_ltxv_add_latent_guide_temporal_schedule_collapses_for_single_latent_frame():
