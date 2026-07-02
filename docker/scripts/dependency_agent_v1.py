@@ -6869,6 +6869,13 @@ class DependencyAgent:
             )
             self._install_furgen_video_compat_nodes()
             return
+        if bundle_id == "video_gen_v2_ltx_context_windows":
+            self._update_comfyui_core(
+                git_ref="cd77c551d6c7efa46a8ba514fd6f4e04aac76b4d",
+                install_requirements=True,
+                force_reset=True,
+            )
+            return
         if bundle_id == "video_gen_v2_furgen_color_nodes":
             self._install_furgen_video_tools_node(
                 required_class_types=required_class_types or self._video_gen_v2_bundle_verify_class_types(bundle_id)
@@ -6925,6 +6932,10 @@ class DependencyAgent:
                 "LTXAddVideoICLoRAGuide",
                 "ImageBatchExtendWithOverlap",
                 "VHS_LoadVideo",
+            ]
+        if bundle_id == "video_gen_v2_ltx_context_windows":
+            return [
+                "LTXVContextWindows",
             ]
         if bundle_id == "video_gen_v2_furgen_color_nodes":
             return [

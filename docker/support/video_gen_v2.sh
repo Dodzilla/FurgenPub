@@ -10,6 +10,7 @@ FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.
 VIDEO_GEN_V2_IMAGE_FILTERS_REPO="${VIDEO_GEN_V2_IMAGE_FILTERS_REPO:-https://github.com/spacepxl/ComfyUI-Image-Filters}"
 VIDEO_GEN_V2_IMAGE_FILTERS_PIN="${VIDEO_GEN_V2_IMAGE_FILTERS_PIN:-bbb3fb0045461adf3602faeedaf40af57090d4e2}"
 VIDEO_GEN_V2_IMAGE_FILTERS_OPENCV_REQUIREMENT="${VIDEO_GEN_V2_IMAGE_FILTERS_OPENCV_REQUIREMENT:-opencv-contrib-python==4.10.0.84}"
+VIDEO_GEN_V2_LTX_CONTEXT_WINDOWS_COMFYUI_PIN="${VIDEO_GEN_V2_LTX_CONTEXT_WINDOWS_COMFYUI_PIN:-cd77c551d6c7efa46a8ba514fd6f4e04aac76b4d}"
 
 mkdir -p "${WORKSPACE}" "${DM_COMFYUI_DIR}" || true
 
@@ -264,6 +265,21 @@ function provisioning_update_comfyui() {
         fi
     else
         echo "DEBUG: ComfyUI git repository not found."
+    fi
+}
+
+function provisioning_install_ltx_context_windows() {
+    local previous_pin="${COMFYUI_PIN}"
+    local update_status=0
+    COMFYUI_PIN="${VIDEO_GEN_V2_LTX_CONTEXT_WINDOWS_COMFYUI_PIN}"
+    provisioning_update_comfyui || update_status=$?
+    COMFYUI_PIN="${previous_pin}"
+    if [[ "${update_status}" -ne 0 ]]; then
+        return "${update_status}"
+    fi
+    if ! grep -R "LTXVContextWindows" "${COMFYUI_DIR}/comfy_extras" >/dev/null 2>&1; then
+        printf "ERROR: LTXVContextWindows was not found after updating ComfyUI to %s.\n" "${VIDEO_GEN_V2_LTX_CONTEXT_WINDOWS_COMFYUI_PIN}"
+        return 1
     fi
 }
 
@@ -687,6 +703,9 @@ function provisioning_install_requested_bundles() {
                 ;;
             video_gen_v2_furgen_color_nodes_v2)
                 provisioning_install_furgen_video_tools_node || return 1
+                ;;
+            video_gen_v2_ltx_context_windows)
+                provisioning_install_ltx_context_windows || return 1
                 ;;
             *)
                 printf "ERROR: Unknown video_gen_v2 bundle id '%s'.\n" "${bundle_id}"
