@@ -9114,6 +9114,13 @@ class DependencyAgent:
 
         bundle_ids = [bundle_id for bundle_id in payload.get("bundleIds", []) if isinstance(bundle_id, str) and bundle_id]
         verify_class_types = [class_type for class_type in payload.get("verifyClassTypes", []) if isinstance(class_type, str) and class_type]
+        required_install_signatures_raw = payload.get("requiredInstallSignatures")
+        required_install_signature_bundle_ids: Set[str] = set()
+        if isinstance(required_install_signatures_raw, dict):
+            for bundle_id in bundle_ids:
+                signature = required_install_signatures_raw.get(bundle_id)
+                if isinstance(signature, str) and re.match(r"^[0-9a-fA-F]{64}$", signature.strip()):
+                    required_install_signature_bundle_ids.add(bundle_id)
         if not verify_class_types and (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad"):
             seen_verify_classes: Set[str] = set()
             for bundle_id in bundle_ids:
@@ -9130,7 +9137,7 @@ class DependencyAgent:
             verify_class_types,
         )
 
-        if self._local_comfy_has_all_class_types(verify_class_types):
+        if self._local_comfy_has_all_class_types(verify_class_types) and not required_install_signature_bundle_ids:
             compat_changed = self._ensure_node_bundle_runtime_compatibility(
                 bundle_ids,
                 bundle_specs=bundle_specs,
@@ -9147,6 +9154,11 @@ class DependencyAgent:
             self._write_local_readiness_file()
             self._agent_ack(item_id, lease_id, "command_succeeded")
             return
+        if required_install_signature_bundle_ids:
+            logging.info(
+                "Installing node bundle(s) despite existing verification classes because install signatures are required: %s",
+                ",".join(sorted(required_install_signature_bundle_ids)),
+            )
 
         had_readiness_marker_before_install = self._local_readiness_file_present()
         comfy_restart_attempted = False
