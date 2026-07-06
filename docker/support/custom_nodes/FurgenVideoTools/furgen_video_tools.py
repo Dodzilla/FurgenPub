@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -829,6 +830,235 @@ def _mean_std_transfer(
     ratio = (ref_std / src_std).clamp(float(std_min), float(std_max))
     ratio = torch.ones_like(ratio).lerp(ratio, max(0.0, min(1.0, float(std_strength))))
     return (source - src_mean) * ratio + src_mean + (ref_mean - src_mean) * mean_strengths
+
+
+def _parse_video_entries_with_options(video_entries: str) -> list[dict]:
+    """Parse entries of the form 'url' or 'url|start=1.5|end=4.0'.
+
+    start/end are seconds within the source clip. Unknown options are
+    ignored so the format can grow without breaking older senders.
+    """
+    parsed: list[dict] = []
+    for raw_line in (video_entries or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        entry = {"path": _resolve_video_entry(parts[0]), "start": 0.0, "end": None}
+        for option in parts[1:]:
+            key, sep, value = option.partition("=")
+            if not sep:
+                continue
+            key = key.strip().lower()
+            try:
+                number = float(value.strip())
+            except ValueError:
+                continue
+            if not math.isfinite(number):
+                continue
+            if key == "start" and number > 0:
+                entry["start"] = number
+            elif key in ("end", "stop") and number > 0:
+                entry["end"] = number
+        if entry["end"] is not None and entry["end"] <= entry["start"]:
+            raise ValueError(f"video entry has an empty trim range: {line}")
+        parsed.append(entry)
+    if len(parsed) < 1:
+        raise ValueError("at least one video entry is required")
+    return parsed
+
+
+class FCSConcatVideosV2(FCSConcatVideos):
+    """Streaming concat with optional per-entry trims.
+
+    video_entries lines accept 'url|start=S|end=E'; trims run inside the
+    ffmpeg filtergraph so each clip's source audio follows its cut. The
+    overlap_frames input still drops duplicated leading frames of clips 2+
+    (applied after the entry's own start trim). Seam-repair inputs are
+    accepted for signature compatibility but ignored.
+    """
+
+    def concat_videos(
+        self,
+        video_entries,
+        frame_rate,
+        overlap_frames,
+        filename_prefix,
+        pix_fmt,
+        crf,
+        save_output,
+        seam_repair_mode=FCS_SEAM_REPAIR_NONE,
+        seam_repair_source_weights="0.35,0.15",
+    ):
+        entries = _parse_video_entries_with_options(video_entries)
+        probes = [_probe_video(entry["path"]) for entry in entries]
+        base_width = probes[0]["width"] or 1920
+        base_height = probes[0]["height"] or 1088
+        overlap_frames = max(0, int(overlap_frames or 0))
+        frame_rate = float(frame_rate or 60.0)
+        overlap_seconds = float(overlap_frames) / frame_rate if overlap_frames > 0 else 0.0
+
+        for idx, (entry, probe) in enumerate(zip(entries, probes)):
+            start = float(entry["start"]) + (overlap_seconds if idx > 0 else 0.0)
+            end = entry["end"] if entry["end"] is not None else probe["duration"]
+            if end is not None and probe["duration"]:
+                end = min(float(end), float(probe["duration"]))
+            if end is not None and end - start < 1.0 / frame_rate:
+                raise ValueError(
+                    f"clip {idx + 1} trim leaves no frames: start={start:.3f}s end={end:.3f}s"
+                )
+            entry["_effective_start"] = start
+            entry["_effective_end"] = end
+
+        output_dir = (
+            folder_paths.get_output_directory()
+            if save_output
+            else folder_paths.get_temp_directory()
+        )
+        full_output_folder, filename, _, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix,
+            output_dir,
+        )
+        existing = sorted(Path(full_output_folder).glob(f"{filename}_*.mp4"))
+        counter = 1
+        if existing:
+            suffixes = []
+            for item in existing:
+                stem = item.stem
+                parts = stem.split("_")
+                if parts:
+                    tail = parts[-1].replace("-audio", "")
+                    if tail.isdigit():
+                        suffixes.append(int(tail))
+            if suffixes:
+                counter = max(suffixes) + 1
+
+        base_file = f"{filename}_{counter:05}.mp4"
+        audio_file = f"{filename}_{counter:05}-audio.mp4"
+        base_path = os.path.join(full_output_folder, base_file)
+        audio_path = os.path.join(full_output_folder, audio_file)
+
+        self._concat_trimmed_videos_ffmpeg_filtergraph(
+            entries=entries,
+            probes=probes,
+            frame_rate=frame_rate,
+            base_width=base_width,
+            base_height=base_height,
+            pix_fmt=pix_fmt,
+            crf=crf,
+            base_path=base_path,
+            audio_path=audio_path,
+        )
+
+        preview = {
+            "filename": audio_file,
+            "subfolder": subfolder,
+            "type": "output" if save_output else "temp",
+            "format": "video/h264-mp4",
+            "frame_rate": frame_rate,
+            "fullpath": audio_path,
+        }
+        return {
+            "ui": {"gifs": [preview]},
+            "result": ((save_output, [base_path, audio_path]),),
+        }
+
+    def _concat_trimmed_videos_ffmpeg_filtergraph(
+        self,
+        *,
+        entries,
+        probes,
+        frame_rate,
+        base_width,
+        base_height,
+        pix_fmt,
+        crf,
+        base_path,
+        audio_path,
+    ):
+        ffmpeg_inputs = []
+        filter_parts = []
+        concat_inputs = []
+        for idx, (entry, probe) in enumerate(zip(entries, probes)):
+            start = float(entry.get("_effective_start") or 0.0)
+            end = entry.get("_effective_end")
+            ffmpeg_inputs.extend(["-i", probe["path"]])
+
+            trim_args = []
+            if start > 0:
+                trim_args.append(f"start={start:.6f}")
+            if end is not None:
+                trim_args.append(f"end={float(end):.6f}")
+            video_filters = []
+            if trim_args:
+                video_filters.extend([f"trim={':'.join(trim_args)}", "setpts=PTS-STARTPTS"])
+            video_filters.extend(
+                [
+                    f"fps={frame_rate}",
+                    f"scale={base_width}:{base_height}:flags=lanczos:force_original_aspect_ratio=decrease",
+                    f"pad={base_width}:{base_height}:(ow-iw)/2:(oh-ih)/2:black",
+                    f"format={pix_fmt}",
+                    "setsar=1",
+                ]
+            )
+            filter_parts.append(f"[{idx}:v]{','.join(video_filters)}[v{idx}]")
+
+            if probe["has_audio"]:
+                audio_filters = []
+                if trim_args:
+                    audio_filters.extend([f"atrim={':'.join(trim_args)}", "asetpts=PTS-STARTPTS"])
+                audio_filters.extend(
+                    [
+                        "aresample=48000",
+                        "aformat=sample_fmts=fltp:channel_layouts=stereo",
+                    ]
+                )
+                filter_parts.append(f"[{idx}:a]{','.join(audio_filters)}[a{idx}]")
+            else:
+                clip_end = float(end) if end is not None else float(probe["duration"] or 0.0)
+                silent_duration = max(0.001, clip_end - start)
+                filter_parts.append(
+                    f"anullsrc=channel_layout=stereo:sample_rate=48000:d={silent_duration:.6f}[a{idx}]"
+                )
+            concat_inputs.extend([f"[v{idx}]", f"[a{idx}]"])
+
+        filter_parts.append("".join(concat_inputs) + f"concat=n={len(probes)}:v=1:a=1[v][a]")
+        cmd = [
+            FFMPEG_BIN,
+            "-y",
+            "-v",
+            "error",
+            *ffmpeg_inputs,
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            pix_fmt,
+            "-r",
+            str(frame_rate),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            audio_path,
+        ]
+        subprocess.run(cmd, check=True)
+
+        subprocess.run(
+            [FFMPEG_BIN, "-y", "-v", "error", "-i", audio_path, "-an", "-c:v", "copy", base_path],
+            check=True,
+        )
 
 
 class FurgenExposureAdjust:
@@ -2091,6 +2321,7 @@ class FurgenAssertFiniteLatent:
 
 NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
+    "FCSConcatVideosV2": FCSConcatVideosV2,
     "FurgenExposureAdjust": FurgenExposureAdjust,
     "FurgenGetImageRangeFromBatch": FurgenGetImageRangeFromBatch,
     "FurgenPrependImageToBatch": FurgenPrependImageToBatch,
@@ -2110,6 +2341,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FCSConcatVideos": "Furgen Concat Videos",
+    "FCSConcatVideosV2": "Furgen Concat Videos V2 (trims)",
     "FurgenExposureAdjust": "Furgen Exposure Adjust",
     "FurgenGetImageRangeFromBatch": "Furgen Get Image Range From Batch",
     "FurgenPrependImageToBatch": "Furgen Prepend Image To Batch",
