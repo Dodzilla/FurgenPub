@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.85"
+AGENT_VERSION = "dm-agent-py/0.10.86"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "021c600f73e5c77da9ef1ec2e53e803cdbedaf76"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -8499,6 +8499,11 @@ class DependencyAgent:
                 self._ready_agent_item_ids.remove(item_id)
             except ValueError:
                 pass
+        # A slot just freed. Poll locally for any backlog item instead of relying
+        # on the server to bump our own agentQueue signal (a self-wake the server
+        # suppresses when AGENT_SELF_WAKE_QUEUE_SIGNAL_ENABLED=false). Newly
+        # server-assigned work still arrives via its own dispatch signal.
+        self._request_agent_queue_poll()
 
     def _request_agent_queue_poll(self) -> None:
         self._agent_poll_wakeup.set()
