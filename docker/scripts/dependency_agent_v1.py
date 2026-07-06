@@ -4082,7 +4082,7 @@ class DependencyAgent:
             h["X-DM-Secret"] = self.shared_secret
         return h
 
-    def _agent_headers(self, use_token: bool = True, include_secret: bool = False) -> Dict[str, str]:
+    def _agent_headers(self, use_token: bool = True, include_secret: bool = True) -> Dict[str, str]:
         h: Dict[str, str] = {}
         if use_token and self._agent_access_token:
             h["Authorization"] = f"Bearer {self._agent_access_token}"
@@ -4157,7 +4157,7 @@ class DependencyAgent:
         query: Optional[Dict[str, Any]] = None,
         timeout_seconds: float = 30.0,
         use_token: bool = True,
-        include_secret: bool = False,
+        include_secret: bool = True,
     ) -> Dict[str, Any]:
         url = self._resolve_agent_endpoint_url(endpoint)
         if query:
@@ -8154,7 +8154,7 @@ class DependencyAgent:
             },
             timeout_seconds=max(30.0, float(wait_value) + 10.0),
             use_token=True,
-            include_secret=False,
+            include_secret=True,
         )
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         items = data.get("items")
@@ -8181,7 +8181,7 @@ class DependencyAgent:
             },
             timeout_seconds=30.0,
             use_token=True,
-            include_secret=False,
+            include_secret=True,
         )
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         item = data.get("item")
@@ -8213,7 +8213,7 @@ class DependencyAgent:
             for key in ("jobId", "executionAttempt", "attemptEpoch"):
                 if key in tuple_fields:
                     body[key] = tuple_fields[key]
-        resp = self._agent_api("POST", "/agent/ack", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
+        resp = self._agent_api("POST", "/agent/ack", body=body, timeout_seconds=30.0, use_token=True, include_secret=True)
         return resp.get("data") if isinstance(resp.get("data"), dict) else {}
 
     def _agent_event(
@@ -8242,7 +8242,7 @@ class DependencyAgent:
         digest_body = {k: v for k, v in body.items() if k != "eventDigest"}
         body["eventDigest"] = _sha256_hex_bytes(_canonical_json_bytes(digest_body))
 
-        resp = self._agent_api("POST", "/agent/event", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
+        resp = self._agent_api("POST", "/agent/event", body=body, timeout_seconds=30.0, use_token=True, include_secret=True)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         accepted = data.get("accepted")
         reason = data.get("reason")
@@ -8438,7 +8438,7 @@ class DependencyAgent:
             self._last_agent_heartbeat_ms = now_ms
             return {}
 
-        resp = self._agent_api("POST", "/agent/heartbeat", body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
+        resp = self._agent_api("POST", "/agent/heartbeat", body=body, timeout_seconds=30.0, use_token=True, include_secret=True)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         self._apply_agent_runtime_config(data.get("agentRuntimeConfig"), "/agent/heartbeat")
         self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/heartbeat")
@@ -9985,7 +9985,7 @@ class DependencyAgent:
             "leaseId": lease.lease_id,
             "refreshToken": refresh_token,
         }
-        resp = self._agent_api("POST", endpoint, body=body, timeout_seconds=30.0, use_token=True, include_secret=False)
+        resp = self._agent_api("POST", endpoint, body=body, timeout_seconds=30.0, use_token=True, include_secret=True)
         data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
         if isinstance(data.get("inputFiles"), list):
             command_state["inputFiles"] = data.get("inputFiles")
