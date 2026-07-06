@@ -11,6 +11,9 @@ import torch.nn.functional as F
 
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
+FCS_SEAM_REPAIR_NONE = "none"
+FCS_SEAM_REPAIR_BLEND2_AFTER_TRIM = "blend2_after_trim"
+FCS_SEAM_REPAIR_BLEND2_AFTER_CONCAT = "blend2_after_concat"
 
 
 RGB_LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
@@ -81,6 +84,44 @@ def _probe_video(path: str) -> dict:
     }
 
 
+def _parse_seam_repair_weights(value: str) -> list[float]:
+    weights = []
+    for raw in str(value or "").replace(";", ",").split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        try:
+            weights.append(max(0.0, min(1.0, float(item))))
+        except Exception:
+            continue
+    return weights or [0.35, 0.15]
+
+
+def _read_exact(pipe, size: int) -> bytes:
+    chunks = []
+    remaining = int(size)
+    while remaining > 0:
+        chunk = pipe.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _blend_rgb24_frame(source: bytes, frame: bytes, source_weight: float) -> bytes:
+    if not source or len(source) != len(frame):
+        return frame
+    source_weight = max(0.0, min(1.0, float(source_weight)))
+    frame_weight = 1.0 - source_weight
+    out = bytearray(len(frame))
+    src_view = memoryview(source)
+    frame_view = memoryview(frame)
+    for idx in range(len(frame)):
+        out[idx] = min(255, max(0, int(src_view[idx] * source_weight + frame_view[idx] * frame_weight + 0.5)))
+    return bytes(out)
+
+
 class FCSConcatVideos:
     @classmethod
     def INPUT_TYPES(cls):
@@ -114,7 +155,21 @@ class FCSConcatVideos:
                     "BOOLEAN",
                     {"default": True},
                 ),
-            }
+            },
+            "optional": {
+                "seam_repair_mode": (
+                    [
+                        FCS_SEAM_REPAIR_NONE,
+                        FCS_SEAM_REPAIR_BLEND2_AFTER_TRIM,
+                        FCS_SEAM_REPAIR_BLEND2_AFTER_CONCAT,
+                    ],
+                    {"default": FCS_SEAM_REPAIR_NONE},
+                ),
+                "seam_repair_source_weights": (
+                    "STRING",
+                    {"default": "0.35,0.15"},
+                ),
+            },
         }
 
     RETURN_TYPES = ("VHS_FILENAMES",)
@@ -132,13 +187,20 @@ class FCSConcatVideos:
         pix_fmt,
         crf,
         save_output,
+        seam_repair_mode=FCS_SEAM_REPAIR_NONE,
+        seam_repair_source_weights="0.35,0.15",
     ):
         entries = _parse_video_entries(video_entries)
         probes = [_probe_video(entry) for entry in entries]
         base_width = probes[0]["width"] or 1920
         base_height = probes[0]["height"] or 1088
         overlap_frames = max(0, int(overlap_frames or 0))
-        overlap_seconds = float(overlap_frames) / float(frame_rate or 60.0) if overlap_frames > 0 else 0.0
+        frame_rate = float(frame_rate or 60.0)
+        overlap_seconds = float(overlap_frames) / frame_rate if overlap_frames > 0 else 0.0
+        seam_repair_mode = str(seam_repair_mode or FCS_SEAM_REPAIR_NONE).strip()
+        if seam_repair_mode == FCS_SEAM_REPAIR_BLEND2_AFTER_CONCAT:
+            seam_repair_mode = FCS_SEAM_REPAIR_BLEND2_AFTER_TRIM
+        seam_repair_weights = _parse_seam_repair_weights(seam_repair_source_weights)
 
         if overlap_seconds > 0:
             for idx, probe in enumerate(probes):
@@ -177,6 +239,61 @@ class FCSConcatVideos:
         base_path = os.path.join(full_output_folder, base_file)
         audio_path = os.path.join(full_output_folder, audio_file)
 
+        if seam_repair_mode == FCS_SEAM_REPAIR_BLEND2_AFTER_TRIM and len(probes) > 1:
+            self._concat_videos_with_seam_repair(
+                probes=probes,
+                frame_rate=frame_rate,
+                overlap_frames=overlap_frames,
+                overlap_seconds=overlap_seconds,
+                base_width=base_width,
+                base_height=base_height,
+                pix_fmt=pix_fmt,
+                crf=crf,
+                base_path=base_path,
+                audio_path=audio_path,
+                source_weights=seam_repair_weights,
+            )
+        else:
+            self._concat_videos_ffmpeg_filtergraph(
+                probes=probes,
+                frame_rate=frame_rate,
+                overlap_frames=overlap_frames,
+                overlap_seconds=overlap_seconds,
+                base_width=base_width,
+                base_height=base_height,
+                pix_fmt=pix_fmt,
+                crf=crf,
+                base_path=base_path,
+                audio_path=audio_path,
+            )
+
+        preview = {
+            "filename": audio_file,
+            "subfolder": subfolder,
+            "type": "output" if save_output else "temp",
+            "format": "video/h264-mp4",
+            "frame_rate": frame_rate,
+            "fullpath": audio_path,
+        }
+        return {
+            "ui": {"gifs": [preview]},
+            "result": ((save_output, [base_path, audio_path]),),
+        }
+
+    def _concat_videos_ffmpeg_filtergraph(
+        self,
+        *,
+        probes,
+        frame_rate,
+        overlap_frames,
+        overlap_seconds,
+        base_width,
+        base_height,
+        pix_fmt,
+        crf,
+        base_path,
+        audio_path,
+    ):
         ffmpeg_inputs = []
         filter_parts = []
         concat_inputs = []
@@ -191,7 +308,7 @@ class FCSConcatVideos:
                 video_filters.extend(
                     [
                         f"select='gte(n,{clip_trim_frames})'",
-                        f"setpts=N/{float(frame_rate or 60.0):.6f}/TB",
+                        f"setpts=N/{float(frame_rate):.6f}/TB",
                     ]
                 )
             video_filters.extend(
@@ -261,18 +378,209 @@ class FCSConcatVideos:
             check=True,
         )
 
-        preview = {
-            "filename": audio_file,
-            "subfolder": subfolder,
-            "type": "output" if save_output else "temp",
-            "format": "video/h264-mp4",
-            "frame_rate": frame_rate,
-            "fullpath": audio_path,
-        }
-        return {
-            "ui": {"gifs": [preview]},
-            "result": ((save_output, [base_path, audio_path]),),
-        }
+    def _concat_videos_with_seam_repair(
+        self,
+        *,
+        probes,
+        frame_rate,
+        overlap_frames,
+        overlap_seconds,
+        base_width,
+        base_height,
+        pix_fmt,
+        crf,
+        base_path,
+        audio_path,
+        source_weights,
+    ):
+        frame_size = int(base_width) * int(base_height) * 3
+        if frame_size <= 0:
+            raise ValueError("invalid concat frame size for seam repair")
+
+        encode_cmd = [
+            FFMPEG_BIN,
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{base_width}x{base_height}",
+            "-r",
+            f"{float(frame_rate):.6f}",
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            pix_fmt,
+            "-r",
+            f"{float(frame_rate):.6f}",
+            "-movflags",
+            "+faststart",
+            base_path,
+        ]
+        encoder = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert encoder.stdin is not None
+        previous_last_frame = None
+        try:
+            for idx, probe in enumerate(probes):
+                clip_trim_frames = overlap_frames if idx > 0 else 0
+                video_filters = [f"fps={float(frame_rate):.6f}"]
+                if clip_trim_frames > 0:
+                    video_filters.extend(
+                        [
+                            f"select='gte(n,{clip_trim_frames})'",
+                            f"setpts=N/{float(frame_rate):.6f}/TB",
+                        ]
+                    )
+                video_filters.extend(
+                    [
+                        f"scale={base_width}:{base_height}:flags=lanczos:force_original_aspect_ratio=decrease",
+                        f"pad={base_width}:{base_height}:(ow-iw)/2:(oh-ih)/2:black",
+                        "format=rgb24",
+                        "setsar=1",
+                    ]
+                )
+                decode_cmd = [
+                    FFMPEG_BIN,
+                    "-v",
+                    "error",
+                    "-i",
+                    probe["path"],
+                    "-vf",
+                    ",".join(video_filters),
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-",
+                ]
+                decoder = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                assert decoder.stdout is not None
+                frame_index = 0
+                current_last_frame = None
+                while True:
+                    frame = _read_exact(decoder.stdout, frame_size)
+                    if not frame:
+                        break
+                    if len(frame) != frame_size:
+                        raise ValueError("short raw frame while concatenating videos")
+                    if previous_last_frame is not None and frame_index < len(source_weights):
+                        frame = _blend_rgb24_frame(previous_last_frame, frame, source_weights[frame_index])
+                    encoder.stdin.write(frame)
+                    current_last_frame = frame
+                    frame_index += 1
+                decoder_rc = decoder.wait()
+                stderr = decoder.stderr.read().decode("utf-8", errors="replace") if decoder.stderr else ""
+                if decoder_rc != 0:
+                    raise RuntimeError(f"ffmpeg decode failed for clip {idx + 1}: {stderr[-2000:]}")
+                if current_last_frame is None:
+                    raise ValueError(f"clip {idx + 1} produced no frames after trim")
+                previous_last_frame = current_last_frame
+        finally:
+            try:
+                encoder.stdin.close()
+            except Exception:
+                pass
+
+        encoder_rc = encoder.wait()
+        encoder_stderr = encoder.stderr.read().decode("utf-8", errors="replace") if encoder.stderr else ""
+        if encoder_rc != 0:
+            raise RuntimeError(f"ffmpeg seam-repair video encode failed: {encoder_stderr[-2000:]}")
+
+        audio_tmp = f"{os.path.splitext(audio_path)[0]}-track.m4a"
+        try:
+            self._write_concat_audio_track(
+                probes=probes,
+                overlap_seconds=overlap_seconds,
+                output_path=audio_tmp,
+            )
+            subprocess.run(
+                [
+                    FFMPEG_BIN,
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    base_path,
+                    "-i",
+                    audio_tmp,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "copy",
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                    audio_path,
+                ],
+                check=True,
+            )
+        finally:
+            try:
+                if os.path.exists(audio_tmp):
+                    os.remove(audio_tmp)
+            except Exception:
+                pass
+
+    def _write_concat_audio_track(self, *, probes, overlap_seconds, output_path):
+        ffmpeg_inputs = []
+        filter_parts = []
+        concat_inputs = []
+        for idx, probe in enumerate(probes):
+            clip_trim_seconds = overlap_seconds if idx > 0 else 0.0
+            ffmpeg_inputs.extend(["-i", probe["path"]])
+            if probe["has_audio"]:
+                audio_filters = [
+                    "aresample=48000",
+                    "aformat=sample_fmts=fltp:channel_layouts=stereo",
+                ]
+                if clip_trim_seconds > 0:
+                    audio_filters.extend(
+                        [
+                            f"atrim=start={clip_trim_seconds:.6f}",
+                            "asetpts=PTS-STARTPTS",
+                        ]
+                    )
+                filter_parts.append(f"[{idx}:a]{','.join(audio_filters)}[a{idx}]")
+            else:
+                silent_duration = max(0.001, probe["duration"] - clip_trim_seconds)
+                filter_parts.append(
+                    f"anullsrc=channel_layout=stereo:sample_rate=48000:d={silent_duration:.6f}[a{idx}]"
+                )
+            concat_inputs.append(f"[a{idx}]")
+
+        filter_parts.append("".join(concat_inputs) + f"concat=n={len(probes)}:v=0:a=1[a]")
+        cmd = [
+            FFMPEG_BIN,
+            "-y",
+            "-v",
+            "error",
+            *ffmpeg_inputs,
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[a]",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+        subprocess.run(cmd, check=True)
 
 
 def _is_neutral(value: float, neutral: float) -> bool:
