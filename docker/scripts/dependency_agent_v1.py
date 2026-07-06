@@ -127,8 +127,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.86"
-VIDEO_GEN_V2_FURGENPUB_COMMIT = "021c600f73e5c77da9ef1ec2e53e803cdbedaf76"
+AGENT_VERSION = "dm-agent-py/0.10.87"
+VIDEO_GEN_V2_FURGENPUB_COMMIT = "46beaf89b9ea5325b7bb06c80da676f36b4a8dea"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
@@ -6984,6 +6984,7 @@ class DependencyAgent:
         if bundle_id == "video_gen_v2_fcs_concat_videos":
             return [
                 "FCSConcatVideos",
+                "FCSConcatVideosV2",
             ]
         if bundle_id == "video_gen_v2_image_filters_nodes":
             return [
