@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.84"
+AGENT_VERSION = "dm-agent-py/0.10.85"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "021c600f73e5c77da9ef1ec2e53e803cdbedaf76"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -9141,7 +9141,7 @@ class DependencyAgent:
                 signature = required_install_signatures_raw.get(bundle_id)
                 if isinstance(signature, str) and re.match(r"^[0-9a-fA-F]{64}$", signature.strip()):
                     required_install_signature_bundle_ids.add(bundle_id)
-        if not verify_class_types and (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad"):
+        if not verify_class_types and (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3"):
             seen_verify_classes: Set[str] = set()
             for bundle_id in bundle_ids:
                 for class_type in self._video_gen_v2_bundle_verify_class_types(bundle_id):
@@ -9218,7 +9218,10 @@ class DependencyAgent:
                     check=True,
                     timeout=max(1800, 300 * max(1, len(legacy_bundle_ids))),
                 )
-            elif server_type in ("video_gen_v2", "video_gen_v2_salad") and legacy_bundle_ids:
+            elif server_type in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3") and legacy_bundle_ids:
+                # video_gen_v3 shares the video_gen_v2 bundle catalog; the
+                # installers are server-type agnostic (git nodes + managed
+                # FurgenVideoTools copies).
                 for bundle_id in legacy_bundle_ids:
                     self._install_video_gen_v2_node_bundle(
                         bundle_id,

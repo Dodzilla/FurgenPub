@@ -14,6 +14,7 @@ source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
 # Pin to the latest official ComfyUI release (v0.18.2, 2026-03-25).
 COMFYUI_PIN="${COMFYUI_PIN:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
+FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support}"
 
 # NOTE:
 # - Do NOT put Hugging Face tokens in this file (or in git clone URLs).
@@ -149,6 +150,42 @@ function provisioning_update_comfyui() {
     fi
 }
 
+function provisioning_install_furgen_video_tools_node() {
+    local script_dir src_dir dest_dir remote_base
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    src_dir="${script_dir}/custom_nodes/FurgenVideoTools"
+    dest_dir="${COMFYUI_DIR}/custom_nodes/FurgenVideoTools"
+    remote_base="${FURGENPUB_RAW_BASE_URL%/}/custom_nodes/FurgenVideoTools"
+
+    mkdir -p "${COMFYUI_DIR}/custom_nodes"
+    rm -rf "${dest_dir}"
+    mkdir -p "${dest_dir}"
+
+    if [[ -d "${src_dir}" && -f "${src_dir}/furgen_video_tools.py" ]] && grep -q "FurgenTemporalUnsharpMask" "${src_dir}/furgen_video_tools.py"; then
+        cp -R "${src_dir}/." "${dest_dir}/"
+        printf "Installed managed custom node: FurgenVideoTools (local copy)\n"
+        return 0
+    elif [[ -d "${src_dir}" ]]; then
+        printf "WARN: Local FurgenVideoTools source is missing FurgenTemporalUnsharpMask; using pinned remote copy.\n"
+    fi
+
+    printf "Downloading managed custom node from %s\n" "${remote_base}"
+    curl -fsSL "${remote_base}/__init__.py" -o "${dest_dir}/__init__.py" || {
+        printf "ERROR: Failed to download FurgenVideoTools __init__.py from %s\n" "${remote_base}"
+        return 1
+    }
+    curl -fsSL "${remote_base}/furgen_video_tools.py" -o "${dest_dir}/furgen_video_tools.py" || {
+        printf "ERROR: Failed to download FurgenVideoTools implementation from %s\n" "${remote_base}"
+        return 1
+    }
+    if ! grep -q "FurgenTemporalUnsharpMask" "${dest_dir}/furgen_video_tools.py"; then
+        printf "ERROR: Downloaded FurgenVideoTools implementation is missing FurgenTemporalUnsharpMask from %s\n" "${remote_base}"
+        return 1
+    fi
+
+    printf "Installed managed custom node: FurgenVideoTools (downloaded)\n"
+}
+
 function provisioning_start() {
     local soft_failures=0
 
@@ -158,6 +195,12 @@ function provisioning_start() {
     load_node_pins_from_env
     provisioning_get_nodes || {
         printf "WARN: Provisioning step 'provisioning_get_nodes' failed with exit code %s; continuing.\n" "$?"
+        soft_failures=1
+    }
+    # Furgen-owned video nodes (FurgenExposureAdjust etc.) — required by the
+    # video_combine_v2 edit-render workflows submitted by furgenai.
+    provisioning_install_furgen_video_tools_node || {
+        printf "WARN: Provisioning step 'provisioning_install_furgen_video_tools_node' failed with exit code %s; continuing.\n" "$?"
         soft_failures=1
     }
     # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
