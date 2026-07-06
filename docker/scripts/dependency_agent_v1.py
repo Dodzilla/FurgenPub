@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.82"
+AGENT_VERSION = "dm-agent-py/0.10.83"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "021c600f73e5c77da9ef1ec2e53e803cdbedaf76"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3529,6 +3529,17 @@ class DependencyAgent:
             15.0,
             min(1800.0, _env_float("DM_AGENT_RTDB_SIGNAL_SAFETY_MIN_SECONDS", 900.0)),
         )
+        # A queue signal always triggers an immediate (cheap, direct-RTDB) queue claim,
+        # but it must NOT force a full /agent/heartbeat on every bump: under active job
+        # churn the server bumps the agentQueue signal many times per second, and forcing
+        # a heartbeat per bump turned normal traffic into a ~24x coordinationApi request +
+        # RTDB egress storm (incident 2026-07-05). This floor caps how often a signal may
+        # force a heartbeat; default = the normal heartbeat cadence, so signals never
+        # accelerate heartbeats past the timer. Set to 0 to restore forcing on every signal.
+        self.agent_signal_heartbeat_min_seconds = max(
+            0.0,
+            _env_float("DM_AGENT_SIGNAL_HEARTBEAT_MIN_SECONDS", self.agent_heartbeat_seconds),
+        )
         self.coordination_runtime_full_sync_seconds = max(
             60.0,
             min(3600.0, _env_float("DM_COORDINATION_RUNTIME_FULL_SYNC_SECONDS", 900.0)),
@@ -5610,8 +5621,14 @@ class DependencyAgent:
         if not isinstance(path, str):
             path = "/"
         if path == "/" or path.startswith("/agentQueue"):
-            self._last_agent_heartbeat_ms = 0
+            # Claim immediately (cheap direct-RTDB read) so pickup latency is unchanged,
+            # but only nudge a heartbeat if one is already ~due. Forcing a heartbeat on
+            # every signal is what amplified normal churn into the 2026-07-05 storm; the
+            # heartbeat timer already POSTs promptly when held-lease/stage state changes.
             self._request_agent_queue_poll()
+            min_ms = self.agent_signal_heartbeat_min_seconds * 1000.0
+            if (self._server_now_ms() - int(self._last_agent_heartbeat_ms)) >= min_ms:
+                self._last_agent_heartbeat_ms = 0
         if path == "/" or path.startswith("/dependencyQueue"):
             self._request_dependency_queue_poll()
 
