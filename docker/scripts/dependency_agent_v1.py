@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.83"
+AGENT_VERSION = "dm-agent-py/0.10.84"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "021c600f73e5c77da9ef1ec2e53e803cdbedaf76"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3536,6 +3536,7 @@ class DependencyAgent:
         # RTDB egress storm (incident 2026-07-05). This floor caps how often a signal may
         # force a heartbeat; default = the normal heartbeat cadence, so signals never
         # accelerate heartbeats past the timer. Set to 0 to restore forcing on every signal.
+        self._agent_signal_heartbeat_min_seconds_env = _env_str("DM_AGENT_SIGNAL_HEARTBEAT_MIN_SECONDS") is not None
         self.agent_signal_heartbeat_min_seconds = max(
             0.0,
             _env_float("DM_AGENT_SIGNAL_HEARTBEAT_MIN_SECONDS", self.agent_heartbeat_seconds),
@@ -4596,6 +4597,8 @@ class DependencyAgent:
                 self.agent_heartbeat_seconds = heartbeat_seconds
                 if self.agent_idle_heartbeat_seconds < self.agent_heartbeat_seconds:
                     self.agent_idle_heartbeat_seconds = self.agent_heartbeat_seconds
+                if not self._agent_signal_heartbeat_min_seconds_env:
+                    self.agent_signal_heartbeat_min_seconds = self.agent_heartbeat_seconds
                 changes.append(f"activeHeartbeat={heartbeat_seconds:.1f}s")
 
         idle_heartbeat_seconds = self._runtime_config_seconds(raw.get("idleAgentHeartbeatSec"), 2.0, 300.0)
@@ -11443,10 +11446,13 @@ class DependencyAgent:
                                 logging.warning("Agent heartbeat unauthorized (status=%d); token refresh required.", e.status)
                                 self._agent_access_token = None
                                 self._agent_access_token_expires_at_ms = 0
+                                self._last_agent_heartbeat_ms = now
                             else:
                                 logging.warning("Agent heartbeat API error (status=%d): %s", e.status, e)
+                                self._last_agent_heartbeat_ms = now
                         except Exception as e:
                             logging.warning("Agent heartbeat failed: %s", e)
+                            self._last_agent_heartbeat_ms = now
 
                     execute_capacity = self._agent_effective_execute_capacity()
                     with self._lock:
