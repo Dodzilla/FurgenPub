@@ -7950,7 +7950,7 @@ class DependencyAgent:
         }
         if error:
             body["error"] = error[:MAX_AGENT_ERROR_MESSAGE_CHARS]
-        api_json("POST", url, body=body, headers=self._headers(use_token=True, include_secret=False), timeout_seconds=30.0)
+        api_json("POST", url, body=body, headers=self._headers(use_token=True), timeout_seconds=30.0)
 
     def _heartbeat(self, queue_depth: Optional[int] = None) -> None:
         if not self._resolved_instance_id:
@@ -7984,7 +7984,7 @@ class DependencyAgent:
         if queue_depth is not None:
             body["queueDepth"] = int(queue_depth)
 
-        status, resp = api_json("POST", url, body=body, headers=self._headers(use_token=True, include_secret=False), timeout_seconds=30.0)
+        status, resp = api_json("POST", url, body=body, headers=self._headers(use_token=True), timeout_seconds=30.0)
         if status != 200 or not isinstance(resp, dict):
             raise RuntimeError(f"Unexpected heartbeat response: {status} {resp}")
         self._maybe_queue_self_update(resp.get("agentUpdate"), "dependencies/heartbeat")
@@ -8000,7 +8000,7 @@ class DependencyAgent:
             return rtdb_items
         instance_id = self._resolved_instance_id
         url = f"{self.api_base_url}/dependencies/queue?instanceId={urllib.parse.quote(instance_id)}&limit={int(limit)}"
-        status, resp = api_json("GET", url, headers=self._headers(use_token=True, include_secret=False), timeout_seconds=30.0)
+        status, resp = api_json("GET", url, headers=self._headers(use_token=True), timeout_seconds=30.0)
         if status != 200 or not isinstance(resp, dict):
             raise RuntimeError(f"Unexpected queue response: {status} {resp}")
         items = resp.get("items", [])
@@ -8023,7 +8023,7 @@ class DependencyAgent:
             f"?instanceId={urllib.parse.quote(instance_id)}"
             f"&itemId={urllib.parse.quote(item_id)}"
         )
-        status, resp = api_json("GET", url, headers=self._headers(use_token=True, include_secret=False), timeout_seconds=30.0)
+        status, resp = api_json("GET", url, headers=self._headers(use_token=True), timeout_seconds=30.0)
         if status != 200 or not isinstance(resp, dict):
             raise RuntimeError(f"Unexpected queue item response: {status} {resp}")
         item = resp.get("item")
