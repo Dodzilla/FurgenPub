@@ -538,9 +538,45 @@ function provisioning_get_pip_packages() {
     fi
 }
 
+function provisioning_purge_python_bytecode_for_package() {
+    local package_name="$1"
+    python - "$package_name" <<'PY' || return 1
+import importlib.util
+import pathlib
+import shutil
+import sys
+
+package_name = sys.argv[1]
+spec = importlib.util.find_spec(package_name)
+roots = []
+if spec is not None:
+    if spec.submodule_search_locations:
+        roots.extend(pathlib.Path(path) for path in spec.submodule_search_locations)
+    elif spec.origin:
+        roots.append(pathlib.Path(spec.origin).parent)
+
+removed = 0
+for root in roots:
+    if not root.exists():
+        continue
+    for path in root.rglob("__pycache__"):
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    for path in root.rglob("*.pyc"):
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+
+print(f"Purged {removed} cached bytecode entries for {package_name}")
+PY
+}
+
 function provisioning_fix_python_compatibility() {
     printf "Enforcing video_gen_v2 Python compatibility pins...\n"
     pip install --no-cache-dir "kornia<0.8" || return 1
+    provisioning_purge_python_bytecode_for_package "kornia" || return 1
     python - <<'PY' || return 1
 from kornia.geometry.transform.pyramid import pad
 print("Verified kornia pyramid.pad import for ComfyUI-LTXVideo")
