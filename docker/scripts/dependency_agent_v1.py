@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.89"
+AGENT_VERSION = "dm-agent-py/0.10.90"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -159,6 +159,7 @@ PRL_MINER_KINDS = {"alpha_miner", "srbminer_multi"}
 DEFAULT_PRL_MINER_KIND = "alpha_miner"
 PRL_MINER_PACKAGE_TYPES = {"binary", "tar_gz"}
 DEFAULT_PRL_MINER_PACKAGE_TYPE = "binary"
+AGENT_GPU_BLOCKING_STAGES = {"ready", "preparing_prompt", "executing"}
 PRL_MINER_SHARE_SIGNAL_RE = re.compile(
     r"\b(accepted|rejected|share submission returned error|stratum error response|dropped reason=|action=drop_share|action=reconnect_drop_ambiguous_share)\b",
     re.IGNORECASE,
@@ -3504,9 +3505,6 @@ class DependencyAgent:
             2.0,
             min(30.0, _env_float("DM_IDLE_PRL_FREE_COMFY_TIMEOUT_SECONDS", 10.0)),
         )
-        self.idle_prl_resume_grace_ms = int(
-            max(0.0, min(3600.0, _env_float("DM_IDLE_PRL_RESUME_GRACE_SECONDS", 60.0))) * 1000
-        )
         self._last_idle_prl_comfy_free_ms = 0
 
         # Agent control channel knobs (execute pull mode).
@@ -3620,7 +3618,6 @@ class DependencyAgent:
         self._agent_max_prefetch_jobs = 0
         self._active_exec_by_item: Dict[str, AgentExecuteLease] = {}
         self._active_maintenance_by_item: Dict[str, Dict[str, Any]] = {}
-        self._last_agent_work_activity_ms = 0
         self._ready_agent_item_ids: deque[str] = deque()
         self._agent_lease_order = 0
         self._input_cache_downloading: Set[str] = set()
@@ -4041,16 +4038,13 @@ class DependencyAgent:
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
-                active_agent_work_count = len(self._active_exec_by_item)
+                gpu_blocking_work_count = sum(
+                    1
+                    for lease in self._active_exec_by_item.values()
+                    if str(getattr(lease, "stage", "") or "") in AGENT_GPU_BLOCKING_STAGES
+                )
                 maintenance_count = len(self._agent_maintenance_inflight)
-                last_agent_work_activity_ms = int(self._last_agent_work_activity_ms or 0)
-            if active_agent_work_count > 0 or maintenance_count > 0:
-                return
-            if (
-                self.idle_prl_resume_grace_ms > 0 and
-                last_agent_work_activity_ms > 0 and
-                _now_ms() - last_agent_work_activity_ms < self.idle_prl_resume_grace_ms
-            ):
+            if gpu_blocking_work_count > 0 or maintenance_count > 0:
                 return
             if self._pending_self_update is not None:
                 return
@@ -8497,12 +8491,10 @@ class DependencyAgent:
 
     def _register_active_lease(self, lease: AgentExecuteLease) -> None:
         with self._lock:
-            self._last_agent_work_activity_ms = _now_ms()
             self._active_exec_by_item[lease.item_id] = lease
 
     def _finish_active_lease(self, item_id: str) -> None:
         with self._lock:
-            self._last_agent_work_activity_ms = _now_ms()
             self._active_exec_by_item.pop(item_id, None)
             try:
                 self._ready_agent_item_ids.remove(item_id)
@@ -8587,6 +8579,22 @@ class DependencyAgent:
                 lease.stage = "preparing_prompt"
                 return lease
         return None
+
+    def _drain_ready_agent_leases(self) -> int:
+        if self._agent_execute_executor is None:
+            return 0
+        execute_capacity = self._agent_effective_execute_capacity()
+        with self._lock:
+            active_execute_count, _prefetch_count_unused, _upload_count_unused = self._agent_stage_counts_locked()
+        submitted = 0
+        while active_execute_count < execute_capacity:
+            ready_lease = self._pop_next_ready_lease()
+            if ready_lease is None:
+                break
+            self._submit_agent_execute(ready_lease)
+            active_execute_count += 1
+            submitted += 1
+        return submitted
 
     def _is_cancel_requested(self, lease: AgentExecuteLease) -> bool:
         with self._lock:
@@ -10828,11 +10836,13 @@ class DependencyAgent:
                 active.ready_at_ms = _now_ms()
                 self._enqueue_ready_locked(active)
             retain_lease = True
-            self._request_agent_queue_poll()
+            self._stop_idle_prl_mining_for_work("execute_job")
             try:
                 self._emit_agent_event_best_effort(lease, "inputs_ready", None)
             except Exception as e:
                 logging.debug("inputs_ready emit failed for %s: %s", lease.job_id, e)
+            self._drain_ready_agent_leases()
+            self._request_agent_queue_poll()
         except Exception as e:
             if not terminal_sent:
                 event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
@@ -10875,6 +10885,7 @@ class DependencyAgent:
                 terminal_sent = True
                 return
 
+            self._stop_idle_prl_mining_for_work("execute_job")
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 prefetched_inputs = list(active.prefetched_inputs) if active else list(lease.prefetched_inputs)
@@ -10897,7 +10908,6 @@ class DependencyAgent:
                     active.stage = "executing"
                     active.execute_started_at_ms = execute_started_at_ms
                 lease.execute_started_at_ms = execute_started_at_ms
-            self._stop_idle_prl_mining_for_work("execute_job")
             if not self._local_comfy_reachable(timeout_seconds=5.0):
                 logging.warning("Local ComfyUI is not reachable before prompt submit; restarting before jobId=%s", lease.job_id)
                 self._restart_local_comfy(prefer_process_restart=True)
@@ -11337,7 +11347,7 @@ class DependencyAgent:
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d idlePrlResumeGrace=%.1fs miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
@@ -11352,7 +11362,6 @@ class DependencyAgent:
             self.agent_local_readiness_file,
             int(self.agent_max_execute_workers),
             int(self.agent_max_upload_workers),
-            self.idle_prl_resume_grace_ms / 1000.0,
             "yes" if self.mining_only else "no",
         )
         logging.info(
@@ -11472,15 +11481,7 @@ class DependencyAgent:
                             logging.warning("Agent heartbeat failed: %s", e)
                             self._last_agent_heartbeat_ms = now
 
-                    execute_capacity = self._agent_effective_execute_capacity()
-                    with self._lock:
-                        active_execute_count, _prefetch_count_unused, _upload_count_unused = self._agent_stage_counts_locked()
-                    while active_execute_count < execute_capacity:
-                        ready_lease = self._pop_next_ready_lease()
-                        if ready_lease is None:
-                            break
-                        self._submit_agent_execute(ready_lease)
-                        active_execute_count += 1
+                    self._drain_ready_agent_leases()
 
                 with self._lock:
                     active_leases = list(self._active_exec_by_item.values())
