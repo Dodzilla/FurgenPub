@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.88"
+AGENT_VERSION = "dm-agent-py/0.10.89"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -159,7 +159,6 @@ PRL_MINER_KINDS = {"alpha_miner", "srbminer_multi"}
 DEFAULT_PRL_MINER_KIND = "alpha_miner"
 PRL_MINER_PACKAGE_TYPES = {"binary", "tar_gz"}
 DEFAULT_PRL_MINER_PACKAGE_TYPE = "binary"
-AGENT_GPU_BLOCKING_STAGES = {"ready", "preparing_prompt", "executing"}
 PRL_MINER_SHARE_SIGNAL_RE = re.compile(
     r"\b(accepted|rejected|share submission returned error|stratum error response|dropped reason=|action=drop_share|action=reconnect_drop_ambiguous_share)\b",
     re.IGNORECASE,
@@ -3505,6 +3504,9 @@ class DependencyAgent:
             2.0,
             min(30.0, _env_float("DM_IDLE_PRL_FREE_COMFY_TIMEOUT_SECONDS", 10.0)),
         )
+        self.idle_prl_resume_grace_ms = int(
+            max(0.0, min(3600.0, _env_float("DM_IDLE_PRL_RESUME_GRACE_SECONDS", 60.0))) * 1000
+        )
         self._last_idle_prl_comfy_free_ms = 0
 
         # Agent control channel knobs (execute pull mode).
@@ -3618,6 +3620,7 @@ class DependencyAgent:
         self._agent_max_prefetch_jobs = 0
         self._active_exec_by_item: Dict[str, AgentExecuteLease] = {}
         self._active_maintenance_by_item: Dict[str, Dict[str, Any]] = {}
+        self._last_agent_work_activity_ms = 0
         self._ready_agent_item_ids: deque[str] = deque()
         self._agent_lease_order = 0
         self._input_cache_downloading: Set[str] = set()
@@ -4038,13 +4041,16 @@ class DependencyAgent:
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
-                gpu_blocking_work_count = sum(
-                    1
-                    for lease in self._active_exec_by_item.values()
-                    if str(getattr(lease, "stage", "") or "") in AGENT_GPU_BLOCKING_STAGES
-                )
+                active_agent_work_count = len(self._active_exec_by_item)
                 maintenance_count = len(self._agent_maintenance_inflight)
-            if gpu_blocking_work_count > 0 or maintenance_count > 0:
+                last_agent_work_activity_ms = int(self._last_agent_work_activity_ms or 0)
+            if active_agent_work_count > 0 or maintenance_count > 0:
+                return
+            if (
+                self.idle_prl_resume_grace_ms > 0 and
+                last_agent_work_activity_ms > 0 and
+                _now_ms() - last_agent_work_activity_ms < self.idle_prl_resume_grace_ms
+            ):
                 return
             if self._pending_self_update is not None:
                 return
@@ -8491,10 +8497,12 @@ class DependencyAgent:
 
     def _register_active_lease(self, lease: AgentExecuteLease) -> None:
         with self._lock:
+            self._last_agent_work_activity_ms = _now_ms()
             self._active_exec_by_item[lease.item_id] = lease
 
     def _finish_active_lease(self, item_id: str) -> None:
         with self._lock:
+            self._last_agent_work_activity_ms = _now_ms()
             self._active_exec_by_item.pop(item_id, None)
             try:
                 self._ready_agent_item_ids.remove(item_id)
@@ -11329,7 +11337,7 @@ class DependencyAgent:
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d idlePrlResumeGrace=%.1fs miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
@@ -11344,6 +11352,7 @@ class DependencyAgent:
             self.agent_local_readiness_file,
             int(self.agent_max_execute_workers),
             int(self.agent_max_upload_workers),
+            self.idle_prl_resume_grace_ms / 1000.0,
             "yes" if self.mining_only else "no",
         )
         logging.info(
