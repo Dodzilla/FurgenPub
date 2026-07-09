@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.90"
+AGENT_VERSION = "dm-agent-py/0.10.91"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -2440,6 +2440,7 @@ class AgentExecuteLease:
     tmp_root: Optional[str] = None
     ready_at_ms: int = 0
     execute_started_at_ms: int = 0
+    prompt_submitted_at_ms: int = 0
     upload_enqueued_at_ms: int = 0
     upload_started_at_ms: int = 0
 
@@ -8288,6 +8289,28 @@ class DependencyAgent:
                 event_version = int(lease.event_version)
         return self._agent_event(lease, event_version, event_type, payload=payload)
 
+    def _coalesce_agent_lifecycle_events(self, lease: AgentExecuteLease) -> bool:
+        policy = lease.payload.get("eventPolicy") if isinstance(lease.payload, dict) else None
+        return bool(isinstance(policy, dict) and policy.get("coalesceLifecycle") is True)
+
+    def _coalesced_agent_lifecycle_payload(self, lease: AgentExecuteLease) -> Dict[str, Any]:
+        now_ms = _now_ms()
+        inputs_ready_at_ms = int(lease.ready_at_ms or lease.execute_started_at_ms or now_ms)
+        prompt_submitted_at_ms = max(
+            inputs_ready_at_ms,
+            int(lease.prompt_submitted_at_ms or lease.execute_started_at_ms or now_ms),
+        )
+        execution_started_at_ms = max(
+            prompt_submitted_at_ms,
+            int(lease.execute_started_at_ms or now_ms),
+        )
+        return {
+            "version": 1,
+            "inputsReadyAtMs": inputs_ready_at_ms,
+            "promptSubmittedAtMs": prompt_submitted_at_ms,
+            "executionStartedAtMs": execution_started_at_ms,
+        }
+
     def _emit_agent_event_best_effort(self, lease: AgentExecuteLease, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
         try:
             self._emit_agent_event(lease, event_type, payload)
@@ -10320,6 +10343,7 @@ class DependencyAgent:
             attempt_epoch=int(attempt_epoch),
             started_at_ms=_now_ms(),
             command_id=payload.get("commandId") if isinstance(payload.get("commandId"), str) else "",
+            payload=payload,
         )
         self._register_active_lease(lease)
 
@@ -10362,10 +10386,11 @@ class DependencyAgent:
             raise RuntimeError(f"Durable agent event {event_type} failed without an error")
 
         try:
-            try:
-                emit("job_dispatched", {"commandId": lease.command_id} if lease.command_id else None)
-            except Exception as e:
-                logging.debug("job_dispatched emit failed for %s: %s", lease.job_id, e)
+            if not self._coalesce_agent_lifecycle_events(lease):
+                try:
+                    emit("job_dispatched", {"commandId": lease.command_id} if lease.command_id else None)
+                except Exception as e:
+                    logging.debug("job_dispatched emit failed for %s: %s", lease.job_id, e)
 
             required_dep_ids_raw = payload.get("requiredDepIds")
             required_dep_ids = [d for d in required_dep_ids_raw if isinstance(d, str) and d] if isinstance(required_dep_ids_raw, list) else []
@@ -10462,7 +10487,9 @@ class DependencyAgent:
 
                     self._copy_input_to_comfy(local_path, name)
 
-            emit_best_effort("inputs_ready", None)
+            lease.ready_at_ms = _now_ms()
+            if not self._coalesce_agent_lifecycle_events(lease):
+                emit_best_effort("inputs_ready", None)
 
             if self._is_cancel_requested(lease):
                 self._comfy_interrupt()
@@ -10477,14 +10504,17 @@ class DependencyAgent:
                 if active:
                     active.stage = "executing"
             self._stop_idle_prl_mining_for_work("execute_job")
+            lease.execute_started_at_ms = _now_ms()
             prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{job_id}-{uuid.uuid4().hex[:12]}")
+            lease.prompt_submitted_at_ms = _now_ms()
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 if active:
                     active.prompt_id = prompt_id
 
-            emit_best_effort("prompt_submitted", {"promptId": prompt_id})
-            emit_durable("execution_started", {"promptId": prompt_id})
+            if not self._coalesce_agent_lifecycle_events(lease):
+                emit_best_effort("prompt_submitted", {"promptId": prompt_id})
+                emit_durable("execution_started", {"promptId": prompt_id})
 
             start_exec_ms = _now_ms()
             last_progress_emit_ms = 0
@@ -10560,7 +10590,10 @@ class DependencyAgent:
                 if active:
                     active.stage = "uploading"
             self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
-            emit_durable("output_commit_started", {"promptId": prompt_id})
+            output_commit_payload: Dict[str, Any] = {"promptId": prompt_id}
+            if self._coalesce_agent_lifecycle_events(lease):
+                output_commit_payload["coalescedLifecycle"] = self._coalesced_agent_lifecycle_payload(lease)
+            emit_durable("output_commit_started", output_commit_payload)
 
             output_targets_initial = command_state.get("outputTargets")
             if not isinstance(output_targets_initial, list) or len(output_targets_initial) == 0:
@@ -10618,15 +10651,16 @@ class DependencyAgent:
                     sha256_sum,
                 )
                 uploaded_outputs.append(out_meta)
-                try:
-                    emit_best_effort("output_uploaded", out_meta)
-                except Exception as e:
-                    logging.debug(
-                        "output_uploaded emit failed for %s/%s: %s",
-                        lease.job_id,
-                        out_meta.get("logicalOutputKey"),
-                        e,
-                    )
+                if not self._coalesce_agent_lifecycle_events(lease):
+                    try:
+                        emit_best_effort("output_uploaded", out_meta)
+                    except Exception as e:
+                        logging.debug(
+                            "output_uploaded emit failed for %s/%s: %s",
+                            lease.job_id,
+                            out_meta.get("logicalOutputKey"),
+                            e,
+                        )
 
             if not uploaded_outputs:
                 raise RuntimeError("No outputs were uploaded.")
@@ -10749,10 +10783,11 @@ class DependencyAgent:
                     return
                 active.stage = "prefetching"
 
-            try:
-                self._emit_agent_event(lease, "job_dispatched", {"commandId": lease.command_id} if lease.command_id else None)
-            except Exception as e:
-                logging.debug("job_dispatched emit failed for %s: %s", lease.job_id, e)
+            if not self._coalesce_agent_lifecycle_events(lease):
+                try:
+                    self._emit_agent_event(lease, "job_dispatched", {"commandId": lease.command_id} if lease.command_id else None)
+                except Exception as e:
+                    logging.debug("job_dispatched emit failed for %s: %s", lease.job_id, e)
 
             if self._is_cancel_requested(lease):
                 self._emit_agent_event_durable(
@@ -10837,10 +10872,11 @@ class DependencyAgent:
                 self._enqueue_ready_locked(active)
             retain_lease = True
             self._stop_idle_prl_mining_for_work("execute_job")
-            try:
-                self._emit_agent_event_best_effort(lease, "inputs_ready", None)
-            except Exception as e:
-                logging.debug("inputs_ready emit failed for %s: %s", lease.job_id, e)
+            if not self._coalesce_agent_lifecycle_events(lease):
+                try:
+                    self._emit_agent_event_best_effort(lease, "inputs_ready", None)
+                except Exception as e:
+                    logging.debug("inputs_ready emit failed for %s: %s", lease.job_id, e)
             self._drain_ready_agent_leases()
             self._request_agent_queue_poll()
         except Exception as e:
@@ -10913,12 +10949,14 @@ class DependencyAgent:
                 self._restart_local_comfy(prefer_process_restart=True)
                 self._wait_for_local_comfy_ready(timeout_seconds=300.0)
             prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{lease.job_id}-{uuid.uuid4().hex[:12]}")
+            lease.prompt_submitted_at_ms = _now_ms()
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 if active:
                     active.prompt_id = prompt_id
 
-            self._emit_agent_event_durable(lease, "execution_started", {"promptId": prompt_id})
+            if not self._coalesce_agent_lifecycle_events(lease):
+                self._emit_agent_event_durable(lease, "execution_started", {"promptId": prompt_id})
 
             start_exec_ms = _now_ms()
             last_progress_emit_ms = 0
@@ -11001,7 +11039,10 @@ class DependencyAgent:
             lease.history_entry = history_entry
             lease.prompt_id = prompt_id
             self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
-            self._emit_agent_event_durable(lease, "output_commit_started", {"promptId": prompt_id})
+            output_commit_payload: Dict[str, Any] = {"promptId": prompt_id}
+            if self._coalesce_agent_lifecycle_events(lease):
+                output_commit_payload["coalescedLifecycle"] = self._coalesced_agent_lifecycle_payload(lease)
+            self._emit_agent_event_durable(lease, "output_commit_started", output_commit_payload)
 
             self._submit_agent_upload(lease)
             retain_lease = True
@@ -11120,15 +11161,16 @@ class DependencyAgent:
                     "agentUploadWorkerQueueMs": upload_worker_queue_ms,
                 }
                 uploaded_outputs.append(out_meta)
-                try:
-                    self._emit_agent_event_best_effort(lease, "output_uploaded", out_meta)
-                except Exception as e:
-                    logging.debug(
-                        "output_uploaded emit failed for %s/%s: %s",
-                        lease.job_id,
-                        out_meta.get("logicalOutputKey"),
-                        e,
-                    )
+                if not self._coalesce_agent_lifecycle_events(lease):
+                    try:
+                        self._emit_agent_event_best_effort(lease, "output_uploaded", out_meta)
+                    except Exception as e:
+                        logging.debug(
+                            "output_uploaded emit failed for %s/%s: %s",
+                            lease.job_id,
+                            out_meta.get("logicalOutputKey"),
+                            e,
+                        )
 
             if not uploaded_outputs:
                 raise RuntimeError("No outputs were uploaded.")
