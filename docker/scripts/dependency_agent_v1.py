@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.91"
+AGENT_VERSION = "dm-agent-py/0.10.92"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -8247,6 +8247,20 @@ class DependencyAgent:
     ) -> Dict[str, Any]:
         if not self._resolved_instance_id:
             raise RuntimeError("Cannot emit event without resolved instanceId")
+        event_payload = dict(payload) if isinstance(payload, dict) else {}
+        if (
+            self._coalesce_agent_lifecycle_events(lease)
+            and int(lease.prompt_submitted_at_ms or 0) > 0
+            and event_type in {
+                "execution_progress",
+                "output_commit_started",
+                "job_completed",
+                "job_failed",
+                "job_cancelled",
+            }
+        ):
+            event_payload.setdefault("coalescedLifecycle", self._coalesced_agent_lifecycle_payload(lease))
+
         body: Dict[str, Any] = {
             "schemaVersion": 1,
             "instanceId": self._resolved_instance_id,
@@ -8257,8 +8271,8 @@ class DependencyAgent:
             "eventVersion": int(event_version),
             "eventType": event_type,
         }
-        if payload:
-            for k, v in payload.items():
+        if event_payload:
+            for k, v in event_payload.items():
                 body[k] = v
 
         digest_body = {k: v for k, v in body.items() if k != "eventDigest"}
@@ -10517,7 +10531,7 @@ class DependencyAgent:
                 emit_durable("execution_started", {"promptId": prompt_id})
 
             start_exec_ms = _now_ms()
-            last_progress_emit_ms = 0
+            last_progress_emit_ms = start_exec_ms
             history_entry: Dict[str, Any] = {}
             history_errors = 0
             while True:
@@ -10651,16 +10665,15 @@ class DependencyAgent:
                     sha256_sum,
                 )
                 uploaded_outputs.append(out_meta)
-                if not self._coalesce_agent_lifecycle_events(lease):
-                    try:
-                        emit_best_effort("output_uploaded", out_meta)
-                    except Exception as e:
-                        logging.debug(
-                            "output_uploaded emit failed for %s/%s: %s",
-                            lease.job_id,
-                            out_meta.get("logicalOutputKey"),
-                            e,
-                        )
+                try:
+                    emit_best_effort("output_uploaded", out_meta)
+                except Exception as e:
+                    logging.debug(
+                        "output_uploaded emit failed for %s/%s: %s",
+                        lease.job_id,
+                        out_meta.get("logicalOutputKey"),
+                        e,
+                    )
 
             if not uploaded_outputs:
                 raise RuntimeError("No outputs were uploaded.")
@@ -10959,7 +10972,7 @@ class DependencyAgent:
                 self._emit_agent_event_durable(lease, "execution_started", {"promptId": prompt_id})
 
             start_exec_ms = _now_ms()
-            last_progress_emit_ms = 0
+            last_progress_emit_ms = start_exec_ms
             history_entry: Dict[str, Any] = {}
             history_errors = 0
             while True:
@@ -11161,16 +11174,15 @@ class DependencyAgent:
                     "agentUploadWorkerQueueMs": upload_worker_queue_ms,
                 }
                 uploaded_outputs.append(out_meta)
-                if not self._coalesce_agent_lifecycle_events(lease):
-                    try:
-                        self._emit_agent_event_best_effort(lease, "output_uploaded", out_meta)
-                    except Exception as e:
-                        logging.debug(
-                            "output_uploaded emit failed for %s/%s: %s",
-                            lease.job_id,
-                            out_meta.get("logicalOutputKey"),
-                            e,
-                        )
+                try:
+                    self._emit_agent_event_best_effort(lease, "output_uploaded", out_meta)
+                except Exception as e:
+                    logging.debug(
+                        "output_uploaded emit failed for %s/%s: %s",
+                        lease.job_id,
+                        out_meta.get("logicalOutputKey"),
+                        e,
+                    )
 
             if not uploaded_outputs:
                 raise RuntimeError("No outputs were uploaded.")
