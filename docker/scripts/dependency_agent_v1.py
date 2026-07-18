@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.94"
+AGENT_VERSION = "dm-agent-py/0.10.95"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3597,6 +3597,10 @@ class DependencyAgent:
 
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        # A ComfyUI restart is a process-level operation shared by every agent
+        # worker. Keep the restart and readiness wait in one critical section so
+        # concurrent execute workers cannot issue overlapping supervisor restarts.
+        self._comfy_restart_lock = threading.RLock()
         self._token: Optional[str] = None
         self._resolved_instance_id: Optional[str] = None
         self._profile: Dict[str, Any] = {}
@@ -7190,35 +7194,65 @@ class DependencyAgent:
             return False
 
     def _restart_local_comfy(self, prefer_process_restart: bool = False) -> None:
-        if prefer_process_restart and self._restart_local_comfy_with_supervisor():
-            return
-
-        comfy_was_reachable = self._local_comfy_reachable(timeout_seconds=2.0)
-        restart_endpoints = [
-            "/manager/reboot",
-            "/api/manager/reboot",
-            "/restart",
-            "/system/restart",
-            "/reboot",
-        ]
-        for endpoint in restart_endpoints:
-            try:
-                self._comfy_api_json("GET", endpoint, timeout_seconds=10.0)
+        with self._comfy_restart_lock:
+            if prefer_process_restart and self._restart_local_comfy_with_supervisor():
                 return
-            except Exception as exc:
-                msg = str(exc).lower()
-                if (
-                    comfy_was_reachable
-                    and ("connection reset" in msg or "ecconnreset" in msg or "timeout" in msg)
-                ):
+
+            comfy_was_reachable = self._local_comfy_reachable(timeout_seconds=2.0)
+            restart_endpoints = [
+                "/manager/reboot",
+                "/api/manager/reboot",
+                "/restart",
+                "/system/restart",
+                "/reboot",
+            ]
+            for endpoint in restart_endpoints:
+                try:
+                    self._comfy_api_json("GET", endpoint, timeout_seconds=10.0)
                     return
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    if (
+                        comfy_was_reachable
+                        and ("connection reset" in msg or "ecconnreset" in msg or "timeout" in msg)
+                    ):
+                        return
 
-        if not prefer_process_restart and self._restart_local_comfy_with_supervisor():
-            return
-        if self._restart_local_comfy_with_launch_script():
-            return
+            if not prefer_process_restart and self._restart_local_comfy_with_supervisor():
+                return
+            if self._restart_local_comfy_with_launch_script():
+                return
 
-        raise RuntimeError("All local ComfyUI restart endpoints failed or are unavailable.")
+            raise RuntimeError("All local ComfyUI restart endpoints failed or are unavailable.")
+
+    def _restart_local_comfy_and_wait(
+        self,
+        prefer_process_restart: bool = False,
+        verify_class_types: Optional[List[str]] = None,
+        timeout_seconds: float = 300.0,
+        skip_if_reachable: bool = False,
+    ) -> bool:
+        """Restart ComfyUI once and wait for readiness while blocking peer restarts.
+
+        When failure recovery workers arrive concurrently, the first worker owns
+        the restart. Later workers recheck reachability after acquiring the lock
+        and join the completed recovery instead of restarting ComfyUI again.
+        Returns True when this caller initiated the restart.
+        """
+        with self._comfy_restart_lock:
+            if skip_if_reachable and self._local_comfy_reachable(timeout_seconds=5.0):
+                logging.info("ComfyUI recovered while waiting for restart ownership; skipping duplicate restart.")
+                return False
+
+            self._restart_local_comfy(prefer_process_restart=prefer_process_restart)
+            if verify_class_types is None:
+                self._wait_for_local_comfy_ready(timeout_seconds=timeout_seconds)
+            else:
+                self._wait_for_local_comfy_restart(
+                    verify_class_types,
+                    timeout_seconds=timeout_seconds,
+                )
+            return True
 
     def _local_comfy_has_class_type(self, class_type: str, timeout_seconds: float = 10.0) -> bool:
         if not isinstance(class_type, str) or not class_type.strip():
@@ -9226,9 +9260,9 @@ class DependencyAgent:
             if compat_changed:
                 self._stop_idle_prl_mining_for_work("install_node_bundles_comfy_restart")
                 self._remove_local_readiness_file()
-                self._restart_local_comfy(prefer_process_restart=True)
-                self._wait_for_local_comfy_restart(
-                    verify_class_types,
+                self._restart_local_comfy_and_wait(
+                    prefer_process_restart=True,
+                    verify_class_types=verify_class_types,
                     timeout_seconds=max(300.0, 120.0 * max(1, len(bundle_ids))),
                 )
             self._write_local_readiness_file()
@@ -9297,9 +9331,8 @@ class DependencyAgent:
             self._stop_idle_prl_mining_for_work("install_node_bundles_comfy_restart")
             self._remove_local_readiness_file()
             comfy_restart_attempted = True
-            self._restart_local_comfy()
-            self._wait_for_local_comfy_restart(
-                verify_class_types,
+            self._restart_local_comfy_and_wait(
+                verify_class_types=verify_class_types,
                 timeout_seconds=max(300.0, 120.0 * max(1, len(bundle_ids))),
             )
             self._write_local_readiness_file()
@@ -9379,8 +9412,10 @@ class DependencyAgent:
         self._stop_idle_prl_mining_for_work("restart_comfy")
         self._remove_local_readiness_file()
         try:
-            self._restart_local_comfy(prefer_process_restart=prefer_process_restart)
-            self._wait_for_local_comfy_ready(timeout_seconds=300.0)
+            self._restart_local_comfy_and_wait(
+                prefer_process_restart=prefer_process_restart,
+                timeout_seconds=300.0,
+            )
             self._write_local_readiness_file()
             self._agent_ack(item_id, lease_id, "command_succeeded")
             try:
@@ -10960,8 +10995,11 @@ class DependencyAgent:
                 lease.execute_started_at_ms = execute_started_at_ms
             if not self._local_comfy_reachable(timeout_seconds=5.0):
                 logging.warning("Local ComfyUI is not reachable before prompt submit; restarting before jobId=%s", lease.job_id)
-                self._restart_local_comfy(prefer_process_restart=True)
-                self._wait_for_local_comfy_ready(timeout_seconds=300.0)
+                self._restart_local_comfy_and_wait(
+                    prefer_process_restart=True,
+                    timeout_seconds=300.0,
+                    skip_if_reachable=True,
+                )
             prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{lease.job_id}-{uuid.uuid4().hex[:12]}")
             lease.prompt_submitted_at_ms = _now_ms()
             with self._lock:
