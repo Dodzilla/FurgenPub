@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.95"
+AGENT_VERSION = "dm-agent-py/0.10.96"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
