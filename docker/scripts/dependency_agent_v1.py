@@ -7193,9 +7193,13 @@ class DependencyAgent:
             logging.warning("ComfyUI launch-script restart failed (%s): %s", launch_script, exc)
             return False
 
-    def _restart_local_comfy(self, prefer_process_restart: bool = False) -> None:
+    def _restart_local_comfy(
+        self,
+        prefer_process_restart: bool = False,
+        allow_supervisor_restart: bool = True,
+    ) -> None:
         with self._comfy_restart_lock:
-            if prefer_process_restart and self._restart_local_comfy_with_supervisor():
+            if allow_supervisor_restart and prefer_process_restart and self._restart_local_comfy_with_supervisor():
                 return
 
             comfy_was_reachable = self._local_comfy_reachable(timeout_seconds=2.0)
@@ -7218,7 +7222,7 @@ class DependencyAgent:
                     ):
                         return
 
-            if not prefer_process_restart and self._restart_local_comfy_with_supervisor():
+            if allow_supervisor_restart and not prefer_process_restart and self._restart_local_comfy_with_supervisor():
                 return
             if self._restart_local_comfy_with_launch_script():
                 return
@@ -7228,6 +7232,7 @@ class DependencyAgent:
     def _restart_local_comfy_and_wait(
         self,
         prefer_process_restart: bool = False,
+        allow_supervisor_restart: bool = True,
         verify_class_types: Optional[List[str]] = None,
         timeout_seconds: float = 300.0,
         skip_if_reachable: bool = False,
@@ -7244,7 +7249,13 @@ class DependencyAgent:
                 logging.info("ComfyUI recovered while waiting for restart ownership; skipping duplicate restart.")
                 return False
 
-            self._restart_local_comfy(prefer_process_restart=prefer_process_restart)
+            if allow_supervisor_restart:
+                self._restart_local_comfy(prefer_process_restart=prefer_process_restart)
+            else:
+                self._restart_local_comfy(
+                    prefer_process_restart=prefer_process_restart,
+                    allow_supervisor_restart=False,
+                )
             if verify_class_types is None:
                 self._wait_for_local_comfy_ready(timeout_seconds=timeout_seconds)
             else:
@@ -9409,11 +9420,13 @@ class DependencyAgent:
             return
 
         prefer_process_restart = payload.get("preferProcessRestart") is not False
+        allow_supervisor_restart = payload.get("allowSupervisorRestart") is not False
         self._stop_idle_prl_mining_for_work("restart_comfy")
         self._remove_local_readiness_file()
         try:
             self._restart_local_comfy_and_wait(
                 prefer_process_restart=prefer_process_restart,
+                allow_supervisor_restart=allow_supervisor_restart,
                 timeout_seconds=300.0,
             )
             self._write_local_readiness_file()
