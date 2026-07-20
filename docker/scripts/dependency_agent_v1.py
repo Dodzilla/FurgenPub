@@ -127,7 +127,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.96"
+AGENT_VERSION = "dm-agent-py/0.10.97"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3601,6 +3601,9 @@ class DependencyAgent:
         # worker. Keep the restart and readiness wait in one critical section so
         # concurrent execute workers cannot issue overlapping supervisor restarts.
         self._comfy_restart_lock = threading.RLock()
+        self._comfy_restart_command_active = threading.Event()
+        self._interrupted_comfy_restart_path = self.workspace / ".fcs" / "comfy_restart_in_progress.json"
+        self._next_interrupted_comfy_restart_recovery_ms = 0
         self._token: Optional[str] = None
         self._resolved_instance_id: Optional[str] = None
         self._profile: Dict[str, Any] = {}
@@ -3751,7 +3754,7 @@ class DependencyAgent:
                 "    watchdog_log_path=\"${DM_AGENT_WATCHDOG_LOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.log}\"\n"
                 "    if [[ -x \"${watchdog_path}\" ]]; then\n"
                 "        if ! command -v pgrep >/dev/null 2>&1 || ! pgrep -f \"${watchdog_path}\" >/dev/null 2>&1; then\n"
-                "            nohup \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+                "            nohup setsid \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
                 "        fi\n"
                 "    fi\n"
                 "fi\n"
@@ -3782,6 +3785,32 @@ class DependencyAgent:
             return True
         except Exception as exc:
             logging.warning("Failed to repair video_gen_v2 ComfyUI launch script: %s", exc)
+            return False
+
+    def _repair_comfy_watchdog_process_isolation(self) -> bool:
+        """Ensure future supervisor starts launch the agent outside Comfy's process group."""
+        launch_script = Path("/opt/supervisor-scripts/comfyui.sh")
+        try:
+            if not launch_script.exists() or not launch_script.is_file():
+                return False
+            source = launch_script.read_text(encoding="utf-8")
+            next_source = source.replace(
+                'nohup "${watchdog_path}" >> "${watchdog_log_path}" 2>&1 &',
+                'nohup setsid "${watchdog_path}" >> "${watchdog_log_path}" 2>&1 &',
+            )
+            if next_source == source:
+                return False
+            launch_script.write_text(next_source, encoding="utf-8")
+            try:
+                launch_script.chmod(0o755)
+            except Exception:
+                pass
+            logging.warning(
+                "Repaired ComfyUI watchdog launch isolation; it will take effect on the next supervisor start."
+            )
+            return True
+        except Exception as exc:
+            logging.warning("Failed repairing ComfyUI watchdog launch isolation: %s", exc)
             return False
 
     def _video_gen_v2_bootstrap_gate_active(self) -> bool:
@@ -5392,6 +5421,7 @@ class DependencyAgent:
                     "dependencyDeleteFiles": True,
                     "idlePrlMining": True,
                     "miningOnly": bool(self.mining_only),
+                    "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
                 },
             }
         now_ms = _now_ms()
@@ -5426,6 +5456,7 @@ class DependencyAgent:
                 "dependencyDeleteFiles": True,
                 "idlePrlMining": True,
                 "miningOnly": bool(self.mining_only),
+                "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
             }
             body_capabilities = body.get("capabilities")
             if isinstance(body_capabilities, dict):
@@ -5741,6 +5772,32 @@ class DependencyAgent:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"Provisioning completed at {_now_iso()}\n", encoding="utf-8")
 
+    def _write_interrupted_comfy_restart_intent(self, item_id: str) -> None:
+        path = self._interrupted_comfy_restart_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"itemId": str(item_id or ""), "startedAt": _now_iso()}) + "\n",
+            encoding="utf-8",
+        )
+
+    def _clear_interrupted_comfy_restart_intent(self) -> None:
+        try:
+            self._interrupted_comfy_restart_path.unlink(missing_ok=True)
+        except Exception as exc:
+            logging.warning("Failed clearing interrupted ComfyUI restart intent: %s", exc)
+
+    def _recover_interrupted_comfy_restart_readiness(self) -> bool:
+        if self._comfy_restart_command_active.is_set():
+            return False
+        if not self._interrupted_comfy_restart_path.exists():
+            return False
+        if not self._local_comfy_reachable(timeout_seconds=5.0):
+            return False
+        self._write_local_readiness_file()
+        self._clear_interrupted_comfy_restart_intent()
+        logging.warning("Recovered readiness marker after an interrupted ComfyUI restart.")
+        return True
+
     def _restore_local_readiness_file_after_pre_restart_failure(self, reason: str) -> bool:
         try:
             if not self._local_comfy_reachable(timeout_seconds=10.0):
@@ -5756,6 +5813,24 @@ class DependencyAgent:
         try:
             return self._local_readiness_file_path().exists()
         except Exception:
+            return False
+
+    def _comfy_restart_process_isolated(self) -> bool:
+        """Return true only when killing Comfy's process group cannot kill this agent."""
+        try:
+            agent_pgid = os.getpgrp()
+            comfy_pids = self._find_local_comfy_processes()
+            if not comfy_pids:
+                return False
+            for pid in comfy_pids:
+                try:
+                    if os.getpgid(pid) == agent_pgid:
+                        return False
+                except ProcessLookupError:
+                    continue
+            return True
+        except Exception as exc:
+            logging.warning("Unable to verify ComfyUI restart process isolation: %s", exc)
             return False
 
     def _normalize_local_comfy_base_url(self, raw: Optional[str]) -> Optional[str]:
@@ -8118,6 +8193,7 @@ class DependencyAgent:
                 "agentPullExecution": True,
                 "dependencyDeleteFiles": True,
                 "downloadTool": self._resolve_download_tool(),
+                "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
             },
         }
         if self.instance_bootstrap_token:
@@ -8517,6 +8593,7 @@ class DependencyAgent:
                 "dependencyDeleteFiles": True,
                 "idlePrlMining": True,
                 "miningOnly": bool(self.mining_only),
+                "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
             },
         }
         now_ms = _now_ms()
@@ -9418,10 +9495,31 @@ class DependencyAgent:
         if self.mining_only:
             self._agent_ack(item_id, lease_id, "command_ignored_stale")
             return
+        if not self._comfy_restart_process_isolated():
+            self._agent_ack(
+                item_id,
+                lease_id,
+                "command_failed",
+                error_code="restart_comfy_process_group_unsafe",
+                error_message="Dependency agent is not isolated from the ComfyUI supervisor process group.",
+            )
+            return
 
         prefer_process_restart = payload.get("preferProcessRestart") is not False
         allow_supervisor_restart = payload.get("allowSupervisorRestart") is not False
         self._stop_idle_prl_mining_for_work("restart_comfy")
+        try:
+            self._write_interrupted_comfy_restart_intent(item_id)
+        except Exception as exc:
+            self._agent_ack(
+                item_id,
+                lease_id,
+                "command_failed",
+                error_code="restart_comfy_intent_write_failed",
+                error_message=str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
+            )
+            return
+        self._comfy_restart_command_active.set()
         self._remove_local_readiness_file()
         try:
             self._restart_local_comfy_and_wait(
@@ -9430,13 +9528,15 @@ class DependencyAgent:
                 timeout_seconds=300.0,
             )
             self._write_local_readiness_file()
+            self._clear_interrupted_comfy_restart_intent()
             self._agent_ack(item_id, lease_id, "command_succeeded")
             try:
                 self._heartbeat(queue_depth=None)
             except Exception:
                 pass
         except Exception as exc:
-            self._remove_local_readiness_file()
+            if self._restore_local_readiness_file_after_pre_restart_failure(str(exc)):
+                self._clear_interrupted_comfy_restart_intent()
             self._agent_ack(
                 item_id,
                 lease_id,
@@ -9444,6 +9544,8 @@ class DependencyAgent:
                 error_code="restart_comfy_failed",
                 error_message=str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
             )
+        finally:
+            self._comfy_restart_command_active.clear()
 
     def _agent_handle_prl_miner_command(self, item: Dict[str, Any]) -> None:
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
@@ -11490,6 +11592,7 @@ class DependencyAgent:
             logging.info("Dynamic eviction disabled (set profile.dynamicPolicy.enabled or DM_DYNAMIC_EVICTION_ENABLED=1)")
 
         self._repair_video_gen_v2_comfy_launch_contract(restart_if_unreachable=True)
+        self._repair_comfy_watchdog_process_isolation()
 
         dep_executor = ThreadPoolExecutor(max_workers=self.max_parallel)
         dep_inflight: Set[Future[None]] = set()
@@ -11515,6 +11618,12 @@ class DependencyAgent:
         while not self._stop.is_set():
             try:
                 now = _now_ms()
+                if now >= self._next_interrupted_comfy_restart_recovery_ms:
+                    self._next_interrupted_comfy_restart_recovery_ms = now + 5_000
+                    try:
+                        self._recover_interrupted_comfy_restart_readiness()
+                    except Exception as exc:
+                        logging.warning("Interrupted ComfyUI restart recovery failed: %s", exc)
                 agent_poll_wakeup_requested = False
                 if self._dependency_poll_wakeup.is_set():
                     self._dependency_poll_wakeup.clear()
