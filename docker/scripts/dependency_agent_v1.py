@@ -73,6 +73,8 @@ Optional knobs:
   - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
+  - DM_VIDEO_GEN_V2_BOOTSTRAP_GATE_WAIT_SECONDS (max wait for the managed video bootstrap gate; default: 1800)
+  - DM_VIDEO_GEN_V2_BOOTSTRAP_COMFY_WAIT_SECONDS (max post-gate wait for managed Comfy startup; default: 300)
   - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
   - DM_MINING_ONLY                (set to 1 for PRL mining-only instances; skips Comfy probes and job execution)
   - DM_INPUT_CACHE_DIR            (persistent remote-input cache dir; default: $WORKSPACE/.dm_input_cache)
@@ -127,7 +129,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.97"
+AGENT_VERSION = "dm-agent-py/0.10.98"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3823,6 +3825,80 @@ class DependencyAgent:
             or str(self.workspace / ".furgen_comfyui_start_allowed")
         )
         return not allowed_path.exists()
+
+    def _wait_for_video_gen_v2_bootstrap_ready(self, item_id: str, lease_id: str) -> None:
+        """Avoid racing the foreground support bootstrap for the same Comfy checkout.
+
+        The Vast onstart script deliberately holds a gate while it installs the
+        baseline video node stack and rewrites the managed Comfy launch script.
+        A create-time install_node_bundles command can otherwise touch the same
+        repos and launch that script while it is still being rewritten. Keep the
+        maintenance lease alive while waiting, then let the foreground bootstrap
+        finish starting Comfy before running the incremental bundle verification.
+        """
+        if (self.server_type or "").strip() != "video_gen_v2":
+            return
+        if not _env_bool("FURGEN_COMFYUI_BOOTSTRAP_GATE_ENABLED", True):
+            return
+        if not _env_str("FURGEN_COMFYUI_START_ALLOWED_FILE"):
+            # Only defer instances that explicitly opted into the managed Vast
+            # bootstrap gate. Other video_gen_v2 environments may use the agent
+            # bundle installer as their primary bootstrap path.
+            return
+        if not self._video_gen_v2_bootstrap_gate_active():
+            return
+
+        held_lease = [{
+            "itemId": item_id,
+            "leaseId": lease_id,
+            "stage": "maintenance:install_node_bundles:bootstrap_gate",
+        }]
+
+        def refresh_lease() -> None:
+            if not self._coordination:
+                return
+            self._coordination_check_active_lease_cancels(held_lease)
+
+        gate_timeout = max(
+            60.0,
+            _env_float("DM_VIDEO_GEN_V2_BOOTSTRAP_GATE_WAIT_SECONDS", 1800.0),
+        )
+        gate_deadline = time.monotonic() + gate_timeout
+        logging.info(
+            "Deferring video_gen_v2 node bundle install until managed bootstrap gate is released: itemId=%s",
+            item_id,
+        )
+        while self._video_gen_v2_bootstrap_gate_active():
+            refresh_lease()
+            if time.monotonic() >= gate_deadline:
+                raise RuntimeError(
+                    f"Timed out waiting for video_gen_v2 bootstrap gate before node bundle install ({int(gate_timeout)}s)."
+                )
+            if self._stop.wait(2.0):
+                raise RuntimeError("Dependency agent stopped while waiting for video_gen_v2 bootstrap gate.")
+
+        comfy_timeout = max(
+            30.0,
+            _env_float("DM_VIDEO_GEN_V2_BOOTSTRAP_COMFY_WAIT_SECONDS", 300.0),
+        )
+        comfy_deadline = time.monotonic() + comfy_timeout
+        while not (
+            self._local_comfy_reachable(timeout_seconds=2.0)
+            and self._local_readiness_file_present()
+        ):
+            refresh_lease()
+            if time.monotonic() >= comfy_deadline:
+                raise RuntimeError(
+                    f"Managed video_gen_v2 bootstrap released its gate but ComfyUI did not become ready within {int(comfy_timeout)}s."
+                )
+            if self._stop.wait(2.0):
+                raise RuntimeError("Dependency agent stopped while waiting for managed video_gen_v2 ComfyUI startup.")
+
+        refresh_lease()
+        logging.info(
+            "Managed video_gen_v2 bootstrap is ready; continuing node bundle install: itemId=%s",
+            item_id,
+        )
 
     def _repair_video_gen_v2_comfy_launch_contract(self, restart_if_unreachable: bool = False) -> None:
         if (self.server_type or "").strip() != "video_gen_v2":
@@ -9313,6 +9389,7 @@ class DependencyAgent:
         if self.mining_only:
             self._agent_ack(item_id, lease_id, "command_ignored_stale")
             return
+        self._wait_for_video_gen_v2_bootstrap_ready(item_id, lease_id)
 
         bundle_ids = [bundle_id for bundle_id in payload.get("bundleIds", []) if isinstance(bundle_id, str) and bundle_id]
         verify_class_types = [class_type for class_type in payload.get("verifyClassTypes", []) if isinstance(class_type, str) and class_type]
