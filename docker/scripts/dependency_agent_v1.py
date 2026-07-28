@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.99"
+AGENT_VERSION = "dm-agent-py/0.10.100"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -2778,8 +2778,9 @@ class PrlMinerController:
                 out["lastAutoRestartAttemptAtMs"] = int(self._last_auto_restart_attempt_ms)
             if self._last_auto_restart_reason:
                 out["lastAutoRestartReason"] = self._last_auto_restart_reason
-            if self._last_failure_category:
-                out["lastFailureCategory"] = self._last_failure_category
+            # Keep the key present so RTDB PATCH mirrors delete a stale failure
+            # category after a later start succeeds.
+            out["lastFailureCategory"] = self._last_failure_category or None
             if self._last_network_diagnostics:
                 out["networkDiagnostics"] = self._last_network_diagnostics
             out["pauseMode"] = self._pause_mode
