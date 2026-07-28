@@ -99,6 +99,7 @@ import base64
 from collections import deque
 import hashlib
 import http.client
+import ipaddress
 import json
 import logging
 import math
@@ -129,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.98"
+AGENT_VERSION = "dm-agent-py/0.10.99"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -427,7 +428,25 @@ def _tls_issuer_for_host(host: str, timeout_seconds: float = 5.0) -> str:
 
 
 def _is_prl_sinkhole_ips(ips: List[str]) -> bool:
-    return any(str(ip).strip() in PRL_SINKHOLE_IPS for ip in ips)
+    """Treat any non-public answer for a public PRL endpoint as blocked.
+
+    Some providers redirect blocked download hosts to loopback or RFC1918
+    addresses instead of the known Cisco Umbrella sinkhole. Those answers must
+    trigger the same repair path; otherwise the miner endlessly retries a local
+    connection and remains invisible to the pool.
+    """
+    if not ips:
+        return True
+    for raw_ip in ips:
+        cleaned = str(raw_ip or "").strip().split("%", 1)[0]
+        if cleaned in PRL_SINKHOLE_IPS:
+            return True
+        try:
+            if not ipaddress.ip_address(cleaned).is_global:
+                return True
+        except ValueError:
+            return True
+    return False
 
 
 def _is_cisco_umbrella_issuer(issuer: str) -> bool:
@@ -449,6 +468,60 @@ def _write_clean_resolv_conf() -> Tuple[bool, str]:
             pass
         path.write_text(desired, encoding="utf-8")
         return True, "updated"
+    except Exception as exc:
+        return False, str(exc)[:300]
+
+
+def _remove_blocked_prl_host_overrides(
+    hosts: Iterable[str],
+    hosts_path: Path = Path("/etc/hosts"),
+) -> Tuple[bool, str]:
+    """Remove only target host aliases mapped to non-public addresses.
+
+    Preserve localhost and unrelated aliases even when they share the same
+    hosts-file line. This is deliberately narrower than rewriting /etc/hosts.
+    """
+    targets = {str(host or "").strip().lower().rstrip(".") for host in hosts if str(host or "").strip()}
+    if not targets:
+        return True, "no_targets"
+    try:
+        if not hosts_path.exists():
+            return True, "missing"
+        existing = hosts_path.read_text(encoding="utf-8", errors="replace")
+        next_lines: List[str] = []
+        removed: List[str] = []
+        for original_line in existing.splitlines():
+            body, separator, comment = original_line.partition("#")
+            tokens = body.split()
+            if len(tokens) < 2 or not _is_prl_sinkhole_ips([tokens[0]]):
+                next_lines.append(original_line)
+                continue
+            kept_aliases: List[str] = []
+            for alias in tokens[1:]:
+                normalized = alias.strip().lower().rstrip(".")
+                if normalized in targets:
+                    removed.append(alias)
+                else:
+                    kept_aliases.append(alias)
+            if len(kept_aliases) == len(tokens) - 1:
+                next_lines.append(original_line)
+                continue
+            if kept_aliases:
+                rebuilt = f"{tokens[0]}\t{' '.join(kept_aliases)}"
+                if separator:
+                    rebuilt += f"  #{comment}"
+                next_lines.append(rebuilt)
+            elif separator and comment.strip():
+                next_lines.append(f"#{comment}")
+        if not removed:
+            return True, "unchanged"
+        backup = Path(f"{hosts_path}.fcs-prl-preflight.{int(time.time())}.bak")
+        try:
+            shutil.copy2(str(hosts_path), str(backup))
+        except Exception:
+            pass
+        hosts_path.write_text("\n".join(next_lines) + "\n", encoding="utf-8")
+        return True, f"removed:{','.join(sorted(set(removed)))[:220]}"
     except Exception as exc:
         return False, str(exc)[:300]
 
@@ -504,13 +577,21 @@ def _prl_network_preflight(pool_url: str, miner_urls: List[str]) -> Dict[str, An
     bad = collect()
     if bad:
         diagnostics["resolverRepairAttempted"] = True
+        hosts_repaired, hosts_detail = _remove_blocked_prl_host_overrides(
+            host for _, host, _ in unique_hosts
+        )
+        diagnostics["hostsRepairSucceeded"] = hosts_repaired
+        diagnostics["hostsRepairDetail"] = hosts_detail
         repaired, detail = _write_clean_resolv_conf()
         diagnostics["resolverRepairSucceeded"] = repaired
         diagnostics["resolverRepairDetail"] = detail
         bad = collect()
     diagnostics["ok"] = not bad
     if bad:
-        raise PrlNetworkPreflightError("PRL network preflight failed: sinkhole DNS or TLS interception detected", diagnostics)
+        raise PrlNetworkPreflightError(
+            "PRL network preflight failed: blocked/non-public DNS resolution or TLS interception detected",
+            diagnostics,
+        )
     return diagnostics
 
 
