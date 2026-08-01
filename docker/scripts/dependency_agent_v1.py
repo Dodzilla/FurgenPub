@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.100"
+AGENT_VERSION = "dm-agent-py/0.10.101"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -7469,6 +7469,7 @@ class DependencyAgent:
         verify_class_types: Optional[List[str]] = None,
         timeout_seconds: float = 300.0,
         skip_if_reachable: bool = False,
+        require_readiness_marker: bool = True,
     ) -> bool:
         """Restart ComfyUI once and wait for readiness while blocking peer restarts.
 
@@ -7490,7 +7491,13 @@ class DependencyAgent:
                     allow_supervisor_restart=False,
                 )
             if verify_class_types is None:
-                self._wait_for_local_comfy_ready(timeout_seconds=timeout_seconds)
+                if require_readiness_marker:
+                    self._wait_for_local_comfy_ready(timeout_seconds=timeout_seconds)
+                else:
+                    self._wait_for_local_comfy_ready(
+                        timeout_seconds=timeout_seconds,
+                        require_readiness_marker=False,
+                    )
             else:
                 self._wait_for_local_comfy_restart(
                     verify_class_types,
@@ -7519,10 +7526,16 @@ class DependencyAgent:
         except Exception:
             return False
 
-    def _wait_for_local_comfy_ready(self, timeout_seconds: float = 300.0) -> None:
+    def _wait_for_local_comfy_ready(
+        self,
+        timeout_seconds: float = 300.0,
+        require_readiness_marker: bool = True,
+    ) -> None:
         deadline = time.time() + max(30.0, timeout_seconds)
         while time.time() < deadline:
-            if self._local_comfy_reachable(timeout_seconds=5.0) and self._local_readiness_file_present():
+            reachable = self._local_comfy_reachable(timeout_seconds=5.0)
+            marker_ready = not require_readiness_marker or self._local_readiness_file_present()
+            if reachable and marker_ready:
                 return
             time.sleep(2.0)
         raise RuntimeError("Local ComfyUI did not become ready after restart.")
@@ -9685,9 +9698,11 @@ class DependencyAgent:
                 prefer_process_restart=prefer_process_restart,
                 allow_supervisor_restart=allow_supervisor_restart,
                 timeout_seconds=300.0,
+                require_readiness_marker=False,
             )
             self._write_local_readiness_file()
             self._clear_interrupted_comfy_restart_intent()
+            logging.info("Periodic ComfyUI restart completed; readiness restored and acknowledging success itemId=%s", item_id)
             self._agent_ack(item_id, lease_id, "command_succeeded")
             try:
                 self._heartbeat(queue_depth=None)
