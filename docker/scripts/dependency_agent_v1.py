@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.101"
+AGENT_VERSION = "dm-agent-py/0.10.102"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -5954,6 +5954,41 @@ class DependencyAgent:
         self._write_local_readiness_file()
         self._clear_interrupted_comfy_restart_intent()
         logging.warning("Recovered readiness marker after an interrupted ComfyUI restart.")
+        return True
+
+    def _repair_orphaned_video_gen_v2_readiness(self) -> bool:
+        """Restore a lost video_gen_v2 marker after Comfy is safely usable.
+
+        The managed launch and bundle-install paths remove the readiness marker
+        before restarting ComfyUI. A process interruption or an out-of-band
+        supervisor restart can leave that marker absent even after ComfyUI has
+        recovered. Agent-pull assignment then remains blocked indefinitely
+        because there is no interrupted-restart intent to trigger the narrower
+        recovery path above.
+
+        Never repair while bootstrap, restart, or maintenance work is active;
+        in those states a missing marker is intentional.
+        """
+        if (self.server_type or "").strip() != "video_gen_v2" or self.mining_only:
+            return False
+        if self._local_readiness_file_present():
+            return False
+        if self._comfy_restart_command_active.is_set():
+            return False
+        if self._interrupted_comfy_restart_path.exists():
+            return False
+        if self._video_gen_v2_bootstrap_gate_active():
+            return False
+        with self._lock:
+            if self._agent_maintenance_inflight or self._active_maintenance_by_item:
+                return False
+        if not self._local_comfy_reachable(timeout_seconds=5.0):
+            return False
+
+        self._write_local_readiness_file()
+        logging.warning(
+            "Repaired orphaned video_gen_v2 readiness marker after confirming local ComfyUI health."
+        )
         return True
 
     def _restore_local_readiness_file_after_pre_restart_failure(self, reason: str) -> bool:
@@ -11798,6 +11833,10 @@ class DependencyAgent:
                         self._recover_interrupted_comfy_restart_readiness()
                     except Exception as exc:
                         logging.warning("Interrupted ComfyUI restart recovery failed: %s", exc)
+                    try:
+                        self._repair_orphaned_video_gen_v2_readiness()
+                    except Exception as exc:
+                        logging.warning("Orphaned video_gen_v2 readiness repair failed: %s", exc)
                 agent_poll_wakeup_requested = False
                 if self._dependency_poll_wakeup.is_set():
                     self._dependency_poll_wakeup.clear()
