@@ -223,7 +223,11 @@ while true; do
 done
 EOF
     chmod +x "${agent_path}" "${watchdog_path}" || true
-    nohup "${watchdog_path}" >> "${watchdog_log_path}" 2>&1 &
+    if setsid --help 2>&1 | grep -q -- '--fork'; then
+        nohup setsid -f "${watchdog_path}" >> "${watchdog_log_path}" 2>&1 &
+    else
+        nohup setsid "${watchdog_path}" >> "${watchdog_log_path}" 2>&1 &
+    fi
 }
 
 function provisioning_start() {

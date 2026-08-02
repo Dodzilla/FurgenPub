@@ -1825,7 +1825,11 @@ block = (
     "    watchdog_log_path=\"${DM_AGENT_WATCHDOG_LOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.log}\"\n"
     "    if [[ -x \"${watchdog_path}\" ]]; then\n"
     "        if ! command -v pgrep >/dev/null 2>&1 || ! pgrep -f \"${watchdog_path}\" >/dev/null 2>&1; then\n"
-    "            nohup \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+    "            if setsid --help 2>&1 | grep -q -- '--fork'; then\n"
+    "                nohup setsid -f \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+    "            else\n"
+    "                nohup setsid \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+    "            fi\n"
     "        fi\n"
     "    fi\n"
     "fi\n"
@@ -1883,7 +1887,11 @@ function dependency_manager_start_agent() {
     fi
 
     echo "Dependency manager: starting agent watchdog; log=$watchdog_log_path"
-    nohup "$watchdog_path" >> "$watchdog_log_path" 2>&1 &
+    if setsid --help 2>&1 | grep -q -- '--fork'; then
+        nohup setsid -f "$watchdog_path" >> "$watchdog_log_path" 2>&1 &
+    else
+        nohup setsid "$watchdog_path" >> "$watchdog_log_path" 2>&1 &
+    fi
 }
 
 # Start the dependency manager agent (best-effort; safe if required env vars are missing).
