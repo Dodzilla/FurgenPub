@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.102"
+AGENT_VERSION = "dm-agent-py/0.10.103"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3810,7 +3810,10 @@ class DependencyAgent:
             return False
 
     def _repair_video_gen_v2_supervisor_launch_script(self) -> bool:
-        launch_script = Path("/opt/supervisor-scripts/comfyui.sh")
+        launch_script = Path(
+            _env_str("DM_COMFYUI_SUPERVISOR_LAUNCH_SCRIPT")
+            or "/opt/supervisor-scripts/comfyui.sh"
+        )
         try:
             if not launch_script.exists() or not launch_script.is_file():
                 return False
@@ -3838,7 +3841,11 @@ class DependencyAgent:
                 "    watchdog_log_path=\"${DM_AGENT_WATCHDOG_LOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.log}\"\n"
                 "    if [[ -x \"${watchdog_path}\" ]]; then\n"
                 "        if ! command -v pgrep >/dev/null 2>&1 || ! pgrep -f \"${watchdog_path}\" >/dev/null 2>&1; then\n"
-                "            nohup setsid \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+                "            if setsid --help 2>&1 | grep -q -- '--fork'; then\n"
+                "                nohup setsid -f \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+                "            else\n"
+                "                nohup setsid \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+                "            fi\n"
                 "        fi\n"
                 "    fi\n"
                 "fi\n"
@@ -3872,16 +3879,29 @@ class DependencyAgent:
             return False
 
     def _repair_comfy_watchdog_process_isolation(self) -> bool:
-        """Ensure future supervisor starts launch the agent outside Comfy's process group."""
-        launch_script = Path("/opt/supervisor-scripts/comfyui.sh")
+        """Ensure future supervisor starts detach the watchdog from Comfy's process tree."""
+        launch_script = Path(
+            _env_str("DM_COMFYUI_SUPERVISOR_LAUNCH_SCRIPT")
+            or "/opt/supervisor-scripts/comfyui.sh"
+        )
         try:
             if not launch_script.exists() or not launch_script.is_file():
                 return False
             source = launch_script.read_text(encoding="utf-8")
-            next_source = source.replace(
-                'nohup "${watchdog_path}" >> "${watchdog_log_path}" 2>&1 &',
-                'nohup setsid "${watchdog_path}" >> "${watchdog_log_path}" 2>&1 &',
+            detached_launch = (
+                "if setsid --help 2>&1 | grep -q -- '--fork'; then\n"
+                "                nohup setsid -f \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+                "            else\n"
+                "                nohup setsid \"${watchdog_path}\" >> \"${watchdog_log_path}\" 2>&1 &\n"
+                "            fi"
             )
+            launch_pattern = re.compile(
+                r'(?:if setsid --help 2>&1 \| grep -q -- \'--fork\'; then\n\s*'
+                r'nohup setsid -f "\$\{watchdog_path\}" >> "\$\{watchdog_log_path\}" 2>&1 &\n\s*'
+                r'else\n\s*nohup setsid "\$\{watchdog_path\}" >> "\$\{watchdog_log_path\}" 2>&1 &\n\s*fi|'
+                r'nohup(?: setsid(?: -f)?)? "\$\{watchdog_path\}" >> "\$\{watchdog_log_path\}" 2>&1 &)'
+            )
+            next_source = launch_pattern.sub(detached_launch, source)
             if next_source == source:
                 return False
             launch_script.write_text(next_source, encoding="utf-8")
@@ -3890,7 +3910,7 @@ class DependencyAgent:
             except Exception:
                 pass
             logging.warning(
-                "Repaired ComfyUI watchdog launch isolation; it will take effect on the next supervisor start."
+                "Repaired ComfyUI watchdog launch detachment; it will take effect on the next supervisor start."
             )
             return True
         except Exception as exc:
@@ -5930,13 +5950,58 @@ class DependencyAgent:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"Provisioning completed at {_now_iso()}\n", encoding="utf-8")
 
-    def _write_interrupted_comfy_restart_intent(self, item_id: str) -> None:
+    def _write_interrupted_comfy_restart_intent(self, item_id: str, lease_id: str = "") -> None:
         path = self._interrupted_comfy_restart_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"itemId": str(item_id or ""), "startedAt": _now_iso()}) + "\n",
-            encoding="utf-8",
-        )
+        payload: Dict[str, Any] = {
+            "schemaVersion": 2,
+            "itemId": str(item_id or ""),
+            "leaseId": str(lease_id or ""),
+            "startedAt": _now_iso(),
+        }
+        temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        fd: Optional[int] = None
+        try:
+            fd = os.open(str(temp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(fd, encoded[offset:])
+                if written <= 0:
+                    raise OSError("short write while persisting interrupted ComfyUI restart intent")
+                offset += written
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            os.replace(str(temp_path), str(path))
+            try:
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception:
+                pass
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _read_interrupted_comfy_restart_intent(self) -> Optional[Dict[str, Any]]:
+        try:
+            raw = json.loads(self._interrupted_comfy_restart_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except Exception as exc:
+            logging.warning("Failed reading interrupted ComfyUI restart intent: %s", exc)
+            return None
+        return raw if isinstance(raw, dict) else None
 
     def _clear_interrupted_comfy_restart_intent(self) -> None:
         try:
@@ -5947,13 +6012,66 @@ class DependencyAgent:
     def _recover_interrupted_comfy_restart_readiness(self) -> bool:
         if self._comfy_restart_command_active.is_set():
             return False
-        if not self._interrupted_comfy_restart_path.exists():
+        intent = self._read_interrupted_comfy_restart_intent()
+        if intent is None:
             return False
         if not self._local_comfy_reachable(timeout_seconds=5.0):
             return False
         self._write_local_readiness_file()
+        item_id = str(intent.get("itemId") or "").strip()
+        lease_id = str(intent.get("leaseId") or "").strip()
+        schema_version = int(intent.get("schemaVersion") or 0) if isinstance(intent.get("schemaVersion"), (int, float)) else 0
+
+        if schema_version >= 2 and item_id and lease_id:
+            if not self._agent_access_token:
+                logging.info(
+                    "Recovered readiness after an interrupted ComfyUI restart; waiting for agent registration before ACK itemId=%s",
+                    item_id,
+                )
+                return False
+            try:
+                ack = self._agent_ack(item_id, lease_id, "command_succeeded")
+            except Exception as exc:
+                logging.warning(
+                    "Interrupted ComfyUI restart recovery ACK failed; retaining intent for retry itemId=%s: %s",
+                    item_id,
+                    exc,
+                )
+                return False
+            accepted = ack.get("accepted") is True
+            stale_terminal = ack.get("accepted") is False and str(ack.get("reason") or "") in {
+                "stale_lease",
+                "terminal",
+                "already_terminal",
+            }
+            if not accepted and not stale_terminal:
+                logging.warning(
+                    "Interrupted ComfyUI restart recovery ACK was not accepted; retaining intent itemId=%s response=%s",
+                    item_id,
+                    ack,
+                )
+                return False
+            self._clear_interrupted_comfy_restart_intent()
+            self._request_agent_queue_poll()
+            logging.warning(
+                "Recovered interrupted ComfyUI restart; readiness restored and %s itemId=%s",
+                "success ACK applied" if accepted else "terminal command reconciled",
+                item_id,
+            )
+            try:
+                self._agent_heartbeat()
+            except Exception:
+                pass
+            return True
+
+        # Legacy intents did not persist the lease ID, so they cannot safely ACK.
+        # Restore readiness and force an HTTP queue reconciliation immediately
+        # instead of waiting for the normal 15-minute RTDB safety poll.
+        self._request_agent_queue_poll()
         self._clear_interrupted_comfy_restart_intent()
-        logging.warning("Recovered readiness marker after an interrupted ComfyUI restart.")
+        logging.warning(
+            "Recovered readiness marker from a legacy interrupted ComfyUI restart intent; requested immediate queue reconciliation."
+        )
         return True
 
     def _repair_orphaned_video_gen_v2_readiness(self) -> bool:
@@ -6008,23 +6126,75 @@ class DependencyAgent:
         except Exception:
             return False
 
-    def _comfy_restart_process_isolated(self) -> bool:
-        """Return true only when killing Comfy's process group cannot kill this agent."""
+    def _process_parent_pid(self, pid: int) -> Optional[int]:
+        try:
+            raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+            close_idx = raw.rfind(")")
+            if close_idx < 0:
+                return None
+            fields = raw[close_idx + 1:].strip().split()
+            return int(fields[1]) if len(fields) > 1 else None
+        except Exception:
+            return None
+
+    def _process_command_line(self, pid: int) -> str:
+        try:
+            raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+            return raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    def _comfy_restart_isolation_mode(self) -> str:
+        """Describe whether a Comfy restart can kill or relaunch this agent."""
         try:
             agent_pgid = os.getpgrp()
             comfy_pids = self._find_local_comfy_processes()
             if not comfy_pids:
-                return False
+                return "unknown"
             for pid in comfy_pids:
                 try:
                     if os.getpgid(pid) == agent_pgid:
-                        return False
+                        return "unsafe_shared_process_group"
                 except ProcessLookupError:
                     continue
-            return True
+            ancestors: Set[int] = set()
+            ancestor_commands: List[str] = []
+            cursor = os.getpid()
+            for _ in range(64):
+                parent = self._process_parent_pid(cursor)
+                if not parent or parent <= 1 or parent == cursor:
+                    break
+                ancestors.add(parent)
+                ancestor_commands.append(self._process_command_line(parent))
+                cursor = parent
+            configured_supervisor_script = str(
+                Path(
+                    _env_str("DM_COMFYUI_SUPERVISOR_LAUNCH_SCRIPT")
+                    or "/opt/supervisor-scripts/comfyui.sh"
+                )
+            )
+            supervisor_basename = Path(configured_supervisor_script).name
+            supervisor_ancestor = any(
+                command and (
+                    configured_supervisor_script in command
+                    or "/supervisor-scripts/comfyui.sh" in command
+                    or (supervisor_basename == "comfyui.sh" and re.search(r"(?:^|\s)comfyui\.sh(?:\s|$)", command))
+                )
+                for command in ancestor_commands
+            )
+            if supervisor_ancestor or any(pid in ancestors for pid in comfy_pids):
+                return "supervisor_descendant_recoverable"
+            return "detached"
         except Exception as exc:
             logging.warning("Unable to verify ComfyUI restart process isolation: %s", exc)
-            return False
+            return "unknown"
+
+    def _comfy_restart_process_isolated(self) -> bool:
+        """Return true when restart is detached or crash-recoverable via the supervisor."""
+        return self._comfy_restart_isolation_mode() in {
+            "detached",
+            "supervisor_descendant_recoverable",
+        }
 
     def _normalize_local_comfy_base_url(self, raw: Optional[str]) -> Optional[str]:
         if not isinstance(raw, str):
@@ -8400,6 +8570,7 @@ class DependencyAgent:
                 "dependencyDeleteFiles": True,
                 "downloadTool": self._resolve_download_tool(),
                 "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
+                "comfyRestartIsolationMode": self._comfy_restart_isolation_mode(),
             },
         }
         if self.instance_bootstrap_token:
@@ -8800,6 +8971,7 @@ class DependencyAgent:
                 "idlePrlMining": True,
                 "miningOnly": bool(self.mining_only),
                 "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
+                "comfyRestartIsolationMode": self._comfy_restart_isolation_mode(),
             },
         }
         now_ms = _now_ms()
@@ -9716,7 +9888,7 @@ class DependencyAgent:
         allow_supervisor_restart = payload.get("allowSupervisorRestart") is not False
         self._stop_idle_prl_mining_for_work("restart_comfy")
         try:
-            self._write_interrupted_comfy_restart_intent(item_id)
+            self._write_interrupted_comfy_restart_intent(item_id, lease_id)
         except Exception as exc:
             self._agent_ack(
                 item_id,
