@@ -844,7 +844,18 @@ def _parse_video_entries_with_options(video_entries: str) -> list[dict]:
         if not line or line.startswith("#"):
             continue
         parts = [part.strip() for part in line.split("|")]
-        entry = {"path": _resolve_video_entry(parts[0]), "start": 0.0, "end": None}
+        entry = {
+            "path": _resolve_video_entry(parts[0]),
+            "start": 0.0,
+            "end": None,
+            # V3 options. Neutral defaults, so a V2-style line behaves the same.
+            "speed": 1.0,
+            "brightness": 1.0,
+            "contrast": 1.0,
+            "saturation": 1.0,
+            # Crossfade seconds into the NEXT entry (0 = straight concat).
+            "xfade": 0.0,
+        }
         for option in parts[1:]:
             key, sep, value = option.partition("=")
             if not sep:
@@ -860,6 +871,12 @@ def _parse_video_entries_with_options(video_entries: str) -> list[dict]:
                 entry["start"] = number
             elif key in ("end", "stop") and number > 0:
                 entry["end"] = number
+            elif key == "speed" and number > 0:
+                entry["speed"] = number
+            elif key in ("brightness", "contrast", "saturation") and number > 0:
+                entry[key] = number
+            elif key in ("xfade", "crossfade") and number > 0:
+                entry["xfade"] = number
         if entry["end"] is not None and entry["end"] <= entry["start"]:
             raise ValueError(f"video entry has an empty trim range: {line}")
         parsed.append(entry)
@@ -2319,9 +2336,313 @@ class FurgenAssertFiniteLatent:
         return (latent,)
 
 
+def _atempo_chain(speed: float) -> list[str]:
+    """atempo filters realising `speed`.
+
+    A single atempo is only well-conditioned within [0.5, 2.0] on older
+    ffmpeg builds, so decompose anything outside that into a product of
+    in-range factors (3x -> 1.5 * 2.0).
+    """
+    filters: list[str] = []
+    remaining = float(speed)
+    if abs(remaining - 1.0) <= 1e-6:
+        return filters
+    while remaining > 2.0 + 1e-9:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5 - 1e-9:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    if abs(remaining - 1.0) > 1e-6:
+        filters.append(f"atempo={remaining:.6f}")
+    return filters
+
+
+def _color_filters(brightness: float, contrast: float, saturation: float) -> list[str]:
+    """Video filters matching the client's CSS preview.
+
+    The Studio previews grades with `filter: brightness(b) contrast(c)
+    saturate(s)`, applied in that order. CSS brightness is a MULTIPLIER,
+    while ffmpeg's eq=brightness is an additive offset — so multiply the
+    channels with colorchannelmixer instead, and let eq handle contrast and
+    saturation, which are multiplicative in both.
+    """
+    filters: list[str] = []
+    if abs(brightness - 1.0) > 1e-4:
+        b = max(0.0, float(brightness))
+        filters.append(f"colorchannelmixer=rr={b:.6f}:gg={b:.6f}:bb={b:.6f}")
+    eq_parts = []
+    if abs(contrast - 1.0) > 1e-4:
+        eq_parts.append(f"contrast={float(contrast):.6f}")
+    if abs(saturation - 1.0) > 1e-4:
+        eq_parts.append(f"saturation={float(saturation):.6f}")
+    if eq_parts:
+        filters.append("eq=" + ":".join(eq_parts))
+    return filters
+
+
+class FCSConcatVideosV3(FCSConcatVideosV2):
+    """Concat with per-entry trims, speed, colour grading and crossfades.
+
+    Everything runs in one ffmpeg filtergraph, so each clip's audio is
+    trimmed, tempo-shifted and crossfaded alongside its picture instead of
+    being dropped. Entry lines extend V2's syntax:
+
+        url|start=S|end=E|speed=X|brightness=B|contrast=C|saturation=T|xfade=D
+
+    `xfade=D` crossfades D seconds into the NEXT entry; omit it (or 0) for a
+    straight concat. Speed scales BOTH streams (setpts + atempo), so audio
+    stays in sync rather than drifting.
+    """
+
+    def concat_videos(
+        self,
+        video_entries,
+        frame_rate,
+        overlap_frames,
+        filename_prefix,
+        pix_fmt,
+        crf,
+        save_output,
+        seam_repair_mode=FCS_SEAM_REPAIR_NONE,
+        seam_repair_source_weights="0.35,0.15",
+    ):
+        entries = _parse_video_entries_with_options(video_entries)
+        probes = [_probe_video(entry["path"]) for entry in entries]
+        base_width = probes[0]["width"] or 1920
+        base_height = probes[0]["height"] or 1088
+        overlap_frames = max(0, int(overlap_frames or 0))
+        frame_rate = float(frame_rate or 60.0)
+        overlap_seconds = float(overlap_frames) / frame_rate if overlap_frames > 0 else 0.0
+
+        for idx, (entry, probe) in enumerate(zip(entries, probes)):
+            start = float(entry["start"]) + (overlap_seconds if idx > 0 else 0.0)
+            end = entry["end"] if entry["end"] is not None else probe["duration"]
+            if end is not None and probe["duration"]:
+                end = min(float(end), float(probe["duration"]))
+            if end is not None and end - start < 1.0 / frame_rate:
+                raise ValueError(
+                    f"clip {idx + 1} trim leaves no frames: start={start:.3f}s end={end:.3f}s"
+                )
+            entry["_effective_start"] = start
+            entry["_effective_end"] = end
+            speed = float(entry.get("speed") or 1.0)
+            source_span = (float(end) - start) if end is not None else 0.0
+            # Duration this clip contributes to the timeline once sped up.
+            entry["_output_duration"] = (source_span / speed) if speed > 0 else source_span
+
+        # A crossfade can never be longer than either clip it joins.
+        for idx in range(len(entries) - 1):
+            fade = float(entries[idx].get("xfade") or 0.0)
+            if fade <= 0:
+                continue
+            budget = min(entries[idx]["_output_duration"], entries[idx + 1]["_output_duration"])
+            entries[idx]["xfade"] = max(0.0, min(fade, max(0.0, budget - 1.0 / frame_rate)))
+
+        output_dir = (
+            folder_paths.get_output_directory()
+            if save_output
+            else folder_paths.get_temp_directory()
+        )
+        full_output_folder, filename, _, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix,
+            output_dir,
+        )
+        existing = sorted(Path(full_output_folder).glob(f"{filename}_*.mp4"))
+        counter = 1
+        if existing:
+            suffixes = []
+            for item in existing:
+                stem = item.stem
+                parts = stem.split("_")
+                if parts:
+                    tail = parts[-1].replace("-audio", "")
+                    if tail.isdigit():
+                        suffixes.append(int(tail))
+            if suffixes:
+                counter = max(suffixes) + 1
+
+        base_file = f"{filename}_{counter:05}.mp4"
+        audio_file = f"{filename}_{counter:05}-audio.mp4"
+        base_path = os.path.join(full_output_folder, base_file)
+        audio_path = os.path.join(full_output_folder, audio_file)
+
+        self._render_edited_videos_ffmpeg_filtergraph(
+            entries=entries,
+            probes=probes,
+            frame_rate=frame_rate,
+            base_width=base_width,
+            base_height=base_height,
+            pix_fmt=pix_fmt,
+            crf=crf,
+            base_path=base_path,
+            audio_path=audio_path,
+        )
+
+        preview = {
+            "filename": audio_file,
+            "subfolder": subfolder,
+            "type": "output" if save_output else "temp",
+            "format": "video/h264-mp4",
+            "frame_rate": frame_rate,
+            "fullpath": audio_path,
+        }
+        return {
+            "ui": {"gifs": [preview]},
+            "result": ((save_output, [base_path, audio_path]),),
+        }
+
+    def _render_edited_videos_ffmpeg_filtergraph(
+        self,
+        *,
+        entries,
+        probes,
+        frame_rate,
+        base_width,
+        base_height,
+        pix_fmt,
+        crf,
+        base_path,
+        audio_path,
+    ):
+        ffmpeg_inputs = []
+        filter_parts = []
+        for idx, (entry, probe) in enumerate(zip(entries, probes)):
+            start = float(entry.get("_effective_start") or 0.0)
+            end = entry.get("_effective_end")
+            speed = float(entry.get("speed") or 1.0)
+            ffmpeg_inputs.extend(["-i", probe["path"]])
+
+            trim_args = []
+            if start > 0:
+                trim_args.append(f"start={start:.6f}")
+            if end is not None:
+                trim_args.append(f"end={float(end):.6f}")
+
+            video_filters = []
+            if trim_args:
+                video_filters.append(f"trim={':'.join(trim_args)}")
+            # Re-baselining timestamps and applying speed in one setpts keeps
+            # the expression exact; a separate pass would round twice.
+            video_filters.append(
+                "setpts=PTS-STARTPTS" if abs(speed - 1.0) <= 1e-6
+                else f"setpts=(PTS-STARTPTS)/{speed:.6f}"
+            )
+            video_filters.extend(_color_filters(
+                float(entry.get("brightness") or 1.0),
+                float(entry.get("contrast") or 1.0),
+                float(entry.get("saturation") or 1.0),
+            ))
+            video_filters.extend(
+                [
+                    f"fps={frame_rate}",
+                    f"scale={base_width}:{base_height}:flags=lanczos:force_original_aspect_ratio=decrease",
+                    f"pad={base_width}:{base_height}:(ow-iw)/2:(oh-ih)/2:black",
+                    f"format={pix_fmt}",
+                    "setsar=1",
+                ]
+            )
+            filter_parts.append(f"[{idx}:v]{','.join(video_filters)}[v{idx}]")
+
+            if probe["has_audio"]:
+                audio_filters = []
+                if trim_args:
+                    audio_filters.extend([f"atrim={':'.join(trim_args)}", "asetpts=PTS-STARTPTS"])
+                else:
+                    audio_filters.append("asetpts=PTS-STARTPTS")
+                audio_filters.extend(_atempo_chain(speed))
+                audio_filters.extend(
+                    [
+                        "aresample=48000",
+                        "aformat=sample_fmts=fltp:channel_layouts=stereo",
+                    ]
+                )
+                filter_parts.append(f"[{idx}:a]{','.join(audio_filters)}[a{idx}]")
+            else:
+                silent_duration = max(0.001, float(entry.get("_output_duration") or 0.001))
+                filter_parts.append(
+                    f"anullsrc=channel_layout=stereo:sample_rate=48000:d={silent_duration:.6f}[a{idx}]"
+                )
+
+        has_crossfade = any(float(e.get("xfade") or 0.0) > 0 for e in entries[:-1])
+        if not has_crossfade:
+            concat_inputs = []
+            for idx in range(len(probes)):
+                concat_inputs.extend([f"[v{idx}]", f"[a{idx}]"])
+            filter_parts.append(
+                "".join(concat_inputs) + f"concat=n={len(probes)}:v=1:a=1[v][a]"
+            )
+        else:
+            # xfade/acrossfade are pairwise, so fold the clips left to right.
+            # Each fade overlaps the streams, so the running duration grows by
+            # the next clip's length MINUS the fade, and the next offset is
+            # measured against that accumulated timeline.
+            cur_v, cur_a = "[v0]", "[a0]"
+            acc = float(entries[0].get("_output_duration") or 0.0)
+            for idx in range(1, len(entries)):
+                fade = float(entries[idx - 1].get("xfade") or 0.0)
+                nxt_v, nxt_a = f"[v{idx}]", f"[a{idx}]"
+                out_v, out_a = f"[vx{idx}]", f"[ax{idx}]"
+                nxt_duration = float(entries[idx].get("_output_duration") or 0.0)
+                if fade > 0:
+                    offset = max(0.0, acc - fade)
+                    filter_parts.append(
+                        f"{cur_v}{nxt_v}xfade=transition=fade:duration={fade:.6f}:offset={offset:.6f}{out_v}"
+                    )
+                    filter_parts.append(
+                        f"{cur_a}{nxt_a}acrossfade=d={fade:.6f}:c1=tri:c2=tri{out_a}"
+                    )
+                    acc = acc + nxt_duration - fade
+                else:
+                    filter_parts.append(f"{cur_v}{nxt_v}concat=n=2:v=1:a=0{out_v}")
+                    filter_parts.append(f"{cur_a}{nxt_a}concat=n=2:v=0:a=1{out_a}")
+                    acc = acc + nxt_duration
+                cur_v, cur_a = out_v, out_a
+            filter_parts.append(f"{cur_v}null[v]")
+            filter_parts.append(f"{cur_a}anull[a]")
+
+        cmd = [
+            FFMPEG_BIN,
+            "-y",
+            "-v",
+            "error",
+            *ffmpeg_inputs,
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            pix_fmt,
+            "-r",
+            str(frame_rate),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            audio_path,
+        ]
+        subprocess.run(cmd, check=True)
+
+        subprocess.run(
+            [FFMPEG_BIN, "-y", "-v", "error", "-i", audio_path, "-an", "-c:v", "copy", base_path],
+            check=True,
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
     "FCSConcatVideosV2": FCSConcatVideosV2,
+    "FCSConcatVideosV3": FCSConcatVideosV3,
     "FurgenExposureAdjust": FurgenExposureAdjust,
     "FurgenGetImageRangeFromBatch": FurgenGetImageRangeFromBatch,
     "FurgenPrependImageToBatch": FurgenPrependImageToBatch,
@@ -2342,6 +2663,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FCSConcatVideos": "Furgen Concat Videos",
     "FCSConcatVideosV2": "Furgen Concat Videos V2 (trims)",
+    "FCSConcatVideosV3": "Furgen Concat Videos V3 (trims, speed, colour, crossfade)",
     "FurgenExposureAdjust": "Furgen Exposure Adjust",
     "FurgenGetImageRangeFromBatch": "Furgen Get Image Range From Batch",
     "FurgenPrependImageToBatch": "Furgen Prepend Image To Batch",
