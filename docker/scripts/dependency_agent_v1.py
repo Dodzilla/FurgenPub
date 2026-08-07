@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.103"
+AGENT_VERSION = "dm-agent-py/0.10.104"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6392,6 +6392,25 @@ class DependencyAgent:
                 continue
         return None
 
+    def _comfy_python_executable(self) -> str:
+        """Return the Python interpreter used by the local ComfyUI runtime."""
+        configured = _env_str("DM_COMFY_PYTHON_EXECUTABLE")
+        candidates = [
+            Path(configured) if configured else None,
+            Path("/venv/main/bin/python"),
+            self.comfyui_dir / ".venv" / "bin" / "python",
+            self.comfyui_dir / "venv" / "bin" / "python",
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+            except OSError:
+                continue
+        return sys.executable
+
     def _install_git_custom_node(
         self,
         repo_url: str,
@@ -6407,7 +6426,7 @@ class DependencyAgent:
         git = shutil.which("git")
         if not git:
             raise RuntimeError("git not found; cannot install custom node repository")
-        pip_cmd = [sys.executable, "-m", "pip"]
+        pip_cmd = [self._comfy_python_executable(), "-m", "pip"]
         node_dir = (verify_dir_name or os.path.basename(repo_url.rstrip("/"))).removesuffix(".git")
         if not re.match(r"^[A-Za-z0-9_.-]{1,128}$", node_dir):
             raise RuntimeError(f"Unsupported custom node directory name: {node_dir}")
@@ -6508,15 +6527,27 @@ class DependencyAgent:
 
     def _python_package_version(self, package_name: str) -> Optional[str]:
         try:
-            import importlib.metadata as importlib_metadata
-            return importlib_metadata.version(package_name)
+            proc = subprocess.run(
+                [
+                    self._comfy_python_executable(),
+                    "-c",
+                    "import importlib.metadata as m,sys; print(m.version(sys.argv[1]))",
+                    package_name,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            return proc.stdout.strip() or None
         except Exception:
             return None
 
     def _ensure_python_package_constraint(self, requirement: str, package_name: str) -> bool:
         before = self._python_package_version(package_name)
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-cache-dir", requirement],
+            [self._comfy_python_executable(), "-m", "pip", "install", "--no-cache-dir", requirement],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -6552,7 +6583,7 @@ class DependencyAgent:
         ]
         for _ in range(2):
             subprocess.run(
-                [sys.executable, "-m", "pip", "uninstall", "-y", *opencv_packages],
+                [self._comfy_python_executable(), "-m", "pip", "uninstall", "-y", *opencv_packages],
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -6560,7 +6591,7 @@ class DependencyAgent:
             )
         subprocess.run(
             [
-                sys.executable,
+                self._comfy_python_executable(),
                 "-m",
                 "pip",
                 "install",
@@ -6576,7 +6607,7 @@ class DependencyAgent:
         )
         subprocess.run(
             [
-                sys.executable,
+                self._comfy_python_executable(),
                 "-c",
                 "import cv2; from cv2.ximgproc import guidedFilter; print(cv2.__version__)",
             ],
@@ -6812,7 +6843,7 @@ class DependencyAgent:
             "        getattr(mod, name)\n"
         )
         subprocess.run(
-            [sys.executable, "-c", script],
+            [self._comfy_python_executable(), "-c", script],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -6873,7 +6904,7 @@ class DependencyAgent:
             packages = self._safe_python_package_specs(step.get("packages"))
             if not packages:
                 raise RuntimeError(f"Bundle {bundle_id} pip_install step has no valid packages")
-            command = [sys.executable, "-m", "pip", "install", "--no-cache-dir"]
+            command = [self._comfy_python_executable(), "-m", "pip", "install", "--no-cache-dir"]
             if step.get("forceReinstall") is True:
                 command.append("--force-reinstall")
             if step.get("noDeps") is True:
@@ -6886,7 +6917,7 @@ class DependencyAgent:
             if not packages:
                 raise RuntimeError(f"Bundle {bundle_id} pip_uninstall step has no valid packages")
             subprocess.run(
-                [sys.executable, "-m", "pip", "uninstall", "-y", *packages],
+                [self._comfy_python_executable(), "-m", "pip", "uninstall", "-y", *packages],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -7094,7 +7125,7 @@ class DependencyAgent:
                 requirements = self.comfyui_dir / requirements_name
                 if requirements.exists():
                     subprocess.run(
-                        [sys.executable, "-m", "pip", "install", "--no-cache-dir", "-r", str(requirements)],
+                        [self._comfy_python_executable(), "-m", "pip", "install", "--no-cache-dir", "-r", str(requirements)],
                         check=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
@@ -7117,7 +7148,7 @@ class DependencyAgent:
             try:
                 if src_path.exists():
                     shutil.copy2(src_path, compat_path)
-                    subprocess.run([sys.executable, "-m", "py_compile", str(compat_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+                    subprocess.run([self._comfy_python_executable(), "-m", "py_compile", str(compat_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
                     logging.info("Installed Furgen video compat nodes from local source: %s", src_path)
                     return
             except Exception as exc:
@@ -7127,7 +7158,7 @@ class DependencyAgent:
         request = urllib.request.Request(remote_url, headers={"User-Agent": "furgen-dependency-agent/1.0"})
         with urllib.request.urlopen(request, timeout=60.0) as resp:
             compat_path.write_bytes(resp.read())
-        subprocess.run([sys.executable, "-m", "py_compile", str(compat_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        subprocess.run([self._comfy_python_executable(), "-m", "py_compile", str(compat_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         logging.info("Installed Furgen video compat nodes from raw source: %s", remote_url)
     def _furgen_video_tools_source_candidates(self) -> List[Path]:
         candidates: List[Path] = []
@@ -7598,6 +7629,10 @@ class DependencyAgent:
         # The Vast Comfy image portal wrapper can block forever waiting for
         # /etc/portal.yaml when launched outside its original supervisor path.
         env["SERVERLESS"] = "true"
+        # Vast's launch wrapper uses `unbuffer -p` when available. In a
+        # detached dependency-agent process stdin is already closed, so `-p`
+        # propagates EOF and terminates ComfyUI during startup.
+        env["DISABLE_PTY"] = "true"
         configured = self._normalize_local_comfy_base_url(self.agent_local_comfy_base_url) or "http://127.0.0.1:8188"
         parsed = urllib.parse.urlparse(configured)
         launch_port = parsed.port or 8188
