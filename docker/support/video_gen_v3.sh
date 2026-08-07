@@ -43,6 +43,7 @@ PIP_PACKAGES=(
 
 NODES=(
     "https://github.com/ltdrdata/ComfyUI-Manager"
+    "https://github.com/Dodzilla/easy-comfy-nodes-async"
     "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
     "https://github.com/GACLove/ComfyUI-VFI"
     "https://github.com/kijai/ComfyUI-KJNodes"
@@ -64,6 +65,7 @@ NODE_PINS[comfyui_controlnet_aux]="cc6b232f4a47f0cdf70f4e1bfa24b74bd0d75bf1"
 NODE_PINS[ComfyUI-Impact-Subpack]="50c7b71a6a224734cc9b21963c6d1926816a97f1"
 NODE_PINS[ComfyUI-KJNodes]="35e5956193769d18a13136cdedb73a36a05c73e6"
 NODE_PINS[ComfyUI-Manager]="b5a2bed5396e6be8a2d1970793f5ce2f1e74c8c2"
+NODE_PINS[easy-comfy-nodes-async]="a7d58d21de8a47fc42537c204650f9c03066f22a"
 NODE_PINS[ComfyUI-VideoHelperSuite]="4ee72c065db22c9d96c2427954dc69e7b908444b"
 NODE_PINS[ComfyUI-VFI]="6176a430f12cd16003f4664c1e3c6af8e96cc3c6"
 NODE_PINS[Nvidia_RTX_Nodes_ComfyUI]="892515e3eb9a4920a131a502a047e47adca9eb0d"
