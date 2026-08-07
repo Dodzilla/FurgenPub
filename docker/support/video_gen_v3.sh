@@ -12,8 +12,9 @@ fi
 
 source /venv/main/bin/activate
 COMFYUI_DIR="${DM_COMFYUI_DIR}"
-# Pin to the latest official ComfyUI release (v0.18.2, 2026-03-25).
-COMFYUI_PIN="${COMFYUI_PIN:-a0ae3f3bd46b9e58f43fccfe17077873bf16f905}"
+# Pin the official ComfyUI revision used by video_gen_v3 and containing the
+# native MiniMax H3 nodes.
+COMFYUI_PIN="${COMFYUI_PIN:-bdcb886a4705a03cf40f4a7226de9fc7c059fc90}"
 FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support}"
 
 # NOTE:
@@ -36,35 +37,16 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    "flash-attn"
-    "triton"
-    "sageattention"
     "onnxruntime"
-    # For authenticated snapshot downloads from Hugging Face (avoids git/LFS auth issues)
     "huggingface_hub>=0.20.0"
-    # Ensure Impact-Pack imports succeed even if its requirements
-    # fail due to VCS deps (e.g., git+sam2). piexif is small and safe.
-    "piexif"
 )
 
 NODES=(
     "https://github.com/ltdrdata/ComfyUI-Manager"
-    "https://github.com/cubiq/ComfyUI_essentials"
-    "https://github.com/ltdrdata/ComfyUI-Impact-Pack"
-
-    # Video processing nodes
     "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite"
     "https://github.com/GACLove/ComfyUI-VFI"
-    "https://github.com/Lightricks/ComfyUI-LTXVideo"
-
-    # Shared helper nodes for LTX and reference-audio workflows
     "https://github.com/kijai/ComfyUI-KJNodes"
-
-    # Other nodes
-    "https://github.com/Dodzilla/easy-comfy-nodes-async"
-    "https://github.com/evanspearman/ComfyMath"
-    "https://github.com/kijai/ComfyUI-MelBandRoFormer"
-    "https://github.com/ClownsharkBatwing/RES4LYF"
+    "https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI"
 )
 
 # Hugging Face repo snapshots (download the whole repo into a folder).
@@ -80,21 +62,11 @@ declare -A NODE_PINS
 NODE_PINS[ComfyUI-Impact-Pack]="61bd8397a18e7e7668e6a24e95168967768c2bed"
 NODE_PINS[comfyui_controlnet_aux]="cc6b232f4a47f0cdf70f4e1bfa24b74bd0d75bf1"
 NODE_PINS[ComfyUI-Impact-Subpack]="50c7b71a6a224734cc9b21963c6d1926816a97f1"
-NODE_PINS[ComfyUI-KJNodes]="7b1327192e4729085788a3020a9cbb095e0c7811"
+NODE_PINS[ComfyUI-KJNodes]="35e5956193769d18a13136cdedb73a36a05c73e6"
 NODE_PINS[ComfyUI-Manager]="b5a2bed5396e6be8a2d1970793f5ce2f1e74c8c2"
-NODE_PINS[ComfyUI_essentials]="9d9f4bedfc9f0321c19faf71855e228c93bd0dc9"
-NODE_PINS[was-node-suite-comfyui]="ea935d1044ae5a26efa54ebeb18fe9020af49a45"
-NODE_PINS[ComfyUI_Comfyroll_CustomNodes]="d78b780ae43fcf8c6b7c6505e6ffb4584281ceca"
-NODE_PINS[ComfyUI-ComfyCouple]="6c815b13e6269b7ade1dd3a49ef67de71a0014eb"
-NODE_PINS[LoopsGroundingDino]="8d84e5501d147d974ba4b6bfeb5de67c324523a0"
-NODE_PINS[ComfyUI-RMBG]="b28ce10b51e1d505a2ebf2608184119f0cf662d3"
-NODE_PINS[ComfyUI-VideoHelperSuite]="08e8df15db24da292d4b7f943c460dc2ab442b24"
-
-# New repos (latest as of now)
-NODE_PINS[ComfyUI-Frame-Interpolation]="a969c01dbccd9e5510641be04eb51fe93f6bfc3d"
-NODE_PINS[ComfyUI-GGUF]="be2a08330d7ec232d684e50ab938870d7529471e"
-NODE_PINS[rgthree-comfy]="2b9eb36d3e1741e88dbfccade0e08137f7fa2bfb"
-NODE_PINS[ComfyUI-Custom-Scripts]="f2838ed5e59de4d73cde5c98354b87a8d3200190"
+NODE_PINS[ComfyUI-VideoHelperSuite]="4ee72c065db22c9d96c2427954dc69e7b908444b"
+NODE_PINS[ComfyUI-VFI]="6176a430f12cd16003f4664c1e3c6af8e96cc3c6"
+NODE_PINS[Nvidia_RTX_Nodes_ComfyUI]="892515e3eb9a4920a131a502a047e47adca9eb0d"
 function load_node_pins_from_env() {
     [[ -z "$COMFY_NODE_PINS" ]] && return 0
     local payload entries
@@ -187,32 +159,27 @@ function provisioning_install_furgen_video_tools_node() {
 }
 
 function provisioning_start() {
-    local soft_failures=0
-
     provisioning_print_header
-    provisioning_update_comfyui
+    provisioning_update_comfyui || return 1
     provisioning_get_apt_packages
     load_node_pins_from_env
     provisioning_get_nodes || {
-        printf "WARN: Provisioning step 'provisioning_get_nodes' failed with exit code %s; continuing.\n" "$?"
-        soft_failures=1
+        printf "ERROR: Required MiniMax H3 output-node provisioning failed with exit code %s.\n" "$?"
+        return 1
     }
     # Furgen-owned video nodes (FurgenExposureAdjust etc.) — required by the
     # video_combine_v2 edit-render workflows submitted by furgenai.
     provisioning_install_furgen_video_tools_node || {
-        printf "WARN: Provisioning step 'provisioning_install_furgen_video_tools_node' failed with exit code %s; continuing.\n" "$?"
-        soft_failures=1
+        printf "ERROR: Provisioning step 'provisioning_install_furgen_video_tools_node' failed with exit code %s.\n" "$?"
+        return 1
     }
     # Safety pass: re-apply any per-node requirements and ensure Impact-Pack deps
     provisioning_ensure_node_requirements
     provisioning_get_pip_packages || {
-        printf "WARN: Provisioning step 'provisioning_get_pip_packages' failed with exit code %s; continuing.\n" "$?"
-        soft_failures=1
+        printf "ERROR: Provisioning step 'provisioning_get_pip_packages' failed with exit code %s.\n" "$?"
+        return 1
     }
     provisioning_print_end || return 1
-    if [[ "$soft_failures" -ne 0 ]]; then
-        printf "Provisioning completed with non-fatal warnings.\n"
-    fi
 }
 
 function provisioning_get_apt_packages() {
@@ -240,14 +207,22 @@ function provisioning_get_nodes() {
             fi
             pin_node_if_requested "$dir" "$path"
             if [[ -e $requirements ]]; then
-               pip install --no-cache-dir -r "$requirements"
+               if [[ "$dir" == "Nvidia_RTX_Nodes_ComfyUI" ]]; then
+                   pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com -r "$requirements"
+               else
+                   pip install --no-cache-dir -r "$requirements"
+               fi
             fi
         else
             printf "Downloading node: %s...\n" "${repo}"
             git clone "${repo}" "${path}" --recursive
             pin_node_if_requested "$dir" "$path"
             if [[ -e $requirements ]]; then
-                pip install --no-cache-dir -r "${requirements}"
+                if [[ "$dir" == "Nvidia_RTX_Nodes_ComfyUI" ]]; then
+                    pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com -r "${requirements}"
+                else
+                    pip install --no-cache-dir -r "${requirements}"
+                fi
             fi
         fi
     done
