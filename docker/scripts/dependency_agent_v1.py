@@ -130,8 +130,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.106"
-VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
+AGENT_VERSION = "dm-agent-py/0.10.107"
+VIDEO_GEN_V2_FURGENPUB_COMMIT = "b587838a8f082098247a6003ce6f3b9491328dd9"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
@@ -3835,6 +3835,9 @@ class DependencyAgent:
                 "    unset COMFYUI_ARGS\n"
                 "fi\n"
                 "unset furgen_saved_comfyui_args furgen_had_comfyui_args\n"
+                "if [[ \" ${COMFYUI_ARGS:-} \" != *\" --use-sage-attention \"* ]]; then\n"
+                "    COMFYUI_ARGS=\"${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header} --use-sage-attention\"\n"
+                "fi\n"
                 "dm_agent_disable=\"$(printf '%s' \"${DM_AGENT_DISABLE:-}\" | tr '[:upper:]' '[:lower:]')\"\n"
                 "if [[ \"${dm_agent_disable}\" != \"1\" && \"${dm_agent_disable}\" != \"true\" ]]; then\n"
                 "    watchdog_path=\"${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.sh}\"\n"
@@ -7636,7 +7639,10 @@ class DependencyAgent:
         configured = self._normalize_local_comfy_base_url(self.agent_local_comfy_base_url) or "http://127.0.0.1:8188"
         parsed = urllib.parse.urlparse(configured)
         launch_port = parsed.port or 8188
-        env["COMFYUI_ARGS"] = f"--disable-auto-launch --listen 0.0.0.0 --port {launch_port} --enable-cors-header"
+        launch_args = f"--disable-auto-launch --listen 0.0.0.0 --port {launch_port} --enable-cors-header"
+        if self.server_type == "video_gen_v2":
+            launch_args += " --use-sage-attention"
+        env["COMFYUI_ARGS"] = launch_args
         log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
