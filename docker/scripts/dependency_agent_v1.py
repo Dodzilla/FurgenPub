@@ -130,8 +130,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.108"
-VIDEO_GEN_V2_FURGENPUB_COMMIT = "4240bafaa3e250e562726c17644c18ff21caeb2d"
+AGENT_VERSION = "dm-agent-py/0.10.109"
+VIDEO_GEN_V2_FURGENPUB_COMMIT = "1a996a16705d524f13e1962cf4712a8244bf8d41"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
@@ -5940,6 +5940,41 @@ class DependencyAgent:
             return candidate
         return self.comfyui_dir / "input" / self.agent_local_readiness_file
 
+    def _video_gen_v2_sageattention_runtime_path(self) -> Path:
+        configured = _env_str("VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH")
+        return Path(configured) if configured else self.workspace / "sageattention2_runtime.json"
+
+    def _video_gen_v2_sageattention_runtime_ready(self) -> bool:
+        if (self.server_type or "").strip() != "video_gen_v2":
+            return True
+        try:
+            payload = json.loads(
+                self._video_gen_v2_sageattention_runtime_path().read_text(encoding="utf-8")
+            )
+            if not isinstance(payload, dict):
+                return False
+            if str(payload.get("attentionBackend") or "").strip().lower() != "sageattention2":
+                return False
+            if payload.get("kernelSmokePassed") is not True:
+                return False
+
+            capability_text = str(payload.get("cudaCapability") or "").strip()
+            capability_match = re.fullmatch(r"(\d+)\.(\d+)", capability_text)
+            if capability_match is None:
+                return False
+            capability_major = int(capability_match.group(1))
+            kernel_policy = str(payload.get("kernelPolicy") or "").strip()
+            if capability_major == 12:
+                expected_policy = "sm120_qk_int8_pv_fp16_per_thread_fp32"
+                return (
+                    kernel_policy == expected_policy
+                    and payload.get("comfyPolicyActive") is True
+                    and str(payload.get("comfyPolicy") or "").strip() == expected_policy
+                )
+            return kernel_policy == "upstream_auto_dispatch"
+        except Exception:
+            return False
+
     def _remove_local_readiness_file(self) -> None:
         try:
             path = self._local_readiness_file_path()
@@ -6019,6 +6054,8 @@ class DependencyAgent:
         if intent is None:
             return False
         if not self._local_comfy_reachable(timeout_seconds=5.0):
+            return False
+        if not self._video_gen_v2_sageattention_runtime_ready():
             return False
         self._write_local_readiness_file()
         item_id = str(intent.get("itemId") or "").strip()
@@ -6105,6 +6142,8 @@ class DependencyAgent:
                 return False
         if not self._local_comfy_reachable(timeout_seconds=5.0):
             return False
+        if not self._video_gen_v2_sageattention_runtime_ready():
+            return False
 
         self._write_local_readiness_file()
         logging.warning(
@@ -6116,6 +6155,8 @@ class DependencyAgent:
         try:
             if not self._local_comfy_reachable(timeout_seconds=10.0):
                 return False
+            if not self._video_gen_v2_sageattention_runtime_ready():
+                return False
             self._write_local_readiness_file()
             logging.warning("Restored readiness marker after pre-restart failure: %s", reason)
             return True
@@ -6125,7 +6166,10 @@ class DependencyAgent:
 
     def _local_readiness_file_present(self) -> bool:
         try:
-            return self._local_readiness_file_path().exists()
+            return (
+                self._local_readiness_file_path().exists()
+                and self._video_gen_v2_sageattention_runtime_ready()
+            )
         except Exception:
             return False
 
