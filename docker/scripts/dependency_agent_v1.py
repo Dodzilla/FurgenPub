@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.110"
+AGENT_VERSION = "dm-agent-py/0.10.111"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "1a996a16705d524f13e1962cf4712a8244bf8d41"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -7282,6 +7282,14 @@ class DependencyAgent:
         impl_path = src_dir / "furgen_video_tools.py"
         if not init_path.exists() or not impl_path.exists():
             return False
+        try:
+            init_source = init_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return False
+        if "furgen_sageattention_policy" in init_source and not (src_dir / "furgen_sageattention_policy.py").exists():
+            if log_skip:
+                logging.warning("Skipping incomplete FurgenVideoTools source missing SageAttention policy module: %s", src_dir)
+            return False
         required = self._normalize_required_class_types(required_class_types)
         if not required:
             return True
@@ -7357,6 +7365,16 @@ class DependencyAgent:
                 with urllib.request.urlopen(request, timeout=60.0) as resp:
                     data = resp.read()
                 (temp_dir / filename).write_bytes(data)
+            init_source = (temp_dir / "__init__.py").read_text(encoding="utf-8", errors="replace")
+            if "furgen_sageattention_policy" in init_source:
+                policy_filename = "furgen_sageattention_policy.py"
+                policy_url = f"{remote_base}/{policy_filename}"
+                policy_request = urllib.request.Request(
+                    policy_url,
+                    headers={"User-Agent": "furgen-dependency-agent/1.0"},
+                )
+                with urllib.request.urlopen(policy_request, timeout=60.0) as resp:
+                    (temp_dir / policy_filename).write_bytes(resp.read())
             if required and not self._furgen_video_tools_source_is_usable(temp_dir, required_class_types=required):
                 raise RuntimeError(
                     "Downloaded FurgenVideoTools source is missing required class types "
