@@ -11,6 +11,10 @@ VIDEO_GEN_V2_IMAGE_FILTERS_REPO="${VIDEO_GEN_V2_IMAGE_FILTERS_REPO:-https://gith
 VIDEO_GEN_V2_IMAGE_FILTERS_PIN="${VIDEO_GEN_V2_IMAGE_FILTERS_PIN:-bbb3fb0045461adf3602faeedaf40af57090d4e2}"
 VIDEO_GEN_V2_IMAGE_FILTERS_OPENCV_REQUIREMENT="${VIDEO_GEN_V2_IMAGE_FILTERS_OPENCV_REQUIREMENT:-opencv-contrib-python==4.10.0.84}"
 VIDEO_GEN_V2_LTX_CONTEXT_WINDOWS_COMFYUI_PIN="${VIDEO_GEN_V2_LTX_CONTEXT_WINDOWS_COMFYUI_PIN:-cd77c551d6c7efa46a8ba514fd6f4e04aac76b4d}"
+export VIDEO_GEN_V2_SAGEATTENTION_VERSION="${VIDEO_GEN_V2_SAGEATTENTION_VERSION:-2.2.0}"
+export VIDEO_GEN_V2_SAGEATTENTION_SOURCE_COMMIT="${VIDEO_GEN_V2_SAGEATTENTION_SOURCE_COMMIT:-eb615cf6cf4d221338033340ee2de1c37fbdba4a}"
+export VIDEO_GEN_V2_SAGEATTENTION_WHEEL_BASE_URL="${VIDEO_GEN_V2_SAGEATTENTION_WHEEL_BASE_URL:-https://github.com/Comfy-Org/wheels/releases/download/sageattention-latest}"
+export VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH="${VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH:-${WORKSPACE}/sageattention2_runtime.json}"
 
 mkdir -p "${WORKSPACE}" "${DM_COMFYUI_DIR}" || true
 
@@ -50,7 +54,6 @@ APT_PACKAGES=(
 PIP_PACKAGES=(
     "flash-attn"
     "triton"
-    "sageattention"
     "kornia<0.8"
     "onnxruntime"
     # For authenticated snapshot downloads from Hugging Face (avoids git/LFS auth issues)
@@ -306,6 +309,7 @@ function provisioning_start() {
         printf "WARN: Provisioning step 'provisioning_get_pip_packages' failed with exit code %s; continuing.\n" "$?"
         soft_failures=1
     }
+    provisioning_install_sageattention2 || return 1
     provisioning_fix_python_compatibility || return 1
     provisioning_install_furgen_compat_nodes || return 1
     provisioning_print_end || return 1
@@ -353,7 +357,10 @@ source = re.sub(
 
 block = (
     "# FURGEN ComfyUI launch args normalization\n"
-    "COMFYUI_ARGS=${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header}\n"
+    "COMFYUI_ARGS=${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header --use-sage-attention}\n"
+    "if [[ \" ${COMFYUI_ARGS} \" != *\" --use-sage-attention \"* ]]; then\n"
+    "    COMFYUI_ARGS=\"${COMFYUI_ARGS} --use-sage-attention\"\n"
+    "fi\n"
     "COMFYUI_ARGS=\"${COMFYUI_ARGS// --disable-cuda-malloc/}\"\n"
     "COMFYUI_ARGS=\"${COMFYUI_ARGS//--disable-cuda-malloc/}\"\n"
     "video_gen_v2_disable_cuda_malloc=\"$(printf '%s' \"${VIDEO_GEN_V2_COMFY_DISABLE_CUDA_MALLOC:-false}\" | tr '[:upper:]' '[:lower:]')\"\n"
@@ -455,15 +462,26 @@ block = (
     "(\n"
     "    furgen_ready_port=\"${furgen_comfyui_port}\"\n"
     "    furgen_ready_file=\"${furgen_readiness_file}\"\n"
+    "    furgen_sage_verify_path=\"${VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH:-${WORKSPACE:-/workspace}/sageattention2_runtime.json}\"\n"
     "    for furgen_ready_attempt in $(seq 1 300); do\n"
     "        if curl -fsS --max-time 2 \"http://127.0.0.1:${furgen_ready_port}/queue\" >/dev/null 2>&1; then\n"
+    "            if [[ ! -s \"${furgen_sage_verify_path}\" ]]; then\n"
+    "                echo \"WARN: SageAttention2 runtime verification is missing; readiness marker not written.\" >&2\n"
+    "                sleep 2\n"
+    "                continue\n"
+    "            fi\n"
+    "            if ! ps -eo args= | grep -Eq '[p]ython([0-9.]+)? .*main\\.py .*--use-sage-attention'; then\n"
+    "                echo \"WARN: ComfyUI is reachable without --use-sage-attention; readiness marker not written.\" >&2\n"
+    "                sleep 2\n"
+    "                continue\n"
+    "            fi\n"
     "            mkdir -p \"$(dirname \"${furgen_ready_file}\")\"\n"
-    "            echo \"Provisioning completed and ComfyUI ready at $(date)\" > \"${furgen_ready_file}\"\n"
+    "            echo \"Provisioning completed with SageAttention2 and ComfyUI ready at $(date)\" > \"${furgen_ready_file}\"\n"
     "            exit 0\n"
     "        fi\n"
     "        sleep 2\n"
     "    done\n"
-    "    echo \"WARN: ComfyUI did not become locally reachable on port ${furgen_ready_port}; readiness marker not written.\" >&2\n"
+    "    echo \"WARN: ComfyUI did not become ready with SageAttention2 on port ${furgen_ready_port}; readiness marker not written.\" >&2\n"
     ") &\n"
     "# Bypass Vast's unbuffer-based pty wrapper for Comfy. The wrapper can exit\n"
     "# cleanly while long GPU jobs are still running, causing supervisor to\n"
@@ -536,6 +554,115 @@ function provisioning_get_pip_packages() {
     if [[ -n $PIP_PACKAGES ]]; then
             pip install --no-cache-dir ${PIP_PACKAGES[@]}
     fi
+}
+
+function provisioning_install_sageattention2() {
+    local runtime_key wheel_name wheel_url wheel_sha256 wheel_size wheel_path actual_size actual_sha256
+
+    runtime_key="$(python - <<'PY' || true
+import platform
+import sys
+
+import torch
+
+torch_version = torch.__version__.split("+", 1)[0].split(".")
+torch_series = ".".join(torch_version[:2])
+cuda_runtime = str(torch.version.cuda or "")
+python_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+machine = platform.machine().lower()
+print(f"{torch_series}|{cuda_runtime}|{python_tag}|{machine}")
+PY
+)"
+
+    case "${runtime_key}" in
+        "2.10|12.8|cp312|x86_64"|"2.10|12.8|cp312|amd64")
+            wheel_name="sageattention-2.2.0+cu128torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
+            wheel_sha256="78adfed40544519b77d2d11a10b216011c91c17a7ae1634f616807c1e9c3d1aa"
+            wheel_size="27418276"
+            ;;
+        "2.10|12.9|cp312|x86_64"|"2.10|12.9|cp312|amd64")
+            wheel_name="sageattention-2.2.0+cu129torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
+            wheel_sha256="5e5cda462f73306cd8c201516d736357fc577ab5b9372dc5069362b4eab85dcf"
+            wheel_size="33809602"
+            ;;
+        "2.10|13.0|cp312|x86_64"|"2.10|13.0|cp312|amd64")
+            wheel_name="sageattention-2.2.0+cu130torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
+            wheel_sha256="f0f8a1b9ba89719ab69c4481c1c94e959c4950d53f92bf0c96e3652e81544b21"
+            wheel_size="27466865"
+            ;;
+        *)
+            printf "ERROR: No pinned SageAttention2 wheel is registered for runtime %s.\n" "${runtime_key:-unknown}"
+            return 1
+            ;;
+    esac
+
+    wheel_url="${VIDEO_GEN_V2_SAGEATTENTION_WHEEL_BASE_URL%/}/${wheel_name//+/%2B}"
+    wheel_path="/tmp/${wheel_name}"
+    printf "Installing pinned SageAttention2 %s for runtime %s.\n" "${VIDEO_GEN_V2_SAGEATTENTION_VERSION}" "${runtime_key}"
+    curl -fL --retry 3 --retry-all-errors -o "${wheel_path}" "${wheel_url}" || return 1
+
+    actual_size="$(stat -c '%s' "${wheel_path}")"
+    if [[ "${actual_size}" != "${wheel_size}" ]]; then
+        printf "ERROR: SageAttention2 wheel size mismatch: expected %s, got %s.\n" "${wheel_size}" "${actual_size}"
+        return 1
+    fi
+    actual_sha256="$(sha256sum "${wheel_path}" | awk '{print $1}')"
+    if [[ "${actual_sha256}" != "${wheel_sha256}" ]]; then
+        printf "ERROR: SageAttention2 wheel SHA-256 mismatch: expected %s, got %s.\n" "${wheel_sha256}" "${actual_sha256}"
+        return 1
+    fi
+
+    python -m pip uninstall -y sageattention || true
+    python -m pip install --no-cache-dir --no-deps --force-reinstall "${wheel_path}" || return 1
+
+    VIDEO_GEN_V2_SAGEATTENTION_VERSION="${VIDEO_GEN_V2_SAGEATTENTION_VERSION}" \
+    VIDEO_GEN_V2_SAGEATTENTION_SOURCE_COMMIT="${VIDEO_GEN_V2_SAGEATTENTION_SOURCE_COMMIT}" \
+    VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH="${VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH}" \
+    VIDEO_GEN_V2_SAGEATTENTION_EXPECTED_WHEEL_SHA256="${wheel_sha256}" \
+    VIDEO_GEN_V2_SAGEATTENTION_RUNTIME_KEY="${runtime_key}" \
+    python - <<'PY' || return 1
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+
+import torch
+from sageattention import sageattn
+
+expected = os.environ["VIDEO_GEN_V2_SAGEATTENTION_VERSION"]
+actual = importlib.metadata.version("sageattention")
+if actual.split("+", 1)[0] != expected:
+    raise RuntimeError(f"SageAttention version mismatch: expected {expected}, got {actual}")
+if not torch.cuda.is_available():
+    raise RuntimeError("SageAttention2 runtime verification requires a CUDA GPU")
+
+device = torch.device("cuda")
+q = torch.randn((1, 2, 256, 64), device=device, dtype=torch.bfloat16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+out = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+torch.cuda.synchronize()
+if out.shape != q.shape or not torch.isfinite(out).all().item():
+    raise RuntimeError(f"SageAttention2 kernel returned invalid output: {tuple(out.shape)}")
+
+major, minor = torch.cuda.get_device_capability(device)
+payload = {
+    "attentionBackend": "sageattention2",
+    "package": "sageattention",
+    "version": actual,
+    "sourceCommit": os.environ["VIDEO_GEN_V2_SAGEATTENTION_SOURCE_COMMIT"],
+    "wheelSha256": os.environ["VIDEO_GEN_V2_SAGEATTENTION_EXPECTED_WHEEL_SHA256"],
+    "runtimeKey": os.environ["VIDEO_GEN_V2_SAGEATTENTION_RUNTIME_KEY"],
+    "torchVersion": torch.__version__,
+    "torchCudaRuntime": torch.version.cuda,
+    "cudaCapability": f"{major}.{minor}",
+    "deviceName": torch.cuda.get_device_name(device),
+    "kernelSmokePassed": True,
+}
+verify_path = Path(os.environ["VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH"])
+verify_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+print("SAGEATTENTION2_RUNTIME_OK " + json.dumps(payload, sort_keys=True))
+PY
 }
 
 function provisioning_purge_python_bytecode_for_package() {
@@ -1647,7 +1774,7 @@ function provisioning_start_comfyui_direct() {
 set -euo pipefail
 export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
-export COMFYUI_ARGS="--disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header"
+export COMFYUI_ARGS="--disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header --use-sage-attention"
 export COMFYUI_ARGS
 export COMFYUI_LOG_PATH="${COMFYUI_LOG_PATH:-${WORKSPACE}/comfyui_direct_start.log}"
 mkdir -p "$(dirname "${COMFYUI_LOG_PATH}")" || true
@@ -1685,9 +1812,11 @@ function provisioning_wait_for_local_comfyui() {
     readiness_file="${WORKSPACE}/ComfyUI/input/${DM_LOCAL_READINESS_FILE:-provisioned_furry_all.txt}"
 
     for _ in $(seq 1 "${attempts}"); do
-        if curl -fsS --max-time 2 "${ready_port%/}/queue" >/dev/null 2>&1; then
+        if curl -fsS --max-time 2 "${ready_port%/}/queue" >/dev/null 2>&1 && \
+           [[ -s "${VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH}" ]] && \
+           ps -eo args= | grep -Eq '[p]ython([0-9.]+)? .*main\.py .*--use-sage-attention'; then
             mkdir -p "$(dirname "${readiness_file}")" || true
-            echo "Provisioning completed and ComfyUI ready at $(date)" > "${readiness_file}" || true
+            echo "Provisioning completed with SageAttention2 and ComfyUI ready at $(date)" > "${readiness_file}" || true
             return 0
         fi
         sleep 2
@@ -1700,8 +1829,10 @@ function provisioning_start_comfyui_after_bootstrap() {
     launch_script="/opt/supervisor-scripts/comfyui.sh"
     provisioning_release_comfyui_start_gate || true
 
-    if curl -fsS --max-time 2 "http://127.0.0.1:8188/queue" >/dev/null 2>&1; then
-        echo "ComfyUI is already locally reachable after provisioning."
+    if curl -fsS --max-time 2 "http://127.0.0.1:8188/queue" >/dev/null 2>&1 && \
+       [[ -s "${VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH}" ]] && \
+       ps -eo args= | grep -Eq '[p]ython([0-9.]+)? .*main\.py .*--use-sage-attention'; then
+        echo "ComfyUI is already locally reachable with SageAttention2 after provisioning."
         return 0
     fi
 
