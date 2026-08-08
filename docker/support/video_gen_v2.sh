@@ -557,7 +557,7 @@ function provisioning_get_pip_packages() {
 }
 
 function provisioning_install_sageattention2() {
-    local runtime_key wheel_name wheel_url wheel_sha256 wheel_size wheel_path actual_size actual_sha256
+    local runtime_key cuda_capability wheel_name wheel_url wheel_sha256 wheel_size wheel_path actual_size actual_sha256
 
     runtime_key="$(python - <<'PY' || true
 import platform
@@ -574,31 +574,55 @@ print(f"{torch_series}|{cuda_runtime}|{python_tag}|{machine}")
 PY
 )"
 
-    case "${runtime_key}" in
-        "2.10|12.8|cp312|x86_64"|"2.10|12.8|cp312|amd64")
-            wheel_name="sageattention-2.2.0+cu128torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
-            wheel_sha256="78adfed40544519b77d2d11a10b216011c91c17a7ae1634f616807c1e9c3d1aa"
-            wheel_size="27418276"
-            ;;
-        "2.10|12.9|cp312|x86_64"|"2.10|12.9|cp312|amd64")
-            wheel_name="sageattention-2.2.0+cu129torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
-            wheel_sha256="5e5cda462f73306cd8c201516d736357fc577ab5b9372dc5069362b4eab85dcf"
-            wheel_size="33809602"
-            ;;
-        "2.10|13.0|cp312|x86_64"|"2.10|13.0|cp312|amd64")
+    cuda_capability="$(python - <<'PY' || true
+import torch
+
+if not torch.cuda.is_available():
+    raise SystemExit(1)
+major, minor = torch.cuda.get_device_capability()
+print(f"{major}.{minor}")
+PY
+)"
+
+    case "${runtime_key}|${cuda_capability}" in
+        # The Comfy-Org cu128/cu129 Linux wheels do not contain an SM 12.0
+        # kernel image. Their cu130 torch2.10 wheel is ABI-compatible with the
+        # cu128/cu129 torch2.10 runtimes and is verified below on the real GPU.
+        "2.10|12.8|cp312|x86_64|12.0"|"2.10|12.8|cp312|amd64|12.0"|\
+        "2.10|12.9|cp312|x86_64|12.0"|"2.10|12.9|cp312|amd64|12.0")
             wheel_name="sageattention-2.2.0+cu130torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
             wheel_sha256="f0f8a1b9ba89719ab69c4481c1c94e959c4950d53f92bf0c96e3652e81544b21"
             wheel_size="27466865"
             ;;
         *)
-            printf "ERROR: No pinned SageAttention2 wheel is registered for runtime %s.\n" "${runtime_key:-unknown}"
-            return 1
+            case "${runtime_key}" in
+                "2.10|12.8|cp312|x86_64"|"2.10|12.8|cp312|amd64")
+                    wheel_name="sageattention-2.2.0+cu128torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
+                    wheel_sha256="78adfed40544519b77d2d11a10b216011c91c17a7ae1634f616807c1e9c3d1aa"
+                    wheel_size="27418276"
+                    ;;
+                "2.10|12.9|cp312|x86_64"|"2.10|12.9|cp312|amd64")
+                    wheel_name="sageattention-2.2.0+cu129torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
+                    wheel_sha256="5e5cda462f73306cd8c201516d736357fc577ab5b9372dc5069362b4eab85dcf"
+                    wheel_size="33809602"
+                    ;;
+                "2.10|13.0|cp312|x86_64"|"2.10|13.0|cp312|amd64")
+                    wheel_name="sageattention-2.2.0+cu130torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl"
+                    wheel_sha256="f0f8a1b9ba89719ab69c4481c1c94e959c4950d53f92bf0c96e3652e81544b21"
+                    wheel_size="27466865"
+                    ;;
+                *)
+                    printf "ERROR: No pinned SageAttention2 wheel is registered for runtime %s.\n" "${runtime_key:-unknown}"
+                    return 1
+                    ;;
+            esac
             ;;
     esac
 
     wheel_url="${VIDEO_GEN_V2_SAGEATTENTION_WHEEL_BASE_URL%/}/${wheel_name//+/%2B}"
     wheel_path="/tmp/${wheel_name}"
-    printf "Installing pinned SageAttention2 %s for runtime %s.\n" "${VIDEO_GEN_V2_SAGEATTENTION_VERSION}" "${runtime_key}"
+    printf "Installing pinned SageAttention2 %s for runtime %s on compute capability %s.\n" \
+        "${VIDEO_GEN_V2_SAGEATTENTION_VERSION}" "${runtime_key}" "${cuda_capability:-unknown}"
     curl -fL --retry 3 --retry-all-errors -o "${wheel_path}" "${wheel_url}" || return 1
 
     actual_size="$(stat -c '%s' "${wheel_path}")"
