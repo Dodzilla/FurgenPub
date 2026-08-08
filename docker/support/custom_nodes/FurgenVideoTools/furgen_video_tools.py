@@ -2283,6 +2283,19 @@ def _finite_summary(tensor: torch.Tensor) -> str:
     return summary
 
 
+def _nested_tensor_leaves(value):
+    if isinstance(value, torch.Tensor):
+        return [("", value)]
+    tensors = getattr(value, "tensors", None)
+    if not isinstance(tensors, (list, tuple)):
+        return []
+    leaves = []
+    for index, tensor in enumerate(tensors):
+        for suffix, leaf in _nested_tensor_leaves(tensor):
+            leaves.append((f"[{index}]{suffix}", leaf))
+    return leaves
+
+
 class FurgenAssertFiniteImages:
     @classmethod
     def INPUT_TYPES(cls):
@@ -2326,13 +2339,23 @@ class FurgenAssertFiniteLatent:
         if not isinstance(latent, dict):
             raise ValueError(f"FurgenAssertFiniteLatent {label}: latent must be a LATENT dict")
         samples = latent.get("samples")
-        if not isinstance(samples, torch.Tensor):
-            raise ValueError(f"FurgenAssertFiniteLatent {label}: latent.samples must be a tensor")
-        if not torch.isfinite(samples).all():
-            raise ValueError(f"FurgenAssertFiniteLatent {label}: non-finite latent.samples {_finite_summary(samples)}")
+        sample_leaves = _nested_tensor_leaves(samples)
+        if not sample_leaves:
+            raise ValueError(f"FurgenAssertFiniteLatent {label}: latent.samples must contain tensors")
+        for suffix, sample_tensor in sample_leaves:
+            if not torch.isfinite(sample_tensor).all():
+                raise ValueError(
+                    f"FurgenAssertFiniteLatent {label}: non-finite latent.samples{suffix} "
+                    f"{_finite_summary(sample_tensor)}"
+                )
         mask = latent.get("noise_mask")
-        if check_noise_mask and isinstance(mask, torch.Tensor) and not torch.isfinite(mask).all():
-            raise ValueError(f"FurgenAssertFiniteLatent {label}: non-finite latent.noise_mask {_finite_summary(mask)}")
+        if check_noise_mask:
+            for suffix, mask_tensor in _nested_tensor_leaves(mask):
+                if not torch.isfinite(mask_tensor).all():
+                    raise ValueError(
+                        f"FurgenAssertFiniteLatent {label}: non-finite latent.noise_mask{suffix} "
+                        f"{_finite_summary(mask_tensor)}"
+                    )
         return (latent,)
 
 

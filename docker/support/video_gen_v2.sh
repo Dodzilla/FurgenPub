@@ -661,15 +661,34 @@ if not torch.cuda.is_available():
     raise RuntimeError("SageAttention2 runtime verification requires a CUDA GPU")
 
 device = torch.device("cuda")
-q = torch.randn((1, 2, 256, 64), device=device, dtype=torch.bfloat16)
+major, minor = torch.cuda.get_device_capability(device)
+q = torch.randn((1, 8, 257, 128), device=device, dtype=torch.bfloat16)
 k = torch.randn_like(q)
 v = torch.randn_like(q)
-out = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+if major == 12:
+    from sageattention.core import sageattn_qk_int8_pv_fp16_cuda
+
+    kernel_policy = "sm120_qk_int8_pv_fp16_per_thread_fp32"
+    out = sageattn_qk_int8_pv_fp16_cuda(
+        q,
+        k,
+        v,
+        tensor_layout="HND",
+        is_causal=False,
+        qk_quant_gran="per_thread",
+        pv_accum_dtype="fp32",
+    )
+else:
+    kernel_policy = "upstream_auto_dispatch"
+    out = sageattn(q, k, v, tensor_layout="HND", is_causal=False)
 torch.cuda.synchronize()
-if out.shape != q.shape or not torch.isfinite(out).all().item():
+if (
+    out.shape != q.shape
+    or not torch.isfinite(out).all().item()
+    or not torch.count_nonzero(out).item()
+):
     raise RuntimeError(f"SageAttention2 kernel returned invalid output: {tuple(out.shape)}")
 
-major, minor = torch.cuda.get_device_capability(device)
 payload = {
     "attentionBackend": "sageattention2",
     "package": "sageattention",
@@ -681,6 +700,7 @@ payload = {
     "torchCudaRuntime": torch.version.cuda,
     "cudaCapability": f"{major}.{minor}",
     "deviceName": torch.cuda.get_device_name(device),
+    "kernelPolicy": kernel_policy,
     "kernelSmokePassed": True,
 }
 verify_path = Path(os.environ["VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH"])
@@ -745,12 +765,14 @@ function provisioning_install_furgen_video_tools_node() {
     rm -rf "${dest_dir}"
     mkdir -p "${dest_dir}"
 
-    if [[ -d "${src_dir}" && -f "${src_dir}/furgen_video_tools.py" ]] && grep -q "FurgenTemporalUnsharpMask" "${src_dir}/furgen_video_tools.py"; then
+    if [[ -d "${src_dir}" && -f "${src_dir}/furgen_video_tools.py" && -f "${src_dir}/furgen_sageattention_policy.py" ]] \
+        && grep -q "FurgenTemporalUnsharpMask" "${src_dir}/furgen_video_tools.py" \
+        && grep -q "sm120_qk_int8_pv_fp16_per_thread_fp32" "${src_dir}/furgen_sageattention_policy.py"; then
         cp -R "${src_dir}/." "${dest_dir}/"
         printf "Installed managed custom node: FurgenVideoTools (local copy)\n"
         return 0
     elif [[ -d "${src_dir}" ]]; then
-        printf "WARN: Local FurgenVideoTools source is missing FurgenTemporalUnsharpMask; using pinned remote copy.\n"
+        printf "WARN: Local FurgenVideoTools source is incomplete; using pinned remote copy.\n"
     fi
 
     printf "Downloading managed custom node from %s\n" "${remote_base}"
@@ -762,8 +784,16 @@ function provisioning_install_furgen_video_tools_node() {
         printf "ERROR: Failed to download FurgenVideoTools implementation from %s\n" "${remote_base}"
         return 1
     }
+    curl -fsSL "${remote_base}/furgen_sageattention_policy.py" -o "${dest_dir}/furgen_sageattention_policy.py" || {
+        printf "ERROR: Failed to download FurgenVideoTools SageAttention2 policy from %s\n" "${remote_base}"
+        return 1
+    }
     if ! grep -q "FurgenTemporalUnsharpMask" "${dest_dir}/furgen_video_tools.py"; then
         printf "ERROR: Downloaded FurgenVideoTools implementation is missing FurgenTemporalUnsharpMask from %s\n" "${remote_base}"
+        return 1
+    fi
+    if ! grep -q "sm120_qk_int8_pv_fp16_per_thread_fp32" "${dest_dir}/furgen_sageattention_policy.py"; then
+        printf "ERROR: Downloaded FurgenVideoTools SageAttention2 policy is invalid from %s\n" "${remote_base}"
         return 1
     fi
 

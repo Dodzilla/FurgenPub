@@ -52,6 +52,115 @@ def _load_furgen_video_tools():
     return module
 
 
+def _load_sageattention_policy():
+    support_dir = Path(__file__).parents[1]
+    policy_path = support_dir / "custom_nodes" / "FurgenVideoTools" / "furgen_sageattention_policy.py"
+    spec = importlib.util.spec_from_file_location("furgen_sageattention_policy_test", policy_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_sageattention_policy_only_overrides_sm12x():
+    module = _load_sageattention_policy()
+
+    assert module.policy_for_capability((12, 0)) == module.SM120_SAFE_POLICY
+    assert module.policy_for_capability((12, 1)) == module.SM120_SAFE_POLICY
+    assert module.policy_for_capability((8, 9)) is None
+    assert module.policy_for_capability(None) is None
+
+
+def test_sageattention_policy_uses_fp16_value_kernel_with_fp32_accumulation():
+    module = _load_sageattention_policy()
+    calls = []
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def get_device_capability():
+            return 12, 0
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    def upstream(*args, **kwargs):
+        raise AssertionError("upstream FP8 dispatcher should not be called on SM120")
+
+    def safe_kernel(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "safe-output"
+
+    comfy_attention = types.SimpleNamespace(sageattn=upstream)
+    status = module.install_sageattention_policy(
+        torch_module=FakeTorch(),
+        comfy_attention_module=comfy_attention,
+        safe_kernel=safe_kernel,
+    )
+
+    output = comfy_attention.sageattn(
+        "q",
+        "k",
+        "v",
+        tensor_layout="NHD",
+        is_causal=True,
+        sm_scale=0.25,
+        return_lse=True,
+        qk_quant_gran="per_warp",
+        pv_accum_dtype="fp16",
+        attn_mask=None,
+    )
+
+    assert status == {
+        "active": True,
+        "policy": module.SM120_SAFE_POLICY,
+        "cudaCapability": "12.0",
+        "reason": "installed",
+    }
+    assert output == "safe-output"
+    assert len(calls) == 1
+    assert calls[0][1] == {
+        "tensor_layout": "NHD",
+        "is_causal": True,
+        "qk_quant_gran": "per_thread",
+        "sm_scale": 0.25,
+        "pv_accum_dtype": "fp32",
+        "return_lse": True,
+        "attn_mask": None,
+    }
+
+
+def test_sageattention_policy_preserves_upstream_dispatch_on_pre_sm12_gpu():
+    module = _load_sageattention_policy()
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def get_device_capability():
+            return 8, 9
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    upstream = object()
+    comfy_attention = types.SimpleNamespace(sageattn=upstream)
+    status = module.install_sageattention_policy(
+        torch_module=FakeTorch(),
+        comfy_attention_module=comfy_attention,
+        safe_kernel=lambda *args, **kwargs: None,
+    )
+
+    assert status["active"] is False
+    assert status["reason"] == "upstream_dispatch_preserved"
+    assert comfy_attention.sageattn is upstream
+
+
 def test_furgen_video_tools_registers_tail_context_utility_nodes():
     module = _load_furgen_video_tools()
 
@@ -236,3 +345,30 @@ def test_furgen_assert_finite_latent_fails_on_inf_mask():
         assert "non-finite latent.noise_mask" in str(exc)
     else:
         raise AssertionError("expected finite latent check to fail")
+
+
+def test_furgen_assert_finite_latent_checks_nested_tensor_leaves():
+    module = _load_furgen_video_tools()
+
+    class Nested:
+        def __init__(self, tensors):
+            self.tensors = tensors
+
+    latent = {
+        "samples": Nested([
+            torch.zeros((1, 128, 2, 3, 4), dtype=torch.float32),
+            torch.ones((1, 16, 8), dtype=torch.float32),
+        ]),
+        "noise_mask": Nested([torch.ones((1, 1, 2, 1, 1), dtype=torch.float32)]),
+    }
+    returned, = module.FurgenAssertFiniteLatent().check(latent, "av", True)
+    assert returned is latent
+
+    latent["samples"].tensors[1][0, 0, 0] = float("nan")
+    try:
+        module.FurgenAssertFiniteLatent().check(latent, "av", True)
+    except ValueError as exc:
+        assert "latent.samples[1]" in str(exc)
+        assert "non-finite" in str(exc)
+    else:
+        raise AssertionError("expected nested finite latent check to fail")
