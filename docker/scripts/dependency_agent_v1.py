@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.105"
+AGENT_VERSION = "dm-agent-py/0.10.106"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -10411,7 +10411,12 @@ class DependencyAgent:
                     raise RuntimeError(f"sha256 mismatch for {dep_id}: expected {sha256_expected}, got {actual}")
         except Exception as e:
             # Keep partial downloads for retryable errors so future retries can resume.
-            retryable = self._is_retryable_download_error(e)
+            # Pass the queue item here as well as in the outer retry handler. The
+            # Hugging Face resumability policy depends on the original /resolve/
+            # URL; without the item this inner cleanup path misclassifies aria2
+            # redirect failures as terminal and deletes the resumable partial
+            # before the outer handler schedules the retry.
+            retryable = self._is_retryable_download_error(e, item)
             if not retryable:
                 try:
                     if partial.exists():
