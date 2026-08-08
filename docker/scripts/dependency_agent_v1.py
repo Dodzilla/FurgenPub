@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.104"
+AGENT_VERSION = "dm-agent-py/0.10.105"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "821b7308d2a16d5d03c9d07a2ac893b310fac3df"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -8483,9 +8483,14 @@ class DependencyAgent:
         self._token = agent_token
         logging.info("Registered dependency agent: instanceId=%s", instance_id)
 
-    def _post_status(self, item: Dict[str, Any], state: str, error: Optional[str] = None) -> None:
+    def _post_status(
+        self,
+        item: Dict[str, Any],
+        state: str,
+        error: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         if not self._resolved_instance_id:
-            return
+            return None
         url = f"{self.api_base_url}/dependencies/status"
         with self._lock:
             dynamic_bytes_used = int(self._dynamic_bytes_used)
@@ -8503,7 +8508,16 @@ class DependencyAgent:
         }
         if error:
             body["error"] = error[:MAX_AGENT_ERROR_MESSAGE_CHARS]
-        api_json("POST", url, body=body, headers=self._headers(use_token=True), timeout_seconds=30.0)
+        status, response = api_json(
+            "POST",
+            url,
+            body=body,
+            headers=self._headers(use_token=True),
+            timeout_seconds=30.0,
+        )
+        if status == 200 and isinstance(response, dict):
+            return response
+        return None
 
     def _heartbeat(self, queue_depth: Optional[int] = None) -> None:
         if not self._resolved_instance_id:
@@ -9987,8 +10001,41 @@ class DependencyAgent:
             return f"Bearer {self.civitai_token}"
         raise RuntimeError(f"Unsupported auth type: {auth}")
 
-    def _is_retryable_download_error(self, err: Exception) -> bool:
+    def _is_retryable_download_error(
+        self,
+        err: Exception,
+        item: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         msg = str(err).lower()
+        resolved = item.get("resolved") if isinstance(item, dict) else None
+        source_url = resolved.get("url") if isinstance(resolved, dict) else None
+        source_host = ""
+        source_path = ""
+        if isinstance(source_url, str) and source_url:
+            try:
+                parsed_source = urllib.parse.urlparse(source_url)
+                source_host = (parsed_source.hostname or "").lower()
+                source_path = parsed_source.path.lower()
+            except Exception:
+                pass
+
+        # Hugging Face resolve URLs redirect to short-lived Xet/CDN URLs. Large,
+        # segmented downloads can receive a 403/416 or aria2 exit 22 after the
+        # redirect expires or its range state goes stale. Re-fetching the resolve
+        # URL produces a fresh signed redirect and aria2 resumes the partial file.
+        # Treat only this narrow, resumable shape as transient; ordinary 4xx
+        # responses (including missing/private models) remain terminal.
+        is_huggingface_resolve = (
+            source_host in {"huggingface.co", "www.huggingface.co"}
+            and "/resolve/" in source_path
+        )
+        if is_huggingface_resolve:
+            status_codes = _http_status_codes_from_error(err)
+            if any(code in {403, 416} for code in status_codes):
+                return True
+            if "aria2c failed (exit=22)" in msg and not status_codes:
+                return True
+
         if _is_permanent_http_error(err):
             return False
         # Configuration / policy errors won't resolve without human action.
@@ -10559,7 +10606,7 @@ class DependencyAgent:
                 return
             except Exception as e:
                 err_msg = str(e)
-                retryable = self._is_retryable_download_error(e)
+                retryable = self._is_retryable_download_error(e, item)
                 if dep_id:
                     self._clear_download_activity(dep_id)
                 if retryable:
@@ -10582,7 +10629,21 @@ class DependencyAgent:
                         self._downloading.discard(dep_id)
                         self._save_state()
                 logging.warning("Download failed (non-retryable) itemId=%s depId=%s: %s", item_id, dep_id, err_msg)
-                self._post_status(item, "failed", error=err_msg)
+                status_response = self._post_status(item, "failed", error=err_msg)
+                if (
+                    dep_id
+                    and isinstance(status_response, dict)
+                    and status_response.get("clearFailedDepId") is True
+                ):
+                    # The backend failed the requesting job and cancelled this
+                    # shared dependency item. Do not advertise a permanent local
+                    # failure that would block a different queued job from
+                    # re-queuing the same dependency.
+                    self._forget_retry(dep_id)
+                    try:
+                        self._heartbeat(queue_depth=None)
+                    except Exception:
+                        pass
                 return
 
         if op == "delete":
