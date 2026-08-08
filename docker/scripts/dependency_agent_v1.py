@@ -130,8 +130,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.112"
-VIDEO_GEN_V2_FURGENPUB_COMMIT = "0429c05f5c24e21ea15f58e6c369e1f55b4655c1"
+AGENT_VERSION = "dm-agent-py/0.10.113"
+VIDEO_GEN_V2_FURGENPUB_COMMIT = "720375e158f225e31c4d38523550d04e45cd2024"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
@@ -5965,7 +5965,7 @@ class DependencyAgent:
             capability_major = int(capability_match.group(1))
             kernel_policy = str(payload.get("kernelPolicy") or "").strip()
             if capability_major == 12:
-                expected_policy = "sm120_qk_int8_pv_fp16_per_thread_fp32"
+                expected_policy = "sm120_qk_int8_pv_fp16_triton"
                 return (
                     kernel_policy == expected_policy
                     and payload.get("comfyPolicyActive") is True
