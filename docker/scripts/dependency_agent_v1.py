@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.114"
+AGENT_VERSION = "dm-agent-py/0.10.115"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -148,6 +148,10 @@ RTDB_AGENT_NON_TERMINAL_QUEUE_STATES = {
     "cancel_requested",
     "retrying",
 }
+
+
+def _available_dependency_slots(max_parallel: int, inflight_count: int) -> int:
+    return max(0, max(1, int(max_parallel)) - max(0, int(inflight_count)))
 RIFE_VFI_ZIP_URLS = [
     "https://huggingface.co/hzwer/RIFE/resolve/main/RIFEv4.26_0921.zip",
     "https://hf-mirror.com/hzwer/RIFE/resolve/main/RIFEv4.26_0921.zip",
@@ -7479,6 +7483,7 @@ class DependencyAgent:
         if bundle_id == "video_gen_v2_10s_ltx_nodes":
             return [
                 "CM_FloatToInt",
+                "GuiderParameters",
                 "ImageResizeKJv2",
                 "VHS_VideoCombine",
                 "LatentMotionSharpener",
@@ -7497,6 +7502,7 @@ class DependencyAgent:
                 "LTXVLatentUpsampler",
                 "LTXVSeparateAVLatent",
                 "LTXAddVideoICLoRAGuide",
+                "MultimodalGuider",
                 "ImageBatchExtendWithOverlap",
                 "VHS_LoadVideo",
             ]
@@ -12278,18 +12284,24 @@ class DependencyAgent:
                 # but refusing both dependency work and agent jobs indefinitely.
                 # Only perform the restart when the process is actually idle.
                 if not self.mining_only and now >= next_dep_poll_at_ms:
-                    try:
-                        items = self._fetch_queue(limit=25)
-                    except ApiError as e:
-                        if e.status in (401, 403):
-                            logging.warning("Dependency queue unauthorized (status=%d); re-registering.", e.status)
-                            try:
-                                self._register()
-                            except Exception as re:
-                                logging.error("Dependency re-register failed: %s", re)
-                            items = []
-                        else:
-                            raise
+                    available_dep_slots = _available_dependency_slots(self.max_parallel, len(dep_inflight))
+                    items: List[Dict[str, Any]] = []
+                    if available_dep_slots > 0:
+                        try:
+                            # Direct RTDB reads claim every returned item. Never claim
+                            # more work than the local executor can start, or the excess
+                            # claims sit locally, expire, and churn through stale recovery.
+                            items = self._fetch_queue(limit=available_dep_slots)
+                        except ApiError as e:
+                            if e.status in (401, 403):
+                                logging.warning("Dependency queue unauthorized (status=%d); re-registering.", e.status)
+                                try:
+                                    self._register()
+                                except Exception as re:
+                                    logging.error("Dependency re-register failed: %s", re)
+                                items = []
+                            else:
+                                raise
 
                     queue_depth = len(items)
                     queued_dep_ids: Set[str] = set()
@@ -12306,7 +12318,9 @@ class DependencyAgent:
                     due_retry_items: List[Dict[str, Any]] = []
                     retry_candidates: List[Tuple[str, Dict[str, Any]]] = []
                     retry_changed = False
-                    retry_cap = max(0, int(self.max_parallel) - len(dep_inflight))
+                    # Fresh queue claims already reserve executor capacity. Local
+                    # retries may use only the slots that remain after those claims.
+                    retry_cap = max(0, available_dep_slots - len(items))
                     if retry_cap > 0:
                         with self._lock:
                             downloading_now = set(self._downloading)
