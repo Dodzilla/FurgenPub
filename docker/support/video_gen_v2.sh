@@ -1710,8 +1710,11 @@ function provisioning_start_comfyui_after_bootstrap() {
     if curl -fsS --max-time 2 "http://127.0.0.1:8188/queue" >/dev/null 2>&1 && \
        [[ -s "${VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH}" ]] && \
        ps -eo args= | grep -Eq '[p]ython([0-9.]+)? .*main\.py .*--use-sage-attention'; then
-        echo "ComfyUI is already locally reachable with SageAttention2 after provisioning."
-        return 0
+        if provisioning_wait_for_local_comfyui 1; then
+            echo "ComfyUI is already locally reachable with SageAttention2 after provisioning; readiness marker restored."
+            return 0
+        fi
+        echo "WARN: ComfyUI readiness changed while restoring the provisioning marker; continuing with restart recovery."
     fi
 
     if command -v supervisorctl >/dev/null 2>&1; then
