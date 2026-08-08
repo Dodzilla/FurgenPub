@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.109"
+AGENT_VERSION = "dm-agent-py/0.10.110"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "1a996a16705d524f13e1962cf4712a8244bf8d41"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6963,13 +6963,21 @@ class DependencyAgent:
             packages = self._safe_python_package_specs(step.get("packages"))
             if not packages:
                 raise RuntimeError(f"Bundle {bundle_id} pip_uninstall step has no valid packages")
-            subprocess.run(
+            result = subprocess.run(
                 [self._comfy_python_executable(), "-m", "pip", "uninstall", "-y", *packages],
-                check=True,
+                check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=600,
             )
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", errors="replace") if isinstance(result.stderr, bytes) else str(result.stderr or "")
+                logging.warning(
+                    "Best-effort pip uninstall failed for node bundle %s (exit=%d); continuing to the pinned install and import verification: %s",
+                    bundle_id,
+                    int(result.returncode),
+                    stderr.strip()[-1000:] or "no stderr",
+                )
             return True
         if step_type == "python_import_check":
             self._execute_python_import_check_step(step)
