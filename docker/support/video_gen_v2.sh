@@ -666,17 +666,16 @@ q = torch.randn((1, 8, 257, 128), device=device, dtype=torch.bfloat16)
 k = torch.randn_like(q)
 v = torch.randn_like(q)
 if major == 12:
-    from sageattention.core import sageattn_qk_int8_pv_fp16_cuda
+    from sageattention.core import sageattn_qk_int8_pv_fp16_triton
 
-    kernel_policy = "sm120_qk_int8_pv_fp16_per_thread_fp32"
-    out = sageattn_qk_int8_pv_fp16_cuda(
+    kernel_policy = "sm120_qk_int8_pv_fp16_triton"
+    out = sageattn_qk_int8_pv_fp16_triton(
         q,
         k,
         v,
         tensor_layout="HND",
+        quantization_backend="triton",
         is_causal=False,
-        qk_quant_gran="per_thread",
-        pv_accum_dtype="fp32",
     )
 else:
     kernel_policy = "upstream_auto_dispatch"
@@ -767,7 +766,7 @@ function provisioning_install_furgen_video_tools_node() {
 
     if [[ -d "${src_dir}" && -f "${src_dir}/furgen_video_tools.py" && -f "${src_dir}/furgen_sageattention_policy.py" ]] \
         && grep -q "FurgenTemporalUnsharpMask" "${src_dir}/furgen_video_tools.py" \
-        && grep -q "sm120_qk_int8_pv_fp16_per_thread_fp32" "${src_dir}/furgen_sageattention_policy.py"; then
+        && grep -q "sm120_qk_int8_pv_fp16_triton" "${src_dir}/furgen_sageattention_policy.py"; then
         cp -R "${src_dir}/." "${dest_dir}/"
         printf "Installed managed custom node: FurgenVideoTools (local copy)\n"
         return 0
@@ -792,7 +791,7 @@ function provisioning_install_furgen_video_tools_node() {
         printf "ERROR: Downloaded FurgenVideoTools implementation is missing FurgenTemporalUnsharpMask from %s\n" "${remote_base}"
         return 1
     fi
-    if ! grep -q "sm120_qk_int8_pv_fp16_per_thread_fp32" "${dest_dir}/furgen_sageattention_policy.py"; then
+    if ! grep -q "sm120_qk_int8_pv_fp16_triton" "${dest_dir}/furgen_sageattention_policy.py"; then
         printf "ERROR: Downloaded FurgenVideoTools SageAttention2 policy is invalid from %s\n" "${remote_base}"
         return 1
     fi

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-SM120_SAFE_POLICY = "sm120_qk_int8_pv_fp16_per_thread_fp32"
+SM120_SAFE_POLICY = "sm120_qk_int8_pv_fp16_triton"
 POLICY_LOG_PREFIX = "FURGEN_SAGEATTENTION2_POLICY"
 
 
@@ -77,12 +77,11 @@ def install_sageattention_policy(
 ) -> dict[str, Any]:
     """Patch ComfyUI's SageAttention2 callable on SM 12.x GPUs.
 
-    SageAttention 2.2 auto-dispatches SM120 to its FP8 value kernel. That path
-    can produce non-finite LTX-Video 2.3 audio/video latents. The managed path
-    retains SageAttention2's INT8 Q/K CUDA implementation, while using FP16 V
-    and full FP32 accumulation. Per-thread Q/K quantization is intentional: the
-    first per-warp FP16 call in a fresh SM120 process can return an all-zero
-    result with the current wheel.
+    SageAttention 2.2 auto-dispatches SM120 to its FP8 value kernel. The CUDA
+    FP16-value path can also drive LTX-Video 2.3 audio/video latents non-finite,
+    even with per-thread Q/K quantization and FP32 accumulation. Use the
+    SageAttention2 Triton FP16-value kernel instead; its per-block Q/K
+    quantization and FP32-buffered accumulation remain finite for this model.
     """
 
     def finish(result: dict[str, Any]) -> dict[str, Any]:
@@ -115,7 +114,7 @@ def install_sageattention_policy(
             import comfy.ldm.modules.attention as comfy_attention_module
 
         if safe_kernel is None:
-            from sageattention.core import sageattn_qk_int8_pv_fp16_cuda as safe_kernel
+            from sageattention.core import sageattn_qk_int8_pv_fp16_triton as safe_kernel
 
         upstream = getattr(comfy_attention_module, "sageattn", None)
         if upstream is None:
@@ -147,15 +146,15 @@ def install_sageattention_policy(
             kernel_kwargs = dict(kwargs)
             kernel_kwargs.pop("qk_quant_gran", None)
             kernel_kwargs.pop("pv_accum_dtype", None)
+            kernel_kwargs.pop("quantization_backend", None)
             return safe_kernel(
                 q,
                 k,
                 v,
                 tensor_layout=tensor_layout,
+                quantization_backend="triton",
                 is_causal=is_causal,
-                qk_quant_gran="per_thread",
                 sm_scale=sm_scale,
-                pv_accum_dtype="fp32",
                 return_lse=return_lse,
                 **kernel_kwargs,
             )
@@ -171,7 +170,8 @@ def install_sageattention_policy(
         )
         print(
             f"{POLICY_LOG_PREFIX} active={policy} "
-            f"cuda={result['cudaCapability']} qk=per_thread pv=fp16 accum=fp32"
+            f"cuda={result['cudaCapability']} qk=per_block pv=fp16 "
+            "accum=fp32_buffered backend=triton"
         )
         return finish(result)
     except Exception as exc:

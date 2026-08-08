@@ -71,7 +71,7 @@ def test_sageattention_policy_only_overrides_sm12x():
     assert module.policy_for_capability(None) is None
 
 
-def test_sageattention_policy_uses_fp16_value_kernel_with_fp32_accumulation():
+def test_sageattention_policy_uses_triton_fp16_value_kernel():
     module = _load_sageattention_policy()
     calls = []
 
@@ -124,10 +124,9 @@ def test_sageattention_policy_uses_fp16_value_kernel_with_fp32_accumulation():
     assert len(calls) == 1
     assert calls[0][1] == {
         "tensor_layout": "NHD",
+        "quantization_backend": "triton",
         "is_causal": True,
-        "qk_quant_gran": "per_thread",
         "sm_scale": 0.25,
-        "pv_accum_dtype": "fp32",
         "return_lse": True,
         "attn_mask": None,
     }
