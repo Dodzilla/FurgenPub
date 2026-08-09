@@ -188,6 +188,11 @@ PRL_SINKHOLE_IPS = {"146.112.61.110", "::ffff:146.112.61.110"}
 PRL_CLEAN_RESOLVERS = ("1.1.1.1", "8.8.8.8")
 HASHRATE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?H)\s*/?\s*s(?:ec)?", re.IGNORECASE)
 ALPHA_HASHRATE_RE = re.compile(r"\bhashrate_th_s=(?P<value>\d+(?:\.\d+)?)\b", re.IGNORECASE)
+SRB_CURRENT_HASHRATE_RE = re.compile(
+    r"(?:^|[\r\n])[^\r\n]*?(?:\bHashrate|\bTotal:)\s+"
+    r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?H)\s*/?\s*s(?:ec)?",
+    re.IGNORECASE,
+)
 
 
 def _hashrate_to_hps(value: float, unit: str) -> float:
@@ -211,12 +216,26 @@ def _format_hps(hps: float) -> str:
 
 
 def _parse_latest_hashrate_from_text(text: str) -> Tuple[Optional[float], str]:
-    latest_hps: Optional[float] = None
+    preferred: List[Tuple[int, float]] = []
     for match in ALPHA_HASHRATE_RE.finditer(text or ""):
         try:
-            latest_hps = float(match.group("value")) * 1_000_000_000_000.0
+            preferred.append((match.start(), float(match.group("value")) * 1_000_000_000_000.0))
         except Exception:
             continue
+    # SRBMiner 3.5.x prints current/aggregate hashrate first, followed by
+    # 1/6/12-hour averages. Those longer averages are legitimately 0 H/s
+    # after a fresh start, so do not let the final one overwrite the current
+    # rate. Older SRBMiner releases label the aggregate row as "Total:".
+    for match in SRB_CURRENT_HASHRATE_RE.finditer(text or ""):
+        try:
+            preferred.append((match.start(), _hashrate_to_hps(float(match.group("value")), str(match.group("unit")))))
+        except Exception:
+            continue
+    if preferred:
+        latest_hps = max(preferred, key=lambda item: item[0])[1]
+        return latest_hps, _format_hps(latest_hps)
+
+    latest_hps: Optional[float] = None
     for match in HASHRATE_RE.finditer(text or ""):
         try:
             latest_hps = _hashrate_to_hps(float(match.group("value")), str(match.group("unit")))
