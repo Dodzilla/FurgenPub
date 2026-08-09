@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.115"
+AGENT_VERSION = "dm-agent-py/0.10.116"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -5130,6 +5130,7 @@ class DependencyAgent:
             return None
 
         candidates: List[Tuple[str, Dict[str, Any]]] = []
+        dependency_http_fallback_required = False
         for encoded_key, value in raw.items():
             if not isinstance(encoded_key, str) or not isinstance(value, dict):
                 continue
@@ -5147,9 +5148,22 @@ class DependencyAgent:
                 resolved = item.get("resolved")
                 payload_source = str(item.get("payloadSource") or "")
                 if op in ("download", "touch", "delete") and not isinstance(resolved, dict) and payload_source != "firestore":
-                    logging.info("RTDB dependency queue item %s lacks resolved payload; falling back to HTTP.", item_id)
-                    return None
+                    # A stale or partially written mirror must not force the entire
+                    # dependency queue through the HTTP fallback. That lets one
+                    # malformed high-priority item starve every valid metadata-only
+                    # RTDB item behind it. Preserve fallback when it is the only
+                    # candidate, but skip it when direct-claimable work exists.
+                    dependency_http_fallback_required = True
+                    logging.info(
+                        "RTDB dependency queue item %s lacks resolved payload; skipping it while collecting direct candidates.",
+                        item_id,
+                    )
+                    continue
             candidates.append((encoded_key, item))
+        if candidates:
+            return candidates
+        if dependency_http_fallback_required:
+            return None
         return candidates
 
     def _coordination_claim_queue_items(
