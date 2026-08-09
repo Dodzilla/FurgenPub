@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.116"
+AGENT_VERSION = "dm-agent-py/0.10.117"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -1997,12 +1997,18 @@ def aria2_download(
             return 0
 
     last_progress_at = 0.0
+    last_progress_bytes = int(existing_bytes)
+    last_byte_progress_at = time.time()
     oversize_error: Optional[str] = None
+    stalled_error: Optional[str] = None
     while True:
         ret = proc.poll()
         now = time.time()
         if progress_cb and (ret is not None or now - last_progress_at >= 2.0):
             current_bytes = _current_downloaded_bytes()
+            if current_bytes > last_progress_bytes:
+                last_progress_bytes = int(current_bytes)
+                last_byte_progress_at = now
             try:
                 progress_cb(int(current_bytes), int(expected_size_bytes or 0))
             except Exception:
@@ -2011,6 +2017,15 @@ def aria2_download(
                 oversize_error = (
                     f"Download exceeded expected size for {safe_url}: "
                     f"got {current_bytes} bytes, expected {int(expected_size_bytes)} bytes"
+                )
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            elif now - last_byte_progress_at >= float(timeout_seconds):
+                stalled_error = (
+                    f"aria2c stalled for {safe_url}: no byte progress for "
+                    f"{int(now - last_byte_progress_at)}s at {int(current_bytes)} bytes"
                 )
                 try:
                     proc.terminate()
@@ -2030,6 +2045,13 @@ def aria2_download(
             pass
         _discard_oversized_partial(dest_partial, int(expected_size_bytes), safe_url)
         raise RuntimeError(oversize_error)
+    if stalled_error:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        raise RuntimeError(stalled_error)
 
     if proc.returncode != 0:
         tail = "\n".join("".join(output_lines).splitlines()[-30:])
@@ -10455,17 +10477,71 @@ class DependencyAgent:
 
         try:
             resolved_tool = self._resolve_download_tool()
+            checksum_verified = False
             if resolved_tool == "aria2":
-                aria2_download(
-                    url=url,
-                    dest_partial=partial,
-                    auth_header=auth_header,
-                    expected_size_bytes=int(expected_size_bytes),
-                    timeout_seconds=float(self.download_timeout_seconds),
-                    allowed_domains=allowed_domains,
-                    debug=self.download_debug,
-                    progress_cb=_progress_cb("downloading", "aria2"),
-                )
+                try:
+                    aria2_download(
+                        url=url,
+                        dest_partial=partial,
+                        auth_header=auth_header,
+                        expected_size_bytes=int(expected_size_bytes),
+                        timeout_seconds=float(self.download_timeout_seconds),
+                        allowed_domains=allowed_domains,
+                        debug=self.download_debug,
+                        progress_cb=_progress_cb("downloading", "aria2"),
+                    )
+                    if isinstance(sha256_expected, str) and sha256_expected:
+                        aria2_actual = sha256_file(
+                            partial,
+                            progress_cb=_progress_cb("verifying_download", "local"),
+                        )
+                        if aria2_actual.lower() != sha256_expected.lower():
+                            raise RuntimeError(
+                                f"sha256 mismatch for {dep_id}: expected {sha256_expected}, got {aria2_actual}"
+                            )
+                        checksum_verified = True
+                except Exception as aria2_error:
+                    # Parallel range requests can produce a full-sized but corrupt
+                    # file on some signed CDN/Xet endpoints, and occasionally stop
+                    # making byte progress indefinitely. Never accept those bytes:
+                    # restart from zero through a single-stream downloader and keep
+                    # the catalog checksum as the source of truth.
+                    try:
+                        if partial.exists():
+                            partial.unlink()
+                    except Exception:
+                        pass
+                    fallback_tool = "wget" if _command_exists("wget") else "python"
+                    logging.warning(
+                        "aria2 download failed validation for %s; retrying from zero with %s: %s",
+                        dep_id,
+                        fallback_tool,
+                        str(aria2_error),
+                    )
+                    if fallback_tool == "wget":
+                        wget_download(
+                            url=url,
+                            dest_partial=partial,
+                            auth_header=auth_header,
+                            expected_size_bytes=int(expected_size_bytes),
+                            timeout_seconds=float(self.download_timeout_seconds),
+                            allowed_domains=allowed_domains,
+                            debug=self.download_debug,
+                            progress_cb=_progress_cb("downloading_fallback", "wget"),
+                        )
+                    else:
+                        http_download(
+                            url=url,
+                            dest_partial=partial,
+                            auth_header=auth_header,
+                            expected_size_bytes=int(expected_size_bytes),
+                            timeout_seconds=float(self.download_timeout_seconds),
+                            chunk_size=int(self.download_chunk_size),
+                            allowed_domains=allowed_domains,
+                            verbose=self.verbose_progress,
+                            debug=self.download_debug,
+                            progress_cb=_progress_cb("downloading_fallback", "python"),
+                        )
             elif resolved_tool == "wget":
                 wget_download(
                     url=url,
@@ -10493,7 +10569,7 @@ class DependencyAgent:
             else:
                 raise RuntimeError(f"Unsupported DM_DOWNLOAD_TOOL: {self.download_tool}")
 
-            if isinstance(sha256_expected, str) and sha256_expected:
+            if isinstance(sha256_expected, str) and sha256_expected and not checksum_verified:
                 actual = sha256_file(
                     partial,
                     progress_cb=_progress_cb("verifying_download", "local"),
