@@ -557,6 +557,7 @@ function dependency_manager_persist_agent_env() {
         LD_LIBRARY_PATH \
         DM_LOCAL_COMFY_BASE_URL \
         DM_LOCAL_READINESS_FILE \
+        FURGENPUB_RAW_BASE_URL \
         COMFY_NODE_PINS \
         COMFYUI_PIN \
         COMFYUI_PIN_COMMIT
