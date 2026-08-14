@@ -152,6 +152,10 @@ function provisioning_install_furgen_video_tools_node() {
         printf "ERROR: Failed to download FurgenVideoTools implementation from %s\n" "${remote_base}"
         return 1
     }
+    curl -fsSL "${remote_base}/furgen_sageattention_policy.py" -o "${dest_dir}/furgen_sageattention_policy.py" || {
+        printf "ERROR: Failed to download FurgenVideoTools SageAttention policy from %s\n" "${remote_base}"
+        return 1
+    }
     if ! grep -q "FurgenTemporalUnsharpMask" "${dest_dir}/furgen_video_tools.py"; then
         printf "ERROR: Downloaded FurgenVideoTools implementation is missing FurgenTemporalUnsharpMask from %s\n" "${remote_base}"
         return 1
