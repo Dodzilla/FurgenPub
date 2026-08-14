@@ -130,7 +130,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.118"
+AGENT_VERSION = "dm-agent-py/0.10.119"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -3688,7 +3688,10 @@ class DependencyAgent:
         self.agent_terminal_event_retry_attempts = max(1, min(20, _env_int("DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS", 8)))
         self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
-        self.local_comfy_allow_discovery = _env_bool("DM_LOCAL_COMFY_ALLOW_DISCOVERY", self.server_type != "video_gen_v2")
+        self.local_comfy_allow_discovery = _env_bool(
+            "DM_LOCAL_COMFY_ALLOW_DISCOVERY",
+            self.server_type not in ("video_gen_v2", "video_gen_v3"),
+        )
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         default_readiness_file = "provisioned_furry_all.txt" if (self.server_type or "").strip() == "video_gen_v2" else "provisioning_complete.txt"
         self.agent_local_readiness_file = self._agent_local_readiness_file_env or default_readiness_file
@@ -6004,7 +6007,8 @@ class DependencyAgent:
         return Path(configured) if configured else self.workspace / "sageattention2_runtime.json"
 
     def _video_gen_v2_sageattention_runtime_ready(self) -> bool:
-        if (self.server_type or "").strip() != "video_gen_v2":
+        server_type = (self.server_type or "").strip()
+        if server_type not in ("video_gen_v2", "video_gen_v3"):
             return True
         try:
             payload = json.loads(
@@ -6016,6 +6020,29 @@ class DependencyAgent:
                 return False
             if payload.get("kernelSmokePassed") is not True:
                 return False
+
+            if server_type == "video_gen_v3":
+                expected_torch = str(payload.get("torchVersion") or "").strip()
+                configured_torch = _env_str("FURGEN_H3_PYTORCH_RUNTIME_VERSION", "2.10.0+cu129") or ""
+                configured_sage = _env_str("FURGEN_H3_SAGEATTENTION_VERSION", "2.2.0") or ""
+                configured_wheel_sha = _env_str("FURGEN_H3_SAGEATTENTION_WHEEL_SHA256") or ""
+                if expected_torch != configured_torch:
+                    return False
+                if str(payload.get("version") or "").split("+", 1)[0] != configured_sage:
+                    return False
+                if str(payload.get("torchCudaRuntime") or "").strip() != "12.9":
+                    return False
+                if configured_wheel_sha and str(payload.get("wheelSha256") or "").strip() != configured_wheel_sha:
+                    return False
+                status, stats = self._comfy_api_json("GET", "/system_stats", timeout_seconds=5.0)
+                system = stats.get("system") if status == 200 and isinstance(stats, dict) else None
+                argv = system.get("argv") if isinstance(system, dict) else None
+                return (
+                    bool(expected_torch)
+                    and isinstance(argv, list)
+                    and "--use-sage-attention" in argv
+                    and str(system.get("pytorch_version") or "").strip() == expected_torch
+                )
 
             capability_text = str(payload.get("cudaCapability") or "").strip()
             capability_match = re.fullmatch(r"(\d+)\.(\d+)", capability_text)
@@ -7758,7 +7785,7 @@ class DependencyAgent:
         env.setdefault("WORKSPACE", str(self.workspace))
         env.setdefault("DM_COMFYUI_DIR", str(self.comfyui_dir))
         env["DM_LOCAL_COMFY_BASE_URL"] = self.agent_local_comfy_base_url
-        if self.server_type == "video_gen_v2":
+        if self.server_type in ("video_gen_v2", "video_gen_v3"):
             env["DM_LOCAL_COMFY_ALLOW_DISCOVERY"] = "false"
         # The Vast Comfy image portal wrapper can block forever waiting for
         # /etc/portal.yaml when launched outside its original supervisor path.
@@ -7771,7 +7798,7 @@ class DependencyAgent:
         parsed = urllib.parse.urlparse(configured)
         launch_port = parsed.port or 8188
         launch_args = f"--disable-auto-launch --listen 0.0.0.0 --port {launch_port} --enable-cors-header"
-        if self.server_type == "video_gen_v2":
+        if self.server_type in ("video_gen_v2", "video_gen_v3"):
             launch_args += " --use-sage-attention"
         env["COMFYUI_ARGS"] = launch_args
         log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
@@ -7912,7 +7939,8 @@ class DependencyAgent:
         while time.time() < deadline:
             reachable = self._local_comfy_reachable(timeout_seconds=5.0)
             marker_ready = not require_readiness_marker or self._local_readiness_file_present()
-            if reachable and marker_ready:
+            runtime_ready = self._video_gen_v2_sageattention_runtime_ready()
+            if reachable and marker_ready and runtime_ready:
                 return
             time.sleep(2.0)
         raise RuntimeError("Local ComfyUI did not become ready after restart.")
@@ -7939,9 +7967,10 @@ class DependencyAgent:
                 for class_type in normalized_verify
                 if not self._local_comfy_has_class_type(class_type, timeout_seconds=5.0)
             ]
-            if not missing and (saw_down or normalized_verify):
+            runtime_ready = self._video_gen_v2_sageattention_runtime_ready()
+            if runtime_ready and not missing and (saw_down or normalized_verify):
                 return
-            if not normalized_verify and saw_down and reachable:
+            if runtime_ready and not normalized_verify and saw_down and reachable:
                 return
 
             last_missing = missing
