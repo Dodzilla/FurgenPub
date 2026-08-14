@@ -72,6 +72,8 @@ Optional knobs:
   - DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS (extra retries for terminal job events; default: 8)
   - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
+  - DM_COMFY_NODE_TIMING_ENABLED  (capture native Comfy node-boundary timings; default: true only on video_gen_v3)
+  - DM_COMFY_NODE_TIMING_MAX_ROWS (maximum persisted slow-node rows per job; default/max: 64)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
   - DM_VIDEO_GEN_V2_BOOTSTRAP_GATE_WAIT_SECONDS (max wait for the managed video bootstrap gate; default: 1800)
   - DM_VIDEO_GEN_V2_BOOTSTRAP_COMFY_WAIT_SECONDS (max post-gate wait for managed Comfy startup; default: 300)
@@ -112,6 +114,7 @@ import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tarfile
@@ -130,12 +133,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.119"
+AGENT_VERSION = "dm-agent-py/0.10.120"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
+MAX_COMFY_NODE_TIMING_ROWS = 64
+MAX_COMFY_WS_FRAME_BYTES = 32 * 1024 * 1024
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 NON_RETRYABLE_QUEUE_STATES = {"cancelled", "canceled", "succeeded", "completed", "deleted"}
 RTDB_AGENT_NON_TERMINAL_QUEUE_STATES = {
@@ -3596,6 +3601,411 @@ class PrlMinerController:
             )
 
 
+class ComfyNodeTimingCollector:
+    """Best-effort, dependency-free reader for ComfyUI's local WebSocket events.
+
+    This intentionally measures wall time between native ``executing`` boundaries.
+    It never synchronizes CUDA, polls GPU state, or participates in job completion.
+    Any telemetry failure is recorded as partial coverage and must remain fail-open.
+    """
+
+    _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(
+        self,
+        base_url: str,
+        client_id: str,
+        prompt_id: str,
+        workflow: Dict[str, Any],
+        max_rows: int = MAX_COMFY_NODE_TIMING_ROWS,
+    ) -> None:
+        self.base_url = str(base_url or "").rstrip("/")
+        self.client_id = str(client_id)
+        self.prompt_id = str(prompt_id)
+        self.max_rows = max(1, min(MAX_COMFY_NODE_TIMING_ROWS, int(max_rows)))
+        self._node_meta: Dict[str, Dict[str, str]] = {}
+        for raw_id, raw_node in workflow.items():
+            if not isinstance(raw_node, dict):
+                continue
+            node_id = str(raw_id)[:64]
+            class_type = str(raw_node.get("class_type") or "")[:96]
+            meta = raw_node.get("_meta") if isinstance(raw_node.get("_meta"), dict) else {}
+            title = str(meta.get("title") or "")[:96]
+            self._node_meta[node_id] = {
+                "classType": class_type,
+                "title": title,
+            }
+
+        self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._terminal = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._sock: Optional[socket.socket] = None
+        self._recv_buffer = bytearray()
+        self._fragments = bytearray()
+        self._fragment_opcode: Optional[int] = None
+        self._capture_started_ns = time.monotonic_ns()
+        self._execution_started_ns: Optional[int] = None
+        self._execution_finished_ns: Optional[int] = None
+        self._active: Optional[Dict[str, Any]] = None
+        self._spans: List[Dict[str, Any]] = []
+        self._cached_node_ids: Set[str] = set()
+        self._terminal_event = ""
+        self._issues: Set[str] = set()
+        self._connected = False
+
+    def start(self, timeout_seconds: float = 3.0) -> bool:
+        try:
+            self._connect(timeout_seconds=max(0.5, min(10.0, timeout_seconds)))
+            self._thread = threading.Thread(
+                target=self._run,
+                name=f"comfy-node-timing-{self.prompt_id[:8]}",
+                daemon=True,
+            )
+            self._thread.start()
+            if not self._ready.wait(timeout=max(0.5, min(10.0, timeout_seconds))):
+                self._record_issue("status_handshake_timeout")
+                self.stop()
+                return False
+            return True
+        except Exception as exc:
+            self._record_issue("connect_failed")
+            logging.debug("Comfy node timing unavailable for prompt %s: %s", self.prompt_id, exc)
+            self.stop()
+            return False
+
+    def wait_terminal(self, timeout_seconds: float = 1.0) -> bool:
+        return self._terminal.wait(timeout=max(0.0, min(2.0, timeout_seconds)))
+
+    def finish_from_history(self, terminal_status: str, observed_ns: Optional[int] = None) -> None:
+        """Close an otherwise-open span after authoritative history is terminal."""
+        now_ns = int(observed_ns) if isinstance(observed_ns, int) and observed_ns > 0 else time.monotonic_ns()
+        with self._lock:
+            if self._execution_finished_ns is None:
+                self._close_active_locked(now_ns, "history_terminal", complete=False)
+                self._execution_finished_ns = now_ns
+                self._terminal_event = f"history_{str(terminal_status or 'terminal')[:32]}"
+                self._issues.add("missing_ws_terminal")
+        self._terminal.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            spans = [dict(row) for row in self._spans]
+            execution_started_ns = self._execution_started_ns
+            execution_finished_ns = self._execution_finished_ns
+            cached_count = len(self._cached_node_ids)
+            issues = sorted(self._issues)
+            terminal_event = self._terminal_event
+
+        aggregate: Dict[str, Dict[str, Any]] = {}
+        for span in spans:
+            node_id = str(span.get("nodeId") or "")[:64]
+            if not node_id:
+                continue
+            duration_ms = max(0, int(span.get("durationMs") or 0))
+            row = aggregate.get(node_id)
+            if row is None:
+                row = {
+                    "nodeId": node_id,
+                    "classType": str(span.get("classType") or "")[:96],
+                    "title": str(span.get("title") or "")[:96],
+                    "durationMs": 0,
+                    "runs": 0,
+                }
+                aggregate[node_id] = row
+            row["durationMs"] = int(row["durationMs"]) + duration_ms
+            row["runs"] = int(row["runs"]) + 1
+
+        rows = sorted(aggregate.values(), key=lambda row: (-int(row["durationMs"]), str(row["nodeId"])))
+        total_node_ms = sum(int(row["durationMs"]) for row in rows)
+        kept = rows[:self.max_rows]
+        omitted = rows[self.max_rows:]
+        for row in kept:
+            if not row.get("classType"):
+                row.pop("classType", None)
+            if not row.get("title"):
+                row.pop("title", None)
+            if row.get("runs") == 1:
+                row.pop("runs", None)
+
+        wall_ms: Optional[int] = None
+        if execution_started_ns is not None and execution_finished_ns is not None:
+            wall_ms = max(0, int(round((execution_finished_ns - execution_started_ns) / 1_000_000)))
+        complete = bool(terminal_event) and execution_started_ns is not None and execution_finished_ns is not None and not issues
+        payload: Dict[str, Any] = {
+            "version": 1,
+            "source": "comfy_websocket_boundaries_v1",
+            "complete": complete,
+            "nodeCount": len(rows),
+            "cachedNodeCount": cached_count,
+            "totalNodeMs": total_node_ms,
+            "truncated": len(omitted) > 0,
+            "nodes": kept,
+        }
+        if wall_ms is not None:
+            payload["wallMs"] = wall_ms
+            payload["unattributedMs"] = max(0, wall_ms - total_node_ms)
+        if terminal_event:
+            payload["terminalEvent"] = terminal_event[:48]
+        if omitted:
+            payload["omittedNodeCount"] = len(omitted)
+            payload["omittedNodeMs"] = sum(int(row["durationMs"]) for row in omitted)
+        if issues:
+            payload["issues"] = issues[:8]
+        return payload
+
+    def _record_issue(self, issue: str) -> None:
+        with self._lock:
+            self._issues.add(str(issue)[:64])
+
+    def _connect(self, timeout_seconds: float) -> None:
+        parsed = urllib.parse.urlparse(self.base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise RuntimeError(f"Unsupported local Comfy URL for WebSocket: {self.base_url}")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        sock = socket.create_connection((parsed.hostname, port), timeout=timeout_seconds)
+        self._sock = sock
+        if parsed.scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=parsed.hostname)
+            self._sock = sock
+        sock.settimeout(1.0)
+
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        base_path = (parsed.path or "").rstrip("/")
+        target = f"{base_path}/ws?{urllib.parse.urlencode({'clientId': self.client_id})}"
+        host = parsed.hostname if port in (80, 443) else f"{parsed.hostname}:{port}"
+        request = (
+            f"GET {target} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        sock.sendall(request)
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("Comfy WebSocket closed during handshake")
+            response.extend(chunk)
+            if len(response) > 65536:
+                raise RuntimeError("Comfy WebSocket handshake response was too large")
+        header_bytes, remainder = bytes(response).split(b"\r\n\r\n", 1)
+        header_text = header_bytes.decode("iso-8859-1")
+        if not header_text.startswith("HTTP/1.1 101"):
+            raise RuntimeError(f"Comfy WebSocket handshake failed: {header_text.splitlines()[0]}")
+        headers: Dict[str, str] = {}
+        for line in header_text.split("\r\n")[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+        expected_accept = base64.b64encode(hashlib.sha1((key + self._WS_GUID).encode("ascii")).digest()).decode("ascii")
+        if headers.get("sec-websocket-accept") != expected_accept:
+            raise RuntimeError("Comfy WebSocket handshake accept key mismatch")
+        self._recv_buffer.extend(remainder)
+        with self._lock:
+            self._connected = True
+        self._send_control(
+            0x1,
+            json.dumps({"type": "feature_flags", "data": {"supports_preview_metadata": True}}).encode("utf-8"),
+        )
+
+    def _recv_exact(self, size: int) -> bytes:
+        while len(self._recv_buffer) < size:
+            sock = self._sock
+            if sock is None:
+                raise EOFError("WebSocket stopped")
+            chunk = sock.recv(min(65536, size - len(self._recv_buffer)))
+            if not chunk:
+                raise EOFError("WebSocket closed")
+            self._recv_buffer.extend(chunk)
+        out = bytes(self._recv_buffer[:size])
+        del self._recv_buffer[:size]
+        return out
+
+    def _recv_frame(self) -> Tuple[int, bool, bytes]:
+        head = self._recv_exact(2)
+        first, second = head[0], head[1]
+        fin = bool(first & 0x80)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(8))[0]
+        if length > MAX_COMFY_WS_FRAME_BYTES:
+            raise RuntimeError(f"Comfy WebSocket frame exceeds {MAX_COMFY_WS_FRAME_BYTES} bytes")
+        mask = self._recv_exact(4) if masked else b""
+        payload = self._recv_exact(int(length))
+        if mask:
+            payload = bytes(byte ^ mask[idx % 4] for idx, byte in enumerate(payload))
+        return opcode, fin, payload
+
+    def _send_control(self, opcode: int, payload: bytes = b"") -> None:
+        sock = self._sock
+        if sock is None:
+            return
+        payload = payload[:125]
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[idx % 4] for idx, byte in enumerate(payload))
+        frame = bytes([0x80 | (opcode & 0x0F), 0x80 | len(payload)]) + mask + masked
+        with self._send_lock:
+            sock.sendall(frame)
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    opcode, fin, payload = self._recv_frame()
+                except socket.timeout:
+                    continue
+                if opcode == 0x8:
+                    if not self._terminal.is_set():
+                        now_ns = time.monotonic_ns()
+                        with self._lock:
+                            self._close_active_locked(now_ns, "websocket_closed", complete=False)
+                            self._issues.add("websocket_disconnected")
+                    break
+                if opcode == 0x9:
+                    self._send_control(0xA, payload)
+                    continue
+                if opcode == 0xA:
+                    continue
+                if opcode in (0x1, 0x2):
+                    if self._fragment_opcode is not None:
+                        raise RuntimeError("Comfy WebSocket started a data frame before finishing the prior message")
+                    self._fragment_opcode = opcode
+                    self._fragments = bytearray(payload)
+                elif opcode == 0x0 and self._fragment_opcode is not None:
+                    self._fragments.extend(payload)
+                else:
+                    continue
+                if len(self._fragments) > MAX_COMFY_WS_FRAME_BYTES:
+                    raise RuntimeError(f"Comfy WebSocket fragmented message exceeds {MAX_COMFY_WS_FRAME_BYTES} bytes")
+                if not fin:
+                    continue
+                complete_opcode = self._fragment_opcode
+                complete_payload = bytes(self._fragments)
+                self._fragment_opcode = None
+                self._fragments.clear()
+                if complete_opcode != 0x1:
+                    continue
+                try:
+                    message = json.loads(complete_payload.decode("utf-8"))
+                except Exception:
+                    continue
+                self._handle_message(message, time.monotonic_ns())
+        except (EOFError, OSError):
+            if not self._stop.is_set() and not self._terminal.is_set():
+                now_ns = time.monotonic_ns()
+                with self._lock:
+                    self._close_active_locked(now_ns, "websocket_disconnected", complete=False)
+                    self._issues.add("websocket_disconnected")
+        except Exception as exc:
+            if not self._stop.is_set() and not self._terminal.is_set():
+                now_ns = time.monotonic_ns()
+                with self._lock:
+                    self._close_active_locked(now_ns, "websocket_reader_failed", complete=False)
+                    self._issues.add("websocket_reader_failed")
+                logging.debug("Comfy node timing reader failed for prompt %s: %s", self.prompt_id, exc)
+        finally:
+            with self._lock:
+                self._connected = False
+
+    def _handle_message(self, message: Any, now_ns: int) -> None:
+        if not isinstance(message, dict):
+            return
+        event_type = message.get("type")
+        data = message.get("data") if isinstance(message.get("data"), dict) else {}
+        if event_type == "status":
+            if not self._ready.is_set():
+                if data.get("sid") == self.client_id:
+                    self._ready.set()
+                else:
+                    self._record_issue("status_sid_mismatch")
+            return
+        if data.get("prompt_id") != self.prompt_id:
+            return
+        with self._lock:
+            if event_type == "execution_start":
+                self._execution_started_ns = now_ns
+                return
+            if event_type == "execution_cached":
+                nodes = data.get("nodes")
+                if isinstance(nodes, list):
+                    for node_id in nodes[:512]:
+                        if isinstance(node_id, (str, int)):
+                            self._cached_node_ids.add(str(node_id)[:64])
+                return
+            if event_type == "executing":
+                node = data.get("node")
+                if node is None:
+                    if self._execution_finished_ns is None:
+                        self._close_active_locked(now_ns, "execution_complete", complete=True)
+                        self._execution_finished_ns = now_ns
+                        self._terminal_event = "executing_complete"
+                        self._terminal.set()
+                    return
+                self._close_active_locked(now_ns, "next_node", complete=True)
+                node_id = str(node)[:64]
+                display_node = str(data.get("display_node") or node_id)[:64]
+                metadata = self._node_meta.get(node_id) or self._node_meta.get(display_node) or {}
+                if self._execution_started_ns is None:
+                    self._execution_started_ns = now_ns
+                    self._issues.add("missing_execution_start")
+                self._active = {
+                    "nodeId": node_id,
+                    "classType": metadata.get("classType", ""),
+                    "title": metadata.get("title", ""),
+                    "startNs": now_ns,
+                }
+                return
+            terminal_event = event_type in ("execution_success", "execution_interrupted") or (
+                event_type == "execution_error" and isinstance(data.get("timestamp"), (int, float))
+            )
+            if terminal_event and self._execution_finished_ns is None:
+                self._close_active_locked(now_ns, str(event_type), complete=True)
+                self._execution_finished_ns = now_ns
+                self._terminal_event = str(event_type)
+                self._terminal.set()
+
+    def _close_active_locked(self, end_ns: int, end_reason: str, complete: bool) -> None:
+        active = self._active
+        self._active = None
+        if not active:
+            return
+        start_ns = int(active.get("startNs") or end_ns)
+        self._spans.append({
+            "nodeId": str(active.get("nodeId") or "")[:64],
+            "classType": str(active.get("classType") or "")[:96],
+            "title": str(active.get("title") or "")[:96],
+            "durationMs": max(0, int(round((end_ns - start_ns) / 1_000_000))),
+            "complete": bool(complete),
+            "endReason": str(end_reason)[:48],
+        })
+
+
 class DependencyAgent:
     def __init__(self) -> None:
         self.api_base_url = (_env_str("FCS_API_BASE_URL") or "").rstrip("/")
@@ -3688,6 +4098,14 @@ class DependencyAgent:
         self.agent_terminal_event_retry_attempts = max(1, min(20, _env_int("DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS", 8)))
         self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
+        self.comfy_node_timing_enabled = _env_bool(
+            "DM_COMFY_NODE_TIMING_ENABLED",
+            self.server_type == "video_gen_v3",
+        )
+        self.comfy_node_timing_max_rows = max(
+            1,
+            min(MAX_COMFY_NODE_TIMING_ROWS, _env_int("DM_COMFY_NODE_TIMING_MAX_ROWS", MAX_COMFY_NODE_TIMING_ROWS)),
+        )
         self.local_comfy_allow_discovery = _env_bool(
             "DM_LOCAL_COMFY_ALLOW_DISCOVERY",
             self.server_type not in ("video_gen_v2", "video_gen_v3"),
@@ -9406,11 +9824,19 @@ class DependencyAgent:
             except Exception:
                 raise first_error
 
-    def _comfy_submit_prompt(self, workflow: Dict[str, Any], client_id: str) -> str:
+    def _comfy_submit_prompt(
+        self,
+        workflow: Dict[str, Any],
+        client_id: str,
+        prompt_id: Optional[str] = None,
+    ) -> str:
+        body: Dict[str, Any] = {"prompt": workflow, "client_id": client_id}
+        if isinstance(prompt_id, str) and prompt_id:
+            body["prompt_id"] = prompt_id
         status, resp = self._comfy_api_json(
             "POST",
             "/prompt",
-            body={"prompt": workflow, "client_id": client_id},
+            body=body,
             timeout_seconds=60.0,
         )
         if status != 200 or not isinstance(resp, dict):
@@ -9418,7 +9844,37 @@ class DependencyAgent:
         prompt_id = resp.get("prompt_id")
         if not isinstance(prompt_id, str) or not prompt_id:
             raise RuntimeError(f"/prompt did not return prompt_id: {resp}")
+        requested_prompt_id = body.get("prompt_id")
+        if isinstance(requested_prompt_id, str) and prompt_id != requested_prompt_id:
+            logging.warning(
+                "ComfyUI ignored requested prompt_id; node timing will be unavailable for this job: expected=%s actual=%s",
+                requested_prompt_id,
+                prompt_id,
+            )
         return prompt_id
+
+    def _start_comfy_node_timing_collector(
+        self,
+        workflow: Dict[str, Any],
+        client_id: str,
+        prompt_id: str,
+    ) -> Optional[ComfyNodeTimingCollector]:
+        if not bool(getattr(self, "comfy_node_timing_enabled", False)):
+            return None
+        try:
+            base_url = self._resolve_local_comfy_base_url(force_refresh=False, timeout_seconds=3.0)
+            collector = ComfyNodeTimingCollector(
+                base_url=base_url,
+                client_id=client_id,
+                prompt_id=prompt_id,
+                workflow=workflow,
+                max_rows=int(getattr(self, "comfy_node_timing_max_rows", MAX_COMFY_NODE_TIMING_ROWS)),
+            )
+            if collector.start(timeout_seconds=3.0):
+                return collector
+        except Exception as exc:
+            logging.debug("Comfy node timing setup failed open for prompt %s: %s", prompt_id, exc)
+        return None
 
     def _comfy_get_history(self, prompt_id: str) -> Dict[str, Any]:
         status, resp = self._comfy_api_json("GET", f"/history/{urllib.parse.quote(prompt_id)}", timeout_seconds=30.0)
@@ -11773,6 +12229,19 @@ class DependencyAgent:
     def _execute_agent_ready_lease(self, lease: AgentExecuteLease) -> None:
         retain_lease = False
         terminal_sent = False
+        node_timing_collector: Optional[ComfyNodeTimingCollector] = None
+
+        def attach_node_timings(payload: Dict[str, Any], terminal_status: str) -> None:
+            if node_timing_collector is None:
+                return
+            history_terminal_ns = time.monotonic_ns()
+            node_timing_collector.wait_terminal(timeout_seconds=0.1)
+            if not node_timing_collector.wait_terminal(timeout_seconds=0.0):
+                node_timing_collector.finish_from_history(terminal_status, observed_ns=history_terminal_ns)
+            timing = node_timing_collector.snapshot()
+            if timing.get("nodeCount", 0) or timing.get("cachedNodeCount", 0):
+                payload["comfyNodeTimings"] = timing
+
         try:
             timeouts = lease.payload.get("timeouts") if isinstance(lease.payload.get("timeouts"), dict) else {}
             execution_timeout_sec = int(timeouts.get("executionTimeoutSec")) if isinstance(timeouts.get("executionTimeoutSec"), (int, float)) else 2400
@@ -11817,7 +12286,22 @@ class DependencyAgent:
                     timeout_seconds=300.0,
                     skip_if_reachable=True,
                 )
-            prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{lease.job_id}-{uuid.uuid4().hex[:12]}")
+            client_id = f"{lease.job_id}-{uuid.uuid4().hex[:12]}"
+            requested_prompt_id = str(uuid.uuid4()) if self.comfy_node_timing_enabled else None
+            if requested_prompt_id is not None:
+                node_timing_collector = self._start_comfy_node_timing_collector(
+                    workflow,
+                    client_id=client_id,
+                    prompt_id=requested_prompt_id,
+                )
+            prompt_id = self._comfy_submit_prompt(
+                workflow,
+                client_id=client_id,
+                prompt_id=requested_prompt_id,
+            )
+            if node_timing_collector is not None and prompt_id != requested_prompt_id:
+                node_timing_collector.stop()
+                node_timing_collector = None
             lease.prompt_submitted_at_ms = _now_ms()
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
@@ -11835,14 +12319,16 @@ class DependencyAgent:
                 if self._is_cancel_requested(lease):
                     self._comfy_interrupt()
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_cancelled")
+                    cancel_payload: Dict[str, Any] = {
+                        "promptId": prompt_id,
+                        "errorCode": "cancel_requested",
+                        "errorMessage": "Cancellation requested during execution.",
+                    }
+                    attach_node_timings(cancel_payload, "cancelled")
                     self._emit_agent_event_durable(
                         lease,
                         "job_cancelled",
-                        {
-                            "promptId": prompt_id,
-                            "errorCode": "cancel_requested",
-                            "errorMessage": "Cancellation requested during execution.",
-                        },
+                        cancel_payload,
                     )
                     terminal_sent = True
                     return
@@ -11850,14 +12336,16 @@ class DependencyAgent:
                 if _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
                     self._comfy_interrupt()
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_timeout")
+                    timeout_payload: Dict[str, Any] = {
+                        "promptId": prompt_id,
+                        "errorCode": "execution_timeout",
+                        "errorMessage": f"Execution exceeded timeout ({execution_timeout_sec}s).",
+                    }
+                    attach_node_timings(timeout_payload, "timeout")
                     self._emit_agent_event_durable(
                         lease,
                         "job_failed",
-                        {
-                            "promptId": prompt_id,
-                            "errorCode": "execution_timeout",
-                            "errorMessage": f"Execution exceeded timeout ({execution_timeout_sec}s).",
-                        },
+                        timeout_payload,
                     )
                     terminal_sent = True
                     return
@@ -11879,14 +12367,16 @@ class DependencyAgent:
 
                 if failed:
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_failed")
+                    failed_payload: Dict[str, Any] = {
+                        "promptId": prompt_id,
+                        "errorCode": "comfy_execution_failed",
+                        "errorMessage": (json.dumps(status_obj)[:MAX_AGENT_ERROR_MESSAGE_CHARS] if status_obj else "ComfyUI execution failed."),
+                    }
+                    attach_node_timings(failed_payload, "failed")
                     self._emit_agent_event_durable(
                         lease,
                         "job_failed",
-                        {
-                            "promptId": prompt_id,
-                            "errorCode": "comfy_execution_failed",
-                            "errorMessage": (json.dumps(status_obj)[:MAX_AGENT_ERROR_MESSAGE_CHARS] if status_obj else "ComfyUI execution failed."),
-                        },
+                        failed_payload,
                     )
                     terminal_sent = True
                     return
@@ -11911,6 +12401,7 @@ class DependencyAgent:
             output_commit_payload: Dict[str, Any] = {"promptId": prompt_id}
             if self._coalesce_agent_lifecycle_events(lease):
                 output_commit_payload["coalescedLifecycle"] = self._coalesced_agent_lifecycle_payload(lease)
+            attach_node_timings(output_commit_payload, "success")
             self._emit_agent_event_durable(lease, "output_commit_started", output_commit_payload)
 
             self._submit_agent_upload(lease)
@@ -11930,6 +12421,7 @@ class DependencyAgent:
                 }
                 if prompt_id:
                     payload["promptId"] = prompt_id
+                attach_node_timings(payload, event_type)
                 try:
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_error")
                     self._emit_agent_event_durable(lease, event_type, payload)
@@ -11945,6 +12437,8 @@ class DependencyAgent:
                 e,
             )
         finally:
+            if node_timing_collector is not None:
+                node_timing_collector.stop()
             if not retain_lease:
                 self._cleanup_agent_lease(lease)
 
