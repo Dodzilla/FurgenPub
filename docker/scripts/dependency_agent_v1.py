@@ -72,7 +72,7 @@ Optional knobs:
   - DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS (extra retries for terminal job events; default: 8)
   - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
-  - DM_COMFY_NODE_TIMING_ENABLED  (capture native Comfy node-boundary timings; default: true only on video_gen_v3)
+  - DM_COMFY_NODE_TIMING_ENABLED  (capture native Comfy node-boundary timings; default: true on video_gen_v3/video_gen_v4)
   - DM_COMFY_NODE_TIMING_MAX_ROWS (maximum persisted slow-node rows per job; default/max: 64)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
   - DM_VIDEO_GEN_V2_BOOTSTRAP_GATE_WAIT_SECONDS (max wait for the managed video bootstrap gate; default: 1800)
@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.120"
+AGENT_VERSION = "dm-agent-py/0.10.121"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -4100,7 +4100,7 @@ class DependencyAgent:
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         self.comfy_node_timing_enabled = _env_bool(
             "DM_COMFY_NODE_TIMING_ENABLED",
-            self.server_type == "video_gen_v3",
+            self.server_type in ("video_gen_v3", "video_gen_v4"),
         )
         self.comfy_node_timing_max_rows = max(
             1,
@@ -4108,7 +4108,7 @@ class DependencyAgent:
         )
         self.local_comfy_allow_discovery = _env_bool(
             "DM_LOCAL_COMFY_ALLOW_DISCOVERY",
-            self.server_type not in ("video_gen_v2", "video_gen_v3"),
+            self.server_type not in ("video_gen_v2", "video_gen_v3", "video_gen_v4"),
         )
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         default_readiness_file = "provisioned_furry_all.txt" if (self.server_type or "").strip() == "video_gen_v2" else "provisioning_complete.txt"
@@ -6426,7 +6426,7 @@ class DependencyAgent:
 
     def _video_gen_v2_sageattention_runtime_ready(self) -> bool:
         server_type = (self.server_type or "").strip()
-        if server_type not in ("video_gen_v2", "video_gen_v3"):
+        if server_type not in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
             return True
         try:
             payload = json.loads(
@@ -6439,7 +6439,7 @@ class DependencyAgent:
             if payload.get("kernelSmokePassed") is not True:
                 return False
 
-            if server_type == "video_gen_v3":
+            if server_type in ("video_gen_v3", "video_gen_v4"):
                 expected_torch = str(payload.get("torchVersion") or "").strip()
                 configured_torch = _env_str("FURGEN_H3_PYTORCH_RUNTIME_VERSION", "2.10.0+cu129") or ""
                 configured_sage = _env_str("FURGEN_H3_SAGEATTENTION_VERSION", "2.2.0") or ""
@@ -7456,6 +7456,13 @@ class DependencyAgent:
             if not packages:
                 raise RuntimeError(f"Bundle {bundle_id} pip_install step has no valid packages")
             command = [self._comfy_python_executable(), "-m", "pip", "install", "--no-cache-dir"]
+            extra_index_urls = [
+                value.strip()
+                for value in (step.get("extraIndexUrls") if isinstance(step.get("extraIndexUrls"), list) else [])
+                if isinstance(value, str) and re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]+)?(?:/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?", value.strip())
+            ][:4]
+            for extra_index_url in extra_index_urls:
+                command.extend(["--extra-index-url", extra_index_url])
             if step.get("forceReinstall") is True:
                 command.append("--force-reinstall")
             if step.get("noDeps") is True:
@@ -8203,7 +8210,7 @@ class DependencyAgent:
         env.setdefault("WORKSPACE", str(self.workspace))
         env.setdefault("DM_COMFYUI_DIR", str(self.comfyui_dir))
         env["DM_LOCAL_COMFY_BASE_URL"] = self.agent_local_comfy_base_url
-        if self.server_type in ("video_gen_v2", "video_gen_v3"):
+        if self.server_type in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
             env["DM_LOCAL_COMFY_ALLOW_DISCOVERY"] = "false"
         # The Vast Comfy image portal wrapper can block forever waiting for
         # /etc/portal.yaml when launched outside its original supervisor path.
@@ -8216,7 +8223,7 @@ class DependencyAgent:
         parsed = urllib.parse.urlparse(configured)
         launch_port = parsed.port or 8188
         launch_args = f"--disable-auto-launch --listen 0.0.0.0 --port {launch_port} --enable-cors-header"
-        if self.server_type in ("video_gen_v2", "video_gen_v3"):
+        if self.server_type in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
             launch_args += " --use-sage-attention"
         env["COMFYUI_ARGS"] = launch_args
         log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
@@ -10373,7 +10380,7 @@ class DependencyAgent:
                 signature = required_install_signatures_raw.get(bundle_id)
                 if isinstance(signature, str) and re.match(r"^[0-9a-fA-F]{64}$", signature.strip()):
                     required_install_signature_bundle_ids.add(bundle_id)
-        if not verify_class_types and (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3"):
+        if not verify_class_types and (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3", "video_gen_v4"):
             seen_verify_classes: Set[str] = set()
             for bundle_id in bundle_ids:
                 for class_type in self._video_gen_v2_bundle_verify_class_types(bundle_id):
@@ -10450,8 +10457,8 @@ class DependencyAgent:
                     check=True,
                     timeout=max(1800, 300 * max(1, len(legacy_bundle_ids))),
                 )
-            elif server_type in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3") and legacy_bundle_ids:
-                # video_gen_v3 shares the video_gen_v2 bundle catalog; the
+            elif server_type in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3", "video_gen_v4") and legacy_bundle_ids:
+                # Newer video server types can share compatible bundle catalogs; the
                 # installers are server-type agnostic (git nodes + managed
                 # FurgenVideoTools copies).
                 for bundle_id in legacy_bundle_ids:
