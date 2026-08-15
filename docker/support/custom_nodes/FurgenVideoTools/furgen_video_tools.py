@@ -1,6 +1,8 @@
 import json
+import hashlib
 import math
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import folder_paths
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
@@ -82,6 +85,58 @@ def _probe_video(path: str) -> dict:
         "height": int(video_stream.get("height") or 0),
         "duration": duration,
         "has_audio": audio_stream is not None,
+    }
+
+
+def _fraction(value) -> float:
+    if value in (None, "", "0/0"):
+        return 0.0
+    text = str(value)
+    if "/" in text:
+        numerator, denominator = text.split("/", 1)
+        denominator_value = float(denominator)
+        return float(numerator) / denominator_value if denominator_value else 0.0
+    return float(text)
+
+
+def _probe_video_details(path: str) -> dict:
+    cmd = [
+        FFPROBE_BIN,
+        "-v", "error",
+        "-print_format", "json",
+        "-count_frames",
+        "-show_streams",
+        "-show_format",
+        path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    payload = json.loads(proc.stdout or "{}")
+    streams = payload.get("streams") or []
+    format_info = payload.get("format") or {}
+    video = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    if not video:
+        raise ValueError(f"no video stream found for {path}")
+    audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+    duration = max(
+        [
+            float(value)
+            for value in (video.get("duration"), audio and audio.get("duration"), format_info.get("duration"))
+            if value not in (None, "")
+        ] or [0.001]
+    )
+    frame_rate = _fraction(video.get("avg_frame_rate") or video.get("r_frame_rate"))
+    frame_count = int(video.get("nb_read_frames") or video.get("nb_frames") or round(duration * frame_rate))
+    bitrate = int(format_info.get("bit_rate") or video.get("bit_rate") or 0)
+    return {
+        "width": int(video.get("width") or 0),
+        "height": int(video.get("height") or 0),
+        "duration_seconds": duration,
+        "frame_rate": frame_rate,
+        "frame_count": frame_count,
+        "bitrate": bitrate,
+        "has_audio": audio is not None,
+        "audio_sample_rate": int(audio.get("sample_rate") or 0) if audio else None,
+        "audio_channels": int(audio.get("channels") or 0) if audio else None,
     }
 
 
@@ -2662,10 +2717,385 @@ class FCSConcatVideosV3(FCSConcatVideosV2):
         )
 
 
+def _output_bundle(filename_prefix, extension_names, save_output):
+    output_dir = folder_paths.get_output_directory() if save_output else folder_paths.get_temp_directory()
+    full_output_folder, filename, _, subfolder, _ = folder_paths.get_save_image_path(filename_prefix, output_dir)
+    # API job prefixes are already unique. Stable names make an idempotent
+    # retry overwrite-safe and keep the gateway's output map exact.
+    stem = f"{filename}_00001"
+    return full_output_folder, subfolder, stem, {
+        name: os.path.join(full_output_folder, f"{stem}{suffix}")
+        for name, suffix in extension_names.items()
+    }
+
+
+def _storyboard_geometry(duration, source_width, source_height):
+    frame_count = min(240, max(1, int(math.ceil(max(0.001, float(duration)) / 0.5))))
+    columns = min(12, frame_count)
+    rows = int(math.ceil(frame_count / columns))
+    frame_width = 160
+    frame_height = max(2, round(frame_width * source_height / max(1, source_width) / 2) * 2)
+    return frame_count, columns, rows, frame_width, frame_height
+
+
+class FCSAnalyzeVideo:
+    """Create deterministic proxy, storyboard, waveform, and metadata artifacts."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_video_url": ("STRING", {"default": "https://example.com/video.mp4"}),
+                "source_fingerprint": ("STRING", {"default": ""}),
+                "filename_prefix": ("STRING", {"default": "video_analysis"}),
+                "save_output": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("VHS_FILENAMES",)
+    RETURN_NAMES = ("Filenames",)
+    OUTPUT_NODE = True
+    CATEGORY = "Furgen"
+    FUNCTION = "analyze_video"
+
+    def analyze_video(self, source_video_url, source_fingerprint, filename_prefix, save_output):
+        source = _resolve_video_entry(source_video_url)
+        details = _probe_video_details(source)
+        folder, subfolder, stem, paths = _output_bundle(
+            filename_prefix,
+            {"proxy": "-proxy.mp4", "storyboard": "-storyboard.webp", "analysis": "-analysis.json"},
+            save_output,
+        )
+        del folder
+        duration = max(0.001, float(details["duration_seconds"]))
+        subprocess.run(
+            [
+                FFMPEG_BIN, "-y", "-v", "error", "-i", source,
+                "-vf", "fps=30,scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-map", "0:v:0", "-map", "0:a?",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", paths["proxy"],
+            ],
+            check=True,
+        )
+        proxy_details = _probe_video_details(paths["proxy"])
+        frame_count, columns, rows, storyboard_width, frame_height = _storyboard_geometry(
+            duration, details["width"], details["height"]
+        )
+        storyboard_png = paths["storyboard"] + ".png"
+        subprocess.run(
+            [
+                FFMPEG_BIN, "-y", "-v", "error", "-i", source,
+                "-vf", f"fps={frame_count / duration:.9f},scale={storyboard_width}:{frame_height},tile={columns}x{rows}:nb_frames={frame_count}:padding=0:margin=0",
+                "-frames:v", "1", "-c:v", "png", storyboard_png,
+            ],
+            check=True,
+        )
+        with Image.open(storyboard_png) as storyboard_image:
+            storyboard_image.save(paths["storyboard"], format="WEBP", quality=82, method=4)
+        os.unlink(storyboard_png)
+
+        peaks, rms = [], []
+        loudness = {}
+        if details["has_audio"]:
+            pcm = subprocess.run(
+                [FFMPEG_BIN, "-v", "error", "-i", source, "-vn", "-ac", "1", "-ar", "48000", "-f", "s16le", "-"],
+                capture_output=True,
+                check=True,
+            ).stdout
+            samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+            block = 2400
+            for start in range(0, samples.size, block):
+                segment = samples[start:start + block]
+                if not segment.size:
+                    continue
+                peaks.append(round(float(np.max(np.abs(segment))), 6))
+                rms.append(round(float(np.sqrt(np.mean(np.square(segment)))), 6))
+            loudness_proc = subprocess.run(
+                [
+                    FFMPEG_BIN, "-v", "info", "-i", source, "-vn",
+                    "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            matches = re.findall(r"\{[^{}]*\}", loudness_proc.stderr or "", re.DOTALL)
+            if matches:
+                try:
+                    measured = json.loads(matches[-1])
+                    loudness = {
+                        "integratedLoudnessLufs": float(measured["input_i"]),
+                        "truePeakDbfs": float(measured["input_tp"]),
+                    }
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    loudness = {}
+
+        canonical_fingerprint = hashlib.sha256(
+            f"{source}|{details['width']}x{details['height']}|{details['duration_seconds']:.6f}|{details['frame_count']}".encode()
+        ).hexdigest()
+        advisory = str(source_fingerprint or "").strip()
+        cache_key = hashlib.sha256(f"video-analysis-v1|{canonical_fingerprint}|{advisory}".encode()).hexdigest()
+        base_names = {key: os.path.basename(value) for key, value in paths.items()}
+        cues = [
+            {
+                "index": index,
+                "timeSeconds": round(min(duration, duration * (index + 0.5) / frame_count), 6),
+                "x": (index % columns) * storyboard_width,
+                "y": (index // columns) * frame_height,
+                "width": storyboard_width,
+                "height": frame_height,
+            }
+            for index in range(frame_count)
+        ]
+        manifest = {
+            "version": 1,
+            "cacheKey": cache_key,
+            "sourceFingerprint": advisory or None,
+            "canonicalSourceFingerprint": canonical_fingerprint,
+            "source": {
+                "width": details["width"], "height": details["height"],
+                "frameRate": details["frame_rate"], "frameCount": details["frame_count"],
+                "durationSeconds": details["duration_seconds"], "bitrate": details["bitrate"],
+                "hasAudio": details["has_audio"], "audioSampleRate": details["audio_sample_rate"],
+                "audioChannels": details["audio_channels"],
+            },
+            "proxy": {
+                "filename": base_names["proxy"], "width": proxy_details["width"],
+                "height": proxy_details["height"], "frameRate": 30,
+                "durationSeconds": proxy_details["duration_seconds"],
+            },
+            "storyboard": {
+                "filename": base_names["storyboard"], "columns": columns, "rows": rows,
+                "frameWidth": storyboard_width, "frameHeight": frame_height, "cues": cues,
+            },
+            "waveform": {"pointsPerSecond": 20, "sampleRate": 48000, "channels": 1, "peaks": peaks, "rms": rms, **loudness},
+            "cors": {"allowOrigin": "*"},
+        }
+        with open(paths["analysis"], "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, separators=(",", ":"), allow_nan=False)
+        previews = [
+            {
+                "filename": base_names["proxy"], "subfolder": subfolder,
+                "type": "output" if save_output else "temp", "format": "video/h264-mp4",
+                "frame_rate": 30, "fullpath": paths["proxy"],
+            }
+        ]
+        return {"ui": {"gifs": previews}, "result": ((save_output, list(paths.values())),)}
+
+
+def _v4_clip_duration(entry, probe):
+    start = max(0.0, float(entry.get("trimStartSeconds") or 0.0))
+    end = min(float(probe["duration"]), float(entry.get("trimEndSeconds") or probe["duration"]))
+    speed = max(0.001, float(entry.get("speed") or 1.0))
+    return start, end, (end - start) / speed
+
+
+class FCSConcatVideosV4(FCSConcatVideosV3):
+    """Precision single-track compositor with framing and full audio control."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "edit_manifest": ("STRING", {"default": "{}", "multiline": True}),
+                "output_width": ("INT", {"default": 1920, "min": 2, "max": 7680, "step": 2}),
+                "output_height": ("INT", {"default": 1080, "min": 2, "max": 7680, "step": 2}),
+                "frame_rate": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 120.0, "step": 1.0}),
+                "audio_crossfade_curve": (["linear", "equalPower"], {"default": "equalPower"}),
+                "filename_prefix": ("STRING", {"default": "video_precision_edit"}),
+                "pix_fmt": (["yuv420p"],),
+                "crf": ("INT", {"default": 15, "min": 0, "max": 51, "step": 1}),
+                "save_output": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    FUNCTION = "concat_videos_v4"
+
+    def concat_videos_v4(self, edit_manifest, output_width, output_height, frame_rate,
+                         audio_crossfade_curve, filename_prefix, pix_fmt, crf, save_output):
+        manifest = json.loads(edit_manifest)
+        entries = manifest.get("clips") or []
+        if not entries:
+            raise ValueError("edit_manifest.clips must contain at least one clip")
+        for entry in entries:
+            entry["path"] = _resolve_video_entry(entry.get("sourceVideoUrl"))
+        probes = [_probe_video(entry["path"]) for entry in entries]
+        for entry, probe in zip(entries, probes):
+            start, end, duration = _v4_clip_duration(entry, probe)
+            if duration < 1.0 / float(frame_rate):
+                raise ValueError("clip trim leaves no output frames")
+            entry["_effective_start"], entry["_effective_end"], entry["_output_duration"] = start, end, duration
+        for index, entry in enumerate(entries[:-1]):
+            transition = entry.get("transitionAfter") or {}
+            fade = 0.0
+            if transition.get("type") == "blend":
+                fade = 19.0 / float(frame_rate)
+            elif transition.get("type") == "crossfade":
+                fade = float(transition.get("durationSeconds") or 0.0)
+            budget = min(entry["_output_duration"], entries[index + 1]["_output_duration"])
+            entry["_xfade"] = min(fade, max(0.0, budget - 1.0 / float(frame_rate)))
+
+        _, subfolder, stem, paths = _output_bundle(
+            filename_prefix, {"video": ".mp4", "audio": "-audio.mp4"}, save_output
+        )
+        self._render_precision_filtergraph(
+            entries=entries, probes=probes, soundtrack=manifest.get("soundtrack"),
+            output_width=int(output_width), output_height=int(output_height), frame_rate=float(frame_rate),
+            audio_curve=audio_crossfade_curve, pix_fmt=pix_fmt, crf=crf,
+            base_path=paths["video"], audio_path=paths["audio"],
+        )
+        preview = {
+            "filename": os.path.basename(paths["audio"]), "subfolder": subfolder,
+            "type": "output" if save_output else "temp", "format": "video/h264-mp4",
+            "frame_rate": frame_rate, "fullpath": paths["audio"],
+        }
+        return {"ui": {"gifs": [preview]}, "result": ((save_output, [paths["video"], paths["audio"]]),)}
+
+    def _render_precision_filtergraph(self, *, entries, probes, soundtrack, output_width,
+                                      output_height, frame_rate, audio_curve, pix_fmt, crf,
+                                      base_path, audio_path):
+        ffmpeg_inputs, filters = [], []
+        for index, (entry, probe) in enumerate(zip(entries, probes)):
+            ffmpeg_inputs.extend(["-i", probe["path"]])
+            start, end = entry["_effective_start"], entry["_effective_end"]
+            duration, speed = entry["_output_duration"], float(entry.get("speed") or 1.0)
+            trim = f"trim=start={start:.6f}:end={end:.6f}"
+            base_filters = [trim, f"setpts=(PTS-STARTPTS)/{speed:.6f}"]
+            adjustments = entry.get("adjustments") or {}
+            base_filters.extend(_color_filters(
+                float(adjustments.get("brightness") or 1.0),
+                float(adjustments.get("contrast") or 1.0),
+                float(adjustments.get("saturation") or 1.0),
+            ))
+            base_filters.append(f"fps={frame_rate}")
+            framing = entry.get("framing") or {}
+            mode = framing.get("mode") or "fit"
+            pan_x = max(0.0, min(1.0, float(framing.get("panX", 0.5))))
+            pan_y = max(0.0, min(1.0, float(framing.get("panY", 0.5))))
+            zoom = max(1.0, min(3.0, float(framing.get("zoom", 1.0))))
+            if mode == "fit" and framing.get("fitBackground", "black") == "blur":
+                filters.append(f"[{index}:v]{','.join(base_filters)},split=2[v{index}bg0][v{index}fg0]")
+                filters.append(
+                    f"[v{index}bg0]scale={output_width}:{output_height}:force_original_aspect_ratio=increase,"
+                    f"crop={output_width}:{output_height},gblur=sigma=30[v{index}bg]"
+                )
+                filters.append(
+                    f"[v{index}fg0]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease[v{index}fg]"
+                )
+                filters.append(
+                    f"[v{index}bg][v{index}fg]overlay=(W-w)/2:(H-h)/2,format={pix_fmt},setsar=1[v{index}]"
+                )
+            elif mode == "fit":
+                base_filters.extend([
+                    f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease",
+                    f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2:black",
+                    f"format={pix_fmt}", "setsar=1",
+                ])
+                filters.append(f"[{index}:v]{','.join(base_filters)}[v{index}]")
+            else:
+                scale_width = max(output_width, int(round(output_width * zoom / 2.0) * 2))
+                scale_height = max(output_height, int(round(output_height * zoom / 2.0) * 2))
+                base_filters.extend([
+                    f"scale={scale_width}:{scale_height}:force_original_aspect_ratio=increase",
+                    f"crop={output_width}:{output_height}:(iw-ow)*{pan_x:.6f}:(ih-oh)*{pan_y:.6f}",
+                    f"format={pix_fmt}", "setsar=1",
+                ])
+                filters.append(f"[{index}:v]{','.join(base_filters)}[v{index}]")
+
+            audio = entry.get("audio") or {}
+            if probe["has_audio"]:
+                audio_filters = [f"atrim=start={start:.6f}:end={end:.6f}", "asetpts=PTS-STARTPTS"]
+                audio_filters.extend(_atempo_chain(speed))
+                gain = 0.0 if audio.get("muted") else max(0.0, min(2.0, float(audio.get("gain", 1.0))))
+                audio_filters.append(f"volume={gain:.6f}")
+                fade_in = min(duration, max(0.0, float(audio.get("fadeInSeconds") or 0.0)))
+                fade_out = min(duration, max(0.0, float(audio.get("fadeOutSeconds") or 0.0)))
+                if fade_in:
+                    audio_filters.append(f"afade=t=in:st=0:d={fade_in:.6f}")
+                if fade_out:
+                    audio_filters.append(f"afade=t=out:st={max(0.0, duration - fade_out):.6f}:d={fade_out:.6f}")
+                audio_filters.extend(["aresample=48000", "aformat=sample_fmts=fltp:channel_layouts=stereo"])
+                filters.append(f"[{index}:a]{','.join(audio_filters)}[a{index}]")
+            else:
+                filters.append(f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration:.6f}[a{index}]")
+
+        cur_v, cur_a = "[v0]", "[a0]"
+        timeline_duration = float(entries[0]["_output_duration"])
+        curve = "tri" if audio_curve == "linear" else "qsin"
+        for index in range(1, len(entries)):
+            fade = float(entries[index - 1].get("_xfade") or 0.0)
+            out_v, out_a = f"[vx{index}]", f"[ax{index}]"
+            if fade:
+                filters.append(
+                    f"{cur_v}[v{index}]xfade=transition=fade:duration={fade:.6f}:"
+                    f"offset={max(0.0, timeline_duration - fade):.6f}{out_v}"
+                )
+                filters.append(f"{cur_a}[a{index}]acrossfade=d={fade:.6f}:c1={curve}:c2={curve}{out_a}")
+                timeline_duration += float(entries[index]["_output_duration"]) - fade
+            else:
+                filters.append(f"{cur_v}[v{index}]concat=n=2:v=1:a=0{out_v}")
+                filters.append(f"{cur_a}[a{index}]concat=n=2:v=0:a=1{out_a}")
+                timeline_duration += float(entries[index]["_output_duration"])
+            cur_v, cur_a = out_v, out_a
+        filters.append(f"{cur_v}null[v]")
+
+        final_audio = cur_a
+        if soundtrack:
+            music_index = len(entries)
+            ffmpeg_inputs.extend(["-i", _resolve_video_entry(soundtrack.get("sourceAudioUrl"))])
+            music_start = max(0.0, float(soundtrack.get("trimStartSeconds") or 0.0))
+            music_end = soundtrack.get("trimEndSeconds")
+            music_filters = [f"atrim=start={music_start:.6f}" + (f":end={float(music_end):.6f}" if music_end else ""), "asetpts=PTS-STARTPTS", "aresample=48000"]
+            if soundtrack.get("loop"):
+                selected_duration = max(0.001, float(music_end or (music_start + timeline_duration)) - music_start)
+                music_filters.append(f"aloop=loop=-1:size={max(1, int(round(selected_duration * 48000)))}")
+            gain = max(0.0, min(2.0, float(soundtrack.get("gain", 1.0))))
+            music_filters.append(f"volume={gain:.6f}")
+            offset = max(0.0, float(soundtrack.get("timelineOffsetSeconds") or 0.0))
+            fade_in = max(0.0, float(soundtrack.get("fadeInSeconds") or 0.0))
+            fade_out = max(0.0, float(soundtrack.get("fadeOutSeconds") or 0.0))
+            available = max(0.0, timeline_duration - offset)
+            if fade_in:
+                music_filters.append(f"afade=t=in:st=0:d={min(fade_in, available):.6f}")
+            if fade_out:
+                music_filters.append(f"afade=t=out:st={max(0.0, available - fade_out):.6f}:d={min(fade_out, available):.6f}")
+            if offset:
+                delay = int(round(offset * 1000))
+                music_filters.append(f"adelay={delay}|{delay}")
+            music_filters.extend([f"apad=whole_dur={timeline_duration:.6f}", f"atrim=end={timeline_duration:.6f}", "aformat=sample_fmts=fltp:channel_layouts=stereo"])
+            filters.append(f"[{music_index}:a]{','.join(music_filters)}[music]")
+            ducking = soundtrack.get("ducking") or {}
+            music_label = "[music]"
+            main_label = cur_a
+            if ducking.get("enabled") and float(ducking.get("depthDb") or 0.0) > 0:
+                depth = max(0.0, min(24.0, float(ducking.get("depthDb") or 0.0)))
+                ratio = 1.0 + depth
+                filters.append(f"{cur_a}asplit=2[mainmix][sidechain]")
+                filters.append(f"[music][sidechain]sidechaincompress=threshold=0.02:ratio={ratio:.6f}:attack=20:release=250[ducked]")
+                music_label = "[ducked]"
+                main_label = "[mainmix]"
+            filters.append(f"{main_label}{music_label}amix=inputs=2:duration=first:normalize=0[a]")
+            final_audio = "[a]"
+        else:
+            filters.append(f"{cur_a}anull[a]")
+            final_audio = "[a]"
+
+        command = [
+            FFMPEG_BIN, "-y", "-v", "error", *ffmpeg_inputs, "-filter_complex", ";".join(filters),
+            "-map", "[v]", "-map", final_audio, "-c:v", "libx264", "-preset", "medium",
+            "-crf", str(crf), "-pix_fmt", pix_fmt, "-r", str(frame_rate),
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", audio_path,
+        ]
+        subprocess.run(command, check=True)
+        subprocess.run([FFMPEG_BIN, "-y", "-v", "error", "-i", audio_path, "-an", "-c:v", "copy", base_path], check=True)
+
+
 NODE_CLASS_MAPPINGS = {
     "FCSConcatVideos": FCSConcatVideos,
     "FCSConcatVideosV2": FCSConcatVideosV2,
     "FCSConcatVideosV3": FCSConcatVideosV3,
+    "FCSConcatVideosV4": FCSConcatVideosV4,
+    "FCSAnalyzeVideo": FCSAnalyzeVideo,
     "FurgenExposureAdjust": FurgenExposureAdjust,
     "FurgenGetImageRangeFromBatch": FurgenGetImageRangeFromBatch,
     "FurgenPrependImageToBatch": FurgenPrependImageToBatch,
@@ -2687,6 +3117,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FCSConcatVideos": "Furgen Concat Videos",
     "FCSConcatVideosV2": "Furgen Concat Videos V2 (trims)",
     "FCSConcatVideosV3": "Furgen Concat Videos V3 (trims, speed, colour, crossfade)",
+    "FCSConcatVideosV4": "Furgen Concat Videos V4 (precision editor)",
+    "FCSAnalyzeVideo": "Furgen Analyze Video",
     "FurgenExposureAdjust": "Furgen Exposure Adjust",
     "FurgenGetImageRangeFromBatch": "Furgen Get Image Range From Batch",
     "FurgenPrependImageToBatch": "Furgen Prepend Image To Batch",

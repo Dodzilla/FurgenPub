@@ -1,5 +1,7 @@
 import ast
 import importlib.util
+import json
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -172,6 +174,86 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FurgenLTXGuideAttentionAdjust" in module.NODE_CLASS_MAPPINGS
     assert "FurgenAssertFiniteImages" in module.NODE_CLASS_MAPPINGS
     assert "FurgenAssertFiniteLatent" in module.NODE_CLASS_MAPPINGS
+    assert "FCSConcatVideosV4" in module.NODE_CLASS_MAPPINGS
+    assert "FCSAnalyzeVideo" in module.NODE_CLASS_MAPPINGS
+
+
+def _make_test_video(path, size="96x64", duration=1.2, frequency=440):
+    subprocess.run([
+        "ffmpeg", "-y", "-v", "error",
+        "-f", "lavfi", "-i", f"color=c=red:s={size}:r=24:d={duration}",
+        "-f", "lavfi", "-i", f"sine=frequency={frequency}:sample_rate=48000:duration={duration}",
+        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path),
+    ], check=True)
+
+
+def test_video_analysis_preserves_proxy_audio_density_and_stable_names(tmp_path, monkeypatch):
+    module = _load_furgen_video_tools()
+    monkeypatch.setattr(module.folder_paths, "get_output_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(module.folder_paths, "get_save_image_path", lambda prefix, output: (output, prefix, 0, "", prefix))
+    source = tmp_path / "source.mp4"
+    _make_test_video(source, duration=1.2)
+    node = module.FCSAnalyzeVideo()
+    first = node.analyze_video(str(source), "content_abc123", "analysis_test", True)
+    second = node.analyze_video(str(source), "content_abc123", "analysis_test", True)
+    assert first["result"] == second["result"]
+    proxy = tmp_path / "analysis_test_00001-proxy.mp4"
+    manifest_path = tmp_path / "analysis_test_00001-analysis.json"
+    streams = json.loads(subprocess.run([
+        "ffprobe", "-v", "error", "-show_streams", "-of", "json", str(proxy),
+    ], capture_output=True, text=True, check=True).stdout)["streams"]
+    assert {stream["codec_type"] for stream in streams} == {"video", "audio"}
+    manifest = json.loads(manifest_path.read_text())
+    assert len(manifest["storyboard"]["cues"]) == 3
+    assert manifest["waveform"]["peaks"]
+    assert manifest["cors"] == {"allowOrigin": "*"}
+
+
+def test_video_analysis_storyboard_density_is_half_second_capped_at_240():
+    module = _load_furgen_video_tools()
+    assert module._storyboard_geometry(60, 1920, 1080)[:3] == (120, 12, 10)
+    assert module._storyboard_geometry(600, 1080, 1920)[:3] == (240, 12, 20)
+
+
+def test_precision_video_render_handles_trimmed_music_loop_ducking_and_mixed_orientation(tmp_path, monkeypatch):
+    module = _load_furgen_video_tools()
+    monkeypatch.setattr(module.folder_paths, "get_output_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(module.folder_paths, "get_save_image_path", lambda prefix, output: (output, prefix, 0, "", prefix))
+    clip_a, clip_b, music = tmp_path / "a.mp4", tmp_path / "b.mp4", tmp_path / "music.mp4"
+    _make_test_video(clip_a, "96x64", 1.2, 440)
+    _make_test_video(clip_b, "64x96", 1.2, 660)
+    _make_test_video(music, "64x64", 0.3, 220)
+    manifest = {
+        "clips": [
+            {
+                "sourceVideoUrl": str(clip_a), "trimEndSeconds": 1.2,
+                "framing": {"mode": "fit", "fitBackground": "blur"},
+                "audio": {"gain": 0.8, "fadeInSeconds": 0.1},
+                "transitionAfter": {"type": "crossfade", "durationSeconds": 0.2},
+            },
+            {
+                "sourceVideoUrl": str(clip_b), "trimEndSeconds": 1.2,
+                "framing": {"mode": "custom", "panX": 0.25, "panY": 0.75, "zoom": 1.5},
+                "audio": {"fadeOutSeconds": 0.1},
+            },
+        ],
+        "soundtrack": {
+            "sourceAudioUrl": str(music), "trimStartSeconds": 0, "trimEndSeconds": 0.3,
+            "loop": True, "gain": 0.4, "ducking": {"enabled": True, "depthDb": 12},
+        },
+    }
+    result = module.FCSConcatVideosV4().concat_videos_v4(
+        json.dumps(manifest), 96, 64, 30, "equalPower", "precision_test", "yuv420p", 23, True,
+    )
+    assert result["result"][0][0] is True
+    output = tmp_path / "precision_test_00001-audio.mp4"
+    probe = json.loads(subprocess.run([
+        "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(output),
+    ], capture_output=True, text=True, check=True).stdout)
+    assert {stream["codec_type"] for stream in probe["streams"]} == {"video", "audio"}
+    video = next(stream for stream in probe["streams"] if stream["codec_type"] == "video")
+    assert (video["width"], video["height"]) == (96, 64)
+    assert 2.1 <= float(probe["format"]["duration"]) <= 2.3
 
 
 def test_furgen_tail_context_utility_nodes_slice_images_and_audio():
