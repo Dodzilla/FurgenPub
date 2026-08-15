@@ -1,6 +1,7 @@
 import ast
 import importlib.util
 import json
+import math
 import subprocess
 import sys
 import types
@@ -213,6 +214,17 @@ def test_video_analysis_storyboard_density_is_half_second_capped_at_240():
     module = _load_furgen_video_tools()
     assert module._storyboard_geometry(60, 1920, 1080)[:3] == (120, 12, 10)
     assert module._storyboard_geometry(600, 1080, 1920)[:3] == (240, 12, 20)
+
+
+def test_precision_video_ducking_depth_is_a_bounded_db_attenuation():
+    module = _load_furgen_video_tools()
+    assert module._ducking_compressor_options(0) == (0.0, 0.0)
+    depth, wet_mix = module._ducking_compressor_options(12)
+    assert depth == 12.0
+    assert math.isclose(1.0 - wet_mix, 10 ** (-12 / 20), rel_tol=1e-9)
+    depth, wet_mix = module._ducking_compressor_options(100)
+    assert depth == 24.0
+    assert math.isclose(1.0 - wet_mix, 10 ** (-24 / 20), rel_tol=1e-9)
 
 
 def test_precision_video_render_handles_trimmed_music_loop_ducking_and_mixed_orientation(tmp_path, monkeypatch):

@@ -2890,6 +2890,14 @@ def _v4_clip_duration(entry, probe):
     return start, end, (end - start) / speed
 
 
+def _ducking_compressor_options(depth_db):
+    depth = max(0.0, min(24.0, float(depth_db or 0.0)))
+    minimum_gain = math.pow(10.0, -depth / 20.0)
+    # FFmpeg's dry/wet mix creates an exact lower gain bound: even when the
+    # compressed branch reaches silence, the dry branch retains minimum_gain.
+    return depth, 1.0 - minimum_gain
+
+
 class FCSConcatVideosV4(FCSConcatVideosV3):
     """Precision single-track compositor with framing and full audio control."""
 
@@ -3068,10 +3076,12 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             music_label = "[music]"
             main_label = cur_a
             if ducking.get("enabled") and float(ducking.get("depthDb") or 0.0) > 0:
-                depth = max(0.0, min(24.0, float(ducking.get("depthDb") or 0.0)))
-                ratio = 1.0 + depth
+                depth, wet_mix = _ducking_compressor_options(ducking.get("depthDb"))
                 filters.append(f"{cur_a}asplit=2[mainmix][sidechain]")
-                filters.append(f"[music][sidechain]sidechaincompress=threshold=0.02:ratio={ratio:.6f}:attack=20:release=250[ducked]")
+                filters.append(
+                    f"[music][sidechain]sidechaincompress=threshold=0.02:ratio=20:"
+                    f"attack=20:release=250:mix={wet_mix:.9f}[ducked]"
+                )
                 music_label = "[ducked]"
                 main_label = "[mainmix]"
             filters.append(f"{main_label}{music_label}amix=inputs=2:duration=first:normalize=0[a]")
