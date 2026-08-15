@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.122"
+AGENT_VERSION = "dm-agent-py/0.10.123"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -4251,6 +4251,18 @@ class DependencyAgent:
             return pinned
         return normalized
 
+    @staticmethod
+    def _pinned_furgenpub_support_base_url(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip().rstrip("/")
+        if not re.fullmatch(
+            r"https://raw\.githubusercontent\.com/Dodzilla/FurgenPub/[0-9a-f]{40}/docker/support",
+            normalized,
+        ):
+            return None
+        return normalized
+
     def validate_env(self) -> None:
         if not self.api_base_url:
             raise SystemExit("Missing required env var: FCS_API_BASE_URL")
@@ -7449,14 +7461,23 @@ class DependencyAgent:
             return True
         if step_type == "furgen_support_custom_node":
             package_name = step.get("packageName")
+            raw_base_value = step.get("furgenPubRawBaseUrl")
+            pinned_raw_base = self._pinned_furgenpub_support_base_url(raw_base_value)
+            if raw_base_value is not None and pinned_raw_base is None:
+                raise RuntimeError(
+                    f"Bundle {bundle_id} furgen_support_custom_node step has an invalid pinned FurgenPub support URL"
+                )
             required = self._normalize_required_class_types(step.get("requiredClassTypes"))
             if not required:
                 required = self._normalize_required_class_types(required_class_types)
             if package_name == "FurgenVideoTools":
-                self._install_furgen_video_tools_node(required_class_types=required)
+                self._install_furgen_video_tools_node(
+                    required_class_types=required,
+                    furgenpub_raw_base_url=pinned_raw_base,
+                )
                 return True
             if package_name in ("furgen_video_compat_nodes.py", "FurgenVideoCompatNodes"):
-                self._install_furgen_video_compat_nodes()
+                self._install_furgen_video_compat_nodes(furgenpub_raw_base_url=pinned_raw_base)
                 return True
             raise RuntimeError(f"Unsupported Furgen support custom node package for {bundle_id}: {package_name}")
         if step_type == "pip_install":
@@ -7706,7 +7727,7 @@ class DependencyAgent:
                         timeout=900,
                     )
 
-    def _install_furgen_video_compat_nodes(self) -> None:
+    def _install_furgen_video_compat_nodes(self, furgenpub_raw_base_url: Optional[str] = None) -> None:
         custom_nodes_dir = self.comfyui_dir / "custom_nodes"
         custom_nodes_dir.mkdir(parents=True, exist_ok=True)
         compat_path = custom_nodes_dir / "furgen_video_compat_nodes.py"
@@ -7728,7 +7749,10 @@ class DependencyAgent:
             except Exception as exc:
                 logging.warning("Failed local Furgen video compat node install from %s: %s", src_path, str(exc)[:500])
 
-        remote_url = f"{self.furgenpub_raw_base_url}/custom_nodes/furgen_video_compat_nodes.py"
+        remote_url = (
+            f"{furgenpub_raw_base_url or self.furgenpub_raw_base_url}"
+            "/custom_nodes/furgen_video_compat_nodes.py"
+        )
         request = urllib.request.Request(remote_url, headers={"User-Agent": "furgen-dependency-agent/1.0"})
         with urllib.request.urlopen(request, timeout=60.0) as resp:
             compat_path.write_bytes(resp.read())
@@ -7851,6 +7875,7 @@ class DependencyAgent:
     def _install_furgen_video_tools_node(
         self,
         required_class_types: Optional[Iterable[str]] = None,
+        furgenpub_raw_base_url: Optional[str] = None,
     ) -> None:
         required = self._normalize_required_class_types(required_class_types)
         custom_nodes_dir = self.comfyui_dir / "custom_nodes"
@@ -7872,7 +7897,10 @@ class DependencyAgent:
             except Exception as exc:
                 logging.warning("Failed local FurgenVideoTools install from %s: %s", src_dir, str(exc)[:500])
 
-        remote_base = f"{self.furgenpub_raw_base_url}/custom_nodes/FurgenVideoTools"
+        remote_base = (
+            f"{furgenpub_raw_base_url or self.furgenpub_raw_base_url}"
+            "/custom_nodes/FurgenVideoTools"
+        )
         temp_dir = dest_dir.with_name(f".{dest_dir.name}.tmp-{uuid.uuid4().hex}")
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
