@@ -198,6 +198,11 @@ def test_video_analysis_preserves_proxy_audio_density_and_stable_names(tmp_path,
     first = node.analyze_video(str(source), "content_abc123", "analysis_test", True)
     second = node.analyze_video(str(source), "content_abc123", "analysis_test", True)
     assert first["result"] == second["result"]
+    assert [row["filename"] for row in first["ui"]["files"]] == [
+        "analysis_test_00001-proxy.mp4",
+        "analysis_test_00001-storyboard.webp",
+        "analysis_test_00001-analysis.json",
+    ]
     proxy = tmp_path / "analysis_test_00001-proxy.mp4"
     manifest_path = tmp_path / "analysis_test_00001-analysis.json"
     streams = json.loads(subprocess.run([

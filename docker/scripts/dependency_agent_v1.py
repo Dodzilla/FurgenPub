@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.121"
+AGENT_VERSION = "dm-agent-py/0.10.122"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -11441,6 +11441,18 @@ class DependencyAgent:
         target: Dict[str, Any],
         used_indexes: Set[int],
     ) -> Optional[Tuple[int, Dict[str, str]]]:
+        expected_filename = target.get("sourceFilename")
+        if isinstance(expected_filename, str) and expected_filename:
+            expected_basename = os.path.basename(expected_filename)
+            for idx, row in enumerate(refs):
+                if idx in used_indexes:
+                    continue
+                filename = row.get("filename")
+                if isinstance(filename, str) and os.path.basename(filename) == expected_basename:
+                    return idx, row
+            if target.get("requireExactSourceFilename") is True:
+                return None
+
         expected_ext = ""
         attempt_path = target.get("attemptObjectPath")
         if isinstance(attempt_path, str) and attempt_path:
@@ -11953,6 +11965,10 @@ class DependencyAgent:
 
                 selected = self._select_output_ref(refs, target, used_ref_indexes)
                 if selected is None:
+                    if target.get("required") is True:
+                        raise RuntimeError(
+                            f"Required output not found in ComfyUI history: {target.get('sourceFilename') or target.get('logicalOutputKey')}"
+                        )
                     continue
                 ref_idx, ref = selected
                 used_ref_indexes.add(ref_idx)

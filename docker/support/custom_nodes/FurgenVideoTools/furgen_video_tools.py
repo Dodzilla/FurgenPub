@@ -2880,7 +2880,17 @@ class FCSAnalyzeVideo:
                 "frame_rate": 30, "fullpath": paths["proxy"],
             }
         ]
-        return {"ui": {"gifs": previews}, "result": ((save_output, list(paths.values())),)}
+        history_files = [
+            {
+                "filename": base_names[key], "subfolder": subfolder,
+                "type": "output" if save_output else "temp",
+            }
+            for key in ("proxy", "storyboard", "analysis")
+        ]
+        return {
+            "ui": {"gifs": previews, "files": history_files},
+            "result": ((save_output, list(paths.values())),),
+        }
 
 
 def _v4_clip_duration(entry, probe):
