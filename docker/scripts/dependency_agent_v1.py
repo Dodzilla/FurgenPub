@@ -4098,6 +4098,13 @@ class DependencyAgent:
         self.agent_terminal_event_retry_attempts = max(1, min(20, _env_int("DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS", 8)))
         self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
+        # video_gen_v4 workflows leave a large amount of host RAM resident in
+        # ComfyUI after completion. Recycle Comfy before releasing the agent
+        # lease so the next queued workflow always starts from a fresh process.
+        self.restart_comfy_after_successful_job = _env_bool(
+            "DM_RESTART_COMFY_AFTER_SUCCESSFUL_JOB",
+            self.server_type == "video_gen_v4",
+        )
         self.comfy_node_timing_enabled = _env_bool(
             "DM_COMFY_NODE_TIMING_ENABLED",
             self.server_type in ("video_gen_v3", "video_gen_v4"),
@@ -4152,6 +4159,7 @@ class DependencyAgent:
         # concurrent execute workers cannot issue overlapping supervisor restarts.
         self._comfy_restart_lock = threading.RLock()
         self._comfy_restart_command_active = threading.Event()
+        self._post_job_comfy_recycle_active = threading.Event()
         self._interrupted_comfy_restart_path = self.workspace / ".fcs" / "comfy_restart_in_progress.json"
         self._next_interrupted_comfy_restart_recovery_ms = 0
         self._token: Optional[str] = None
@@ -8334,6 +8342,79 @@ class DependencyAgent:
                 )
             return True
 
+    def _arm_post_job_comfy_recycle(self, lease: AgentExecuteLease) -> None:
+        if not self.restart_comfy_after_successful_job:
+            return
+        if self._post_job_comfy_recycle_active.is_set():
+            return
+        self._post_job_comfy_recycle_active.set()
+        logging.info(
+            "Armed post-job ComfyUI recycle before releasing capacity: jobId=%s itemId=%s",
+            lease.job_id,
+            lease.item_id,
+        )
+        try:
+            self._write_agent_runtime_mirror(force_full=True)
+        except Exception as exc:
+            logging.debug("Failed to publish post-job ComfyUI recycle gate: %s", exc)
+
+    def _complete_post_job_comfy_recycle(self, lease: AgentExecuteLease) -> bool:
+        if not self._post_job_comfy_recycle_active.is_set():
+            return True
+
+        logging.info(
+            "Recycling ComfyUI after completed workflow before releasing capacity: jobId=%s itemId=%s",
+            lease.job_id,
+            lease.item_id,
+        )
+        self._remove_local_readiness_file()
+        try:
+            self._write_agent_runtime_mirror(force_full=True)
+        except Exception as exc:
+            logging.debug("Failed to publish ComfyUI recycle readiness drain: %s", exc)
+
+        try:
+            self._restart_local_comfy_and_wait(
+                prefer_process_restart=True,
+                allow_supervisor_restart=False,
+                timeout_seconds=300.0,
+                require_readiness_marker=False,
+            )
+            self._write_local_readiness_file()
+            self._post_job_comfy_recycle_active.clear()
+            self._last_agent_http_transition_signature = ""
+            self._last_agent_runtime_signature = ""
+            self._last_agent_heartbeat_ms = 0
+            try:
+                self._write_agent_runtime_mirror(force_full=True)
+            except Exception as exc:
+                logging.debug("Failed to publish completed ComfyUI recycle runtime: %s", exc)
+            self._request_agent_queue_poll()
+            logging.info(
+                "Post-job ComfyUI recycle completed; capacity may resume: jobId=%s itemId=%s",
+                lease.job_id,
+                lease.item_id,
+            )
+            return True
+        except Exception as exc:
+            # Keep both the local capacity gate and readiness drain active. A
+            # queued command may exist already, but it must not execute against
+            # a failed or partially restarted Comfy process.
+            self._last_agent_http_transition_signature = ""
+            self._last_agent_runtime_signature = ""
+            self._last_agent_heartbeat_ms = 0
+            try:
+                self._write_agent_runtime_mirror(force_full=True)
+            except Exception as mirror_exc:
+                logging.debug("Failed to publish failed ComfyUI recycle runtime: %s", mirror_exc)
+            logging.error(
+                "Post-job ComfyUI recycle failed; capacity remains drained: jobId=%s itemId=%s err=%s",
+                lease.job_id,
+                lease.item_id,
+                exc,
+            )
+            return False
+
     def _local_comfy_has_class_type(self, class_type: str, timeout_seconds: float = 10.0) -> bool:
         if not isinstance(class_type, str) or not class_type.strip():
             return False
@@ -9191,6 +9272,8 @@ class DependencyAgent:
 
     def _agent_effective_execute_capacity(self) -> int:
         if self.mining_only:
+            return 0
+        if self._post_job_comfy_recycle_active.is_set():
             return 0
         return max(1, min(int(self.agent_max_execute_workers), int(self._agent_max_concurrent_execute_jobs)))
 
@@ -12420,6 +12503,7 @@ class DependencyAgent:
                     active.prompt_id = prompt_id
             lease.history_entry = history_entry
             lease.prompt_id = prompt_id
+            self._arm_post_job_comfy_recycle(lease)
             self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
             output_commit_payload: Dict[str, Any] = {"promptId": prompt_id}
             if self._coalesce_agent_lifecycle_events(lease):
@@ -12610,6 +12694,7 @@ class DependencyAgent:
                 e,
             )
         finally:
+            self._complete_post_job_comfy_recycle(lease)
             self._cleanup_agent_lease(lease)
 
     def _process_agent_queue_item(self, item: Dict[str, Any]) -> None:
@@ -12774,7 +12859,7 @@ class DependencyAgent:
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d restartComfyAfterSuccessfulJob=%s miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
@@ -12789,6 +12874,7 @@ class DependencyAgent:
             self.agent_local_readiness_file,
             int(self.agent_max_execute_workers),
             int(self.agent_max_upload_workers),
+            "yes" if self.restart_comfy_after_successful_job else "no",
             "yes" if self.mining_only else "no",
         )
         logging.info(
