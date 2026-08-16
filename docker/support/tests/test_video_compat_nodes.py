@@ -170,6 +170,7 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FurgenPrependImageToBatch" in module.NODE_CLASS_MAPPINGS
     assert "FurgenSeamScaleStabilize" in module.NODE_CLASS_MAPPINGS
     assert "FurgenTrimAudioDuration" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenBoundaryGradeMatch" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLatentGuideTemporalMask" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLTXVAddLatentGuideTemporal" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLTXGuideAttentionAdjust" in module.NODE_CLASS_MAPPINGS
@@ -291,6 +292,52 @@ def test_furgen_tail_context_utility_nodes_slice_images_and_audio():
     trimmed, = module.FurgenTrimAudioDuration().trim(audio, 8 / 24, 5 / 24)
     assert trimmed["sample_rate"] == 24
     assert trimmed["waveform"].flatten().tolist() == [8, 9, 10, 11, 12]
+
+
+def test_boundary_grade_uses_one_luma_gain_for_the_entire_clip():
+    module = _load_furgen_video_tools()
+    images = torch.stack((
+        torch.full((2, 2, 3), 0.40),
+        torch.full((2, 2, 3), 0.20),
+    ))
+    reference = torch.full((1, 2, 2, 3), 0.41)
+
+    corrected, = module.FurgenBoundaryGradeMatch().match(
+        images, reference, "luma_gain", 1.0, 0.95, 1.05, 0.0,
+    )
+
+    assert torch.allclose(corrected[0], reference[0], atol=1e-6)
+    assert torch.allclose(corrected[1], torch.full((2, 2, 3), 0.205), atol=1e-6)
+    assert torch.allclose(corrected[1] / corrected[0], images[1] / images[0], atol=1e-6)
+
+
+def test_boundary_grade_rgb_mode_is_bounded_and_preserves_extra_channels():
+    module = _load_furgen_video_tools()
+    images = torch.tensor([[[[0.20, 0.40, 0.50, 0.70]]]], dtype=torch.float32)
+    reference = torch.tensor([[[[0.30, 0.36, 0.60]]]], dtype=torch.float32)
+
+    corrected, = module.FurgenBoundaryGradeMatch().match(
+        images, reference, "rgb_gain", 1.0, 0.90, 1.10, 0.0,
+    )
+
+    assert torch.allclose(
+        corrected[0, 0, 0],
+        torch.tensor([0.22, 0.36, 0.55, 0.70]),
+        atol=1e-6,
+    )
+
+
+def test_boundary_grade_black_boundary_is_finite_and_neutral():
+    module = _load_furgen_video_tools()
+    images = torch.zeros((2, 2, 2, 3), dtype=torch.float32)
+    reference = torch.ones((1, 2, 2, 3), dtype=torch.float32)
+
+    corrected, = module.FurgenBoundaryGradeMatch().match(
+        images, reference, "luma_gain", 1.0, 0.95, 1.05, 0.0,
+    )
+
+    assert torch.isfinite(corrected).all()
+    assert torch.equal(corrected, images)
 
 
 def test_furgen_latent_guide_temporal_mask_adds_front_loaded_noise_mask():

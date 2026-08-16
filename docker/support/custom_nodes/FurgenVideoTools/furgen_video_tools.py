@@ -1567,6 +1567,117 @@ class FurgenReferenceColorMatch:
         return (_blend_and_restore_channels(images, corrected, strength),)
 
 
+class FurgenBoundaryGradeMatch:
+    """Apply one bounded gain, measured at frame zero, to the whole clip.
+
+    Unlike per-frame color matching, this preserves the generated clip's own
+    exposure changes.  It is intended for reconstruction bias at an anchored
+    extension boundary, where the reference is the parent clip's final frame.
+    """
+
+    MODES = ("luma_gain", "rgb_gain")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "mode": (list(cls.MODES), {"default": "luma_gain"}),
+                "strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "gain_min": (
+                    "FLOAT",
+                    {"default": 0.95, "min": 0.10, "max": 4.0, "step": 0.001},
+                ),
+                "gain_max": (
+                    "FLOAT",
+                    {"default": 1.05, "min": 0.10, "max": 4.0, "step": 0.001},
+                ),
+                "preserve_highlights": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "match"
+    CATEGORY = "Furgen/image"
+
+    def match(
+        self,
+        images,
+        reference,
+        mode,
+        strength,
+        gain_min,
+        gain_max,
+        preserve_highlights,
+    ):
+        if _is_neutral(strength, 0.0):
+            return (images,)
+
+        phase = "validate"
+        try:
+            with torch.no_grad():
+                rgb = _image_rgb(images)
+                ref_rgb = _first_reference_rgb(reference, images)
+                if images.shape[0] < 1 or reference.shape[0] < 1:
+                    raise ValueError("images and reference must each contain at least one frame")
+                if mode not in self.MODES:
+                    raise ValueError(f"unsupported boundary grade mode: {mode}")
+
+                phase = "boundary_stats"
+                first_rgb = rgb[:1].float()
+                ref_rgb = ref_rgb.float()
+                if mode == "luma_gain":
+                    source_stat = _luma(first_rgb).mean(dim=(0, 1, 2), keepdim=True)
+                    reference_stat = _luma(ref_rgb).mean(dim=(0, 1, 2), keepdim=True)
+                else:
+                    if ref_rgb.shape[-1] == 1 and first_rgb.shape[-1] > 1:
+                        ref_rgb = ref_rgb.expand(*ref_rgb.shape[:-1], first_rgb.shape[-1])
+                    elif first_rgb.shape[-1] == 1 and ref_rgb.shape[-1] > 1:
+                        ref_rgb = _luma(ref_rgb)
+                    if ref_rgb.shape[-1] != first_rgb.shape[-1]:
+                        raise ValueError("images and reference have incompatible channel counts")
+                    source_stat = first_rgb.mean(dim=(0, 1, 2), keepdim=True)
+                    reference_stat = ref_rgb.mean(dim=(0, 1, 2), keepdim=True)
+
+                if not torch.isfinite(source_stat).all() or not torch.isfinite(reference_stat).all():
+                    raise ValueError("boundary statistics must be finite")
+                eps = _eps_for(first_rgb)
+                neutral = torch.ones_like(source_stat)
+                measured_gain = torch.where(
+                    source_stat.abs() > eps,
+                    reference_stat / source_stat.clamp_min(eps),
+                    neutral,
+                )
+                lo = min(float(gain_min), float(gain_max))
+                hi = max(float(gain_min), float(gain_max))
+                measured_gain = measured_gain.clamp(lo, hi)
+                gain = neutral + (measured_gain - neutral) * float(strength)
+
+                phase = "frame_chunks"
+                output = torch.empty_like(images)
+                for start, end in _chunked_frame_ranges(images):
+                    chunk = images[start:end]
+                    chunk_rgb = _image_rgb(chunk)
+                    corrected = chunk_rgb * gain.to(device=chunk.device, dtype=chunk.dtype)
+                    corrected = _apply_highlight_protection(
+                        chunk_rgb,
+                        corrected,
+                        preserve_highlights,
+                    )
+                    output[start:end] = _restore_channels(chunk, corrected)
+                return (output,)
+        except Exception as exc:
+            raise _node_runtime_error("FurgenBoundaryGradeMatch", images, phase, exc) from exc
+
+
 class FurgenAdaptiveExposureMatch:
     @classmethod
     def INPUT_TYPES(cls):
@@ -3122,6 +3233,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenSeamScaleStabilize": FurgenSeamScaleStabilize,
     "FurgenTrimAudioDuration": FurgenTrimAudioDuration,
     "FurgenReferenceColorMatch": FurgenReferenceColorMatch,
+    "FurgenBoundaryGradeMatch": FurgenBoundaryGradeMatch,
     "FurgenAdaptiveExposureMatch": FurgenAdaptiveExposureMatch,
     "FurgenColorTransferMatch": FurgenColorTransferMatch,
     "FurgenTemporalToneSmooth": FurgenTemporalToneSmooth,
@@ -3145,6 +3257,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenSeamScaleStabilize": "Furgen Seam Scale Stabilize",
     "FurgenTrimAudioDuration": "Furgen Trim Audio Duration",
     "FurgenReferenceColorMatch": "Furgen Reference Color Match",
+    "FurgenBoundaryGradeMatch": "Furgen Boundary Grade Match",
     "FurgenAdaptiveExposureMatch": "Furgen Adaptive Exposure Match",
     "FurgenColorTransferMatch": "Furgen Color Transfer Match",
     "FurgenTemporalToneSmooth": "Furgen Temporal Tone Smooth",
