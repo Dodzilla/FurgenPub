@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.123"
+AGENT_VERSION = "dm-agent-py/0.10.124"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -11312,17 +11312,36 @@ class DependencyAgent:
             except Exception:
                 pass
 
+    def _touch_target_requires_download(self, item: Dict[str, Any]) -> bool:
+        dep_id = item.get("depId")
+        if not isinstance(dep_id, str) or not dep_id:
+            raise RuntimeError("Touch queue item missing depId")
+        resolved = item.get("resolved")
+        if not isinstance(resolved, dict):
+            raise RuntimeError("Touch queue item missing resolved dependency info")
+        dest_rel = resolved.get("destRelativePath")
+        if not isinstance(dest_rel, str) or not dest_rel:
+            raise RuntimeError("Touch queue item missing resolved destination path")
+        dest_abs = safe_join(self.comfyui_dir, dest_rel)
+        expected_size = resolved.get("expectedSizeBytes")
+        expected_size_bytes = int(expected_size) if isinstance(expected_size, (int, float)) and expected_size > 0 else 0
+        file_is_present = dest_abs.is_file()
+        if file_is_present and expected_size_bytes > 0:
+            try:
+                file_is_present = int(dest_abs.stat().st_size) == expected_size_bytes
+            except OSError:
+                file_is_present = False
+        return not file_is_present
+
     def _touch_item(self, item: Dict[str, Any]) -> None:
         dep_id = item.get("depId")
         if not isinstance(dep_id, str) or not dep_id:
-            return
-
+            raise RuntimeError("Touch queue item missing depId")
+        if self._touch_target_requires_download(item):
+            raise RuntimeError(f"Touch target is missing or size-mismatched for dependency {dep_id}")
         resolved = item.get("resolved")
-        kind = None
-        dest_rel = None
-        if isinstance(resolved, dict):
-            kind = resolved.get("kind")
-            dest_rel = resolved.get("destRelativePath")
+        kind = resolved.get("kind") if isinstance(resolved, dict) else None
+        dest_rel = resolved.get("destRelativePath") if isinstance(resolved, dict) else None
 
         with self._lock:
             self._state.failed.discard(dep_id)
@@ -11519,7 +11538,20 @@ class DependencyAgent:
                 self._post_status(item, "failed", error=str(e))
             return
 
-        # touch
+        # touch. If the file was evicted after scheduling, promote this queue
+        # item into the normal download path so retries/backoff remain intact.
+        try:
+            touch_requires_download = self._touch_target_requires_download(item)
+        except Exception as e:
+            self._post_status(item, "failed", error=str(e))
+            return
+        if touch_requires_download:
+            logging.warning(
+                "Touch found missing or size-mismatched dependency; downloading instead. depId=%s",
+                dep_id,
+            )
+            self._process_item({**item, "op": "download"})
+            return
         self._post_status(item, "running")
         try:
             self._touch_item(item)
