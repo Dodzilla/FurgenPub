@@ -2530,10 +2530,21 @@ class LocalState:
     lru: Dict[str, Dict[str, Any]]
     # Download retry schedule: depId -> {itemId, resolved, attempts, nextAttemptAtMs, lastError, lastAttemptAtMs}
     retry: Dict[str, Dict[str, Any]]
+    # Custom-node classes that a successful bundle install proved were
+    # available. Every later ComfyUI restart must re-prove this contract before
+    # the worker can restore its readiness marker.
+    node_bundle_verify_class_types: Set[str]
 
     @staticmethod
     def empty() -> "LocalState":
-        return LocalState(installed_static=set(), installed_dynamic=set(), failed=set(), lru={}, retry={})
+        return LocalState(
+            installed_static=set(),
+            installed_dynamic=set(),
+            failed=set(),
+            lru={},
+            retry={},
+            node_bundle_verify_class_types=set(),
+        )
 
 
 @dataclass
@@ -8402,9 +8413,11 @@ class DependencyAgent:
             logging.debug("Failed to publish ComfyUI recycle readiness drain: %s", exc)
 
         try:
+            verify_class_types = self._node_bundle_restart_verify_class_types()
             self._restart_local_comfy_and_wait(
                 prefer_process_restart=True,
                 allow_supervisor_restart=False,
+                verify_class_types=verify_class_types or None,
                 timeout_seconds=300.0,
                 require_readiness_marker=False,
             )
@@ -8419,9 +8432,10 @@ class DependencyAgent:
                 logging.debug("Failed to publish completed ComfyUI recycle runtime: %s", exc)
             self._request_agent_queue_poll()
             logging.info(
-                "Post-job ComfyUI recycle completed; capacity may resume: jobId=%s itemId=%s",
+                "Post-job ComfyUI recycle completed; capacity may resume: jobId=%s itemId=%s verifiedClassTypes=%d",
                 lease.job_id,
                 lease.item_id,
+                len(verify_class_types),
             )
             return True
         except Exception as exc:
@@ -8821,7 +8835,19 @@ class DependencyAgent:
                             "lastError": last_err or "",
                             "lastAttemptAtMs": max(0, last_attempt),
                         }
-            return LocalState(installed_static=installed_static, installed_dynamic=installed_dynamic, failed=failed, lru=lru, retry=retry)
+            node_bundle_verify_class_types = set(
+                class_type
+                for class_type in data.get("node_bundle_verify_class_types", [])
+                if isinstance(class_type, str) and class_type
+            )
+            return LocalState(
+                installed_static=installed_static,
+                installed_dynamic=installed_dynamic,
+                failed=failed,
+                lru=lru,
+                retry=retry,
+                node_bundle_verify_class_types=node_bundle_verify_class_types,
+            )
         except Exception:
             return LocalState.empty()
 
@@ -8833,11 +8859,38 @@ class DependencyAgent:
             "failed": sorted(self._state.failed),
             "lru": self._state.lru,
             "retry": self._state.retry,
+            "node_bundle_verify_class_types": sorted(self._state.node_bundle_verify_class_types),
             "updatedAtMs": _now_ms(),
         }
         tmp.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True), "utf-8")
         os.replace(str(tmp), str(self.state_path))
+
+    def _remember_node_bundle_verify_class_types(self, class_types: List[str]) -> None:
+        normalized = {
+            class_type
+            for class_type in class_types
+            if isinstance(class_type, str) and class_type
+        }
+        if not normalized:
+            return
+        changed = False
+        with self._lock:
+            missing = normalized - self._state.node_bundle_verify_class_types
+            if missing:
+                self._state.node_bundle_verify_class_types.update(missing)
+                changed = True
+        if changed:
+            self._save_state()
+            logging.info(
+                "Persisted custom-node restart verification contract: added=%d total=%d",
+                len(missing),
+                len(self._state.node_bundle_verify_class_types),
+            )
+
+    def _node_bundle_restart_verify_class_types(self) -> List[str]:
+        with self._lock:
+            return sorted(self._state.node_bundle_verify_class_types)
 
     def _normalize_agent_update_release(self, raw: Any) -> Optional[AgentSelfUpdateRelease]:
         if not isinstance(raw, dict):
@@ -10521,6 +10574,7 @@ class DependencyAgent:
                     verify_class_types=verify_class_types,
                     timeout_seconds=max(300.0, 120.0 * max(1, len(bundle_ids))),
                 )
+            self._remember_node_bundle_verify_class_types(verify_class_types)
             self._write_local_readiness_file()
             self._agent_ack(item_id, lease_id, "command_succeeded")
             return
@@ -10588,9 +10642,10 @@ class DependencyAgent:
             self._remove_local_readiness_file()
             comfy_restart_attempted = True
             self._restart_local_comfy_and_wait(
-                verify_class_types=verify_class_types,
+                verify_class_types=verify_class_types or None,
                 timeout_seconds=max(300.0, 120.0 * max(1, len(bundle_ids))),
             )
+            self._remember_node_bundle_verify_class_types(verify_class_types)
             self._write_local_readiness_file()
             self._agent_ack(item_id, lease_id, "command_succeeded")
         except Exception as exc:
@@ -10690,15 +10745,21 @@ class DependencyAgent:
         self._comfy_restart_command_active.set()
         self._remove_local_readiness_file()
         try:
+            verify_class_types = self._node_bundle_restart_verify_class_types()
             self._restart_local_comfy_and_wait(
                 prefer_process_restart=prefer_process_restart,
                 allow_supervisor_restart=allow_supervisor_restart,
+                verify_class_types=verify_class_types or None,
                 timeout_seconds=300.0,
                 require_readiness_marker=False,
             )
             self._write_local_readiness_file()
             self._clear_interrupted_comfy_restart_intent()
-            logging.info("Periodic ComfyUI restart completed; readiness restored and acknowledging success itemId=%s", item_id)
+            logging.info(
+                "Periodic ComfyUI restart completed; readiness restored and acknowledging success itemId=%s verifiedClassTypes=%d",
+                item_id,
+                len(verify_class_types),
+            )
             self._agent_ack(item_id, lease_id, "command_succeeded")
             try:
                 self._heartbeat(queue_depth=None)
