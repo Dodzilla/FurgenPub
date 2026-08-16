@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.130"
+AGENT_VERSION = "dm-agent-py/0.10.131"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -2534,6 +2534,8 @@ class LocalState:
     # available. Every later ComfyUI restart must re-prove this contract before
     # the worker can restore its readiness marker.
     node_bundle_verify_class_types: Set[str]
+    # Bundle-scoped proof enables targeted repair of the smallest affected set.
+    node_bundle_verify_class_types_by_bundle: Dict[str, Set[str]]
 
     @staticmethod
     def empty() -> "LocalState":
@@ -2544,6 +2546,7 @@ class LocalState:
             lru={},
             retry={},
             node_bundle_verify_class_types=set(),
+            node_bundle_verify_class_types_by_bundle={},
         )
 
 
@@ -4141,6 +4144,10 @@ class DependencyAgent:
         self._comfy_queue_summary_ttl_ms = max(1000, min(10000, int(_env_float("DM_COMFY_QUEUE_SUMMARY_TTL_SECONDS", 2.0) * 1000)))
         self._last_comfy_queue_summary: Dict[str, Any] = {}
         self._last_comfy_queue_summary_at_ms = 0
+        self.node_contract_probe_ttl_ms = int(
+            max(10.0, min(600.0, _env_float("DM_NODE_CONTRACT_PROBE_TTL_SECONDS", 60.0))) * 1000
+        )
+        self._node_contract_probe_cache: Dict[str, Any] = {}
         self.input_cache_dir = Path(_env_str("DM_INPUT_CACHE_DIR") or str(self.workspace / ".dm_input_cache"))
         self.input_cache_max_bytes = max(0, int(_parse_bytes(_env_str("DM_INPUT_CACHE_MAX_BYTES")) or 20 * 1024 * 1024 * 1024))
         self.input_cache_heartbeat_max_keys = max(0, min(1000, _env_int("DM_INPUT_CACHE_HEARTBEAT_MAX_KEYS", 50)))
@@ -4169,6 +4176,7 @@ class DependencyAgent:
         # worker. Keep the restart and readiness wait in one critical section so
         # concurrent execute workers cannot issue overlapping supervisor restarts.
         self._comfy_restart_lock = threading.RLock()
+        self._node_contract_probe_lock = threading.Lock()
         self._comfy_restart_command_active = threading.Event()
         self._post_job_comfy_recycle_active = threading.Event()
         self._interrupted_comfy_restart_path = self.workspace / ".fcs" / "comfy_restart_in_progress.json"
@@ -6084,6 +6092,13 @@ class DependencyAgent:
             held_leases = self._collect_active_leases()
             local_comfy = True if self.mining_only else self._local_comfy_reachable()
             readiness_present = True if self.mining_only else self._local_readiness_file_present()
+            node_contract = {
+                "ready": True,
+                "requiredClassCount": 0,
+                "missingClassTypes": [],
+                "affectedBundleIds": [],
+                "checkedAtMs": _now_ms(),
+            } if self.mining_only else self._local_node_contract_runtime(force=False)
             queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
             input_cache_inventory = self._collect_input_cache_inventory()
             stage_counts = self._agent_stage_counts_payload()
@@ -6091,6 +6106,7 @@ class DependencyAgent:
                 "localComfyReachable": bool(local_comfy),
                 "localReadinessFilePresent": bool(readiness_present),
                 "localReadinessFile": self.agent_local_readiness_file,
+                "nodeContract": node_contract,
                 "queueDepth": int(len(held_leases)),
                 **({"queueSummary": queue_summary} if queue_summary else {}),
                 "stageCounts": stage_counts,
@@ -6127,6 +6143,7 @@ class DependencyAgent:
             "lastHeartbeatAtMs": now_ms,
             "localComfyReachable": body.get("localComfyReachable") is True,
             "localReadinessFilePresent": body.get("localReadinessFilePresent") is True,
+            "nodeContract": body.get("nodeContract") if isinstance(body.get("nodeContract"), dict) else {},
             "queueDepth": int(body.get("queueDepth") or 0),
             "stageCounts": body.get("stageCounts") if isinstance(body.get("stageCounts"), dict) else {},
             "heldLeases": body.get("heldLeases") if isinstance(body.get("heldLeases"), list) else [],
@@ -6169,6 +6186,7 @@ class DependencyAgent:
             "lastHeartbeatAtMs": now_ms,
             "localComfyReachable": agent_control.get("localComfyReachable"),
             "localReadinessFilePresent": agent_control.get("localReadinessFilePresent"),
+            "nodeContract": agent_control.get("nodeContract"),
             "queueDepth": agent_control.get("queueDepth"),
             "stageCounts": agent_control.get("stageCounts"),
             "heldLeaseCount": agent_control.get("heldLeaseCount"),
@@ -6519,6 +6537,13 @@ class DependencyAgent:
             pass
 
     def _write_local_readiness_file(self) -> None:
+        if hasattr(self, "_state"):
+            contract = self._local_node_contract_runtime(force=True)
+            if contract.get("ready") is not True:
+                raise RuntimeError(
+                    "Refusing to write readiness marker with missing custom-node classes: "
+                    + ",".join(contract.get("missingClassTypes", [])[:10])
+                )
         path = self._local_readiness_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"Provisioning completed at {_now_iso()}\n", encoding="utf-8")
@@ -6591,6 +6616,15 @@ class DependencyAgent:
         if not self._local_comfy_reachable(timeout_seconds=5.0):
             return False
         if not self._video_gen_v2_sageattention_runtime_ready():
+            return False
+        node_contract = self._local_node_contract_runtime(force=True)
+        if node_contract.get("ready") is not True:
+            self._remove_local_readiness_file()
+            logging.error(
+                "Refusing orphaned readiness repair because the live node contract is incomplete: missing=%s bundles=%s",
+                ",".join(node_contract.get("missingClassTypes", [])[:10]),
+                ",".join(node_contract.get("affectedBundleIds", [])),
+            )
             return False
         self._write_local_readiness_file()
         item_id = str(intent.get("itemId") or "").strip()
@@ -6679,6 +6713,15 @@ class DependencyAgent:
             return False
         if not self._video_gen_v2_sageattention_runtime_ready():
             return False
+        node_contract = self._local_node_contract_runtime(force=True)
+        if node_contract.get("ready") is not True:
+            self._remove_local_readiness_file()
+            logging.error(
+                "Refusing orphaned readiness repair because the live node contract is incomplete: missing=%s bundles=%s",
+                ",".join(node_contract.get("missingClassTypes", [])[:10]),
+                ",".join(node_contract.get("affectedBundleIds", [])),
+            )
+            return False
 
         recovered_post_job_recycle = self._post_job_comfy_recycle_active.is_set()
         self._write_local_readiness_file()
@@ -6701,6 +6744,8 @@ class DependencyAgent:
                 return False
             if not self._video_gen_v2_sageattention_runtime_ready():
                 return False
+            if self._local_node_contract_runtime(force=True).get("ready") is not True:
+                return False
             self._write_local_readiness_file()
             logging.warning("Restored readiness marker after pre-restart failure: %s", reason)
             return True
@@ -6710,10 +6755,15 @@ class DependencyAgent:
 
     def _local_readiness_file_present(self) -> bool:
         try:
-            return (
-                self._local_readiness_file_path().exists()
-                and self._video_gen_v2_sageattention_runtime_ready()
-            )
+            if not self._local_readiness_file_path().exists():
+                return False
+            if not self._video_gen_v2_sageattention_runtime_ready():
+                return False
+            node_contract = self._local_node_contract_runtime(force=False)
+            if node_contract.get("ready") is not True:
+                self._remove_local_readiness_file()
+                return False
+            return True
         except Exception:
             return False
 
@@ -8141,10 +8191,7 @@ class DependencyAgent:
         wanted = [class_type for class_type in class_types if isinstance(class_type, str) and class_type.strip()]
         if not wanted:
             return False
-        for class_type in wanted:
-            if not self._local_comfy_has_class_type(class_type, timeout_seconds=5.0):
-                return False
-        return True
+        return bool(self._probe_local_node_contract(required_class_types=wanted, force=True).get("ready"))
 
     def _restart_local_comfy_with_supervisor(self) -> bool:
         supervisorctl = shutil.which("supervisorctl")
@@ -8515,6 +8562,97 @@ class DependencyAgent:
             )
             return False
 
+    def _invalidate_local_node_contract_probe(self) -> None:
+        lock = getattr(self, "_node_contract_probe_lock", None)
+        if lock is None:
+            self._node_contract_probe_cache = {}
+            return
+        with lock:
+            self._node_contract_probe_cache = {}
+
+    def _probe_local_node_contract(
+        self,
+        required_class_types: Optional[Iterable[str]] = None,
+        force: bool = False,
+        timeout_seconds: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Check every required custom-node class with one cached Comfy request.
+
+        `/object_info` is intentionally fetched at most once per TTL during
+        steady-state heartbeats. Restart/install paths force a fresh snapshot,
+        so readiness never rests on pre-restart class data.
+        """
+        wanted = sorted({
+            class_type.strip()
+            for class_type in (
+                required_class_types
+                if required_class_types is not None
+                else self._node_bundle_restart_verify_class_types()
+            )
+            if isinstance(class_type, str) and class_type.strip()
+        })
+        # Use datetime rather than time.time() so restart-loop tests and callers
+        # that control the polling clock do not consume an extra deadline tick.
+        checked_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        signature = _sha256_hex_bytes(_canonical_json_bytes(wanted))
+        if not wanted:
+            result = {
+                "ready": True,
+                "requiredClassCount": 0,
+                "missingClassTypes": [],
+                "checkedAtMs": checked_at_ms,
+                "contractHash": signature,
+            }
+            self._node_contract_probe_cache = result
+            return result
+
+        lock = getattr(self, "_node_contract_probe_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._node_contract_probe_lock = lock
+        with lock:
+            cached = getattr(self, "_node_contract_probe_cache", {})
+            ttl_ms = int(getattr(self, "node_contract_probe_ttl_ms", 60_000) or 60_000)
+            if (
+                not force
+                and isinstance(cached, dict)
+                and cached.get("contractHash") == signature
+                and checked_at_ms - int(cached.get("checkedAtMs") or 0) < ttl_ms
+            ):
+                return dict(cached)
+
+            try:
+                status, response = self._comfy_api_json("GET", "/object_info", timeout_seconds=timeout_seconds)
+                if status != 200 or not isinstance(response, dict):
+                    raise RuntimeError(f"object_info returned status={status}")
+                missing = [class_type for class_type in wanted if class_type not in response]
+                result = {
+                    "ready": not missing,
+                    "requiredClassCount": len(wanted),
+                    "missingClassTypes": missing[:100],
+                    "checkedAtMs": checked_at_ms,
+                    "contractHash": signature,
+                }
+            except Exception as exc:
+                result = {
+                    "ready": False,
+                    "requiredClassCount": len(wanted),
+                    "missingClassTypes": wanted[:100],
+                    "checkedAtMs": checked_at_ms,
+                    "contractHash": signature,
+                    "probeError": str(exc)[:500],
+                }
+            self._node_contract_probe_cache = result
+            return dict(result)
+
+    def _local_node_contract_runtime(self, force: bool = False) -> Dict[str, Any]:
+        result = self._probe_local_node_contract(force=force)
+        missing = result.get("missingClassTypes") if isinstance(result.get("missingClassTypes"), list) else []
+        return {
+            **result,
+            "affectedBundleIds": self._node_contract_affected_bundle_ids(missing),
+        }
+
     def _local_comfy_has_class_type(self, class_type: str, timeout_seconds: float = 10.0) -> bool:
         if not isinstance(class_type, str) or not class_type.strip():
             return False
@@ -8577,6 +8715,7 @@ class DependencyAgent:
             if isinstance(class_type, str) and class_type.strip()
         ))
         last_missing = normalized_verify
+        self._invalidate_local_node_contract_probe()
 
         while time.time() < deadline:
             reachable = self._local_comfy_reachable(timeout_seconds=5.0)
@@ -8589,11 +8728,12 @@ class DependencyAgent:
                 time.sleep(2.0)
                 continue
 
-            missing = [
-                class_type
-                for class_type in normalized_verify
-                if not self._local_comfy_has_class_type(class_type, timeout_seconds=5.0)
-            ]
+            contract = self._probe_local_node_contract(
+                required_class_types=normalized_verify,
+                force=True,
+                timeout_seconds=10.0,
+            )
+            missing = contract.get("missingClassTypes") if isinstance(contract.get("missingClassTypes"), list) else normalized_verify
             runtime_ready = self._video_gen_v2_sageattention_runtime_ready()
             # Never validate against the old listener while an asynchronous
             # restart is still pending. A port-down transition or an entirely
@@ -8923,6 +9063,20 @@ class DependencyAgent:
                 for class_type in data.get("node_bundle_verify_class_types", [])
                 if isinstance(class_type, str) and class_type
             )
+            node_bundle_verify_class_types_by_bundle: Dict[str, Set[str]] = {}
+            by_bundle_raw = data.get("node_bundle_verify_class_types_by_bundle", {})
+            if isinstance(by_bundle_raw, dict):
+                for bundle_id, class_types in by_bundle_raw.items():
+                    if not isinstance(bundle_id, str) or not bundle_id or not isinstance(class_types, list):
+                        continue
+                    normalized_classes = {
+                        class_type.strip()
+                        for class_type in class_types
+                        if isinstance(class_type, str) and class_type.strip()
+                    }
+                    if normalized_classes:
+                        node_bundle_verify_class_types_by_bundle[bundle_id] = normalized_classes
+                        node_bundle_verify_class_types.update(normalized_classes)
             return LocalState(
                 installed_static=installed_static,
                 installed_dynamic=installed_dynamic,
@@ -8930,6 +9084,7 @@ class DependencyAgent:
                 lru=lru,
                 retry=retry,
                 node_bundle_verify_class_types=node_bundle_verify_class_types,
+                node_bundle_verify_class_types_by_bundle=node_bundle_verify_class_types_by_bundle,
             )
         except Exception:
             return LocalState.empty()
@@ -8943,13 +9098,22 @@ class DependencyAgent:
             "lru": self._state.lru,
             "retry": self._state.retry,
             "node_bundle_verify_class_types": sorted(self._state.node_bundle_verify_class_types),
+            "node_bundle_verify_class_types_by_bundle": {
+                bundle_id: sorted(class_types)
+                for bundle_id, class_types in sorted(self._state.node_bundle_verify_class_types_by_bundle.items())
+            },
             "updatedAtMs": _now_ms(),
         }
         tmp.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True), "utf-8")
         os.replace(str(tmp), str(self.state_path))
 
-    def _remember_node_bundle_verify_class_types(self, class_types: List[str]) -> None:
+    def _remember_node_bundle_verify_class_types(
+        self,
+        class_types: List[str],
+        bundle_ids: Optional[List[str]] = None,
+        bundle_specs: Optional[Dict[str, Any]] = None,
+    ) -> None:
         normalized = {
             class_type
             for class_type in class_types
@@ -8963,6 +9127,33 @@ class DependencyAgent:
             if missing:
                 self._state.node_bundle_verify_class_types.update(missing)
                 changed = True
+            normalized_bundle_ids = [
+                bundle_id for bundle_id in (bundle_ids or [])
+                if isinstance(bundle_id, str) and bundle_id
+            ]
+            for bundle_id in normalized_bundle_ids:
+                scoped = {
+                    class_type.strip()
+                    for class_type in self._video_gen_v2_bundle_verify_class_types(bundle_id)
+                    if isinstance(class_type, str) and class_type.strip()
+                }
+                spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
+                if isinstance(spec, dict) and isinstance(spec.get("verifyClassTypes"), list):
+                    scoped.update(
+                        class_type.strip()
+                        for class_type in spec["verifyClassTypes"]
+                        if isinstance(class_type, str) and class_type.strip()
+                    )
+                if len(normalized_bundle_ids) == 1 and not scoped:
+                    scoped = set(normalized)
+                scoped.intersection_update(normalized)
+                if not scoped:
+                    continue
+                existing = self._state.node_bundle_verify_class_types_by_bundle.setdefault(bundle_id, set())
+                bundle_missing = scoped - existing
+                if bundle_missing:
+                    existing.update(bundle_missing)
+                    changed = True
         if changed:
             self._save_state()
             logging.info(
@@ -8974,6 +9165,21 @@ class DependencyAgent:
     def _node_bundle_restart_verify_class_types(self) -> List[str]:
         with self._lock:
             return sorted(self._state.node_bundle_verify_class_types)
+
+    def _node_contract_affected_bundle_ids(self, missing_class_types: Iterable[str]) -> List[str]:
+        missing = {
+            class_type.strip()
+            for class_type in missing_class_types
+            if isinstance(class_type, str) and class_type.strip()
+        }
+        if not missing:
+            return []
+        with self._lock:
+            return sorted(
+                bundle_id
+                for bundle_id, class_types in self._state.node_bundle_verify_class_types_by_bundle.items()
+                if missing.intersection(class_types)
+            )
 
     def _normalize_agent_update_release(self, raw: Any) -> Optional[AgentSelfUpdateRelease]:
         if not isinstance(raw, dict):
@@ -9825,6 +10031,13 @@ class DependencyAgent:
         held_leases = self._collect_active_leases()
         local_comfy = True if self.mining_only else self._local_comfy_reachable()
         readiness_present = True if self.mining_only else self._local_readiness_file_present()
+        node_contract = {
+            "ready": True,
+            "requiredClassCount": 0,
+            "missingClassTypes": [],
+            "affectedBundleIds": [],
+            "checkedAtMs": _now_ms(),
+        } if self.mining_only else self._local_node_contract_runtime(force=False)
         queue_depth = len(held_leases)
         queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
         input_cache_inventory = self._collect_input_cache_inventory()
@@ -9836,6 +10049,7 @@ class DependencyAgent:
             "localComfyReachable": bool(local_comfy),
             "localReadinessFilePresent": bool(readiness_present),
             "localReadinessFile": self.agent_local_readiness_file,
+            "nodeContract": node_contract,
             "queueDepth": int(queue_depth),
             **({"queueSummary": queue_summary} if queue_summary else {}),
             "stageCounts": stage_counts,
@@ -9894,6 +10108,7 @@ class DependencyAgent:
         self._last_agent_update_check_ms = self._last_agent_heartbeat_ms
 
         lease_results = data.get("leases")
+        stale_pre_execution: List[AgentExecuteLease] = []
         if isinstance(lease_results, list):
             for row in lease_results:
                 if not isinstance(row, dict):
@@ -9906,6 +10121,14 @@ class DependencyAgent:
                         if lease:
                             lease.cancel_requested = True
                             lease.cancel_reason = "lease_stale"
+                            if lease.stage in ("leased", "ready", "waiting_dependencies"):
+                                stale_pre_execution.append(lease)
+
+        # Do not feed a backend-rejected ready lease through the GPU executor
+        # merely to discover its cancel flag. Prefetching leases are left to
+        # their worker so temporary files cannot be removed beneath an active IO.
+        for lease in stale_pre_execution:
+            self._cleanup_agent_lease(lease)
 
         cancel_signals = data.get("cancelSignals")
         if isinstance(cancel_signals, list):
@@ -9917,6 +10140,39 @@ class DependencyAgent:
     def _register_active_lease(self, lease: AgentExecuteLease) -> None:
         with self._lock:
             self._active_exec_by_item[lease.item_id] = lease
+
+    def _prepare_logical_execute_lease(
+        self,
+        item_id: str,
+        job_id: str,
+        execution_attempt: int,
+        attempt_epoch: int,
+    ) -> str:
+        """Enforce one progressing lease per logical job attempt.
+
+        Equal/older duplicate deliveries are ignored locally without ACKing the
+        current tuple (the backend's ignored-stale ACK intentionally requeues a
+        current dispatched job). A newer epoch cancels older local work; normal
+        capacity accounting keeps the replacement from executing concurrently
+        while an older prompt is still winding down.
+        """
+        with self._lock:
+            if item_id in self._active_exec_by_item:
+                return "duplicate_item"
+            matches = [
+                lease
+                for lease in self._active_exec_by_item.values()
+                if lease.job_id == job_id and int(lease.execution_attempt) == int(execution_attempt)
+            ]
+            if not matches:
+                return "accept"
+            newest_epoch = max(int(lease.attempt_epoch) for lease in matches)
+            if int(attempt_epoch) <= newest_epoch:
+                return "stale_logical_lease" if int(attempt_epoch) < newest_epoch else "duplicate_logical_lease"
+            for lease in matches:
+                lease.cancel_requested = True
+                lease.cancel_reason = "superseded_by_newer_attempt_epoch"
+            return "accept_superseding"
 
     def _finish_active_lease(self, item_id: str) -> None:
         with self._lock:
@@ -10657,7 +10913,11 @@ class DependencyAgent:
                     verify_class_types=verify_class_types,
                     timeout_seconds=max(300.0, 120.0 * max(1, len(bundle_ids))),
                 )
-            self._remember_node_bundle_verify_class_types(verify_class_types)
+            self._remember_node_bundle_verify_class_types(
+                verify_class_types,
+                bundle_ids=bundle_ids,
+                bundle_specs=bundle_specs,
+            )
             self._write_local_readiness_file()
             self._agent_ack(item_id, lease_id, "command_succeeded")
             return
@@ -10728,7 +10988,11 @@ class DependencyAgent:
                 verify_class_types=verify_class_types or None,
                 timeout_seconds=max(300.0, 120.0 * max(1, len(bundle_ids))),
             )
-            self._remember_node_bundle_verify_class_types(verify_class_types)
+            self._remember_node_bundle_verify_class_types(
+                verify_class_types,
+                bundle_ids=bundle_ids,
+                bundle_specs=bundle_specs,
+            )
             self._write_local_readiness_file()
             self._agent_ack(item_id, lease_id, "command_succeeded")
         except Exception as exc:
@@ -12311,6 +12575,16 @@ class DependencyAgent:
             if not terminal_sent:
                 event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
                 err_code = "cancel_requested" if event_type == "job_cancelled" else "execution_error"
+                error_text = str(e)
+                node_contract: Optional[Dict[str, Any]] = None
+                if event_type == "job_failed" and (
+                    "missing_node_type" in error_text.lower()
+                    or ("node" in error_text.lower() and "not found" in error_text.lower())
+                ):
+                    self._invalidate_local_node_contract_probe()
+                    node_contract = self._local_node_contract_runtime(force=True)
+                    self._remove_local_readiness_file()
+                    err_code = "node_contract_missing"
                 prompt_id = None
                 with self._lock:
                     active = self._active_exec_by_item.get(lease.item_id)
@@ -12318,8 +12592,10 @@ class DependencyAgent:
                         prompt_id = active.prompt_id
                 payload: Dict[str, Any] = {
                     "errorCode": err_code,
-                    "errorMessage": str(e)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
+                    "errorMessage": error_text[:MAX_AGENT_ERROR_MESSAGE_CHARS],
                 }
+                if node_contract is not None:
+                    payload["nodeContract"] = node_contract
                 if prompt_id:
                     payload["promptId"] = prompt_id
                 try:
@@ -12721,6 +12997,16 @@ class DependencyAgent:
             if not terminal_sent:
                 event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
                 err_code = "cancel_requested" if event_type == "job_cancelled" else "execution_error"
+                error_text = str(e)
+                node_contract: Optional[Dict[str, Any]] = None
+                if event_type == "job_failed" and (
+                    "missing_node_type" in error_text.lower()
+                    or ("node" in error_text.lower() and "not found" in error_text.lower())
+                ):
+                    self._invalidate_local_node_contract_probe()
+                    node_contract = self._local_node_contract_runtime(force=True)
+                    self._remove_local_readiness_file()
+                    err_code = "node_contract_missing"
                 prompt_id = None
                 with self._lock:
                     active = self._active_exec_by_item.get(lease.item_id)
@@ -12728,8 +13014,10 @@ class DependencyAgent:
                         prompt_id = active.prompt_id
                 payload: Dict[str, Any] = {
                     "errorCode": err_code,
-                    "errorMessage": str(e)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
+                    "errorMessage": error_text[:MAX_AGENT_ERROR_MESSAGE_CHARS],
                 }
+                if node_contract is not None:
+                    payload["nodeContract"] = node_contract
                 if prompt_id:
                     payload["promptId"] = prompt_id
                 attach_node_timings(payload, event_type)
@@ -12931,14 +13219,22 @@ class DependencyAgent:
                 except Exception:
                     pass
                 return
-            with self._lock:
-                if item_id in self._active_exec_by_item:
-                    # Duplicate lease delivery for an already-active item.
-                    try:
-                        self._agent_ack(item_id, lease_id, "command_ignored_stale")
-                    except Exception:
-                        pass
-                    return
+            lease_decision = self._prepare_logical_execute_lease(
+                item_id,
+                job_id,
+                int(execution_attempt),
+                int(attempt_epoch),
+            )
+            if lease_decision != "accept" and lease_decision != "accept_superseding":
+                logging.warning(
+                    "Ignored duplicate/stale logical execute lease without disturbing active work: itemId=%s jobId=%s attempt=%d epoch=%d decision=%s",
+                    item_id,
+                    job_id,
+                    int(execution_attempt),
+                    int(attempt_epoch),
+                    lease_decision,
+                )
+                return
             if self.mining_only:
                 lease = AgentExecuteLease(
                     item_id=item_id,
