@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.127"
+AGENT_VERSION = "dm-agent-py/0.10.128"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6904,6 +6904,14 @@ class DependencyAgent:
         resolved = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=timeout_seconds)
         return self._probe_local_comfy_base_url(resolved, timeout_seconds=timeout_seconds)
 
+    def _wait_for_local_comfy_down(self, timeout_seconds: float = 30.0) -> bool:
+        deadline = time.time() + max(1.0, timeout_seconds)
+        while time.time() < deadline:
+            if not self._local_comfy_reachable(timeout_seconds=1.0):
+                return True
+            time.sleep(0.5)
+        return False
+
     def _local_comfy_queue_summary(
         self,
         timeout_seconds: float = 5.0,
@@ -8271,7 +8279,8 @@ class DependencyAgent:
                 continue
             except Exception as exc:
                 logging.warning("Failed to terminate ComfyUI pid %s before launch-script restart: %s", pid, exc)
-        if pids and not self._wait_for_pids_to_exit(pids, timeout_seconds=20.0):
+        turnover_proven = bool(pids) and self._wait_for_pids_to_exit(pids, timeout_seconds=20.0)
+        if pids and not turnover_proven:
             for pid in pids:
                 try:
                     os.kill(pid, signal.SIGKILL)
@@ -8279,7 +8288,7 @@ class DependencyAgent:
                     continue
                 except Exception as exc:
                     logging.warning("Failed to kill ComfyUI pid %s before launch-script restart: %s", pid, exc)
-            self._wait_for_pids_to_exit(pids, timeout_seconds=5.0)
+            turnover_proven = self._wait_for_pids_to_exit(pids, timeout_seconds=5.0)
 
         env = os.environ.copy()
         env.setdefault("WORKSPACE", str(self.workspace))
@@ -8325,6 +8334,8 @@ class DependencyAgent:
                 start_new_session=True,
             )
             logging.info("Restarted ComfyUI via launch script: %s", launch_script)
+            if turnover_proven:
+                self._last_comfy_restart_process_turnover_proven = True
             return True
         except Exception as exc:
             logging.warning("ComfyUI launch-script restart failed (%s): %s", launch_script, exc)
@@ -8350,6 +8361,8 @@ class DependencyAgent:
             for endpoint in restart_endpoints:
                 try:
                     self._comfy_api_json("GET", endpoint, timeout_seconds=10.0)
+                    if self._wait_for_local_comfy_down(timeout_seconds=30.0):
+                        self._last_comfy_restart_process_turnover_proven = True
                     return
                 except Exception as exc:
                     msg = str(exc).lower()
@@ -8357,6 +8370,8 @@ class DependencyAgent:
                         comfy_was_reachable
                         and ("connection reset" in msg or "ecconnreset" in msg or "timeout" in msg)
                     ):
+                        if self._wait_for_local_comfy_down(timeout_seconds=30.0):
+                            self._last_comfy_restart_process_turnover_proven = True
                         return
 
             if allow_supervisor_restart and not prefer_process_restart and self._restart_local_comfy_with_supervisor():
@@ -8388,6 +8403,7 @@ class DependencyAgent:
                 return False
 
             previous_process_ids = self._find_local_comfy_main_processes()
+            self._last_comfy_restart_process_turnover_proven = False
             if allow_supervisor_restart:
                 self._restart_local_comfy(prefer_process_restart=prefer_process_restart)
             else:
@@ -8543,7 +8559,9 @@ class DependencyAgent:
             int(pid) for pid in restart_process_ids or []
             if isinstance(pid, int) and pid > 0
         }
-        saw_process_turnover = False
+        saw_process_turnover = bool(
+            getattr(self, "_last_comfy_restart_process_turnover_proven", False)
+        )
         normalized_verify = list(dict.fromkeys(
             class_type.strip()
             for class_type in verify_class_types
