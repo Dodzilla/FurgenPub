@@ -327,6 +327,26 @@ def test_boundary_grade_rgb_mode_is_bounded_and_preserves_extra_channels():
     )
 
 
+def test_boundary_grade_rgb_mode_matches_means_after_highlight_clipping():
+    module = _load_furgen_video_tools()
+    images = torch.tensor(
+        [[[[0.20, 0.40, 0.80], [0.10, 0.30, 1.00]]]], dtype=torch.float32
+    )
+    reference = torch.tensor(
+        [[[[0.40, 0.60, 0.90], [0.30, 0.50, 1.00]]]], dtype=torch.float32
+    )
+
+    corrected, = module.FurgenBoundaryGradeMatch().match(
+        images, reference, "rgb_gain", 1.0, 0.50, 3.00, 0.0,
+    )
+
+    assert torch.allclose(
+        corrected.mean(dim=(0, 1, 2)),
+        reference.mean(dim=(0, 1, 2)),
+        atol=0.002,
+    )
+
+
 def test_boundary_grade_black_boundary_is_finite_and_neutral():
     module = _load_furgen_video_tools()
     images = torch.zeros((2, 2, 2, 3), dtype=torch.float32)

@@ -1608,6 +1608,45 @@ class FurgenBoundaryGradeMatch:
     FUNCTION = "match"
     CATEGORY = "Furgen/image"
 
+    @staticmethod
+    def _bounded_gain_for_clipped_mean(first_rgb, source_stat, reference_stat, mode, lo, hi, eps):
+        """Match the post-clamp mean using frame zero only."""
+        neutral = torch.ones_like(source_stat)
+        direct = torch.where(
+            source_stat.abs() > eps,
+            reference_stat / source_stat.clamp_min(eps),
+            neutral,
+        ).clamp(lo, hi)
+
+        if mode == "luma_gain":
+            direct_clips = (first_rgb * direct > 1.0).any().reshape_as(direct)
+        else:
+            direct_clips = (first_rgb * direct > 1.0).any(dim=(0, 1, 2), keepdim=True)
+
+        # Ordinary reconstruction-bias corrections do not clip, so avoid the
+        # iterative path entirely for the common case.
+        if not bool(direct_clips.any().item()):
+            return direct
+
+        # Ten vectorized bisection steps touch only the first 24-fps frame.
+        # The full clip still takes the single multiply/clamp fast path below.
+        lower = torch.full_like(source_stat, lo)
+        upper = torch.full_like(source_stat, hi)
+        for _ in range(10):
+            midpoint = (lower + upper) * 0.5
+            corrected = (first_rgb * midpoint).clamp(0.0, 1.0)
+            corrected_stat = (
+                _luma(corrected).mean(dim=(0, 1, 2), keepdim=True)
+                if mode == "luma_gain"
+                else corrected.mean(dim=(0, 1, 2), keepdim=True)
+            )
+            below_target = corrected_stat < reference_stat
+            lower = torch.where(below_target, midpoint, lower)
+            upper = torch.where(below_target, upper, midpoint)
+
+        solved = torch.where(direct_clips, (lower + upper) * 0.5, direct)
+        return torch.where(source_stat.abs() > eps, solved, neutral)
+
     def match(
         self,
         images,
@@ -1650,15 +1689,18 @@ class FurgenBoundaryGradeMatch:
                 if not torch.isfinite(source_stat).all() or not torch.isfinite(reference_stat).all():
                     raise ValueError("boundary statistics must be finite")
                 eps = _eps_for(first_rgb)
-                neutral = torch.ones_like(source_stat)
-                measured_gain = torch.where(
-                    source_stat.abs() > eps,
-                    reference_stat / source_stat.clamp_min(eps),
-                    neutral,
-                )
                 lo = min(float(gain_min), float(gain_max))
                 hi = max(float(gain_min), float(gain_max))
-                measured_gain = measured_gain.clamp(lo, hi)
+                neutral = torch.ones_like(source_stat)
+                measured_gain = self._bounded_gain_for_clipped_mean(
+                    first_rgb,
+                    source_stat,
+                    reference_stat,
+                    mode,
+                    lo,
+                    hi,
+                    eps,
+                )
                 gain = neutral + (measured_gain - neutral) * float(strength)
 
                 phase = "frame_chunks"
