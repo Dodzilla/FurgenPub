@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.125"
+AGENT_VERSION = "dm-agent-py/0.10.126"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -8370,6 +8370,7 @@ class DependencyAgent:
                 logging.info("ComfyUI recovered while waiting for restart ownership; skipping duplicate restart.")
                 return False
 
+            previous_process_ids = self._find_local_comfy_processes()
             if allow_supervisor_restart:
                 self._restart_local_comfy(prefer_process_restart=prefer_process_restart)
             else:
@@ -8386,10 +8387,14 @@ class DependencyAgent:
                         require_readiness_marker=False,
                     )
             else:
-                self._wait_for_local_comfy_restart(
-                    verify_class_types,
-                    timeout_seconds=timeout_seconds,
-                )
+                self._restart_verify_previous_process_ids = previous_process_ids
+                try:
+                    self._wait_for_local_comfy_restart(
+                        verify_class_types,
+                        timeout_seconds=timeout_seconds,
+                    )
+                finally:
+                    self._restart_verify_previous_process_ids = []
             return True
 
     def _arm_post_job_comfy_recycle(self, lease: AgentExecuteLease) -> None:
@@ -8504,9 +8509,24 @@ class DependencyAgent:
             time.sleep(2.0)
         raise RuntimeError("Local ComfyUI did not become ready after restart.")
 
-    def _wait_for_local_comfy_restart(self, verify_class_types: List[str], timeout_seconds: float = 300.0) -> None:
+    def _wait_for_local_comfy_restart(
+        self,
+        verify_class_types: List[str],
+        timeout_seconds: float = 300.0,
+        previous_process_ids: Optional[Iterable[int]] = None,
+    ) -> None:
         deadline = time.time() + max(30.0, timeout_seconds)
         saw_down = not self._local_comfy_reachable(timeout_seconds=5.0)
+        restart_process_ids = (
+            previous_process_ids
+            if previous_process_ids is not None
+            else getattr(self, "_restart_verify_previous_process_ids", [])
+        )
+        previous_pids = {
+            int(pid) for pid in restart_process_ids or []
+            if isinstance(pid, int) and pid > 0
+        }
+        saw_process_turnover = False
         normalized_verify = list(dict.fromkeys(
             class_type.strip()
             for class_type in verify_class_types
@@ -8516,6 +8536,10 @@ class DependencyAgent:
 
         while time.time() < deadline:
             reachable = self._local_comfy_reachable(timeout_seconds=5.0)
+            if previous_pids:
+                current_pids = set(self._find_local_comfy_processes())
+                if current_pids and current_pids.isdisjoint(previous_pids):
+                    saw_process_turnover = True
             if not reachable:
                 saw_down = True
                 time.sleep(2.0)
@@ -8528,9 +8552,10 @@ class DependencyAgent:
             ]
             runtime_ready = self._video_gen_v2_sageattention_runtime_ready()
             # Never validate against the old listener while an asynchronous
-            # restart is still pending. We must observe the port go down and
-            # then verify every class on the replacement process.
-            if runtime_ready and not missing and saw_down:
+            # restart is still pending. A port-down transition or an entirely
+            # new Comfy PID set proves process turnover; the latter also covers
+            # synchronous launch-script restarts completed before polling.
+            if runtime_ready and not missing and (saw_down or saw_process_turnover):
                 return
             if runtime_ready and not normalized_verify and saw_down and reachable:
                 return
