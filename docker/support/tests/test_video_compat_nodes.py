@@ -347,6 +347,19 @@ def test_boundary_grade_rgb_mode_matches_means_after_highlight_clipping():
     )
 
 
+def test_boundary_grade_encode_compensation_overshoots_target_once():
+    module = _load_furgen_video_tools()
+    images = torch.full((2, 2, 2, 3), 0.40, dtype=torch.float32)
+    reference = torch.full((1, 2, 2, 3), 0.41, dtype=torch.float32)
+
+    corrected, = module.FurgenBoundaryGradeMatch().match(
+        images, reference, "rgb_gain", 1.0, 0.90, 1.10, 0.0, 1.024,
+    )
+
+    assert torch.allclose(corrected[0], reference[0] * 1.024, atol=1e-6)
+    assert torch.allclose(corrected[1], reference[0] * 1.024, atol=1e-6)
+
+
 def test_boundary_grade_black_boundary_is_finite_and_neutral():
     module = _load_furgen_video_tools()
     images = torch.zeros((2, 2, 2, 3), dtype=torch.float32)

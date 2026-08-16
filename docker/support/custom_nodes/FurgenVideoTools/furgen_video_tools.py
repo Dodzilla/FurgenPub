@@ -1600,7 +1600,13 @@ class FurgenBoundaryGradeMatch:
                     "FLOAT",
                     {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
                 ),
-            }
+            },
+            "optional": {
+                "encode_compensation": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.90, "max": 1.10, "step": 0.001},
+                ),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -1656,6 +1662,7 @@ class FurgenBoundaryGradeMatch:
         gain_min,
         gain_max,
         preserve_highlights,
+        encode_compensation=1.0,
     ):
         if _is_neutral(strength, 0.0):
             return (images,)
@@ -1688,6 +1695,8 @@ class FurgenBoundaryGradeMatch:
 
                 if not torch.isfinite(source_stat).all() or not torch.isfinite(reference_stat).all():
                     raise ValueError("boundary statistics must be finite")
+                compensation = max(0.90, min(1.10, float(encode_compensation)))
+                reference_stat = reference_stat * compensation
                 eps = _eps_for(first_rgb)
                 lo = min(float(gain_min), float(gain_max))
                 hi = max(float(gain_min), float(gain_max))
