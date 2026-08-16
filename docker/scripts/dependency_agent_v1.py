@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.126"
+AGENT_VERSION = "dm-agent-py/0.10.127"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -8222,6 +8222,23 @@ class DependencyAgent:
                 pids.append(pid)
         return sorted(set(pids))
 
+    def _find_local_comfy_main_processes(self) -> List[int]:
+        """Return only Comfy's Python main.py PIDs, excluding stable wrappers."""
+        main_pids: List[int] = []
+        for pid in self._find_local_comfy_processes():
+            try:
+                raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+                args = [
+                    part.decode("utf-8", errors="replace")
+                    for part in raw.split(b"\x00")
+                    if part
+                ]
+            except Exception:
+                continue
+            if any(arg == "main.py" or arg.endswith("/main.py") for arg in args):
+                main_pids.append(pid)
+        return sorted(set(main_pids))
+
     def _wait_for_pids_to_exit(self, pids: List[int], timeout_seconds: float) -> bool:
         deadline = time.time() + max(0.0, timeout_seconds)
         remaining = set(int(pid) for pid in pids if isinstance(pid, int) and pid > 0)
@@ -8370,7 +8387,7 @@ class DependencyAgent:
                 logging.info("ComfyUI recovered while waiting for restart ownership; skipping duplicate restart.")
                 return False
 
-            previous_process_ids = self._find_local_comfy_processes()
+            previous_process_ids = self._find_local_comfy_main_processes()
             if allow_supervisor_restart:
                 self._restart_local_comfy(prefer_process_restart=prefer_process_restart)
             else:
@@ -8537,7 +8554,7 @@ class DependencyAgent:
         while time.time() < deadline:
             reachable = self._local_comfy_reachable(timeout_seconds=5.0)
             if previous_pids:
-                current_pids = set(self._find_local_comfy_processes())
+                current_pids = set(self._find_local_comfy_main_processes())
                 if current_pids and current_pids.isdisjoint(previous_pids):
                     saw_process_turnover = True
             if not reachable:
