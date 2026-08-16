@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.124"
+AGENT_VERSION = "dm-agent-py/0.10.125"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -7893,7 +7893,11 @@ class DependencyAgent:
         dest_dir = custom_nodes_dir / "FurgenVideoTools"
         custom_nodes_dir.mkdir(parents=True, exist_ok=True)
 
-        for src_dir in self._furgen_video_tools_source_candidates():
+        # A signed bundle's commit-pinned URL is authoritative. Falling back to
+        # a usable but stale image-local copy would make the recorded install
+        # signature lie about the bytes actually installed.
+        source_candidates = [] if furgenpub_raw_base_url else self._furgen_video_tools_source_candidates()
+        for src_dir in source_candidates:
             try:
                 if self._furgen_video_tools_source_is_usable(src_dir, required_class_types=required, log_skip=True):
                     temp_dir = dest_dir.with_name(f".{dest_dir.name}.tmp-{uuid.uuid4().hex}")
@@ -7938,6 +7942,13 @@ class DependencyAgent:
                     "Downloaded FurgenVideoTools source is missing required class types "
                     f"for install: {', '.join(required)} ({remote_base})"
                 )
+            subprocess.run(
+                [self._comfy_python_executable(), "-m", "py_compile", str(temp_dir / "__init__.py"), str(temp_dir / "furgen_video_tools.py")],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
             if dest_dir.exists():
                 shutil.rmtree(dest_dir)
             os.replace(str(temp_dir), str(dest_dir))
@@ -8516,7 +8527,10 @@ class DependencyAgent:
                 if not self._local_comfy_has_class_type(class_type, timeout_seconds=5.0)
             ]
             runtime_ready = self._video_gen_v2_sageattention_runtime_ready()
-            if runtime_ready and not missing and (saw_down or normalized_verify):
+            # Never validate against the old listener while an asynchronous
+            # restart is still pending. We must observe the port go down and
+            # then verify every class on the replacement process.
+            if runtime_ready and not missing and saw_down:
                 return
             if runtime_ready and not normalized_verify and saw_down and reachable:
                 return
