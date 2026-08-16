@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.128"
+AGENT_VERSION = "dm-agent-py/0.10.129"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6649,8 +6649,8 @@ class DependencyAgent:
         )
         return True
 
-    def _repair_orphaned_video_gen_v2_readiness(self) -> bool:
-        """Restore a lost video_gen_v2 marker after Comfy is safely usable.
+    def _repair_orphaned_readiness_marker(self) -> bool:
+        """Restore a lost readiness marker after Comfy is safely usable.
 
         The managed launch and bundle-install paths remove the readiness marker
         before restarting ComfyUI. A process interruption or an out-of-band
@@ -6662,7 +6662,7 @@ class DependencyAgent:
         Never repair while bootstrap, restart, or maintenance work is active;
         in those states a missing marker is intentional.
         """
-        if (self.server_type or "").strip() != "video_gen_v2" or self.mining_only:
+        if self.mining_only:
             return False
         if self._local_readiness_file_present():
             return False
@@ -6682,7 +6682,8 @@ class DependencyAgent:
 
         self._write_local_readiness_file()
         logging.warning(
-            "Repaired orphaned video_gen_v2 readiness marker after confirming local ComfyUI health."
+            "Repaired orphaned %s readiness marker after confirming local ComfyUI health.",
+            (self.server_type or "unknown").strip() or "unknown",
         )
         return True
 
@@ -13125,9 +13126,9 @@ class DependencyAgent:
                     except Exception as exc:
                         logging.warning("Interrupted ComfyUI restart recovery failed: %s", exc)
                     try:
-                        self._repair_orphaned_video_gen_v2_readiness()
+                        self._repair_orphaned_readiness_marker()
                     except Exception as exc:
-                        logging.warning("Orphaned video_gen_v2 readiness repair failed: %s", exc)
+                        logging.warning("Orphaned readiness marker repair failed: %s", exc)
                 agent_poll_wakeup_requested = False
                 if self._dependency_poll_wakeup.is_set():
                     self._dependency_poll_wakeup.clear()
