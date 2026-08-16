@@ -133,7 +133,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.129"
+AGENT_VERSION = "dm-agent-py/0.10.130"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -6680,10 +6680,18 @@ class DependencyAgent:
         if not self._video_gen_v2_sageattention_runtime_ready():
             return False
 
+        recovered_post_job_recycle = self._post_job_comfy_recycle_active.is_set()
         self._write_local_readiness_file()
+        if recovered_post_job_recycle:
+            self._post_job_comfy_recycle_active.clear()
+            self._last_agent_http_transition_signature = ""
+            self._last_agent_runtime_signature = ""
+            self._last_agent_heartbeat_ms = 0
+        self._request_agent_queue_poll()
         logging.warning(
-            "Repaired orphaned %s readiness marker after confirming local ComfyUI health.",
+            "Repaired orphaned %s readiness marker after confirming local ComfyUI health%s.",
             (self.server_type or "unknown").strip() or "unknown",
+            " and released the stale post-job recycle capacity gate" if recovered_post_job_recycle else "",
         )
         return True
 
