@@ -340,6 +340,20 @@ def test_boundary_grade_black_boundary_is_finite_and_neutral():
     assert torch.equal(corrected, images)
 
 
+def test_boundary_grade_fast_path_does_not_mutate_its_input():
+    module = _load_furgen_video_tools()
+    images = torch.full((3, 2, 2, 3), 0.40, dtype=torch.float32)
+    original = images.clone()
+    reference = torch.full((1, 2, 2, 3), 0.41, dtype=torch.float32)
+
+    corrected, = module.FurgenBoundaryGradeMatch().match(
+        images, reference, "luma_gain", 1.0, 0.95, 1.05, 0.0,
+    )
+
+    assert torch.equal(images, original)
+    assert corrected.data_ptr() != images.data_ptr()
+
+
 def test_furgen_latent_guide_temporal_mask_adds_front_loaded_noise_mask():
     module = _load_furgen_video_tools()
 

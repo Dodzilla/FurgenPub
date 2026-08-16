@@ -1662,17 +1662,26 @@ class FurgenBoundaryGradeMatch:
                 gain = neutral + (measured_gain - neutral) * float(strength)
 
                 phase = "frame_chunks"
-                output = torch.empty_like(images)
-                for start, end in _chunked_frame_ranges(images):
-                    chunk = images[start:end]
-                    chunk_rgb = _image_rgb(chunk)
-                    corrected = chunk_rgb * gain.to(device=chunk.device, dtype=chunk.dtype)
-                    corrected = _apply_highlight_protection(
-                        chunk_rgb,
-                        corrected,
-                        preserve_highlights,
-                    )
-                    output[start:end] = _restore_channels(chunk, corrected)
+                typed_gain = gain.to(device=images.device, dtype=images.dtype)
+                output = images.clone()
+                channel_count = rgb.shape[-1]
+                if _is_neutral(preserve_highlights, 0.0):
+                    # Production fast path: one output allocation, no full-size
+                    # corrected-frame temporary, and alpha/extra channels remain
+                    # byte-for-byte unchanged.
+                    torch.mul(rgb, typed_gain, out=output[..., :channel_count])
+                    output[..., :channel_count].clamp_(0.0, 1.0)
+                else:
+                    for start, end in _chunked_frame_ranges(images):
+                        chunk = images[start:end]
+                        chunk_rgb = _image_rgb(chunk)
+                        corrected = chunk_rgb * typed_gain
+                        corrected = _apply_highlight_protection(
+                            chunk_rgb,
+                            corrected,
+                            preserve_highlights,
+                        )
+                        output[start:end] = _restore_channels(chunk, corrected)
                 return (output,)
         except Exception as exc:
             raise _node_runtime_error("FurgenBoundaryGradeMatch", images, phase, exc) from exc
