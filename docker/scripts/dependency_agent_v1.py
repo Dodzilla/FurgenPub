@@ -921,6 +921,28 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def collect_cgroup_memory_telemetry(cgroup_root: Path = Path("/sys/fs/cgroup")) -> Dict[str, Any]:
+    """Collect cheap container-wide cgroup v2 memory counters for runtime sizing."""
+    fields = {
+        "currentBytes": "memory.current",
+        "peakBytes": "memory.peak",
+        "swapCurrentBytes": "memory.swap.current",
+    }
+    telemetry: Dict[str, Any] = {
+        "source": "cgroup_v2",
+        "measuredAtMs": _now_ms(),
+    }
+    for output_key, file_name in fields.items():
+        try:
+            raw = (cgroup_root / file_name).read_text(encoding="utf-8").strip()
+            value = int(raw)
+            if value >= 0:
+                telemetry[output_key] = value
+        except (OSError, TypeError, ValueError):
+            continue
+    return telemetry if any(key in telemetry for key in fields) else {}
+
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -6102,6 +6124,7 @@ class DependencyAgent:
             queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
             input_cache_inventory = self._collect_input_cache_inventory()
             stage_counts = self._agent_stage_counts_payload()
+            memory_telemetry = collect_cgroup_memory_telemetry()
             body = {
                 "localComfyReachable": bool(local_comfy),
                 "localReadinessFilePresent": bool(readiness_present),
@@ -6120,6 +6143,7 @@ class DependencyAgent:
                 "inputCacheBytesUsed": int(input_cache_inventory.get("bytesUsed", 0)),
                 "inputCacheMaxBytes": int(input_cache_inventory.get("maxBytes", 0)),
                 "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
+                **({"memoryTelemetry": memory_telemetry} if memory_telemetry else {}),
                 "idleMining": self._idle_prl_miner.snapshot(),
                 "agentVersion": AGENT_VERSION,
                 "capabilities": {
@@ -6154,6 +6178,9 @@ class DependencyAgent:
             "maxUploadJobs": int(body.get("maxUploadJobs") or 0),
             "inputCacheKeysHash": input_cache_keys_hash,
         }
+        memory_telemetry = body.get("memoryTelemetry")
+        if isinstance(memory_telemetry, dict) and memory_telemetry:
+            agent_control["memoryTelemetry"] = memory_telemetry
         queue_summary = body.get("queueSummary")
         if isinstance(queue_summary, dict) and queue_summary:
             agent_control["queueSummary"] = queue_summary
@@ -6196,6 +6223,8 @@ class DependencyAgent:
             "maxUploadJobs": agent_control.get("maxUploadJobs"),
             "inputCacheKeysHash": agent_control.get("inputCacheKeysHash"),
         }
+        if "memoryTelemetry" in agent_control:
+            hot_agent_control["memoryTelemetry"] = agent_control.get("memoryTelemetry")
         if "queueSummary" in agent_control:
             hot_agent_control["queueSummary"] = agent_control.get("queueSummary")
         if full:
@@ -10042,6 +10071,7 @@ class DependencyAgent:
         queue_summary = {} if self.mining_only else self._local_comfy_queue_summary(timeout_seconds=5.0)
         input_cache_inventory = self._collect_input_cache_inventory()
         stage_counts = self._agent_stage_counts_payload()
+        memory_telemetry = collect_cgroup_memory_telemetry()
 
         body: Dict[str, Any] = {
             "schemaVersion": 1,
@@ -10063,6 +10093,7 @@ class DependencyAgent:
             "inputCacheBytesUsed": int(input_cache_inventory.get("bytesUsed", 0)),
             "inputCacheMaxBytes": int(input_cache_inventory.get("maxBytes", 0)),
             "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
+            **({"memoryTelemetry": memory_telemetry} if memory_telemetry else {}),
             "idleMining": self._idle_prl_miner.snapshot(),
             "agentVersion": AGENT_VERSION,
             "capabilities": {
