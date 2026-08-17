@@ -921,8 +921,12 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+_CGROUP_MEMORY_PEAK_FALLBACK_BYTES = 0
+
+
 def collect_cgroup_memory_telemetry(cgroup_root: Path = Path("/sys/fs/cgroup")) -> Dict[str, Any]:
     """Collect cheap container-wide cgroup v2 memory counters for runtime sizing."""
+    global _CGROUP_MEMORY_PEAK_FALLBACK_BYTES
     fields = {
         "currentBytes": "memory.current",
         "peakBytes": "memory.peak",
@@ -940,6 +944,14 @@ def collect_cgroup_memory_telemetry(cgroup_root: Path = Path("/sys/fs/cgroup")) 
                 telemetry[output_key] = value
         except (OSError, TypeError, ValueError):
             continue
+    current_bytes = telemetry.get("currentBytes")
+    if isinstance(current_bytes, int):
+        _CGROUP_MEMORY_PEAK_FALLBACK_BYTES = max(_CGROUP_MEMORY_PEAK_FALLBACK_BYTES, current_bytes)
+        if "peakBytes" not in telemetry:
+            telemetry["peakBytes"] = _CGROUP_MEMORY_PEAK_FALLBACK_BYTES
+            telemetry["peakSource"] = "agent_max_current"
+        else:
+            telemetry["peakSource"] = "memory.peak"
     return telemetry if any(key in telemetry for key in fields) else {}
 
 
