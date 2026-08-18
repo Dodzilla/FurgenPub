@@ -170,6 +170,7 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FurgenPrependImageToBatch" in module.NODE_CLASS_MAPPINGS
     assert "FurgenSeamScaleStabilize" in module.NODE_CLASS_MAPPINGS
     assert "FurgenTrimAudioDuration" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenSanitizeAudio" in module.NODE_CLASS_MAPPINGS
     assert "FurgenBoundaryGradeMatch" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLatentGuideTemporalMask" in module.NODE_CLASS_MAPPINGS
     assert "FurgenLTXVAddLatentGuideTemporal" in module.NODE_CLASS_MAPPINGS
@@ -178,6 +179,19 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FurgenAssertFiniteLatent" in module.NODE_CLASS_MAPPINGS
     assert "FCSConcatVideosV4" in module.NODE_CLASS_MAPPINGS
     assert "FCSAnalyzeVideo" in module.NODE_CLASS_MAPPINGS
+
+
+def test_sanitize_audio_replaces_non_finite_samples_without_mutating_input():
+    module = _load_furgen_video_tools()
+    waveform = module.torch.tensor([[[0.25, float("nan"), float("inf"), float("-inf"), 2.0]]])
+    audio = {"waveform": waveform, "sample_rate": 48000}
+
+    sanitized, = module.FurgenSanitizeAudio().sanitize(audio)
+
+    assert sanitized is not audio
+    assert module.torch.isnan(waveform).any()
+    assert sanitized["sample_rate"] == 48000
+    assert sanitized["waveform"].tolist() == [[[0.25, 0.0, 1.0, -1.0, 1.0]]]
 
 
 def _make_test_video(path, size="96x64", duration=1.2, frequency=440):

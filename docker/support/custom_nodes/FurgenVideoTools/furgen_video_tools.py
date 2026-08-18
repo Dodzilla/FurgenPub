@@ -1508,6 +1508,33 @@ class FurgenTrimAudioDuration:
         return (next_audio,)
 
 
+class FurgenSanitizeAudio:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"audio": ("AUDIO",)}}
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "sanitize"
+    CATEGORY = "Furgen/audio"
+
+    def sanitize(self, audio):
+        if not isinstance(audio, dict):
+            return (audio,)
+        waveform = audio.get("waveform")
+        if waveform is None or not hasattr(waveform, "shape"):
+            return (audio,)
+
+        next_audio = dict(audio)
+        next_audio["waveform"] = torch.nan_to_num(
+            waveform,
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp(-1.0, 1.0)
+        return (next_audio,)
+
+
 class FurgenReferenceColorMatch:
     MODES = ("luma_mean_std", "rgb_mean_std", "rgb_mean_only")
 
@@ -3292,6 +3319,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenPrependImageToBatch": FurgenPrependImageToBatch,
     "FurgenSeamScaleStabilize": FurgenSeamScaleStabilize,
     "FurgenTrimAudioDuration": FurgenTrimAudioDuration,
+    "FurgenSanitizeAudio": FurgenSanitizeAudio,
     "FurgenReferenceColorMatch": FurgenReferenceColorMatch,
     "FurgenBoundaryGradeMatch": FurgenBoundaryGradeMatch,
     "FurgenAdaptiveExposureMatch": FurgenAdaptiveExposureMatch,
@@ -3316,6 +3344,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenPrependImageToBatch": "Furgen Prepend Image To Batch",
     "FurgenSeamScaleStabilize": "Furgen Seam Scale Stabilize",
     "FurgenTrimAudioDuration": "Furgen Trim Audio Duration",
+    "FurgenSanitizeAudio": "Furgen Sanitize Audio",
     "FurgenReferenceColorMatch": "Furgen Reference Color Match",
     "FurgenBoundaryGradeMatch": "Furgen Boundary Grade Match",
     "FurgenAdaptiveExposureMatch": "Furgen Adaptive Exposure Match",
