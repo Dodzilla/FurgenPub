@@ -135,7 +135,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.132"
+AGENT_VERSION = "dm-agent-py/0.10.133"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -4480,9 +4480,19 @@ class DependencyAgent:
                 "    unset COMFYUI_ARGS\n"
                 "fi\n"
                 "unset furgen_saved_comfyui_args furgen_had_comfyui_args\n"
-                "if [[ \" ${COMFYUI_ARGS:-} \" != *\" --use-sage-attention \"* ]]; then\n"
-                "    COMFYUI_ARGS=\"${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header} --use-sage-attention\"\n"
+                "furgen_attention_backend=\"$(printf '%s' \"${FURGEN_H3_ATTENTION_BACKEND:-sageattention2}\" | tr '[:upper:]' '[:lower:]')\"\n"
+                "if [[ \"${furgen_attention_backend}\" == \"pytorch\" || \"${furgen_attention_backend}\" == \"pytorch_cross_attention\" || \"${furgen_attention_backend}\" == \"pytorch-cross-attention\" ]]; then\n"
+                "    COMFYUI_ARGS=\"${COMFYUI_ARGS// --use-sage-attention/}\"\n"
+                "    if [[ \" ${COMFYUI_ARGS:-} \" != *\" --use-pytorch-cross-attention \"* ]]; then\n"
+                "        COMFYUI_ARGS=\"${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header} --use-pytorch-cross-attention\"\n"
+                "    fi\n"
+                "else\n"
+                "    COMFYUI_ARGS=\"${COMFYUI_ARGS// --use-pytorch-cross-attention/}\"\n"
+                "    if [[ \" ${COMFYUI_ARGS:-} \" != *\" --use-sage-attention \"* ]]; then\n"
+                "        COMFYUI_ARGS=\"${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header} --use-sage-attention\"\n"
+                "    fi\n"
                 "fi\n"
+                "unset furgen_attention_backend\n"
                 "dm_agent_disable=\"$(printf '%s' \"${DM_AGENT_DISABLE:-}\" | tr '[:upper:]' '[:lower:]')\"\n"
                 "if [[ \"${dm_agent_disable}\" != \"1\" && \"${dm_agent_disable}\" != \"true\" ]]; then\n"
                 "    watchdog_path=\"${DM_AGENT_WATCHDOG_PATH:-${WORKSPACE:-/workspace}/dependency_agent_watchdog.sh}\"\n"
@@ -6620,10 +6630,31 @@ class DependencyAgent:
         configured = _env_str("VIDEO_GEN_V2_SAGEATTENTION_VERIFY_PATH")
         return Path(configured) if configured else self.workspace / "sageattention2_runtime.json"
 
+    def _h3_attention_backend(self) -> str:
+        configured = (_env_str("FURGEN_H3_ATTENTION_BACKEND", "sageattention2") or "").strip().lower()
+        if configured in {"pytorch", "pytorch_cross_attention", "pytorch-cross-attention"}:
+            return "pytorch"
+        return "sageattention2"
+
     def _video_gen_v2_sageattention_runtime_ready(self) -> bool:
         server_type = (self.server_type or "").strip()
         if server_type not in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
             return True
+        if self._h3_attention_backend() == "pytorch":
+            try:
+                expected_torch = _env_str("FURGEN_H3_PYTORCH_RUNTIME_VERSION", "2.10.0+cu129") or ""
+                status, stats = self._comfy_api_json("GET", "/system_stats", timeout_seconds=5.0)
+                system = stats.get("system") if status == 200 and isinstance(stats, dict) else None
+                argv = system.get("argv") if isinstance(system, dict) else None
+                return (
+                    bool(expected_torch)
+                    and isinstance(argv, list)
+                    and "--use-pytorch-cross-attention" in argv
+                    and "--use-sage-attention" not in argv
+                    and str(system.get("pytorch_version") or "").strip() == expected_torch
+                )
+            except Exception:
+                return False
         try:
             payload = json.loads(
                 self._video_gen_v2_sageattention_runtime_path().read_text(encoding="utf-8")
@@ -8511,7 +8542,11 @@ class DependencyAgent:
         launch_port = parsed.port or 8188
         launch_args = f"--disable-auto-launch --listen 0.0.0.0 --port {launch_port} --enable-cors-header"
         if self.server_type in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
-            launch_args += " --use-sage-attention"
+            launch_args += (
+                " --use-pytorch-cross-attention"
+                if self._h3_attention_backend() == "pytorch"
+                else " --use-sage-attention"
+            )
         env["COMFYUI_ARGS"] = launch_args
         log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
         try:
