@@ -71,6 +71,8 @@ Optional knobs:
   - DM_AGENT_API_RETRY_MAX_SECONDS (max agent API retry backoff; default: 20)
   - DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS (extra retries for terminal job events; default: 8)
   - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
+  - DM_VIDEO_OUTPUT_QUALITY_GATE_ENABLED (decode + entropy gate before video upload; default: true on video_gen_v4)
+  - DM_VIDEO_OUTPUT_MIN_NORMALIZED_LUMA_ENTROPY (median normalized luma entropy floor; default: 0.65)
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_COMFY_NODE_TIMING_ENABLED  (capture native Comfy node-boundary timings; default: true on video_gen_v3/video_gen_v4)
   - DM_COMFY_NODE_TIMING_MAX_ROWS (maximum persisted slow-node rows per job; default/max: 64)
@@ -133,7 +135,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.131"
+AGENT_VERSION = "dm-agent-py/0.10.132"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -1239,6 +1241,102 @@ class NetworkError(RuntimeError):
         self.url = _safe_url_for_logs(url)
         self.reason = reason
         super().__init__(f"Network error calling {self.url}: {reason}")
+
+
+class OutputQualityValidationError(RuntimeError):
+    """A generated media artifact decoded but failed the customer-safety gate."""
+
+    def __init__(self, message: str, metrics: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.metrics = metrics or {}
+
+
+def inspect_video_output_quality(
+    video_path: Path,
+    minimum_normalized_luma_entropy: float = 0.65,
+    ffmpeg_path: Optional[str] = None,
+    timeout_seconds: float = 300.0,
+) -> Dict[str, Any]:
+    """Fully decode a video and reject the low-entropy garble seen on bad 5090 hosts.
+
+    The entropy filter samples at one frame per second while ffmpeg still
+    decodes the complete video. Requiring both the median and p90 sample to be
+    low avoids rejecting a normal video for one dark transition frame.
+    """
+    resolved_ffmpeg = ffmpeg_path or shutil.which("ffmpeg")
+    if not resolved_ffmpeg:
+        raise OutputQualityValidationError("output_quality_probe_unavailable: ffmpeg was not found")
+
+    command = [
+        resolved_ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+        "-vf",
+        "fps=1,entropy,metadata=print",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(30.0, float(timeout_seconds)),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OutputQualityValidationError(f"output_quality_probe_failed: {exc}") from exc
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "ffmpeg decode failed").strip()[-500:]
+        raise OutputQualityValidationError(f"output_video_decode_failed: {detail}")
+
+    entropy_values = [
+        float(match.group(1))
+        for match in re.finditer(
+            r"lavfi\.entropy\.normalized_entropy\.normal\.Y=([0-9]+(?:\.[0-9]+)?)",
+            f"{proc.stdout}\n{proc.stderr}",
+        )
+    ]
+    if not entropy_values:
+        raise OutputQualityValidationError(
+            "output_quality_probe_failed: ffmpeg emitted no normalized luma entropy samples",
+        )
+
+    ordered = sorted(entropy_values)
+    sample_count = len(ordered)
+    midpoint = sample_count // 2
+    median = (
+        ordered[midpoint]
+        if sample_count % 2 == 1
+        else (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+    )
+    p90_index = max(0, min(sample_count - 1, int(math.ceil(sample_count * 0.90)) - 1))
+    p90 = ordered[p90_index]
+    threshold = max(0.0, min(1.0, float(minimum_normalized_luma_entropy)))
+    metrics = {
+        "gateVersion": "normalized_luma_entropy_v1",
+        "sampleCount": sample_count,
+        "medianNormalizedLumaEntropy": round(median, 6),
+        "p90NormalizedLumaEntropy": round(p90, 6),
+        "minimumNormalizedLumaEntropy": round(threshold, 6),
+        "decodeVerified": True,
+    }
+    if median < threshold and p90 < min(1.0, threshold + 0.08):
+        raise OutputQualityValidationError(
+            "output_quality_validation_failed: generated video is visually low-entropy/garbled "
+            f"(median={median:.4f}, p90={p90:.4f}, threshold={threshold:.4f})",
+            metrics,
+        )
+    return metrics
 
 
 def _json_loads_or_none(text: str) -> Optional[Any]:
@@ -4145,6 +4243,14 @@ class DependencyAgent:
         )
         self.agent_terminal_event_retry_attempts = max(1, min(20, _env_int("DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS", 8)))
         self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
+        self.video_output_quality_gate_enabled = _env_bool(
+            "DM_VIDEO_OUTPUT_QUALITY_GATE_ENABLED",
+            self.server_type == "video_gen_v4",
+        )
+        self.video_output_min_normalized_luma_entropy = max(
+            0.0,
+            min(1.0, _env_float("DM_VIDEO_OUTPUT_MIN_NORMALIZED_LUMA_ENTROPY", 0.65)),
+        )
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         # video_gen_v4 workflows leave a large amount of host RAM resident in
         # ComfyUI after completion. Recycle Comfy before releasing the agent
@@ -12066,6 +12172,25 @@ class DependencyAgent:
             return idx, row
         return None
 
+    def _validate_local_output_quality(self, filename: str, local_output: Path) -> Optional[Dict[str, Any]]:
+        if not self.video_output_quality_gate_enabled:
+            return None
+        if Path(filename).suffix.lower() not in (".mp4", ".mov", ".mkv", ".webm", ".m4v"):
+            return None
+        metrics = inspect_video_output_quality(
+            local_output,
+            minimum_normalized_luma_entropy=self.video_output_min_normalized_luma_entropy,
+            timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+        )
+        logging.info(
+            "Video output quality gate passed: file=%s samples=%s medianEntropy=%s p90Entropy=%s",
+            os.path.basename(filename),
+            metrics.get("sampleCount"),
+            metrics.get("medianNormalizedLumaEntropy"),
+            metrics.get("p90NormalizedLumaEntropy"),
+        )
+        return metrics
+
     def _upload_output_artifact(
         self,
         lease: AgentExecuteLease,
@@ -12582,6 +12707,7 @@ class DependencyAgent:
                 )
                 bytes_written = int(local_output.stat().st_size)
                 sha256_sum = sha256_file(local_output)
+                quality_validation = self._validate_local_output_quality(filename, local_output)
                 out_meta = self._upload_output_artifact(
                     lease,
                     target,
@@ -12590,6 +12716,8 @@ class DependencyAgent:
                     bytes_written,
                     sha256_sum,
                 )
+                if quality_validation is not None:
+                    out_meta["qualityValidation"] = quality_validation
                 uploaded_outputs.append(out_meta)
                 try:
                     emit_best_effort("output_uploaded", out_meta)
@@ -12619,6 +12747,10 @@ class DependencyAgent:
                 event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
                 err_code = "cancel_requested" if event_type == "job_cancelled" else "execution_error"
                 error_text = str(e)
+                if event_type == "job_failed" and isinstance(e, OutputQualityValidationError):
+                    err_code = "output_quality_validation_failed"
+                    if e.metrics:
+                        error_text = f"{error_text}; metrics={json.dumps(e.metrics, sort_keys=True)}"
                 node_contract: Optional[Dict[str, Any]] = None
                 if event_type == "job_failed" and (
                     "missing_node_type" in error_text.lower()
@@ -13150,6 +13282,7 @@ class DependencyAgent:
                 hash_started_ms = _now_ms()
                 sha256_sum = sha256_file(local_output)
                 hash_ms = max(0, _now_ms() - hash_started_ms)
+                quality_validation = self._validate_local_output_quality(filename, local_output)
                 out_meta = self._upload_output_artifact(
                     lease,
                     target,
@@ -13158,6 +13291,8 @@ class DependencyAgent:
                     bytes_written,
                     sha256_sum,
                 )
+                if quality_validation is not None:
+                    out_meta["qualityValidation"] = quality_validation
                 timing = out_meta.get("uploadTiming") if isinstance(out_meta.get("uploadTiming"), dict) else {}
                 out_meta["uploadTiming"] = {
                     **timing,
@@ -13209,9 +13344,17 @@ class DependencyAgent:
             terminal_sent = True
         except Exception as e:
             if not terminal_sent:
+                error_code = (
+                    "output_quality_validation_failed"
+                    if isinstance(e, OutputQualityValidationError)
+                    else "upload_error"
+                )
+                error_text = str(e)
+                if isinstance(e, OutputQualityValidationError) and e.metrics:
+                    error_text = f"{error_text}; metrics={json.dumps(e.metrics, sort_keys=True)}"
                 payload: Dict[str, Any] = {
-                    "errorCode": "upload_error",
-                    "errorMessage": str(e)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
+                    "errorCode": error_code,
+                    "errorMessage": error_text[:MAX_AGENT_ERROR_MESSAGE_CHARS],
                 }
                 if isinstance(lease.prompt_id, str) and lease.prompt_id:
                     payload["promptId"] = lease.prompt_id
