@@ -135,7 +135,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.133"
+AGENT_VERSION = "dm-agent-py/0.10.134"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -4481,16 +4481,15 @@ class DependencyAgent:
                 "fi\n"
                 "unset furgen_saved_comfyui_args furgen_had_comfyui_args\n"
                 "furgen_attention_backend=\"$(printf '%s' \"${FURGEN_H3_ATTENTION_BACKEND:-sageattention2}\" | tr '[:upper:]' '[:lower:]')\"\n"
+                "COMFYUI_ARGS=\"${COMFYUI_ARGS// --use-sage-attention/}\"\n"
+                "COMFYUI_ARGS=\"${COMFYUI_ARGS// --use-pytorch-cross-attention/}\"\n"
+                "COMFYUI_ARGS=\"${COMFYUI_ARGS// --use-ck-attention/}\"\n"
                 "if [[ \"${furgen_attention_backend}\" == \"pytorch\" || \"${furgen_attention_backend}\" == \"pytorch_cross_attention\" || \"${furgen_attention_backend}\" == \"pytorch-cross-attention\" ]]; then\n"
-                "    COMFYUI_ARGS=\"${COMFYUI_ARGS// --use-sage-attention/}\"\n"
-                "    if [[ \" ${COMFYUI_ARGS:-} \" != *\" --use-pytorch-cross-attention \"* ]]; then\n"
-                "        COMFYUI_ARGS=\"${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header} --use-pytorch-cross-attention\"\n"
-                "    fi\n"
+                "    COMFYUI_ARGS=\"${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header} --use-pytorch-cross-attention\"\n"
+                "elif [[ \"${furgen_attention_backend}\" == \"comfy_kitchen\" || \"${furgen_attention_backend}\" == \"comfy-kitchen\" || \"${furgen_attention_backend}\" == \"ck\" || \"${furgen_attention_backend}\" == \"ck_attention\" || \"${furgen_attention_backend}\" == \"comfy_kitchen_int8\" ]]; then\n"
+                "    COMFYUI_ARGS=\"${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header} --use-ck-attention\"\n"
                 "else\n"
-                "    COMFYUI_ARGS=\"${COMFYUI_ARGS// --use-pytorch-cross-attention/}\"\n"
-                "    if [[ \" ${COMFYUI_ARGS:-} \" != *\" --use-sage-attention \"* ]]; then\n"
-                "        COMFYUI_ARGS=\"${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header} --use-sage-attention\"\n"
-                "    fi\n"
+                "    COMFYUI_ARGS=\"${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header} --use-sage-attention\"\n"
                 "fi\n"
                 "unset furgen_attention_backend\n"
                 "dm_agent_disable=\"$(printf '%s' \"${DM_AGENT_DISABLE:-}\" | tr '[:upper:]' '[:lower:]')\"\n"
@@ -6634,25 +6633,42 @@ class DependencyAgent:
         configured = (_env_str("FURGEN_H3_ATTENTION_BACKEND", "sageattention2") or "").strip().lower()
         if configured in {"pytorch", "pytorch_cross_attention", "pytorch-cross-attention"}:
             return "pytorch"
+        if configured in {"comfy_kitchen", "comfy-kitchen", "ck", "ck_attention", "comfy_kitchen_int8"}:
+            return "comfy_kitchen"
         return "sageattention2"
+
+    def _h3_attention_cli_flag(self) -> str:
+        backend = self._h3_attention_backend()
+        if backend == "pytorch":
+            return "--use-pytorch-cross-attention"
+        if backend == "comfy_kitchen":
+            return "--use-ck-attention"
+        return "--use-sage-attention"
+
+    def _h3_listener_uses_configured_attention(self, argv: Any, expected_torch: str, system: Any) -> bool:
+        if not expected_torch or not isinstance(argv, list):
+            return False
+        if str(system.get("pytorch_version") or "").strip() != expected_torch:
+            return False
+        required = self._h3_attention_cli_flag()
+        forbidden = {
+            "--use-sage-attention",
+            "--use-pytorch-cross-attention",
+            "--use-ck-attention",
+        } - {required}
+        return required in argv and not any(flag in argv for flag in forbidden)
 
     def _video_gen_v2_sageattention_runtime_ready(self) -> bool:
         server_type = (self.server_type or "").strip()
         if server_type not in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
             return True
-        if self._h3_attention_backend() == "pytorch":
+        if self._h3_attention_backend() in {"pytorch", "comfy_kitchen"}:
             try:
                 expected_torch = _env_str("FURGEN_H3_PYTORCH_RUNTIME_VERSION", "2.10.0+cu129") or ""
                 status, stats = self._comfy_api_json("GET", "/system_stats", timeout_seconds=5.0)
                 system = stats.get("system") if status == 200 and isinstance(stats, dict) else None
                 argv = system.get("argv") if isinstance(system, dict) else None
-                return (
-                    bool(expected_torch)
-                    and isinstance(argv, list)
-                    and "--use-pytorch-cross-attention" in argv
-                    and "--use-sage-attention" not in argv
-                    and str(system.get("pytorch_version") or "").strip() == expected_torch
-                )
+                return self._h3_listener_uses_configured_attention(argv, expected_torch, system or {})
             except Exception:
                 return False
         try:
@@ -8542,11 +8558,7 @@ class DependencyAgent:
         launch_port = parsed.port or 8188
         launch_args = f"--disable-auto-launch --listen 0.0.0.0 --port {launch_port} --enable-cors-header"
         if self.server_type in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
-            launch_args += (
-                " --use-pytorch-cross-attention"
-                if self._h3_attention_backend() == "pytorch"
-                else " --use-sage-attention"
-            )
+            launch_args += f" {self._h3_attention_cli_flag()}"
         env["COMFYUI_ARGS"] = launch_args
         log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
         try:
