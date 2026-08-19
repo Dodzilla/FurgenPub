@@ -135,7 +135,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.136"
+AGENT_VERSION = "dm-agent-py/0.10.137"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -4284,21 +4284,21 @@ class DependencyAgent:
             min(1.0, _env_float("DM_VIDEO_OUTPUT_MIN_NORMALIZED_LUMA_ENTROPY", 0.65)),
         )
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
-        # video_gen_v4 workflows leave a large amount of host RAM resident in
-        # ComfyUI after completion. Recycle Comfy before releasing the agent
-        # lease so the next queued workflow always starts from a fresh process.
+        # Post-job Comfy recycle is opt-in only. video_gen_v4 previously
+        # defaulted on, and its Vast template baked
+        # DM_RESTART_COMFY_AFTER_SUCCESSFUL_JOB=true, as an OOM workaround
+        # for an earlier pin. Ignore those pins so already-rented workers
+        # drop the recycle on self-update. Re-enable with
+        # DM_FORCE_RESTART_COMFY_AFTER_SUCCESSFUL_JOB /
+        # DM_FORCE_RESTART_COMFY_AFTER_FAILED_JOB if a current-pin leak
+        # shows it is still needed.
         self.restart_comfy_after_successful_job = _env_bool(
-            "DM_RESTART_COMFY_AFTER_SUCCESSFUL_JOB",
-            self.server_type == "video_gen_v4",
+            "DM_FORCE_RESTART_COMFY_AFTER_SUCCESSFUL_JOB",
+            False,
         )
-        # A workflow that died mid-sample (CUDA OOM in particular) leaves the
-        # process with a fragmented allocator: ComfyUI reports GiBs "reserved
-        # but unallocated" that it can no longer hand out contiguously, so the
-        # next large job inherits the failure. Recycle after terminal failures
-        # too, not just successes.
         self.restart_comfy_after_failed_job = _env_bool(
-            "DM_RESTART_COMFY_AFTER_FAILED_JOB",
-            self.server_type == "video_gen_v4",
+            "DM_FORCE_RESTART_COMFY_AFTER_FAILED_JOB",
+            False,
         )
         self.comfy_node_timing_enabled = _env_bool(
             "DM_COMFY_NODE_TIMING_ENABLED",
