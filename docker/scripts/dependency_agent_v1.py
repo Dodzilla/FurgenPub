@@ -135,12 +135,44 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.135"
+AGENT_VERSION = "dm-agent-py/0.10.136"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
+# Flags that control ComfyUI memory behaviour rather than transport/attention.
+# A restart that rebuilds COMFYUI_ARGS must carry these over from the
+# provisioning env; dropping them changes how the workload allocates VRAM.
+PRESERVED_COMFY_MEMORY_FLAGS = (
+    "--disable-async-offload",
+    "--disable-pinned-memory",
+    "--disable-cuda-malloc",
+    "--cache-none",
+    "--high-ram",
+    "--fast-disk",
+    "--disable-smart-memory",
+)
+PRESERVED_COMFY_MEMORY_VALUE_FLAGS = (
+    "--vram-headroom",
+    "--reserve-vram",
+    "--cache-lru",
+)
+
+
+def _preserved_comfy_memory_flags(source_args: str) -> str:
+    """Return the memory-related flags from source_args, as a prefixed string."""
+    tokens = str(source_args or "").split()
+    preserved: List[str] = []
+    for index, token in enumerate(tokens):
+        if token in PRESERVED_COMFY_MEMORY_FLAGS:
+            preserved.append(token)
+            continue
+        if token in PRESERVED_COMFY_MEMORY_VALUE_FLAGS and index + 1 < len(tokens):
+            value = tokens[index + 1]
+            if not value.startswith("--"):
+                preserved.extend([token, value])
+    return f" {' '.join(preserved)}" if preserved else ""
 MAX_COMFY_NODE_TIMING_ROWS = 64
 MAX_COMFY_WS_FRAME_BYTES = 32 * 1024 * 1024
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -4257,6 +4289,15 @@ class DependencyAgent:
         # lease so the next queued workflow always starts from a fresh process.
         self.restart_comfy_after_successful_job = _env_bool(
             "DM_RESTART_COMFY_AFTER_SUCCESSFUL_JOB",
+            self.server_type == "video_gen_v4",
+        )
+        # A workflow that died mid-sample (CUDA OOM in particular) leaves the
+        # process with a fragmented allocator: ComfyUI reports GiBs "reserved
+        # but unallocated" that it can no longer hand out contiguously, so the
+        # next large job inherits the failure. Recycle after terminal failures
+        # too, not just successes.
+        self.restart_comfy_after_failed_job = _env_bool(
+            "DM_RESTART_COMFY_AFTER_FAILED_JOB",
             self.server_type == "video_gen_v4",
         )
         self.comfy_node_timing_enabled = _env_bool(
@@ -8605,6 +8646,11 @@ class DependencyAgent:
         launch_args = f"--disable-auto-launch --listen 0.0.0.0 --port {launch_port} --enable-cors-header"
         if self.server_type in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
             launch_args += f" {self._h3_attention_cli_flag()}"
+        # The provisioning env carries memory/VRAM flags that the workload
+        # depends on (allocator behaviour, DynamicVRAM headroom, node cache).
+        # This fallback rebuilds COMFYUI_ARGS from scratch, so re-apply them or
+        # a launch-script restart silently downgrades the process.
+        launch_args += _preserved_comfy_memory_flags(os.environ.get("COMFYUI_ARGS", ""))
         env["COMFYUI_ARGS"] = launch_args
         log_path = Path(_env_str("DM_COMFYUI_RESTART_LOG_PATH") or str(self.workspace / "comfyui_restart.log"))
         try:
@@ -8726,16 +8772,22 @@ class DependencyAgent:
                     self._restart_verify_previous_process_ids = []
             return True
 
-    def _arm_post_job_comfy_recycle(self, lease: AgentExecuteLease) -> None:
-        if not self.restart_comfy_after_successful_job:
+    def _arm_post_job_comfy_recycle(self, lease: AgentExecuteLease, outcome: str = "success") -> None:
+        enabled = (
+            self.restart_comfy_after_failed_job
+            if outcome == "failure"
+            else self.restart_comfy_after_successful_job
+        )
+        if not enabled:
             return
         if self._post_job_comfy_recycle_active.is_set():
             return
         self._post_job_comfy_recycle_active.set()
         logging.info(
-            "Armed post-job ComfyUI recycle before releasing capacity: jobId=%s itemId=%s",
+            "Armed post-job ComfyUI recycle before releasing capacity: jobId=%s itemId=%s outcome=%s",
             lease.job_id,
             lease.item_id,
+            outcome,
         )
         try:
             self._write_agent_runtime_mirror(force_full=True)
@@ -13403,6 +13455,20 @@ class DependencyAgent:
             if node_timing_collector is not None:
                 node_timing_collector.stop()
             if not retain_lease:
+                # No upload hand-off happened, so _upload_agent_outputs will
+                # never run _complete_post_job_comfy_recycle for this lease.
+                # Arm and complete inline so a job that died mid-sample cannot
+                # leave its fragmented ComfyUI process serving the next job.
+                try:
+                    self._arm_post_job_comfy_recycle(lease, outcome="failure")
+                    self._complete_post_job_comfy_recycle(lease)
+                except Exception as recycle_exc:
+                    logging.warning(
+                        "Post-failure ComfyUI recycle raised for jobId=%s itemId=%s: %s",
+                        lease.job_id,
+                        lease.item_id,
+                        recycle_exc,
+                    )
                 self._cleanup_agent_lease(lease)
 
     def _upload_agent_outputs(self, lease: AgentExecuteLease) -> None:
@@ -13734,7 +13800,7 @@ class DependencyAgent:
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d restartComfyAfterSuccessfulJob=%s miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d restartComfyAfterSuccessfulJob=%s restartComfyAfterFailedJob=%s miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
@@ -13750,6 +13816,7 @@ class DependencyAgent:
             int(self.agent_max_execute_workers),
             int(self.agent_max_upload_workers),
             "yes" if self.restart_comfy_after_successful_job else "no",
+            "yes" if self.restart_comfy_after_failed_job else "no",
             "yes" if self.mining_only else "no",
         )
         logging.info(
