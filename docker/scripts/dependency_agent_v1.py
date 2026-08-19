@@ -135,7 +135,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.134"
+AGENT_VERSION = "dm-agent-py/0.10.135"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -4287,7 +4287,24 @@ class DependencyAgent:
         self.node_contract_probe_ttl_ms = int(
             max(10.0, min(600.0, _env_float("DM_NODE_CONTRACT_PROBE_TTL_SECONDS", 60.0))) * 1000
         )
+        # A class missing from /object_info is only treated as genuinely absent
+        # once it has stayed missing, with ComfyUI continuously reachable, for
+        # this long. ComfyUI serves /object_info while it is still importing
+        # custom nodes, so a single probe taken during a restart reports classes
+        # that are merely not imported YET. Acting on that snapshot quarantines a
+        # healthy worker and reinstalls healthy bundles (2026-08-19, instance
+        # 48062383). Must comfortably exceed custom-node import time.
+        self.node_contract_missing_confirm_ms = int(
+            max(0.0, min(900.0, _env_float("DM_NODE_CONTRACT_MISSING_CONFIRM_SECONDS", 180.0))) * 1000
+        )
         self._node_contract_probe_cache: Dict[str, Any] = {}
+        # contractHash -> (frozenset(missing), first time that set was observed).
+        # Keyed per contract because the probe is called with DIFFERENT required
+        # sets (the heartbeat's full set, and a restart's verify subset); a single
+        # shared slot would let those two callers reset each other's window so it
+        # never elapsed. Any change to a set (progressive import) or a failed
+        # probe (ComfyUI went away) resets that contract's entry.
+        self._node_contract_missing_windows: Dict[str, Tuple[frozenset, int]] = {}
         self.input_cache_dir = Path(_env_str("DM_INPUT_CACHE_DIR") or str(self.workspace / ".dm_input_cache"))
         self.input_cache_max_bytes = max(0, int(_parse_bytes(_env_str("DM_INPUT_CACHE_MAX_BYTES")) or 20 * 1024 * 1024 * 1024))
         self.input_cache_heartbeat_max_keys = max(0, min(1000, _env_int("DM_INPUT_CACHE_HEARTBEAT_MAX_KEYS", 50)))
@@ -6734,9 +6751,12 @@ class DependencyAgent:
         if hasattr(self, "_state"):
             contract = self._local_node_contract_runtime(force=True)
             if contract.get("ready") is not True:
+                detail = ",".join(contract.get("missingClassTypes", [])[:10])
+                if not detail:
+                    # Inconclusive probe: name the reason instead of an empty list.
+                    detail = str(contract.get("probeError") or "node contract probe inconclusive")
                 raise RuntimeError(
-                    "Refusing to write readiness marker with missing custom-node classes: "
-                    + ",".join(contract.get("missingClassTypes", [])[:10])
+                    "Refusing to write readiness marker with missing custom-node classes: " + detail
                 )
         path = self._local_readiness_file_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -6813,12 +6833,21 @@ class DependencyAgent:
             return False
         node_contract = self._local_node_contract_runtime(force=True)
         if node_contract.get("ready") is not True:
-            self._remove_local_readiness_file()
-            logging.error(
-                "Refusing orphaned readiness repair because the live node contract is incomplete: missing=%s bundles=%s",
-                ",".join(node_contract.get("missingClassTypes", [])[:10]),
-                ",".join(node_contract.get("affectedBundleIds", [])),
-            )
+            # Same rule as _local_readiness_file_present: only a PROVEN-broken
+            # contract may destroy the readiness marker. An inconclusive probe
+            # means ComfyUI is unreachable or still importing nodes.
+            if node_contract.get("conclusive") is True:
+                self._remove_local_readiness_file()
+                logging.error(
+                    "Refusing orphaned readiness repair because the live node contract is incomplete: missing=%s bundles=%s",
+                    ",".join(node_contract.get("missingClassTypes", [])[:10]),
+                    ",".join(node_contract.get("affectedBundleIds", [])),
+                )
+            else:
+                logging.info(
+                    "Deferring orphaned readiness repair until the node contract is conclusive: %s",
+                    node_contract.get("probeError") or "probe inconclusive",
+                )
             return False
         self._write_local_readiness_file()
         item_id = str(intent.get("itemId") or "").strip()
@@ -6909,12 +6938,21 @@ class DependencyAgent:
             return False
         node_contract = self._local_node_contract_runtime(force=True)
         if node_contract.get("ready") is not True:
-            self._remove_local_readiness_file()
-            logging.error(
-                "Refusing orphaned readiness repair because the live node contract is incomplete: missing=%s bundles=%s",
-                ",".join(node_contract.get("missingClassTypes", [])[:10]),
-                ",".join(node_contract.get("affectedBundleIds", [])),
-            )
+            # Same rule as _local_readiness_file_present: only a PROVEN-broken
+            # contract may destroy the readiness marker. An inconclusive probe
+            # means ComfyUI is unreachable or still importing nodes.
+            if node_contract.get("conclusive") is True:
+                self._remove_local_readiness_file()
+                logging.error(
+                    "Refusing orphaned readiness repair because the live node contract is incomplete: missing=%s bundles=%s",
+                    ",".join(node_contract.get("missingClassTypes", [])[:10]),
+                    ",".join(node_contract.get("affectedBundleIds", [])),
+                )
+            else:
+                logging.info(
+                    "Deferring orphaned readiness repair until the node contract is conclusive: %s",
+                    node_contract.get("probeError") or "probe inconclusive",
+                )
             return False
 
         recovered_post_job_recycle = self._post_job_comfy_recycle_active.is_set()
@@ -6955,7 +6993,15 @@ class DependencyAgent:
                 return False
             node_contract = self._local_node_contract_runtime(force=False)
             if node_contract.get("ready") is not True:
-                self._remove_local_readiness_file()
+                # Only destroy the readiness marker when the contract is PROVEN
+                # broken. An inconclusive probe (ComfyUI unreachable or still
+                # importing custom nodes) previously deleted the marker, which
+                # the server reads as "agent readiness file missing" — that is
+                # what turned every routine ComfyUI restart into a quarantine +
+                # bundle reinstall + reboot loop (2026-08-19, instance 48062383).
+                # Report not-ready either way so no job is assigned meanwhile.
+                if node_contract.get("conclusive") is True:
+                    self._remove_local_readiness_file()
                 return False
             return True
         except Exception:
@@ -8760,9 +8806,53 @@ class DependencyAgent:
         lock = getattr(self, "_node_contract_probe_lock", None)
         if lock is None:
             self._node_contract_probe_cache = {}
+            self._reset_node_contract_missing_tracker()
             return
         with lock:
             self._node_contract_probe_cache = {}
+            self._reset_node_contract_missing_tracker()
+
+    def _reset_node_contract_missing_tracker(self, signature: Optional[str] = None) -> None:
+        """Forget in-flight missing-class confirmation windows.
+
+        Clears every contract when `signature` is None (ComfyUI is restarting, so
+        nothing observed before is still valid), otherwise just that contract's
+        window (its probe failed). Keeps each window measuring a CONTINUOUSLY
+        reachable ComfyUI reporting the SAME classes missing — never a total
+        accumulated across restarts.
+        Callers already hold `_node_contract_probe_lock` where one exists.
+        """
+        windows = getattr(self, "_node_contract_missing_windows", None)
+        if not isinstance(windows, dict):
+            self._node_contract_missing_windows = {}
+            return
+        if signature is None:
+            windows.clear()
+        else:
+            windows.pop(signature, None)
+
+    def _track_node_contract_missing(
+        self,
+        signature: str,
+        missing: List[str],
+        checked_at_ms: int,
+    ) -> int:
+        """Return how long this exact missing set has been observed, in ms.
+
+        Any change to the set restarts the clock: while ComfyUI imports custom
+        nodes the set shrinks on every probe, so a still-loading ComfyUI never
+        accumulates time and never gets reported as broken.
+        """
+        windows = getattr(self, "_node_contract_missing_windows", None)
+        if not isinstance(windows, dict):
+            windows = {}
+            self._node_contract_missing_windows = windows
+        current = frozenset(missing)
+        previous = windows.get(signature)
+        if previous is None or previous[0] != current:
+            windows[signature] = (current, checked_at_ms)
+            return 0
+        return max(0, checked_at_ms - int(previous[1]))
 
     def _probe_local_node_contract(
         self,
@@ -8796,6 +8886,7 @@ class DependencyAgent:
                 "missingClassTypes": [],
                 "checkedAtMs": checked_at_ms,
                 "contractHash": signature,
+                "conclusive": True,
             }
             self._node_contract_probe_cache = result
             return result
@@ -8820,20 +8911,61 @@ class DependencyAgent:
                 if status != 200 or not isinstance(response, dict):
                     raise RuntimeError(f"object_info returned status={status}")
                 missing = [class_type for class_type in wanted if class_type not in response]
-                result = {
-                    "ready": not missing,
-                    "requiredClassCount": len(wanted),
-                    "missingClassTypes": missing[:100],
-                    "checkedAtMs": checked_at_ms,
-                    "contractHash": signature,
-                }
+                if not missing:
+                    self._reset_node_contract_missing_tracker(signature)
+                    result = {
+                        "ready": True,
+                        "requiredClassCount": len(wanted),
+                        "missingClassTypes": [],
+                        "checkedAtMs": checked_at_ms,
+                        "contractHash": signature,
+                        "conclusive": True,
+                    }
+                else:
+                    missing_for_ms = self._track_node_contract_missing(signature, missing, checked_at_ms)
+                    if missing_for_ms >= self.node_contract_missing_confirm_ms:
+                        result = {
+                            "ready": False,
+                            "requiredClassCount": len(wanted),
+                            "missingClassTypes": missing[:100],
+                            "checkedAtMs": checked_at_ms,
+                            "contractHash": signature,
+                            "conclusive": True,
+                            "missingForMs": missing_for_ms,
+                        }
+                    else:
+                        # Not yet proven absent. Report it as an inconclusive
+                        # probe (empty missing list + probeError) so neither the
+                        # local readiness marker nor the server-side quarantine
+                        # acts on a ComfyUI that is still importing nodes.
+                        result = {
+                            "ready": False,
+                            "requiredClassCount": len(wanted),
+                            "missingClassTypes": [],
+                            "checkedAtMs": checked_at_ms,
+                            "contractHash": signature,
+                            "conclusive": False,
+                            "missingForMs": missing_for_ms,
+                            "unconfirmedMissingClassTypes": missing[:100],
+                            "probeError": (
+                                f"node contract unconfirmed: {len(missing)} class(es) missing for "
+                                f"{missing_for_ms}ms (<{self.node_contract_missing_confirm_ms}ms); "
+                                "ComfyUI may still be importing custom nodes"
+                            )[:500],
+                        }
             except Exception as exc:
+                # Could not look. Never claim specific classes are absent on the
+                # strength of a failed probe — that is indistinguishable from a
+                # restarting ComfyUI and previously reported the ENTIRE required
+                # contract as missing.
+                self._reset_node_contract_missing_tracker(signature)
                 result = {
                     "ready": False,
                     "requiredClassCount": len(wanted),
-                    "missingClassTypes": wanted[:100],
+                    "missingClassTypes": [],
                     "checkedAtMs": checked_at_ms,
                     "contractHash": signature,
+                    "conclusive": False,
                     "probeError": str(exc)[:500],
                 }
             self._node_contract_probe_cache = result
@@ -8928,12 +9060,22 @@ class DependencyAgent:
                 timeout_seconds=10.0,
             )
             missing = contract.get("missingClassTypes") if isinstance(contract.get("missingClassTypes"), list) else normalized_verify
+            # An inconclusive probe now reports an EMPTY missing list, which must
+            # never be mistaken for "restart verified". Only a conclusive probe
+            # can end this wait.
+            conclusive = contract.get("conclusive") is True
+            if not conclusive:
+                missing = (
+                    contract.get("unconfirmedMissingClassTypes")
+                    if isinstance(contract.get("unconfirmedMissingClassTypes"), list)
+                    else normalized_verify
+                )
             runtime_ready = self._video_gen_v2_sageattention_runtime_ready()
             # Never validate against the old listener while an asynchronous
             # restart is still pending. A port-down transition or an entirely
             # new Comfy PID set proves process turnover; the latter also covers
             # synchronous launch-script restarts completed before polling.
-            if runtime_ready and not missing and (saw_down or saw_process_turnover):
+            if runtime_ready and conclusive and not missing and (saw_down or saw_process_turnover):
                 return
             if runtime_ready and not normalized_verify and saw_down and reachable:
                 return
