@@ -518,98 +518,189 @@ function dependency_manager_render_watchdog() {
 
     cat > "$watchdog_path" <<'EOF'
 #!/bin/bash
+# Consolidated dependency-agent supervisor — liveness-only.
+#
+# This is the single canonical source for the dependency-agent watchdog. It is
+# stamped verbatim into every FurgenPub docker/support/*.sh watchdog heredoc by
+# scripts/generate-support-watchdogs.js, replacing the 13 previously-divergent
+# copies. Taking a change here to the fleet requires republishing the support
+# scripts + reprovisioning (a baked watchdog cannot be hot-patched on a running
+# instance).
+#
+# DESIGN — why this exists (see the 2026-07-06 dueling-watchdog incident):
+#   1. ONE authority for the agent version: the SERVER. The agent self-updates
+#      in-process (os.execv) from register/heartbeat responses. This supervisor
+#      NEVER kills the agent for a version/sha mismatch — it only restarts a DEAD
+#      agent. Removing version enforcement here is what eliminates the
+#      "watchdog (baked pin A) fights agent (server pin B) -> N processes" leak.
+#   2. NO baked version/sha to drift. The agent binary is fetched from a STABLE,
+#      unversioned loader URL (the coordination /agent-releases redirect, which
+#      resolves to the current release from the live config/agentRelease doc),
+#      and ONLY when the file is missing. No target_version, no target_sha256.
+#   3. Hard singleton via flock: at most one supervisor and one agent per host.
+#      The agent runs under an exclusive lock that survives its os.execv
+#      self-update, so a second agent can never start.
+#
+# Contrast with the OLD watchdog it replaces:
+#   - OLD: target_version="${DEPENDENCY_AGENT_TARGET_VERSION:-...:-dm-agent-py/0.10.15}"
+#          then killed the agent whenever running version/sha != target. REMOVED.
+#   - OLD: re-downloaded from the baked (versioned) DM_AGENT_URL to "repair"
+#          version drift. REMOVED (download only when the file is missing).
+#   - OLD: pidfile/pgrep liveness with no mutual exclusion. REPLACED with flock.
 
 set -u
 
+WORKSPACE="${WORKSPACE:-/workspace}"
+env_path="${DM_AGENT_ENV_PATH:-${WORKSPACE}/dependency_agent.env}"
+if [[ -r "$env_path" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$env_path"
+    set +a
+fi
 WORKSPACE="${WORKSPACE:-/workspace}"
 DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
 agent_path="${DM_AGENT_PATH:-${WORKSPACE}/dependency_agent_v1.py}"
 log_path="${DM_AGENT_LOG_PATH:-${WORKSPACE}/dependency_agent.log}"
 pid_path="${DM_AGENT_PID_PATH:-${WORKSPACE}/dependency_agent.pid}"
+lock_dir="${DM_AGENT_LOCK_DIR:-${WORKSPACE}/.fcs/locks}"
+watchdog_lock="${lock_dir}/dependency_agent_watchdog.lock"
+agent_lock="${lock_dir}/dependency_agent.lock"
 watchdog_pid_path="${DM_AGENT_WATCHDOG_PID_PATH:-${WORKSPACE}/dependency_agent_watchdog.pid}"
-agent_url="${DM_AGENT_URL:-${AGENT_URL:-}}"
-fallback_url="https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py"
+poll_seconds="${DM_AGENT_WATCHDOG_POLL_SECONDS:-15}"
 
-dependency_manager_agent_running() {
-    if command -v pgrep >/dev/null 2>&1 && pgrep -f "$agent_path" >/dev/null 2>&1; then
+# Loader for the missing-file bootstrap ONLY. This is not where version
+# correctness comes from: whatever this fetches, the agent self-updates to the
+# server-pinned version in-process right after it starts. So we just need a URL
+# that yields a working agent. Priority: an explicit stable loader, then the
+# baked DM_AGENT_URL/AGENT_URL, then the public main-branch raw file.
+# (Deliberately NOT derived from FCS_API_BASE_URL: the /agent-releases redirect is
+# served by the `api` function, not the coordination base FCS_API_BASE_URL points
+# at, so that path would 404.)
+loader_url="${DM_AGENT_LOADER_URL:-${DM_AGENT_URL:-${AGENT_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/scripts/dependency_agent_v1.py}}}"
+
+log() { echo "dependency-agent watchdog: $*"; }
+
+is_disabled() {
+    local v
+    v="$(printf '%s' "${DM_AGENT_DISABLE:-}" | tr '[:upper:]' '[:lower:]')"
+    [[ "$v" == "1" || "$v" == "true" ]]
+}
+
+have_flock() { command -v flock >/dev/null 2>&1; }
+
+# Identity-verified liveness for a candidate pid.
+#
+# `kill -0` alone is NOT sufficient and caused a permanent supervisor wedge on
+# 2026-08-19 (video_gen_v4 instance 48062383): the pidfile held a pid that had
+# been recycled as a THREAD id of ComfyUI (which spawns 200+ threads the moment
+# it starts, immediately after the agent is launched). `kill -0` succeeds
+# against a thread id, so the supervisor concluded a dead agent was alive and
+# stopped restarting it — the box sat with no agent until it was rebooted.
+#
+# `pgrep -f "$agent_path"` has the mirror-image problem: it matches ANY process
+# whose command line merely mentions the path (an ssh command, a grep, an
+# editor), which also reads as a false "agent is alive".
+#
+# So a pid only counts as the agent when its own /proc cmdline is a python
+# invocation of the agent path. Threads share the parent's cmdline, so a
+# recycled thread id is rejected: ComfyUI's cmdline never names the agent.
+pid_is_agent_process() {
+    local pid="$1" cmdline
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    # No procfs (non-Linux image): degrade to bare liveness rather than
+    # refusing to ever see a running agent.
+    [[ -r "/proc/$pid/cmdline" ]] || return 0
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ "$cmdline" == *python* && "$cmdline" == *"$agent_path"* ]]
+}
+
+# A live agent holds the exclusive agent_lock for its whole lifetime (including
+# across its in-process self-update). If we can acquire the lock, no agent holds
+# it. Fall back to identity-verified pgrep/pidfile when flock is unavailable.
+agent_running() {
+    if have_flock && [[ -e "$agent_lock" ]]; then
+        if flock -n "$agent_lock" true 2>/dev/null; then
+            return 1
+        fi
         return 0
     fi
-
+    if command -v pgrep >/dev/null 2>&1; then
+        local candidate
+        while read -r candidate; do
+            pid_is_agent_process "$candidate" && return 0
+        done < <(pgrep -f -- "$agent_path" 2>/dev/null || true)
+    fi
     if [[ -f "$pid_path" ]]; then
         local pid
         pid="$(cat "$pid_path" 2>/dev/null || true)"
-        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-            return 0
-        fi
+        pid_is_agent_process "$pid" && return 0
     fi
-
     return 1
 }
 
-dependency_manager_install_agent_if_missing() {
-    mkdir -p "$(dirname "$agent_path")" || true
-    mkdir -p "${DM_COMFYUI_DIR}" || true
-
+# Liveness-only: fetch the agent ONLY when the file is missing/empty. Version
+# changes are the agent's own in-process self-update from the server — never a
+# re-download to "correct" a version here.
+download_agent_if_missing() {
+    mkdir -p "$(dirname "$agent_path")" "${DM_COMFYUI_DIR}" 2>/dev/null || true
     if [[ -s "$agent_path" ]]; then
-        chmod +x "$agent_path" || true
+        chmod +x "$agent_path" 2>/dev/null || true
         return 0
     fi
-
-    if [[ -n "$agent_url" ]]; then
-        echo "Dependency manager: watchdog downloading agent from DM_AGENT_URL/AGENT_URL."
-        curl -fsSL "$agent_url" -o "$agent_path" || {
-            echo "WARN: Dependency manager: watchdog failed to download agent from $agent_url"
-            return 1
-        }
-    else
-        echo "Dependency manager: watchdog downloading agent from fallback URL ($fallback_url)."
-        curl -fsSL "$fallback_url" -o "$agent_path" || {
-            echo "WARN: Dependency manager: watchdog failed to download agent from fallback URL"
-            return 1
-        }
+    log "agent file missing; downloading from stable loader $loader_url"
+    if curl -fsSL "$loader_url" -o "$agent_path"; then
+        chmod +x "$agent_path" 2>/dev/null || true
+        return 0
     fi
-
-    chmod +x "$agent_path" || true
+    log "WARN: failed to download agent from $loader_url"
+    return 1
 }
 
-dependency_manager_start_agent_once() {
-    if dependency_manager_agent_running; then
-        return 0
+start_agent() {
+    download_agent_if_missing || return 0
+    log "starting agent; log=$log_path"
+    # The agent runs under an exclusive flock. A second agent that races to start
+    # fails the non-blocking lock and exits, so at most one agent ever runs. The
+    # lock is held across the agent's os.execv self-update (the fd survives exec),
+    # so there is no window for a duplicate during version transitions.
+    if have_flock; then
+        nohup bash -lc "if [[ -f /venv/main/bin/activate ]]; then source /venv/main/bin/activate; fi; exec flock -n '$agent_lock' python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
+    else
+        nohup bash -lc "if [[ -f /venv/main/bin/activate ]]; then source /venv/main/bin/activate; fi; exec python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
     fi
-
-    dependency_manager_install_agent_if_missing || return 0
-
-    echo "Dependency manager: watchdog starting agent; log=$log_path"
-    nohup bash -lc "if [[ -f /venv/main/bin/activate ]]; then source /venv/main/bin/activate; fi; python3 '$agent_path' >> '$log_path' 2>&1" >/dev/null 2>&1 &
     echo $! > "$pid_path"
 }
 
-dm_agent_disable="$(printf '%s' "${DM_AGENT_DISABLE:-}" | tr '[:upper:]' '[:lower:]')"
-if [[ "$dm_agent_disable" == "1" || "$dm_agent_disable" == "true" ]]; then
-    exit 0
-fi
+is_disabled && exit 0
+mkdir -p "$lock_dir" 2>/dev/null || true
 
-mkdir -p "$(dirname "$watchdog_pid_path")" || true
-if [[ -f "$watchdog_pid_path" ]]; then
+# Singleton supervisor: at most one supervise loop per host.
+#  - With flock: hold an exclusive lock for the loop's lifetime.
+#  - Without flock: fall back to a pidfile liveness guard (best-effort, matches
+#    the legacy watchdog) so a second invocation still refuses to spawn a rival.
+exec 9>"$watchdog_lock"
+if have_flock; then
+    if ! flock -n 9; then
+        log "another supervisor holds the lock; exiting"
+        exit 0
+    fi
+elif [[ -f "$watchdog_pid_path" ]]; then
     existing_pid="$(cat "$watchdog_pid_path" 2>/dev/null || true)"
     if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" 2>/dev/null; then
-        echo "Dependency manager: watchdog already running with pid=$existing_pid."
+        log "another supervisor (pid $existing_pid) is running; exiting"
         exit 0
     fi
 fi
+echo "$$" > "$watchdog_pid_path"
 
-echo $$ > "$watchdog_pid_path"
-cleanup() {
-    if [[ -f "$watchdog_pid_path" ]] && [[ "$(cat "$watchdog_pid_path" 2>/dev/null || true)" == "$$" ]]; then
-        rm -f "$watchdog_pid_path"
-    fi
-}
-trap cleanup EXIT INT TERM
-
-dependency_manager_start_agent_once
+log "supervising (poll=${poll_seconds}s, loader=${loader_url})"
 while true; do
-    sleep "${DM_AGENT_WATCHDOG_SECONDS:-15}"
-    dependency_manager_start_agent_once
+    if ! is_disabled && ! agent_running; then
+        start_agent
+    fi
+    sleep "$poll_seconds"
 done
 EOF
 

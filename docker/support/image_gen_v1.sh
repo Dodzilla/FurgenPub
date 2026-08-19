@@ -544,9 +544,36 @@ is_disabled() {
 
 have_flock() { command -v flock >/dev/null 2>&1; }
 
+# Identity-verified liveness for a candidate pid.
+#
+# `kill -0` alone is NOT sufficient and caused a permanent supervisor wedge on
+# 2026-08-19 (video_gen_v4 instance 48062383): the pidfile held a pid that had
+# been recycled as a THREAD id of ComfyUI (which spawns 200+ threads the moment
+# it starts, immediately after the agent is launched). `kill -0` succeeds
+# against a thread id, so the supervisor concluded a dead agent was alive and
+# stopped restarting it — the box sat with no agent until it was rebooted.
+#
+# `pgrep -f "$agent_path"` has the mirror-image problem: it matches ANY process
+# whose command line merely mentions the path (an ssh command, a grep, an
+# editor), which also reads as a false "agent is alive".
+#
+# So a pid only counts as the agent when its own /proc cmdline is a python
+# invocation of the agent path. Threads share the parent's cmdline, so a
+# recycled thread id is rejected: ComfyUI's cmdline never names the agent.
+pid_is_agent_process() {
+    local pid="$1" cmdline
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    # No procfs (non-Linux image): degrade to bare liveness rather than
+    # refusing to ever see a running agent.
+    [[ -r "/proc/$pid/cmdline" ]] || return 0
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [[ "$cmdline" == *python* && "$cmdline" == *"$agent_path"* ]]
+}
+
 # A live agent holds the exclusive agent_lock for its whole lifetime (including
 # across its in-process self-update). If we can acquire the lock, no agent holds
-# it. Fall back to pgrep/pidfile when flock is unavailable.
+# it. Fall back to identity-verified pgrep/pidfile when flock is unavailable.
 agent_running() {
     if have_flock && [[ -e "$agent_lock" ]]; then
         if flock -n "$agent_lock" true 2>/dev/null; then
@@ -554,13 +581,16 @@ agent_running() {
         fi
         return 0
     fi
-    if command -v pgrep >/dev/null 2>&1 && pgrep -f "$agent_path" >/dev/null 2>&1; then
-        return 0
+    if command -v pgrep >/dev/null 2>&1; then
+        local candidate
+        while read -r candidate; do
+            pid_is_agent_process "$candidate" && return 0
+        done < <(pgrep -f -- "$agent_path" 2>/dev/null || true)
     fi
     if [[ -f "$pid_path" ]]; then
         local pid
         pid="$(cat "$pid_path" 2>/dev/null || true)"
-        [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 0
+        pid_is_agent_process "$pid" && return 0
     fi
     return 1
 }
