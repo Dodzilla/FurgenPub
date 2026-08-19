@@ -135,7 +135,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.137"
+AGENT_VERSION = "dm-agent-py/0.10.138"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -4325,6 +4325,12 @@ class DependencyAgent:
         self._comfy_queue_summary_ttl_ms = max(1000, min(10000, int(_env_float("DM_COMFY_QUEUE_SUMMARY_TTL_SECONDS", 2.0) * 1000)))
         self._last_comfy_queue_summary: Dict[str, Any] = {}
         self._last_comfy_queue_summary_at_ms = 0
+        self._comfy_runtime_snapshot_ttl_ms = max(
+            5000,
+            min(300000, int(_env_float("DM_COMFY_RUNTIME_SNAPSHOT_TTL_SECONDS", 30.0) * 1000)),
+        )
+        self._last_comfy_runtime_snapshot: Dict[str, Any] = {}
+        self._last_comfy_runtime_snapshot_at_ms = 0
         self.node_contract_probe_ttl_ms = int(
             max(10.0, min(600.0, _env_float("DM_NODE_CONTRACT_PROBE_TTL_SECONDS", 60.0))) * 1000
         )
@@ -6310,6 +6316,7 @@ class DependencyAgent:
             input_cache_inventory = self._collect_input_cache_inventory()
             stage_counts = self._agent_stage_counts_payload()
             memory_telemetry = collect_cgroup_memory_telemetry()
+            comfy_runtime = {} if self.mining_only else self._comfy_runtime_snapshot()
             body = {
                 "localComfyReachable": bool(local_comfy),
                 "localReadinessFilePresent": bool(readiness_present),
@@ -6329,6 +6336,7 @@ class DependencyAgent:
                 "inputCacheMaxBytes": int(input_cache_inventory.get("maxBytes", 0)),
                 "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
                 **({"memoryTelemetry": memory_telemetry} if memory_telemetry else {}),
+                **({"comfyRuntime": comfy_runtime} if comfy_runtime else {}),
                 "idleMining": self._idle_prl_miner.snapshot(),
                 "agentVersion": AGENT_VERSION,
                 "capabilities": {
@@ -6366,6 +6374,9 @@ class DependencyAgent:
         memory_telemetry = body.get("memoryTelemetry")
         if isinstance(memory_telemetry, dict) and memory_telemetry:
             agent_control["memoryTelemetry"] = memory_telemetry
+        comfy_runtime = body.get("comfyRuntime")
+        if isinstance(comfy_runtime, dict) and comfy_runtime:
+            agent_control["comfyRuntime"] = comfy_runtime
         queue_summary = body.get("queueSummary")
         if isinstance(queue_summary, dict) and queue_summary:
             agent_control["queueSummary"] = queue_summary
@@ -6410,6 +6421,8 @@ class DependencyAgent:
         }
         if "memoryTelemetry" in agent_control:
             hot_agent_control["memoryTelemetry"] = agent_control.get("memoryTelemetry")
+        if "comfyRuntime" in agent_control:
+            hot_agent_control["comfyRuntime"] = agent_control.get("comfyRuntime")
         if "queueSummary" in agent_control:
             hot_agent_control["queueSummary"] = agent_control.get("queueSummary")
         if full:
@@ -7292,6 +7305,116 @@ class DependencyAgent:
             self._last_comfy_queue_summary = dict(summary)
             self._last_comfy_queue_summary_at_ms = now_ms
             return summary
+
+    def _comfy_runtime_snapshot(
+        self,
+        timeout_seconds: float = 3.0,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Snapshot the ComfyUI listener's effective argv and VRAM split.
+
+        Answers two questions that were previously only reachable by SSHing to
+        the box or reading a Vast template by hand: which launch flags the
+        RUNNING process actually has (a restart rebuilds COMFYUI_ARGS, so the
+        template is not authoritative), and how device VRAM divides between the
+        PyTorch caching allocator and everything else. The non-PyTorch share is
+        the number that matters for H3 OOMs -- it is where DynamicVRAM/aimdo
+        holds model weights, and it does not appear in any torch-level metric.
+        """
+        ttl_ms = int(self._comfy_runtime_snapshot_ttl_ms)
+        now_ms = _now_ms()
+        cached = self._last_comfy_runtime_snapshot if isinstance(self._last_comfy_runtime_snapshot, dict) else {}
+        cached_at_ms = int(self._last_comfy_runtime_snapshot_at_ms or 0)
+        if not force_refresh and cached and cached_at_ms > 0 and (now_ms - cached_at_ms) <= ttl_ms:
+            return dict(cached)
+
+        snapshot: Dict[str, Any] = {
+            "source": "comfy_system_stats_v1",
+            "measuredAtMs": int(now_ms),
+            # Read from the agent's own env: ComfyUI inherits it, so a mismatch
+            # against the template means the restart path dropped it.
+            "allocatorConf": _env_str("PYTORCH_ALLOC_CONF", "") or "",
+        }
+        try:
+            status, stats = self._comfy_api_json("GET", "/system_stats", timeout_seconds=timeout_seconds)
+            if status != 200 or not isinstance(stats, dict):
+                raise RuntimeError(f"Unexpected /system_stats response: {status}")
+            system = stats.get("system") if isinstance(stats.get("system"), dict) else {}
+            argv = system.get("argv")
+            if isinstance(argv, list):
+                flags = [str(token) for token in argv[1:] if isinstance(token, (str, int, float))]
+                snapshot["comfyArgs"] = " ".join(flags)[:1000]
+            pytorch_version = str(system.get("pytorch_version") or "").strip()
+            if pytorch_version:
+                snapshot["pytorchVersion"] = pytorch_version
+            for output_key, stats_key in (("ramTotalBytes", "ram_total"), ("ramFreeBytes", "ram_free")):
+                value = system.get(stats_key)
+                if isinstance(value, (int, float)) and value >= 0:
+                    snapshot[output_key] = int(value)
+
+            devices = stats.get("devices") if isinstance(stats.get("devices"), list) else []
+            device = devices[0] if devices and isinstance(devices[0], dict) else {}
+            if device:
+                name = str(device.get("name") or "").strip()
+                if name:
+                    snapshot["deviceName"] = name[:120]
+                for output_key, stats_key in (
+                    ("vramTotalBytes", "vram_total"),
+                    ("vramFreeBytes", "vram_free"),
+                    ("torchVramTotalBytes", "torch_vram_total"),
+                    ("torchVramFreeBytes", "torch_vram_free"),
+                ):
+                    value = device.get(stats_key)
+                    if isinstance(value, (int, float)) and value >= 0:
+                        snapshot[output_key] = int(value)
+                # ComfyUI reports vram_free as (cuda free + torch cached-free)
+                # and torch_vram_total as torch's reserved pool, so everything
+                # the caching allocator does not own falls out as:
+                #   total - free + torchFree - torchReserved
+                required = ("vramTotalBytes", "vramFreeBytes", "torchVramTotalBytes", "torchVramFreeBytes")
+                if all(key in snapshot for key in required):
+                    non_torch = (
+                        snapshot["vramTotalBytes"]
+                        - snapshot["vramFreeBytes"]
+                        + snapshot["torchVramFreeBytes"]
+                        - snapshot["torchVramTotalBytes"]
+                    )
+                    snapshot["nonTorchVramBytes"] = int(max(0, non_torch))
+            self._last_comfy_runtime_snapshot = dict(snapshot)
+            self._last_comfy_runtime_snapshot_at_ms = now_ms
+            return snapshot
+        except Exception as exc:
+            logging.debug("Comfy runtime snapshot failed: %s", exc)
+            snapshot["source"] = "comfy_system_stats_unreachable"
+            snapshot["error"] = str(exc)[:200]
+            self._last_comfy_runtime_snapshot = dict(snapshot)
+            self._last_comfy_runtime_snapshot_at_ms = now_ms
+            return snapshot
+
+    @staticmethod
+    def _format_gib(value: Any) -> str:
+        if not isinstance(value, (int, float)):
+            return "n/a"
+        return f"{float(value) / (1024 ** 3):.2f}GiB"
+
+    def _log_comfy_runtime_snapshot(self, context: str, snapshot: Dict[str, Any]) -> None:
+        if not isinstance(snapshot, dict) or not snapshot:
+            return
+        logging.info(
+            "ComfyUI runtime (%s): args=%r allocatorConf=%r device=%s vramTotal=%s vramFree=%s "
+            "torchReserved=%s torchCachedFree=%s nonTorch=%s ramFree=%s source=%s",
+            context,
+            snapshot.get("comfyArgs", ""),
+            snapshot.get("allocatorConf", ""),
+            snapshot.get("deviceName", "n/a"),
+            self._format_gib(snapshot.get("vramTotalBytes")),
+            self._format_gib(snapshot.get("vramFreeBytes")),
+            self._format_gib(snapshot.get("torchVramTotalBytes")),
+            self._format_gib(snapshot.get("torchVramFreeBytes")),
+            self._format_gib(snapshot.get("nonTorchVramBytes")),
+            self._format_gib(snapshot.get("ramFreeBytes")),
+            snapshot.get("source", ""),
+        )
 
     def _resolve_asset_gen_v5_script(self) -> Optional[Path]:
         candidates: List[Path] = []
@@ -8770,6 +8893,14 @@ class DependencyAgent:
                     )
                 finally:
                     self._restart_verify_previous_process_ids = []
+            # The restart path rebuilds COMFYUI_ARGS from scratch, so the flags
+            # the template baked are not proof of what the new process got.
+            # Record the replacement's actual argv while the restart is still
+            # the obvious cause of any change.
+            self._log_comfy_runtime_snapshot(
+                "after restart",
+                self._comfy_runtime_snapshot(force_refresh=True),
+            )
             return True
 
     def _arm_post_job_comfy_recycle(self, lease: AgentExecuteLease, outcome: str = "success") -> None:
@@ -10431,6 +10562,7 @@ class DependencyAgent:
         input_cache_inventory = self._collect_input_cache_inventory()
         stage_counts = self._agent_stage_counts_payload()
         memory_telemetry = collect_cgroup_memory_telemetry()
+        comfy_runtime = {} if self.mining_only else self._comfy_runtime_snapshot()
 
         body: Dict[str, Any] = {
             "schemaVersion": 1,
@@ -10453,6 +10585,7 @@ class DependencyAgent:
             "inputCacheMaxBytes": int(input_cache_inventory.get("maxBytes", 0)),
             "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
             **({"memoryTelemetry": memory_telemetry} if memory_telemetry else {}),
+            **({"comfyRuntime": comfy_runtime} if comfy_runtime else {}),
             "idleMining": self._idle_prl_miner.snapshot(),
             "agentVersion": AGENT_VERSION,
             "capabilities": {
@@ -13288,6 +13421,14 @@ class DependencyAgent:
                     timeout_seconds=300.0,
                     skip_if_reachable=True,
                 )
+            # Pre-submit baseline. A job that OOMs mid-sample reports only the
+            # torch-side numbers in its exception, so without this there is no
+            # record of how much VRAM was already spoken for before it started,
+            # nor of which flags the listener was actually running under.
+            self._log_comfy_runtime_snapshot(
+                f"job start jobId={lease.job_id}",
+                self._comfy_runtime_snapshot(force_refresh=True),
+            )
             client_id = f"{lease.job_id}-{uuid.uuid4().hex[:12]}"
             requested_prompt_id = str(uuid.uuid4()) if self.comfy_node_timing_enabled else None
             if requested_prompt_id is not None:
