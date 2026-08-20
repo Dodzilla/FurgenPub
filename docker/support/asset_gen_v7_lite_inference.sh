@@ -55,7 +55,7 @@ build_llama_server() {
     # package and keep all model transfer direct from Hugging Face to Vast.
     apt-get install -y --no-install-recommends \
         build-essential ca-certificates cmake curl git ninja-build pkg-config \
-        cuda-nvcc-13-2
+        cuda-nvcc-13-2 libcublas-dev-13-2
     export CUDACXX="${CUDACXX:-/usr/local/cuda-13.2/bin/nvcc}"
     if [[ ! -x "${CUDACXX}" ]]; then
         echo "ERROR: CUDA 13.2 nvcc was not installed at ${CUDACXX}." >&2
