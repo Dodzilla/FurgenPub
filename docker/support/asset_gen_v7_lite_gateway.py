@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -15,8 +16,13 @@ COMFY_BASE_URL = os.environ.get("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:818
 API_KEY = os.environ.get("INFERENCE_INSTANCE_API_KEY", "").strip()
 UPSTREAM_TIMEOUT_SECONDS = int(os.environ.get("QWEN_UPSTREAM_TIMEOUT_SECONDS", "900"))
 SLEEP_TIMEOUT_SECONDS = int(os.environ.get("QWEN_SLEEP_TIMEOUT_SECONDS", "30"))
-MAX_BODY_BYTES = int(os.environ.get("QWEN_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
+SLEEP_POLL_SECONDS = float(os.environ.get("QWEN_SLEEP_POLL_SECONDS", "0.1"))
+MAX_BODY_BYTES = int(os.environ.get("QWEN_MAX_BODY_BYTES", str(32 * 1024 * 1024)))
+RELEASE_TTL_SECONDS = int(os.environ.get("QWEN_RELEASE_TTL_SECONDS", "900"))
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 GPU_LOCK = threading.Lock()
+RELEASES_LOCK = threading.Lock()
+RELEASES = {}
 
 
 def http_request(url, method="GET", payload=None, timeout=10, authorize_backend=False):
@@ -63,8 +69,38 @@ def force_llama_sleep():
     while time.monotonic() < deadline:
         if llama_is_sleeping():
             return True
-        time.sleep(1)
+        time.sleep(SLEEP_POLL_SECONDS)
     return False
+
+
+def prune_releases(now=None):
+    now = time.time() if now is None else now
+    cutoff = now - RELEASE_TTL_SECONDS
+    with RELEASES_LOCK:
+        for request_id in [key for key, value in RELEASES.items() if value.get("updated_at", 0) < cutoff]:
+            RELEASES.pop(request_id, None)
+
+
+def set_release(request_id, phase, **values):
+    now = time.time()
+    with RELEASES_LOCK:
+        previous = RELEASES.get(request_id, {})
+        RELEASES[request_id] = {
+            **previous,
+            **values,
+            "request_id": request_id,
+            "phase": phase,
+            "safe": phase == "safe",
+            "updated_at": now,
+        }
+    prune_releases(now)
+
+
+def get_release(request_id):
+    prune_releases()
+    with RELEASES_LOCK:
+        value = RELEASES.get(request_id)
+        return dict(value) if value else None
 
 
 def health_payload():
@@ -80,25 +116,29 @@ def health_payload():
     except Exception:
         statuses["llama"] = False
     statuses["sleeping"] = llama_is_sleeping() if statuses["llama"] else False
+    statuses["gpu_busy"] = GPU_LOCK.locked()
     statuses["ready"] = statuses["comfyui"] and statuses["llama"]
     return statuses
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FurgenQwenGateway/1.0"
+    server_version = "FurgenQwenGateway/2.0"
 
     def log_message(self, fmt, *args):
         print(f"{self.log_date_time_string()} {self.client_address[0]} {fmt % args}", flush=True)
 
-    def send_bytes(self, status, content_type, body):
+    def send_bytes(self, status, content_type, body, headers=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, str(value))
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
-    def send_json(self, status, payload):
-        self.send_bytes(status, "application/json", json_response_bytes(payload))
+    def send_json(self, status, payload, headers=None):
+        self.send_bytes(status, "application/json", json_response_bytes(payload), headers=headers)
 
     def authorized(self):
         if not API_KEY:
@@ -115,6 +155,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200 if payload["ready"] else 503, payload)
             return
         if not self.authorized():
+            return
+        if self.path.startswith("/v1/gpu/releases/"):
+            request_id = self.path.removeprefix("/v1/gpu/releases/")
+            if not REQUEST_ID_RE.fullmatch(request_id):
+                self.send_json(400, {"error": {"message": "Invalid release id.", "code": "release_id_invalid"}})
+                return
+            release = get_release(request_id)
+            if release is None:
+                self.send_json(404, {"error": {"message": "Release state not found.", "code": "release_not_found"}})
+                return
+            self.send_json(200, release)
             return
         if self.path not in ("/v1/models", "/metrics", "/props"):
             self.send_json(404, {"error": {"message": "Not found", "code": "not_found"}})
@@ -133,6 +184,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.authorized():
             return
+        request_id = self.headers.get("X-Furgen-Request-Id", "").strip()
+        if not REQUEST_ID_RE.fullmatch(request_id):
+            self.send_json(400, {"error": {"message": "X-Furgen-Request-Id is required.", "code": "request_id_required"}})
+            return
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length <= 0 or length > MAX_BODY_BYTES:
             self.send_json(413, {"error": {"message": "Request body is empty or too large.", "code": "request_too_large"}})
@@ -150,8 +205,12 @@ class Handler(BaseHTTPRequestHandler):
         if not GPU_LOCK.acquire(blocking=False):
             self.send_json(429, {"error": {"message": "GPU is busy.", "code": "gpu_busy"}})
             return
+        response_sent = False
+        started_at = time.monotonic()
+        set_release(request_id, "preparing", started_at=time.time())
         try:
             free_comfy_models()
+            set_release(request_id, "inference")
             status, content_type, response_body = http_request(
                 f"{LLAMA_BASE_URL}/v1/chat/completions",
                 method="POST",
@@ -159,14 +218,39 @@ class Handler(BaseHTTPRequestHandler):
                 timeout=UPSTREAM_TIMEOUT_SECONDS,
                 authorize_backend=True,
             )
+            response_ready_ms = round((time.monotonic() - started_at) * 1000)
+            set_release(request_id, "draining", response_ready_ms=response_ready_ms)
+            self.send_bytes(
+                status,
+                content_type,
+                response_body,
+                headers={"X-Furgen-Gpu-Release-Id": request_id},
+            )
+            response_sent = True
             slept = force_llama_sleep()
-            if not slept:
-                self.send_json(502, {"error": {"message": "Inference completed but the model did not release GPU memory.", "code": "gpu_release_failed"}})
-                return
-            self.send_bytes(status, content_type, response_body)
+            release_completed_ms = round((time.monotonic() - started_at) * 1000)
+            if slept:
+                set_release(
+                    request_id,
+                    "safe",
+                    response_ready_ms=response_ready_ms,
+                    release_completed_ms=release_completed_ms,
+                    sleeping=True,
+                )
+            else:
+                set_release(
+                    request_id,
+                    "error",
+                    code="gpu_release_failed",
+                    response_ready_ms=response_ready_ms,
+                    release_completed_ms=release_completed_ms,
+                    sleeping=False,
+                )
         except Exception as error:
             force_llama_sleep()
-            self.send_json(502, {"error": {"message": "Inference gateway failure.", "code": "gateway_failure", "detail": str(error)}})
+            set_release(request_id, "error", code="gateway_failure", detail=str(error)[:500])
+            if not response_sent:
+                self.send_json(502, {"error": {"message": "Inference gateway failure.", "code": "gateway_failure", "detail": str(error)}})
         finally:
             GPU_LOCK.release()
 

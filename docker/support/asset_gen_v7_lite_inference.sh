@@ -8,6 +8,10 @@ MODEL_FILE="Qwen3.8-27B-Uncensored-Q5_K_M.gguf"
 MODEL_PATH="${COMFYUI_DIR}/models/llm/${MODEL_FILE}"
 MODEL_SIZE_BYTES="19535701408"
 MODEL_SHA256="24780644a95f759a9aeeb228c3d852028f2fd40ce0b74d68134246ec4a959547"
+VISION_FILE="Qwen3.8-27B-Uncensored-vision-f16.gguf"
+VISION_PATH="${COMFYUI_DIR}/models/llm/${VISION_FILE}"
+VISION_SIZE_BYTES="927606912"
+VISION_SHA256="5ac423f8a29059dc24e51bc6a43e9380dcd57a9347f28b62591e0b3f60b7081c"
 MODEL_ALIAS="qwen3.8-27b-uncensored"
 LLAMA_CPP_COMMIT="a94d563ed801d1da1b8c2432946de07d0231bb3d"
 LLAMA_REPO="${WORKSPACE}/src/llama.cpp"
@@ -41,6 +45,20 @@ verify_model() {
         echo "ERROR: Model SHA mismatch: expected ${MODEL_SHA256}, got ${sha}" >&2
         return 1
     }
+    if [[ ! -f "${VISION_PATH}" ]]; then
+        echo "ERROR: Vision projector dependency missing: ${VISION_PATH}" >&2
+        return 1
+    fi
+    size="$(stat -c '%s' "${VISION_PATH}")"
+    [[ "${size}" == "${VISION_SIZE_BYTES}" ]] || {
+        echo "ERROR: Vision projector size mismatch: expected ${VISION_SIZE_BYTES}, got ${size}" >&2
+        return 1
+    }
+    sha="$(sha256sum "${VISION_PATH}" | awk '{print $1}')"
+    [[ "${sha}" == "${VISION_SHA256}" ]] || {
+        echo "ERROR: Vision projector SHA mismatch: expected ${VISION_SHA256}, got ${sha}" >&2
+        return 1
+    }
 }
 
 build_llama_server() {
@@ -55,7 +73,7 @@ build_llama_server() {
     # package and keep all model transfer direct from Hugging Face to Vast.
     apt-get install -y --no-install-recommends \
         build-essential ca-certificates cmake curl git ninja-build pkg-config \
-        cuda-nvcc-13-2 libcublas-dev-13-2
+        cuda-nvcc-13-2 libcublas-dev-13-2 vmtouch
     export CUDACXX="${CUDACXX:-/usr/local/cuda-13.2/bin/nvcc}"
     if [[ ! -x "${CUDACXX}" ]]; then
         echo "ERROR: CUDA 13.2 nvcc was not installed at ${CUDACXX}." >&2
@@ -107,7 +125,7 @@ PY
 }
 
 stop_previous() {
-    for pid_file in "${LOG_DIR}/asset_gen_v7_lite_llama.pid" "${LOG_DIR}/asset_gen_v7_lite_gateway.pid"; do
+    for pid_file in "${LOG_DIR}/asset_gen_v7_lite_llama.pid" "${LOG_DIR}/asset_gen_v7_lite_gateway.pid" "${LOG_DIR}/asset_gen_v7_lite_model_cache.pid"; do
         if [[ -f "${pid_file}" ]]; then
             local pid
             pid="$(cat "${pid_file}" 2>/dev/null || true)"
@@ -127,16 +145,24 @@ launch() {
     local llama_dir
     llama_dir="$(dirname "${LLAMA_SERVER}")"
     export LD_LIBRARY_PATH="${llama_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    # llama.cpp releases its own mappings while asleep. Keep an independent,
+    # locked mapping of the Q5 model and vision projector so wakeups read from
+    # host RAM instead of the worker disk.
+    vmtouch -dl -t -P "${LOG_DIR}/asset_gen_v7_lite_model_cache.pid" "${MODEL_PATH}" "${VISION_PATH}"
     nohup "${LLAMA_SERVER}" \
         --host 127.0.0.1 \
         --port "${LLAMA_PORT}" \
         --model "${MODEL_PATH}" \
+        --mmproj "${VISION_PATH}" \
         --alias "${MODEL_ALIAS}" \
         --ctx-size 131072 \
         --batch-size 2048 \
         --ubatch-size 512 \
         --parallel 1 \
         --n-gpu-layers 999 \
+        --load-mode mmap+mlock \
+        --image-max-tokens 4096 \
+        --mtmd-batch-max-tokens 4096 \
         --metrics \
         --flash-attn on \
         --cache-type-k q8_0 \
@@ -144,7 +170,7 @@ launch() {
         --cache-prompt \
         --cont-batching \
         --jinja \
-        --sleep-idle-seconds 5 \
+        --sleep-idle-seconds 1 \
         --spec-type draft-mtp \
         --spec-draft-n-max 1 \
         --reasoning-format deepseek \
@@ -169,6 +195,8 @@ launch() {
     nohup env \
         QWEN_GATEWAY_PORT="${GATEWAY_PORT}" \
         QWEN_LLAMA_BASE_URL="http://127.0.0.1:${LLAMA_PORT}" \
+        QWEN_SLEEP_POLL_SECONDS="0.1" \
+        QWEN_MAX_BODY_BYTES="$((32 * 1024 * 1024))" \
         INFERENCE_INSTANCE_API_KEY="${INFERENCE_INSTANCE_API_KEY}" \
         DM_LOCAL_COMFY_BASE_URL="${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}" \
         python3 "${GATEWAY_SCRIPT}" \

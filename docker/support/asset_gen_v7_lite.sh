@@ -15,6 +15,7 @@ INFERENCE_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_inference.sh"
 GATEWAY_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_gateway.py"
 READINESS_PATH="${DM_COMFYUI_DIR}/input/${DM_LOCAL_READINESS_FILE}"
 MODEL_PATH="${DM_COMFYUI_DIR}/models/llm/Qwen3.8-27B-Uncensored-Q5_K_M.gguf"
+VISION_PATH="${DM_COMFYUI_DIR}/models/llm/Qwen3.8-27B-Uncensored-vision-f16.gguf"
 
 download_support_file() {
     local name="$1" destination="$2"
@@ -65,17 +66,20 @@ env SERVER_TYPE="${SERVER_TYPE}" DM_LOCAL_READINESS_FILE="${DM_LOCAL_READINESS_F
     ASSET_GEN_V5_IGNORED_BUNDLE_IDS="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS}" \
     DM_ASSET_GEN_V5_LITE_SCRIPT="${BASE_SCRIPT}" bash "${BASE_SCRIPT}" start
 
-echo "Waiting for the pinned Qwen dependency at ${MODEL_PATH}..."
+echo "Waiting for the pinned Qwen model and vision projector dependencies..."
 model_ready=0
 for _ in $(seq 1 420); do
-    if [[ -f "${MODEL_PATH}" ]] && [[ "$(stat -c '%s' "${MODEL_PATH}" 2>/dev/null || true)" == "19535701408" ]]; then
+    if [[ -f "${MODEL_PATH}" ]] && \
+       [[ "$(stat -c '%s' "${MODEL_PATH}" 2>/dev/null || true)" == "19535701408" ]] && \
+       [[ -f "${VISION_PATH}" ]] && \
+       [[ "$(stat -c '%s' "${VISION_PATH}" 2>/dev/null || true)" == "927606912" ]]; then
         model_ready=1
         break
     fi
     sleep 5
 done
 if [[ "${model_ready}" != "1" ]]; then
-    echo "ERROR: Qwen model dependency did not become ready." >&2
+    echo "ERROR: Qwen model or vision projector dependency did not become ready." >&2
     tail -n 250 "${WORKSPACE}/dependency_agent.log" >&2 || true
     exit 1
 fi
@@ -93,4 +97,8 @@ printf 'asset_gen_v7_lite ready at %s\nmodel=%s\nsha256=%s\nllama_cpp=%s\n' \
     "24780644a95f759a9aeeb228c3d852028f2fd40ce0b74d68134246ec4a959547" \
     "a94d563ed801d1da1b8c2432946de07d0231bb3d" \
     > "${READINESS_PATH}"
+printf 'vision=%s\nvision_sha256=%s\n' \
+    "Qwen3.8-27B-Uncensored-vision-f16.gguf" \
+    "5ac423f8a29059dc24e51bc6a43e9380dcd57a9347f28b62591e0b3f60b7081c" \
+    >> "${READINESS_PATH}"
 echo "asset_gen_v7_lite provisioning complete."
