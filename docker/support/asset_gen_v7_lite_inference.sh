@@ -49,7 +49,18 @@ build_llama_server() {
     fi
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git ninja-build pkg-config
+    # The v6 CUDA 13.2 image intentionally ships the runtime libraries without
+    # nvcc. Install only the pinned CUDA compiler package needed to build the
+    # Blackwell (sm_120) llama.cpp target; avoid the much larger toolkit meta
+    # package and keep all model transfer direct from Hugging Face to Vast.
+    apt-get install -y --no-install-recommends \
+        build-essential ca-certificates cmake curl git ninja-build pkg-config \
+        cuda-nvcc-13-2
+    export CUDACXX="${CUDACXX:-/usr/local/cuda-13.2/bin/nvcc}"
+    if [[ ! -x "${CUDACXX}" ]]; then
+        echo "ERROR: CUDA 13.2 nvcc was not installed at ${CUDACXX}." >&2
+        return 1
+    fi
     if [[ ! -d "${LLAMA_REPO}/.git" ]]; then
         git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git "${LLAMA_REPO}"
     fi
@@ -57,6 +68,7 @@ build_llama_server() {
     git -C "${LLAMA_REPO}" checkout --detach "${LLAMA_CPP_COMMIT}"
     cmake -S "${LLAMA_REPO}" -B "${LLAMA_BUILD}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_COMPILER="${CUDACXX}" \
         -DCMAKE_CUDA_ARCHITECTURES=120 \
         -DGGML_CUDA=ON \
         -DLLAMA_BUILD_SERVER=ON
