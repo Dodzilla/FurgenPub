@@ -95,6 +95,10 @@ BOOTSTRAP_PLAN_JSON=""
 SKIP_NODE_REQUIREMENTS=(
     "ComfyUI-Impact-Pack"
     "was-node-suite-comfyui"
+    # rembg is unused by the pinned easy-comfy runtime helpers and can pull a
+    # large optional ONNX stack that exceeds the dependency agent's 10-minute
+    # maintenance-command limit on fresh Vast workers.
+    "easy-comfy-nodes-async"
 )
 
 UNPINNED_NODE_DIRS=(
@@ -360,6 +364,11 @@ function provisioning_install_selected_node_bundles() {
         provisioning_get_nodes || return 1
     else
         printf "No asset_gen_v5 node bundles selected; skipping custom-node clone/install phase.\n"
+    fi
+
+    if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]] || bundle_selected "asset_gen_v5_runtime_helpers"; then
+        printf "Installing lightweight easy-comfy runtime requirements (excluding unused rembg).\n"
+        pip install --no-cache-dir requests boto3 pillow-avif-plugin pillow-heif || return 1
     fi
 
     if [[ "${ASSET_GEN_V5_LITE_INSTALL_VIDEO_TOOLS,,}" == "true" ]]; then
