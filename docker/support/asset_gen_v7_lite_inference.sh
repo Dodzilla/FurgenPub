@@ -79,6 +79,33 @@ build_llama_server() {
     touch "${LLAMA_BUILD}/furgen-commit-${LLAMA_CPP_COMMIT}"
 }
 
+protect_comfy_cublas_resolution() {
+    local launch_script="/opt/supervisor-scripts/comfyui.sh"
+    [[ -f "${launch_script}" ]] || return 0
+    /venv/main/bin/python3 - "${launch_script}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+old = (
+    "/venv/main/lib:/venv/main/lib/python3.12/site-packages/torch/lib:"
+    "/opt/miniforge3/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:"
+    "/venv/main/lib/python3.12/site-packages/nvidia/cu13/lib"
+)
+new = (
+    "/venv/main/lib/python3.12/site-packages/nvidia/cu13/lib:"
+    "/venv/main/lib:/venv/main/lib/python3.12/site-packages/torch/lib:"
+    "/opt/miniforge3/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+)
+if old in source:
+    path.write_text(source.replace(old, new), encoding="utf-8")
+    print("Pinned ComfyUI to PyTorch's bundled CUDA 13 CUBLAS runtime.")
+elif new not in source:
+    raise SystemExit("ERROR: Unrecognized ComfyUI LD_LIBRARY_PATH bootstrap; refusing a mixed CUBLAS runtime.")
+PY
+}
+
 stop_previous() {
     for pid_file in "${LOG_DIR}/asset_gen_v7_lite_llama.pid" "${LOG_DIR}/asset_gen_v7_lite_gateway.pid"; do
         if [[ -f "${pid_file}" ]]; then
@@ -169,4 +196,5 @@ launch() {
 
 verify_model
 build_llama_server
+protect_comfy_cublas_resolution
 launch
