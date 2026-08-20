@@ -22,6 +22,27 @@ download_support_file() {
     chmod +x "${destination}"
 }
 
+ensure_comfy_core() {
+    if [[ -f "${DM_COMFYUI_DIR}/main.py" && -f "${DM_COMFYUI_DIR}/comfy/cli_args.py" ]]; then
+        return 0
+    fi
+    echo "Initializing pinned ComfyUI v0.25.1 core in ${DM_COMFYUI_DIR}..."
+    mkdir -p "${DM_COMFYUI_DIR}"
+    if ! command -v git >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends git ca-certificates
+    fi
+    if [[ ! -d "${DM_COMFYUI_DIR}/.git" ]]; then
+        git -C "${DM_COMFYUI_DIR}" init
+        git -C "${DM_COMFYUI_DIR}" remote add origin https://github.com/comfyanonymous/ComfyUI.git
+    fi
+    git config --global --add safe.directory "${DM_COMFYUI_DIR}"
+    git -C "${DM_COMFYUI_DIR}" fetch --depth 1 origin refs/tags/v0.25.1
+    git -C "${DM_COMFYUI_DIR}" checkout --force FETCH_HEAD
+    /venv/main/bin/python -m pip install --no-cache-dir -r "${DM_COMFYUI_DIR}/requirements.txt"
+}
+
 download_support_file asset_gen_v5_lite.sh "${BASE_SCRIPT}"
 
 command="${1:-start}"
@@ -37,6 +58,7 @@ if [[ "${command}" != "start" && -n "${command}" ]]; then
     exit 1
 fi
 
+ensure_comfy_core
 rm -f "${READINESS_PATH}"
 env SERVER_TYPE="${SERVER_TYPE}" DM_LOCAL_READINESS_FILE="${DM_LOCAL_READINESS_FILE}" \
     COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT}" \
