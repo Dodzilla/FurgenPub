@@ -7,6 +7,8 @@ export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
 export DM_LOCAL_COMFY_BASE_URL="${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}"
 export DM_LOCAL_READINESS_FILE="${DM_LOCAL_READINESS_FILE:-provisioned_asset_gen_v7_lite.txt}"
+export COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-v0.25.1}"
+export ASSET_GEN_V5_IGNORED_BUNDLE_IDS="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS:-asset_gen_v6_lite_comfy_core_v0251,asset_gen_v6_lite_runtime_helpers}"
 export FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support}"
 BASE_SCRIPT="${WORKSPACE}/asset_gen_v5_lite.sh"
 INFERENCE_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_inference.sh"
@@ -26,6 +28,8 @@ command="${1:-start}"
 if [[ "${command}" == "install-bundles" ]]; then
     shift
     exec env SERVER_TYPE="${SERVER_TYPE}" DM_ASSET_GEN_V5_LITE_SCRIPT="${BASE_SCRIPT}" \
+        COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT}" \
+        ASSET_GEN_V5_IGNORED_BUNDLE_IDS="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS}" \
         bash "${BASE_SCRIPT}" install-bundles "$@"
 fi
 if [[ "${command}" != "start" && -n "${command}" ]]; then
@@ -35,6 +39,8 @@ fi
 
 rm -f "${READINESS_PATH}"
 env SERVER_TYPE="${SERVER_TYPE}" DM_LOCAL_READINESS_FILE="${DM_LOCAL_READINESS_FILE}" \
+    COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT}" \
+    ASSET_GEN_V5_IGNORED_BUNDLE_IDS="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS}" \
     DM_ASSET_GEN_V5_LITE_SCRIPT="${BASE_SCRIPT}" bash "${BASE_SCRIPT}" start
 
 echo "Waiting for the pinned Qwen dependency at ${MODEL_PATH}..."

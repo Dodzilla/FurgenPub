@@ -20,6 +20,7 @@ ASSET_GEN_V5_INSTALL_MODE="${ASSET_GEN_V5_INSTALL_MODE:-bundle_manager_v1}"
 ASSET_GEN_V5_BOOTSTRAP_ENDPOINT="${ASSET_GEN_V5_BOOTSTRAP_ENDPOINT:-/provisioning/bootstrap-plan}"
 ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE="${ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE:-}"
 ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLES="${ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLES:-${ASSET_GEN_V5_DEFAULT_BOOTSTRAP_BUNDLE:-asset_gen_v5_runtime_helpers,asset_gen_v5_flux_image,asset_gen_v5_omnivoice}}"
+ASSET_GEN_V5_IGNORED_BUNDLE_IDS="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS:-}"
 ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC="${ASSET_GEN_V5_COMFY_DISABLE_CUDA_MALLOC:-false}"
 ASSET_GEN_V5_PYTORCH_CUDA_ALLOC_CONF="${ASSET_GEN_V5_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 ASSET_GEN_V5_LITE_VERIFY_LTX_REFERENCE_AUDIO="${ASSET_GEN_V5_LITE_VERIFY_LTX_REFERENCE_AUDIO:-false}"
@@ -209,6 +210,19 @@ function bundle_selected() {
     return 1
 }
 
+function bundle_ignored() {
+    local bundle_id="$1" ignored_csv ignored
+    local -a ignored_bundle_ids=()
+    ignored_csv="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS// /,}"
+    IFS=',' read -r -a ignored_bundle_ids <<< "${ignored_csv}"
+    for ignored in "${ignored_bundle_ids[@]}"; do
+        if [[ -n "${ignored}" && "${ignored}" == "${bundle_id}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 function append_bundle_repos() {
     local bundle_id="$1"
     case "$bundle_id" in
@@ -266,6 +280,10 @@ function select_nodes_for_bundles() {
     NODES=()
     local bundle_id
     for bundle_id in "${SELECTED_NODE_BUNDLE_IDS[@]}"; do
+        if bundle_ignored "${bundle_id}"; then
+            printf "Delegating external bundle '%s' to the wrapper runtime.\n" "${bundle_id}"
+            continue
+        fi
         append_bundle_repos "$bundle_id" || return 1
     done
 }
