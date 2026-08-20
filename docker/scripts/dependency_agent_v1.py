@@ -8812,6 +8812,17 @@ class DependencyAgent:
         allow_supervisor_restart: bool = True,
     ) -> None:
         with self._comfy_restart_lock:
+            # asset_gen_v7_lite deliberately uses Vast's SSH runtime so port
+            # 8080 belongs to the authenticated inference gateway. That
+            # runtime has no supervisord process to relaunch ComfyUI after a
+            # Comfy-Manager reboot endpoint stops it. Always use the detached
+            # image launch script on v7; otherwise a dynamic node-bundle
+            # install can leave an otherwise healthy worker permanently down.
+            if (self.server_type or "").strip() == "asset_gen_v7_lite":
+                if self._restart_local_comfy_with_launch_script():
+                    return
+                raise RuntimeError("asset_gen_v7_lite ComfyUI launch script is unavailable.")
+
             if allow_supervisor_restart and prefer_process_restart and self._restart_local_comfy_with_supervisor():
                 return
 
