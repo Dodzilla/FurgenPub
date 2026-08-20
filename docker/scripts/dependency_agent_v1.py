@@ -135,7 +135,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.138"
+AGENT_VERSION = "dm-agent-py/0.10.139"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -7420,7 +7420,7 @@ class DependencyAgent:
         candidates: List[Path] = []
         if self.asset_gen_v5_script:
             candidates.append(Path(self.asset_gen_v5_script))
-        if (self.server_type or "").strip() in ("asset_gen_v5_lite", "asset_gen_v6_lite", "foxy_all"):
+        if (self.server_type or "").strip() in ("asset_gen_v5_lite", "asset_gen_v6_lite", "asset_gen_v7_lite", "foxy_all"):
             candidates.extend([
                 self.workspace / f"{(self.server_type or '').strip()}.sh",
                 Path(f"/workspace/{(self.server_type or '').strip()}.sh"),
@@ -11456,7 +11456,13 @@ class DependencyAgent:
 
         try:
             server_type = (self.server_type or "").strip()
-            asset_gen_v5_server_types = ("asset_gen_v5", "asset_gen_v5_lite", "asset_gen_v6_lite", "foxy_all")
+            asset_gen_v5_server_types = (
+                "asset_gen_v5",
+                "asset_gen_v5_lite",
+                "asset_gen_v6_lite",
+                "asset_gen_v7_lite",
+                "foxy_all",
+            )
             legacy_bundle_ids: List[str] = []
             for bundle_id in bundle_ids:
                 spec = bundle_specs.get(bundle_id) if isinstance(bundle_specs, dict) else None
