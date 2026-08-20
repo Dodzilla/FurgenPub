@@ -122,6 +122,44 @@ if old in source:
 elif new not in source:
     raise SystemExit("ERROR: Unrecognized ComfyUI LD_LIBRARY_PATH bootstrap; refusing a mixed CUBLAS runtime.")
 PY
+
+    # SSH-style Vast templates do not have supervisor start ComfyUI while the
+    # on-start hook owns /.provisioning. Allow this script's health-checked
+    # launch to bypass only that wait; normal launches retain the guard.
+    /venv/main/bin/python3 - "${launch_script}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+old = 'while [ -f "/.provisioning" ]; do\n'
+new = 'while [ -f "/.provisioning" ] && [[ "${FURGEN_SKIP_PROVISIONING_WAIT:-false}" != "true" ]]; do\n'
+if old in source:
+    path.write_text(source.replace(old, new, 1), encoding="utf-8")
+elif new not in source:
+    raise SystemExit("ERROR: Unrecognized ComfyUI provisioning wait guard.")
+PY
+}
+
+ensure_comfy_running() {
+    local comfy_base="${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}"
+    if curl -fsS "${comfy_base}/system_stats" >/dev/null 2>&1; then
+        return 0
+    fi
+    mkdir -p "${LOG_DIR}"
+    nohup env FURGEN_SKIP_PROVISIONING_WAIT=true SERVERLESS=true \
+        /opt/supervisor-scripts/comfyui.sh \
+        >>"${LOG_DIR}/asset_gen_v7_lite_comfy.log" 2>&1 &
+    echo $! > "${LOG_DIR}/asset_gen_v7_lite_comfy.pid"
+    for _ in $(seq 1 120); do
+        if curl -fsS "${comfy_base}/system_stats" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    tail -n 200 "${LOG_DIR}/asset_gen_v7_lite_comfy.log" >&2 || true
+    echo "ERROR: ComfyUI did not become locally reachable." >&2
+    return 1
 }
 
 stop_previous() {
@@ -138,6 +176,7 @@ stop_previous() {
 }
 
 launch() {
+    ensure_comfy_running
     curl -fsS -X POST -H 'Content-Type: application/json' \
         -d '{"unload_models":true,"free_memory":true}' \
         "${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}/free" >/dev/null
@@ -145,10 +184,10 @@ launch() {
     local llama_dir
     llama_dir="$(dirname "${LLAMA_SERVER}")"
     export LD_LIBRARY_PATH="${llama_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    # llama.cpp releases its own mappings while asleep. Keep an independent,
-    # locked mapping of the Q5 model and vision projector so wakeups read from
-    # host RAM instead of the worker disk.
-    vmtouch -dl -t -P "${LOG_DIR}/asset_gen_v7_lite_model_cache.pid" "${MODEL_PATH}" "${VISION_PATH}"
+    # The common Vast limit for locked memory is only 64 KiB. Warm the complete
+    # Q5 model and projector into the Linux page cache instead; this worker has
+    # ample host RAM and mmap reloads can then avoid worker-disk I/O.
+    vmtouch -t "${MODEL_PATH}" "${VISION_PATH}"
     nohup "${LLAMA_SERVER}" \
         --host 127.0.0.1 \
         --port "${LLAMA_PORT}" \
@@ -160,7 +199,7 @@ launch() {
         --ubatch-size 512 \
         --parallel 1 \
         --n-gpu-layers 999 \
-        --load-mode mmap+mlock \
+        --load-mode mmap \
         --image-max-tokens 4096 \
         --mtmd-batch-max-tokens 4096 \
         --metrics \
