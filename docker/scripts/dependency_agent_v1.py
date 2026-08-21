@@ -80,6 +80,12 @@ Optional knobs:
   - DM_VIDEO_GEN_V2_BOOTSTRAP_GATE_WAIT_SECONDS (max wait for the managed video bootstrap gate; default: 1800)
   - DM_VIDEO_GEN_V2_BOOTSTRAP_COMFY_WAIT_SECONDS (max post-gate wait for managed Comfy startup; default: 300)
   - DM_AGENT_MAX_EXEC_WORKERS     (local execute_job worker cap; default: 2)
+  - DM_GPU_COORDINATOR_URL        (loopback GPU coordinator base URL; unset disables coordinator integration)
+  - DM_GPU_COORDINATOR_REQUIRED   (fail closed when coordinator discovery is unavailable; default: false)
+  - DM_GPU_COORDINATOR_TOKEN      (optional bearer token for loopback coordinator requests)
+  - DM_GPU_COORDINATOR_LEASE_TTL_SECONDS (renewable coordinator lease TTL; default: 60)
+  - DM_COMFY_FULL_TRIM_MEM_AVAILABLE_GIB (full Comfy cache trim threshold; default: 24)
+  - DM_COMFY_FULL_TRIM_MEMORY_PSI_AVG10 (full Comfy cache trim PSI avg10 threshold; default: 5)
   - DM_MINING_ONLY                (set to 1 for PRL mining-only instances; skips Comfy probes and job execution)
   - DM_INPUT_CACHE_DIR            (persistent remote-input cache dir; default: $WORKSPACE/.dm_input_cache)
   - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 20GiB)
@@ -135,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.140"
+AGENT_VERSION = "dm-agent-py/0.10.141"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -158,6 +164,9 @@ PRESERVED_COMFY_MEMORY_VALUE_FLAGS = (
     "--reserve-vram",
     "--cache-lru",
 )
+PRESERVED_COMFY_MEMORY_TWO_VALUE_FLAGS = (
+    "--cache-ram",
+)
 
 
 def _preserved_comfy_memory_flags(source_args: str) -> str:
@@ -172,6 +181,11 @@ def _preserved_comfy_memory_flags(source_args: str) -> str:
             value = tokens[index + 1]
             if not value.startswith("--"):
                 preserved.extend([token, value])
+            continue
+        if token in PRESERVED_COMFY_MEMORY_TWO_VALUE_FLAGS and index + 2 < len(tokens):
+            values = tokens[index + 1:index + 3]
+            if all(not value.startswith("--") for value in values):
+                preserved.extend([token, *values])
     return f" {' '.join(preserved)}" if preserved else ""
 MAX_COMFY_NODE_TIMING_ROWS = 64
 MAX_COMFY_WS_FRAME_BYTES = 32 * 1024 * 1024
@@ -953,6 +967,20 @@ def _split_csv(v: Optional[str]) -> List[str]:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _linux_process_start_time(pid: int) -> Optional[int]:
+    """Return Linux /proc starttime ticks for PID-reuse-safe process identity."""
+    try:
+        raw = (Path("/proc") / str(int(pid)) / "stat").read_text("utf-8", errors="replace")
+        close_idx = raw.rfind(")")
+        if close_idx < 0:
+            return None
+        fields = raw[close_idx + 1:].strip().split()
+        # fields starts at proc(5) field 3 (state); starttime is field 22.
+        return int(fields[19]) if len(fields) > 19 else None
+    except Exception:
+        return None
 
 
 _CGROUP_MEMORY_PEAK_FALLBACK_BYTES = 0
@@ -2729,6 +2757,250 @@ class DownloadActivity:
     last_sample_bytes: int = 0
 
 
+class GPUCoordinatorError(RuntimeError):
+    """Base error for the optional loopback GPU residency coordinator."""
+
+
+class GPUCoordinatorBusy(GPUCoordinatorError):
+    def __init__(self, message: str, retry_after_seconds: float = 2.0) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = max(0.25, min(60.0, float(retry_after_seconds)))
+
+
+class GPUCoordinatorUnavailable(GPUCoordinatorError):
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = int(status) if isinstance(status, int) else None
+
+
+@dataclass
+class GPUCoordinatorLease:
+    holder: str
+    work_id: str
+    epoch: int
+    fencing_token: str
+    deadline_ms: int
+    ttl_ms: int
+    pid: Optional[int] = None
+    process_start_time: Optional[int] = None
+    process_group_id: Optional[int] = None
+    metadata_provider: Optional[Callable[[], Dict[str, Any]]] = field(default=None, repr=False)
+    renew_stop: threading.Event = field(default_factory=threading.Event, repr=False)
+    lost: threading.Event = field(default_factory=threading.Event, repr=False)
+    renew_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    released: bool = False
+    released_reason: str = ""
+    released_keep_warm: bool = False
+    release_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    identity_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+class GPUCoordinatorClient:
+    """Dependency-free client for the loopback fenced-lease API.
+
+    An unset URL is the backward-compatible feature flag. When a URL is set,
+    transport failures and busy responses remain fail-closed. Only an explicit
+    unsupported response (404/501) may disable an optional coordinator.
+    """
+
+    BUSY_STATUSES = {409, 423, 425, 429, 503}
+
+    def __init__(self, base_url: str, required: bool = False, token: str = "") -> None:
+        self.base_url = str(base_url or "").strip().rstrip("/")
+        if self.base_url:
+            parsed = urllib.parse.urlparse(self.base_url)
+            hostname = str(parsed.hostname or "").strip().lower()
+            is_loopback = hostname == "localhost"
+            if not is_loopback:
+                try:
+                    is_loopback = ipaddress.ip_address(hostname).is_loopback
+                except ValueError:
+                    is_loopback = False
+            if parsed.scheme not in ("http", "https") or not is_loopback:
+                raise ValueError("DM_GPU_COORDINATOR_URL must be an HTTP(S) loopback URL")
+        self.required = bool(required)
+        self.token = str(token or "").strip()
+        self._supported: Optional[bool] = None
+        self._status_cache: Dict[str, Any] = {}
+        self._status_cache_at_ms = 0
+        self._lock = threading.Lock()
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.base_url)
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    @staticmethod
+    def _retry_after_seconds(headers: Any, default: float = 2.0) -> float:
+        try:
+            raw = headers.get("Retry-After") if headers is not None else None
+            if raw is not None:
+                return max(0.25, min(60.0, float(raw)))
+        except (TypeError, ValueError):
+            pass
+        return float(default)
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        body: Optional[Dict[str, Any]] = None,
+        timeout_seconds: float = 5.0,
+    ) -> Tuple[int, Dict[str, Any], Any]:
+        url = f"{self.base_url}{endpoint if endpoint.startswith('/') else '/' + endpoint}"
+        encoded = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(url, data=encoded, headers=self._headers(), method=method.upper())
+        try:
+            with urllib.request.urlopen(request, timeout=max(0.25, timeout_seconds)) as response:
+                raw = response.read()
+                parsed = json.loads(raw.decode("utf-8")) if raw else {}
+                return int(response.status), parsed if isinstance(parsed, dict) else {}, response.headers
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            try:
+                parsed = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:
+                parsed = {}
+            return int(exc.code), parsed if isinstance(parsed, dict) else {}, exc.headers
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            raise GPUCoordinatorUnavailable(f"GPU coordinator request failed: {method} {endpoint}: {exc}") from exc
+
+    def _ensure_supported(self) -> bool:
+        if not self.configured:
+            return False
+        with self._lock:
+            supported = self._supported
+        if supported is not None:
+            return bool(supported)
+        status, payload, _headers = self._request("GET", "/v1/gpu/status", timeout_seconds=2.0)
+        if 200 <= status < 300:
+            with self._lock:
+                self._supported = True
+                self._status_cache = dict(payload)
+                self._status_cache_at_ms = _now_ms()
+            return True
+        if status in (404, 501) and not self.required:
+            logging.warning(
+                "GPU coordinator endpoint is unsupported (status=%d); retaining legacy GPU behavior.",
+                status,
+            )
+            with self._lock:
+                self._supported = False
+            return False
+        raise GPUCoordinatorUnavailable(f"GPU coordinator status probe failed (status={status})")
+
+    def status(self, max_age_ms: int = 5000) -> Dict[str, Any]:
+        if not self.configured:
+            return {"configured": False, "supported": False}
+        if not self._ensure_supported():
+            return {"configured": True, "supported": False}
+        now_ms = _now_ms()
+        with self._lock:
+            cached = dict(self._status_cache)
+            cached_at_ms = int(self._status_cache_at_ms or 0)
+        if cached and now_ms - cached_at_ms <= max(0, int(max_age_ms)):
+            return {"configured": True, "supported": True, **cached}
+        status, payload, _headers = self._request("GET", "/v1/gpu/status", timeout_seconds=2.0)
+        if status < 200 or status >= 300:
+            raise GPUCoordinatorUnavailable(f"GPU coordinator status failed (status={status})")
+        with self._lock:
+            self._status_cache = dict(payload)
+            self._status_cache_at_ms = now_ms
+        return {"configured": True, "supported": True, **payload}
+
+    def acquire(self, holder: str, work_id: str, ttl_ms: int) -> Optional[GPUCoordinatorLease]:
+        if not self._ensure_supported():
+            return None
+        status, payload, headers = self._request(
+            "POST",
+            "/v1/gpu/leases/acquire",
+            body={"holder": holder, "workId": work_id, "ttlMs": int(ttl_ms)},
+            timeout_seconds=10.0,
+        )
+        if status in self.BUSY_STATUSES:
+            reason = str(payload.get("reason") or payload.get("error") or "gpu_coordinator_busy")
+            raise GPUCoordinatorBusy(reason, self._retry_after_seconds(headers))
+        if status < 200 or status >= 300:
+            raise GPUCoordinatorUnavailable(f"GPU coordinator acquire failed (status={status})")
+        return self._parse_lease(payload, holder, work_id, int(ttl_ms))
+
+    @staticmethod
+    def _parse_lease(payload: Dict[str, Any], holder: str, work_id: str, ttl_ms: int) -> GPUCoordinatorLease:
+        lease_data = payload.get("lease") if isinstance(payload.get("lease"), dict) else payload
+        fencing_token = str(lease_data.get("fencingToken") or "")
+        epoch = lease_data.get("epoch")
+        if not fencing_token or not isinstance(epoch, (int, float)):
+            raise GPUCoordinatorUnavailable("GPU coordinator returned an invalid lease")
+        deadline_ms = lease_data.get("deadlineMs")
+        return GPUCoordinatorLease(
+            holder=holder,
+            work_id=work_id,
+            epoch=int(epoch),
+            fencing_token=fencing_token,
+            deadline_ms=int(deadline_ms) if isinstance(deadline_ms, (int, float)) else _now_ms() + int(ttl_ms),
+            ttl_ms=int(ttl_ms),
+        )
+
+    def reconcile(self, holder: str, work_id: str, metadata: Optional[Dict[str, Any]] = None) -> GPUCoordinatorLease:
+        if not self._ensure_supported():
+            raise GPUCoordinatorUnavailable("GPU coordinator is not enabled")
+        status, payload, _headers = self._request(
+            "POST",
+            "/v1/gpu/reconcile",
+            body={"holder": holder, "workId": work_id, "metadata": dict(metadata or {})},
+            timeout_seconds=2.0,
+        )
+        if status < 200 or status >= 300:
+            raise GPUCoordinatorUnavailable(f"GPU coordinator reconcile failed (status={status})")
+        return self._parse_lease(payload, holder, work_id, 60_000)
+
+    def renew(self, lease: GPUCoordinatorLease) -> None:
+        with lease.identity_lock:
+            token = urllib.parse.quote(lease.fencing_token, safe="")
+            body: Dict[str, Any] = {"epoch": int(lease.epoch), "ttlMs": int(lease.ttl_ms)}
+            if isinstance(lease.pid, int) and lease.pid > 0 and isinstance(lease.process_start_time, int):
+                body["metadata"] = {
+                    "pid": int(lease.pid),
+                    "processStartTime": int(lease.process_start_time),
+                }
+                if isinstance(lease.process_group_id, int) and lease.process_group_id > 0:
+                    body["metadata"]["processGroupId"] = int(lease.process_group_id)
+        status, payload, _headers = self._request(
+            "POST",
+            f"/v1/gpu/leases/{token}/renew",
+            body=body,
+            timeout_seconds=5.0,
+        )
+        if status < 200 or status >= 300:
+            raise GPUCoordinatorUnavailable(f"GPU coordinator renew failed (status={status})", status=status)
+        lease_data = payload.get("lease") if isinstance(payload.get("lease"), dict) else payload
+        deadline_ms = lease_data.get("deadlineMs")
+        with lease.identity_lock:
+            lease.deadline_ms = int(deadline_ms) if isinstance(deadline_ms, (int, float)) else _now_ms() + int(lease.ttl_ms)
+
+    def release(self, lease: GPUCoordinatorLease, reason: str, keep_warm: bool = False) -> None:
+        with lease.identity_lock:
+            token = urllib.parse.quote(lease.fencing_token, safe="")
+            epoch = int(lease.epoch)
+        status, _payload, _headers = self._request(
+            "POST",
+            f"/v1/gpu/leases/{token}/release",
+            body={
+                "epoch": epoch,
+                "reason": str(reason or "work_complete")[:160],
+                "keepWarm": bool(keep_warm),
+            },
+            timeout_seconds=5.0,
+        )
+        if status not in (200, 204, 404, 409, 410):
+            raise GPUCoordinatorUnavailable(f"GPU coordinator release failed (status={status})")
+
+
 @dataclass
 class AgentExecuteLease:
     item_id: str
@@ -2754,6 +3026,8 @@ class AgentExecuteLease:
     prompt_submitted_at_ms: int = 0
     upload_enqueued_at_ms: int = 0
     upload_started_at_ms: int = 0
+    gpu_retry_after_ms: int = 0
+    gpu_coordinator_lease: Optional[GPUCoordinatorLease] = None
 
 
 @dataclass(frozen=True)
@@ -2781,6 +3055,7 @@ class PrlMinerController:
         self.binary_metadata_path = self.root / "prl_gpu_miner.meta.json"
         self.log_path = self.root / "prl_miner.log"
         self.agent_update_resume_path = self.root / "resume_after_agent_update.json"
+        self.gate_dir = self.root / "launch_gates"
         self.download_timeout_seconds = max(30.0, float(download_timeout_seconds))
         self.download_chunk_size = max(1024 * 1024, int(download_chunk_size))
         self._lock = threading.Lock()
@@ -2826,6 +3101,7 @@ class PrlMinerController:
         self._last_auto_restart_reason = ""
         self._auto_restart_count = 0
         self._last_agent_update_resume_attempt_ms = 0
+        self._pending_gate_path: Optional[Path] = None
 
     def _reap_locked(self) -> None:
         if self._proc is None:
@@ -2835,6 +3111,13 @@ class PrlMinerController:
             return
         self._last_exit_code = int(return_code)
         self._proc = None
+        gate_path = self._pending_gate_path
+        self._pending_gate_path = None
+        if gate_path is not None:
+            try:
+                gate_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         self._stopped_at_ms = _now_ms()
         if self._desired_state in ("running", "starting"):
             self._state = "failed" if return_code != 0 else "stopped"
@@ -3324,7 +3607,12 @@ class PrlMinerController:
         with self._process_op_lock:
             return self._start_serialized(payload)
 
-    def _start_serialized(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def prepare_gated(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Complete all non-GPU mining preparation before lease admission."""
+        with self._process_op_lock:
+            return self._start_serialized(payload, prepare_only=True)
+
+    def _start_serialized(self, payload: Dict[str, Any], prepare_only: bool = False) -> Dict[str, Any]:
         pool_url = payload.get("poolUrl") if isinstance(payload.get("poolUrl"), str) else ""
         payout_address = payload.get("payoutAddress") if isinstance(payload.get("payoutAddress"), str) else ""
         worker = payload.get("worker") if isinstance(payload.get("worker"), str) else ""
@@ -3436,6 +3724,8 @@ class PrlMinerController:
                         self._suspended_for_work = False
                         self._suspended_at_ms = 0
         if same_target and not force_restart:
+            if prepare_only:
+                return {"alreadyRunning": True, "payload": dict(payload)}
             return self.snapshot()
 
         if already_running:
@@ -3476,6 +3766,30 @@ class PrlMinerController:
             ]
             if static_difficulty:
                 args.extend(["--password", f"x;d={static_difficulty}"])
+
+        if prepare_only:
+            return {
+                "alreadyRunning": False,
+                "args": list(args),
+                "payload": dict(payload),
+                "worker": worker,
+                "poolUrl": pool_url,
+                "minerVersion": miner_version,
+                "minerKind": miner_kind,
+                "minerPackageType": miner_package_type,
+                "minerExecutablePath": miner_executable_path,
+                "cpuMiningEnabled": cpu_mining_enabled,
+                "cpuThreadsReduce": cpu_threads_reduce,
+                "cpuThreadsPriority": cpu_threads_priority,
+                "staticDifficulty": static_difficulty,
+                "staticDifficultySource": static_difficulty_source,
+                "staticDifficultyMatchedGpuName": static_difficulty_matched_gpu_name,
+                "staticDifficultyExperimentId": static_difficulty_experiment_id,
+                "staticDifficultyExperimentVariant": static_difficulty_experiment_variant,
+                "staticDifficultyExperimentBucket": static_difficulty_experiment_bucket,
+                "staticDifficultyExperimentAllocationPct": static_difficulty_experiment_allocation_pct,
+                "pauseMode": pause_mode,
+            }
 
         self.root.mkdir(parents=True, exist_ok=True)
         log_file = self.log_path.open("ab")
@@ -3547,6 +3861,126 @@ class PrlMinerController:
         )
         return self.snapshot()
 
+    def start_gated(self, prepared: Dict[str, Any]) -> Dict[str, Any]:
+        """Launch a non-CUDA wrapper that cannot exec the miner until released."""
+        with self._process_op_lock:
+            if prepared.get("alreadyRunning") is True:
+                return {"alreadyRunning": True, "snapshot": self.snapshot(), "gatePath": None}
+            args = prepared.get("args")
+            if not isinstance(args, list) or not args or not all(isinstance(value, str) and value for value in args):
+                raise RuntimeError("Invalid prepared PRL miner launch")
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.gate_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.gate_dir, 0o700)
+            gate_path = self.gate_dir / f"{uuid.uuid4().hex}.gate"
+            gate_path.unlink(missing_ok=True)
+            wrapper = (
+                "import os,sys,time\n"
+                "gate=sys.argv[1]\n"
+                "argv=sys.argv[2:]\n"
+                "while True:\n"
+                " try:\n"
+                "  flags=os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)\n"
+                "  fd=os.open(gate, flags)\n"
+                "  try: data=os.read(fd, 32)\n"
+                "  finally: os.close(fd)\n"
+                "  if data == b'release\\n':\n"
+                "   try: os.unlink(gate)\n"
+                "   except FileNotFoundError: pass\n"
+                "   os.execvpe(argv[0], argv, os.environ)\n"
+                " except FileNotFoundError: pass\n"
+                " time.sleep(0.02)\n"
+            )
+            log_file = self.log_path.open("ab")
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-c", wrapper, str(gate_path), *args],
+                    cwd=str(self.root),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env=os.environ.copy(),
+                    preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+                )
+            finally:
+                log_file.close()
+            with self._lock:
+                self._proc = proc
+                self._pending_gate_path = gate_path
+                self._state = "starting"
+                self._desired_state = "running"
+                self._worker = str(prepared.get("worker") or "")
+                self._pool_url = str(prepared.get("poolUrl") or "")
+                self._miner_version = str(prepared.get("minerVersion") or "")
+                self._miner_kind = str(prepared.get("minerKind") or DEFAULT_PRL_MINER_KIND)
+                self._miner_package_type = str(prepared.get("minerPackageType") or DEFAULT_PRL_MINER_PACKAGE_TYPE)
+                self._miner_executable_path = str(prepared.get("minerExecutablePath") or "")
+                self._cpu_mining_enabled = prepared.get("cpuMiningEnabled") is True
+                self._cpu_threads_reduce = int(prepared.get("cpuThreadsReduce") or 0)
+                self._cpu_threads_priority = int(prepared.get("cpuThreadsPriority") or 2)
+                self._static_difficulty = str(prepared.get("staticDifficulty") or "")
+                self._static_difficulty_source = str(prepared.get("staticDifficultySource") or "")
+                self._static_difficulty_matched_gpu_name = str(prepared.get("staticDifficultyMatchedGpuName") or "")
+                self._static_difficulty_experiment_id = str(prepared.get("staticDifficultyExperimentId") or "")
+                self._static_difficulty_experiment_variant = str(prepared.get("staticDifficultyExperimentVariant") or "")
+                self._static_difficulty_experiment_bucket = prepared.get("staticDifficultyExperimentBucket")
+                self._static_difficulty_experiment_allocation_pct = prepared.get("staticDifficultyExperimentAllocationPct")
+                self._pause_mode = str(prepared.get("pauseMode") or DEFAULT_PRL_MINER_PAUSE_MODE)
+                self._started_at_ms = _now_ms()
+                self._stopped_at_ms = 0
+                self._last_exit_code = None
+                self._last_error = ""
+                self._last_failure_category = ""
+                self._last_start_payload = dict(prepared.get("payload") or {})
+                self._paused_start_payload = None
+                self._paused_reason = ""
+                self._suspended_for_work = False
+                self._suspended_at_ms = 0
+            return {"alreadyRunning": False, "snapshot": self.snapshot(), "gatePath": str(gate_path)}
+
+    def release_start_gate(self, gate_path_raw: str) -> Dict[str, Any]:
+        with self._process_op_lock:
+            gate_path = Path(str(gate_path_raw or ""))
+            with self._lock:
+                self._reap_locked()
+                proc = self._proc
+                expected_gate = self._pending_gate_path
+            if proc is None or proc.poll() is not None or expected_gate is None or gate_path != expected_gate:
+                raise RuntimeError("PRL miner gate wrapper is no longer active")
+            temporary = gate_path.with_name(f".{gate_path.name}.{uuid.uuid4().hex}.tmp")
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(b"release\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, gate_path)
+                directory_fd = os.open(self.gate_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                temporary.unlink(missing_ok=True)
+            consume_deadline = time.monotonic() + 1.0
+            while gate_path.exists() and proc.poll() is None and time.monotonic() < consume_deadline:
+                time.sleep(0.01)
+            with self._lock:
+                if self._proc is not proc or proc.poll() is not None or gate_path.exists():
+                    gate_path.unlink(missing_ok=True)
+                    raise RuntimeError("PRL miner wrapper exited before gate release")
+                self._pending_gate_path = None
+                self._state = "running"
+                self._desired_state = "running"
+            return self.snapshot()
+
+    def cancel_gated_start(self, reason: str) -> None:
+        with self._process_op_lock:
+            gate_path = self._pending_gate_path
+            if gate_path is not None:
+                gate_path.unlink(missing_ok=True)
+            self._stop_serialized(reason, timeout_seconds=5.0)
+
     def stop(self, reason: str = "", timeout_seconds: float = 10.0) -> Dict[str, Any]:
         with self._process_op_lock:
             return self._stop_serialized(reason, timeout_seconds=timeout_seconds)
@@ -3558,6 +3992,13 @@ class PrlMinerController:
         with self._lock:
             self._reap_locked()
             proc = self._proc
+            gate_path = self._pending_gate_path
+            self._pending_gate_path = None
+            if gate_path is not None:
+                try:
+                    gate_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
             if proc is None:
                 self._state = "stopped"
                 self._desired_state = "stopped"
@@ -3627,13 +4068,18 @@ class PrlMinerController:
             else:
                 self._cleanup_miner_processes(reason or "stop_if_running_without_tracked_proc")
 
-    def pause_for_work(self, reason: str, timeout_seconds: Optional[float] = None) -> None:
+    def pause_for_work(
+        self,
+        reason: str,
+        timeout_seconds: Optional[float] = None,
+        force_stop: bool = False,
+    ) -> None:
         with self._process_op_lock:
             with self._lock:
                 running = self._is_running_locked()
                 payload = dict(self._last_start_payload) if self._last_start_payload else {}
                 proc = self._proc
-                pause_mode = self._pause_mode
+                pause_mode = "stop_start" if force_stop else self._pause_mode
             if not running:
                 self._cleanup_miner_processes(reason or "pause_without_tracked_proc", timeout_seconds=timeout_seconds or 10.0)
                 return
@@ -3743,6 +4189,21 @@ class PrlMinerController:
         self.start(payload)
         return True
 
+    def defer_start(self, payload: Dict[str, Any], reason: str) -> None:
+        """Remember a backend mining request without starting GPU work yet."""
+        with self._lock:
+            self._last_start_payload = dict(payload)
+            self._desired_state = "starting"
+            if self._state not in ("running", "paused"):
+                self._state = "stopped"
+            self._last_error = str(reason or "gpu_coordinator_busy")[:500]
+
+    def desired_start_payload(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            payload = self._paused_start_payload or self._last_start_payload
+            desired = self._desired_state in ("running", "starting") or bool(self._paused_start_payload)
+            return dict(payload) if desired and payload else None
+
     def handle_command(self, item: Dict[str, Any], ack_func: Callable[..., Dict[str, Any]]) -> None:
         item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
         lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
@@ -3758,7 +4219,11 @@ class PrlMinerController:
                 item_reason = item.get("reason") if isinstance(item.get("reason"), str) else ""
                 reason = str(payload.get("reason") or item_reason or "backend_stop_command")
                 if reason.strip() in PRL_MINER_TRANSIENT_STOP_REASONS:
-                    self.pause_for_work(reason, timeout_seconds=timeout)
+                    self.pause_for_work(
+                        reason,
+                        timeout_seconds=timeout,
+                        force_stop=payload.get("forceStop") is True,
+                    )
                 else:
                     self.stop(reason, timeout_seconds=timeout)
             else:
@@ -4224,6 +4689,28 @@ class DependencyAgent:
             min(30.0, _env_float("DM_IDLE_PRL_FREE_COMFY_TIMEOUT_SECONDS", 10.0)),
         )
         self._last_idle_prl_comfy_free_ms = 0
+        coordinator_url = (_env_str("DM_GPU_COORDINATOR_URL") or "").strip().rstrip("/")
+        coordinator_required = _env_bool("DM_GPU_COORDINATOR_REQUIRED", False)
+        if coordinator_required and not coordinator_url:
+            coordinator_url = "http://127.0.0.1:8189"
+        self.gpu_coordinator_lease_ttl_ms = int(
+            max(15.0, min(3600.0, _env_float("DM_GPU_COORDINATOR_LEASE_TTL_SECONDS", 60.0))) * 1000
+        )
+        self._gpu_coordinator = GPUCoordinatorClient(
+            coordinator_url,
+            required=coordinator_required,
+            token=_env_str("DM_GPU_COORDINATOR_TOKEN") or "",
+        )
+        self._mining_gpu_lease: Optional[GPUCoordinatorLease] = None
+        self._mining_gpu_lease_lock = threading.RLock()
+        self._mining_gpu_retry_after_ms = 0
+        self.comfy_full_trim_mem_available_bytes = int(
+            max(1.0, min(256.0, _env_float("DM_COMFY_FULL_TRIM_MEM_AVAILABLE_GIB", 24.0))) * 1024 ** 3
+        )
+        self.comfy_full_trim_memory_psi_avg10 = max(
+            0.0,
+            min(100.0, _env_float("DM_COMFY_FULL_TRIM_MEMORY_PSI_AVG10", 5.0)),
+        )
 
         # Agent control channel knobs (execute pull mode).
         self.agent_control_enabled = _env_bool("DM_AGENT_CONTROL_ENABLED", True)
@@ -4924,17 +5411,339 @@ class DependencyAgent:
             self._idle_prl_miner.stop_if_running("agent_stop")
         except Exception as e:
             logging.warning("Failed stopping idle PRL miner during agent stop: %s", e)
+        finally:
+            self._release_mining_gpu_lease("agent_stop")
+
+    def _start_gpu_lease_renewal(self, lease: Optional[GPUCoordinatorLease]) -> None:
+        if lease is None:
+            return
+
+        def _renew_loop() -> None:
+            # Foreground recovery has a ten-second coordinator reattach window.
+            # Renew Comfy frequently enough to detect an epoch reset in time.
+            normal_interval = (
+                2.0
+                if lease.holder == "comfy"
+                else max(2.0, min(20.0, float(lease.ttl_ms) / 3000.0))
+            )
+            retry_interval = min(1.0, normal_interval)
+            while not lease.renew_stop.wait(normal_interval):
+                while not lease.renew_stop.is_set():
+                    try:
+                        self._refresh_gpu_lease_metadata(lease)
+                        self._renew_gpu_lease_with_reconcile(lease)
+                        break
+                    except Exception as exc:
+                        if lease.lost.is_set():
+                            logging.error(
+                                "Lost GPU coordinator lease holder=%s workId=%s: %s",
+                                lease.holder,
+                                lease.work_id,
+                                exc,
+                            )
+                            return
+                        with lease.identity_lock:
+                            remaining_ms = int(lease.deadline_ms) - _now_ms()
+                            epoch = int(lease.epoch)
+                        if remaining_ms <= 1000:
+                            lease.lost.set()
+                            logging.error(
+                                "Lost GPU coordinator lease holder=%s workId=%s epoch=%d: %s",
+                                lease.holder,
+                                lease.work_id,
+                                epoch,
+                                exc,
+                            )
+                            return
+                        logging.warning(
+                            "GPU coordinator lease renew failed; retrying holder=%s workId=%s remainingMs=%d: %s",
+                            lease.holder,
+                            lease.work_id,
+                            remaining_ms,
+                            exc,
+                        )
+                        if lease.renew_stop.wait(min(retry_interval, max(0.25, remaining_ms / 2000.0))):
+                            return
+
+        thread = threading.Thread(
+            target=_renew_loop,
+            name=f"gpu-lease-renew-{lease.holder}-{lease.work_id[:24]}",
+            daemon=True,
+        )
+        lease.renew_thread = thread
+        thread.start()
+
+    def _refresh_gpu_lease_metadata(self, lease: GPUCoordinatorLease) -> Dict[str, Any]:
+        provider = lease.metadata_provider
+        metadata = provider() if callable(provider) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if metadata:
+            with lease.identity_lock:
+                pid = metadata.get("pid")
+                start_time = metadata.get("processStartTime")
+                process_group_id = metadata.get("processGroupId")
+                lease.pid = int(pid) if isinstance(pid, (int, float)) and int(pid) > 0 else None
+                lease.process_start_time = (
+                    int(start_time) if isinstance(start_time, (int, float, str)) and str(start_time).isdigit() else None
+                )
+                lease.process_group_id = (
+                    int(process_group_id)
+                    if isinstance(process_group_id, (int, float)) and int(process_group_id) > 0
+                    else None
+                )
+        with lease.identity_lock:
+            out: Dict[str, Any] = {}
+            if isinstance(lease.pid, int) and lease.pid > 0:
+                out["pid"] = int(lease.pid)
+            if isinstance(lease.process_start_time, int):
+                out["processStartTime"] = int(lease.process_start_time)
+            if isinstance(lease.process_group_id, int) and lease.process_group_id > 0:
+                out["processGroupId"] = int(lease.process_group_id)
+            return out
+
+    def _renew_gpu_lease_with_reconcile(self, lease: GPUCoordinatorLease) -> None:
+        first_error: Optional[Exception] = None
+        try:
+            self._gpu_coordinator.renew(lease)
+            return
+        except Exception as exc:
+            first_error = exc
+            if lease.holder != "comfy":
+                # Mining is intentionally never adopted across coordinator
+                # epochs; recovery stops it and the agent reacquires later.
+                if isinstance(exc, GPUCoordinatorUnavailable) and exc.status in (404, 409, 410):
+                    lease.lost.set()
+                raise
+
+        recovery_deadline = time.monotonic() + 9.0
+        last_error: Exception = first_error or GPUCoordinatorUnavailable("GPU lease renewal failed")
+        while not lease.renew_stop.is_set() and time.monotonic() < recovery_deadline:
+            metadata = self._refresh_gpu_lease_metadata(lease)
+            try:
+                replacement = self._gpu_coordinator.reconcile(lease.holder, lease.work_id, metadata)
+                with lease.release_lock:
+                    released_during_reconcile = lease.released
+                    released_reason = lease.released_reason or "released_during_reconcile"
+                    released_keep_warm = lease.released_keep_warm
+                    with lease.identity_lock:
+                        lease.epoch = replacement.epoch
+                        lease.fencing_token = replacement.fencing_token
+                        lease.deadline_ms = replacement.deadline_ms
+                        lease.ttl_ms = replacement.ttl_ms
+                if released_during_reconcile:
+                    # The normal release may already have raced using the old
+                    # fence. Close the newly adopted lease explicitly.
+                    self._gpu_coordinator.release(
+                        lease,
+                        released_reason,
+                        keep_warm=released_keep_warm,
+                    )
+                    return
+                logging.warning(
+                    "Reconciled live Comfy GPU lease after coordinator epoch reset workId=%s epoch=%d",
+                    lease.work_id,
+                    replacement.epoch,
+                )
+                return
+            except Exception as reconcile_error:
+                last_error = reconcile_error
+            # A transient request failure need not imply restart. If the old
+            # epoch is still valid, a normal renewal wins without adoption.
+            try:
+                self._gpu_coordinator.renew(lease)
+                return
+            except Exception as renew_error:
+                last_error = renew_error
+            if lease.renew_stop.wait(0.5):
+                return
+        lease.lost.set()
+        with lease.identity_lock:
+            lease.deadline_ms = _now_ms()
+        raise GPUCoordinatorUnavailable(f"Comfy GPU lease reconciliation window expired: {last_error}")
+
+    def _comfy_gpu_process_metadata(self) -> Dict[str, Any]:
+        main_pids = self._find_local_comfy_main_processes()
+        if not main_pids:
+            return {}
+        pid = int(main_pids[0])
+        start_time = _linux_process_start_time(pid)
+        metadata: Dict[str, Any] = {"pid": pid}
+        if start_time is not None:
+            metadata["processStartTime"] = int(start_time)
+        try:
+            process_group_id = os.getpgid(pid)
+            if process_group_id > 0:
+                metadata["processGroupId"] = int(process_group_id)
+        except (OSError, ProcessLookupError):
+            pass
+        return metadata
+
+    def _acquire_gpu_lease(
+        self,
+        holder: str,
+        work_id: str,
+        metadata_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+    ) -> Optional[GPUCoordinatorLease]:
+        lease = self._gpu_coordinator.acquire(holder, work_id, self.gpu_coordinator_lease_ttl_ms)
+        if lease is not None:
+            lease.metadata_provider = metadata_provider
+            self._refresh_gpu_lease_metadata(lease)
+        self._start_gpu_lease_renewal(lease)
+        if lease is not None:
+            logging.info(
+                "Acquired GPU coordinator lease holder=%s workId=%s epoch=%d deadlineMs=%d",
+                holder,
+                work_id,
+                lease.epoch,
+                lease.deadline_ms,
+            )
+        return lease
+
+    def _release_gpu_lease(
+        self,
+        lease: Optional[GPUCoordinatorLease],
+        reason: str,
+        keep_warm: bool = False,
+    ) -> None:
+        if lease is None:
+            return
+        with lease.release_lock:
+            if lease.released:
+                return
+            lease.released = True
+            lease.released_reason = str(reason or "work_complete")[:160]
+            lease.released_keep_warm = bool(keep_warm)
+        lease.renew_stop.set()
+        thread = lease.renew_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        try:
+            self._gpu_coordinator.release(lease, reason, keep_warm=keep_warm)
+            logging.info(
+                "Released GPU coordinator lease holder=%s workId=%s epoch=%d reason=%s keepWarm=%s",
+                lease.holder,
+                lease.work_id,
+                lease.epoch,
+                reason,
+                keep_warm,
+            )
+        except Exception as exc:
+            logging.warning(
+                "GPU coordinator lease release failed holder=%s workId=%s epoch=%d: %s",
+                lease.holder,
+                lease.work_id,
+                lease.epoch,
+                exc,
+            )
+
+    def _release_comfy_gpu_lease(self, lease: AgentExecuteLease, reason: str, keep_warm: bool = True) -> None:
+        coordinator_lease = lease.gpu_coordinator_lease
+        lease.gpu_coordinator_lease = None
+        self._release_gpu_lease(coordinator_lease, reason, keep_warm=keep_warm)
+
+    def _acquire_mining_gpu_lease(self, reason: str) -> bool:
+        if not self._gpu_coordinator.configured:
+            return True
+        if _now_ms() < self._mining_gpu_retry_after_ms:
+            return False
+        with self._mining_gpu_lease_lock:
+            existing = self._mining_gpu_lease
+            if existing is not None and not existing.lost.is_set() and not existing.released:
+                return True
+            if existing is not None:
+                self._mining_gpu_lease = None
+                self._release_gpu_lease(existing, "mining_lease_replaced", keep_warm=False)
+            try:
+                lease = self._acquire_gpu_lease("mining", f"idle-prl:{reason or 'idle'}")
+            except GPUCoordinatorBusy as exc:
+                self._mining_gpu_retry_after_ms = _now_ms() + int(exc.retry_after_seconds * 1000)
+                logging.debug("Idle PRL mining admission deferred reason=%s retryAfter=%.2fs: %s", reason, exc.retry_after_seconds, exc)
+                return False
+            except GPUCoordinatorUnavailable as exc:
+                self._mining_gpu_retry_after_ms = _now_ms() + 2_000
+                logging.debug("Idle PRL mining coordinator unavailable reason=%s: %s", reason, exc)
+                return False
+            if lease is None:
+                return True
+            self._mining_gpu_lease = lease
+            self._mining_gpu_retry_after_ms = 0
+            return True
+
+    def _release_mining_gpu_lease(self, reason: str) -> None:
+        with self._mining_gpu_lease_lock:
+            lease = self._mining_gpu_lease
+            self._mining_gpu_lease = None
+        self._release_gpu_lease(lease, reason, keep_warm=False)
+
+    def _register_mining_process_with_gpu_coordinator(self) -> None:
+        if not self._gpu_coordinator.configured:
+            return
+        snapshot = self._idle_prl_miner.snapshot()
+        pid_value = snapshot.get("pid")
+        if not isinstance(pid_value, (int, float)) or int(pid_value) <= 0:
+            raise GPUCoordinatorUnavailable("Started PRL miner did not report a PID")
+        pid = int(pid_value)
+        process_start_time = _linux_process_start_time(pid)
+        if process_start_time is None:
+            raise GPUCoordinatorUnavailable(f"Unable to read PRL miner process identity for pid={pid}")
+        try:
+            process_group_id = int(os.getpgid(pid))
+        except (OSError, ProcessLookupError) as exc:
+            raise GPUCoordinatorUnavailable(f"Unable to read PRL miner process group for pid={pid}: {exc}") from exc
+        with self._mining_gpu_lease_lock:
+            lease = self._mining_gpu_lease
+            if lease is None:
+                # Optional unsupported coordinators retain legacy behavior.
+                return
+            with lease.identity_lock:
+                lease.pid = pid
+                lease.process_start_time = process_start_time
+                lease.process_group_id = process_group_id
+            self._gpu_coordinator.renew(lease)
+        logging.info(
+            "Registered PRL miner process with GPU coordinator pid=%d processStartTime=%d processGroupId=%d epoch=%d",
+            pid,
+            process_start_time,
+            process_group_id,
+            lease.epoch,
+        )
 
     def _stop_idle_prl_mining_for_work(self, reason: str) -> None:
         try:
             if reason == "execute_job":
-                self._idle_prl_miner.pause_for_work(reason)
+                # Coordinator-managed mining must release VRAM, so suspend/resume
+                # and keep-running modes are deliberately overridden here.
+                if self._gpu_coordinator.configured:
+                    self._idle_prl_miner.pause_for_work(reason, force_stop=True)
+                else:
+                    self._idle_prl_miner.pause_for_work(reason)
             elif reason == "self_update":
                 self._idle_prl_miner.stop_if_running(reason)
             else:
                 logging.debug("Keeping idle PRL miner running during %s", reason)
         except Exception as e:
             logging.warning("Failed stopping idle PRL miner before %s: %s", reason, e)
+        finally:
+            if reason in ("execute_job", "self_update"):
+                self._release_mining_gpu_lease(reason)
+
+    def _host_memory_pressure_requires_full_comfy_trim(self) -> bool:
+        try:
+            meminfo = Path("/proc/meminfo").read_text("utf-8", errors="replace")
+            match = re.search(r"^MemAvailable:\s+(\d+)\s+kB\s*$", meminfo, re.MULTILINE)
+            if match and int(match.group(1)) * 1024 < int(self.comfy_full_trim_mem_available_bytes):
+                return True
+        except Exception:
+            pass
+        try:
+            pressure = Path("/proc/pressure/memory").read_text("utf-8", errors="replace")
+            match = re.search(r"^some\s+avg10=([0-9.]+)", pressure, re.MULTILINE)
+            if match and float(match.group(1)) >= float(self.comfy_full_trim_memory_psi_avg10):
+                return True
+        except Exception:
+            pass
+        return False
 
     def _free_local_comfy_for_idle_prl_mining(self, reason: str) -> None:
         if self.mining_only or not self.idle_prl_free_comfy_before_start:
@@ -4949,17 +5758,24 @@ class DependencyAgent:
         try:
             timeout = self.idle_prl_free_comfy_timeout_seconds
             base_url = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=min(5.0, timeout))
+            # Preserve the existing fleet-wide full trim. CPU cache retention
+            # is intentionally enabled only on coordinator-managed workers.
+            full_trim = (
+                self._host_memory_pressure_requires_full_comfy_trim()
+                if self._gpu_coordinator.configured else True
+            )
             status, _resp = api_json(
                 "POST",
                 f"{base_url}/free",
-                body={"unload_models": True, "free_memory": True},
+                body={"unload_models": True, "free_memory": full_trim},
                 timeout_seconds=timeout,
             )
             logging.info(
-                "Requested local Comfy memory free before idle PRL miner start reason=%s status=%s baseUrl=%s",
+                "Requested local Comfy model unload before idle PRL miner start reason=%s status=%s baseUrl=%s fullTrim=%s",
                 reason or "unspecified",
                 status,
                 base_url,
+                full_trim,
             )
         except Exception as e:
             logging.warning(
@@ -4982,18 +5798,61 @@ class DependencyAgent:
             if self._pending_self_update is not None:
                 return
             miner_snapshot = self._idle_prl_miner.snapshot()
+            miner_running = str(miner_snapshot.get("state") or "") in ("running", "starting", "paused")
             should_attempt_resume = bool(miner_snapshot.get("pausedForWork"))
-            if (
+            should_attempt_start = (
                 should_attempt_resume or
                 (
                     str(miner_snapshot.get("desiredState") or "") in ("running", "starting") and
                     str(miner_snapshot.get("state") or "") != "running"
                 )
-            ):
+            )
+            if self._gpu_coordinator.configured and should_attempt_start:
+                desired_payload = self._idle_prl_miner.desired_start_payload()
+                if not desired_payload:
+                    return
+                try:
+                    prepared = self._idle_prl_miner.prepare_gated({**desired_payload, "forceRestart": True})
+                except Exception as exc:
+                    logging.warning("Idle PRL preparation failed before GPU admission after %s: %s", reason, exc)
+                    return
+                if not self._acquire_mining_gpu_lease(reason):
+                    return
+                try:
+                    gated = self._idle_prl_miner.start_gated(prepared)
+                    gate_path = str(gated.get("gatePath") or "")
+                    self._register_mining_process_with_gpu_coordinator()
+                    self._idle_prl_miner.release_start_gate(gate_path)
+                    logging.info("Started gated idle PRL miner after %s", reason)
+                    self._force_idle_prl_runtime_refresh(reason)
+                except Exception as exc:
+                    self._idle_prl_miner.cancel_gated_start("mining_process_registration_failed")
+                    self._idle_prl_miner.defer_start(desired_payload, "gpu_coordinator_fenced_during_start")
+                    self._release_mining_gpu_lease("mining_start_failed")
+                    logging.info("Deferred gated idle PRL miner after %s: %s", reason, exc)
+                return
+            if (miner_running or should_attempt_start) and not self._acquire_mining_gpu_lease(reason):
+                if miner_running:
+                    should_stop_unmanaged = self._gpu_coordinator.required
+                    try:
+                        should_stop_unmanaged = self._gpu_coordinator.status().get("enforcing") is True
+                    except Exception:
+                        pass
+                    if should_stop_unmanaged:
+                        self._idle_prl_miner.stop_if_running("gpu_coordinator_admission_denied")
+                return
+            if should_attempt_start:
                 self._free_local_comfy_for_idle_prl_mining(reason)
-            resumed = self._idle_prl_miner.resume_if_paused(reason)
-            restarted = False if resumed else self._idle_prl_miner.restart_if_desired(reason)
-            resumed_after_update = False if (resumed or restarted) else self._idle_prl_miner.resume_after_agent_update_if_requested(reason)
+            try:
+                resumed = self._idle_prl_miner.resume_if_paused(reason)
+                restarted = False if resumed else self._idle_prl_miner.restart_if_desired(reason)
+                resumed_after_update = False if (resumed or restarted) else self._idle_prl_miner.resume_after_agent_update_if_requested(reason)
+                if resumed or restarted or resumed_after_update:
+                    self._register_mining_process_with_gpu_coordinator()
+            except Exception:
+                self._idle_prl_miner.stop_if_running("mining_process_registration_failed")
+                self._release_mining_gpu_lease("mining_start_failed")
+                raise
             if resumed or restarted or resumed_after_update:
                 logging.info(
                     "%s idle PRL miner after %s",
@@ -5001,6 +5860,9 @@ class DependencyAgent:
                     reason,
                 )
                 self._force_idle_prl_runtime_refresh(reason)
+            final_snapshot = self._idle_prl_miner.snapshot()
+            if str(final_snapshot.get("state") or "") not in ("running", "starting", "paused"):
+                self._release_mining_gpu_lease("mining_not_running")
         except Exception as e:
             logging.warning("Failed resuming idle PRL miner after %s: %s", reason, e)
 
@@ -5014,6 +5876,7 @@ class DependencyAgent:
             active = self._active_exec_by_item.get(lease.item_id)
             if active:
                 active.stage = final_stage
+        self._release_comfy_gpu_lease(lease, reason, keep_warm=True)
         self._resume_idle_prl_mining_if_idle(reason)
         self._request_agent_queue_poll()
 
@@ -6300,6 +7163,79 @@ class DependencyAgent:
             "deletedOpenFiles": deleted_open,
         }
 
+    def _gpu_coordinator_runtime_snapshot(self) -> Dict[str, Any]:
+        if not self._gpu_coordinator.configured:
+            return {"configured": False, "supported": False}
+        try:
+            status = self._gpu_coordinator.status()
+            payload = {
+                key: status.get(key)
+                for key in (
+                    "configured", "supported", "enforcing", "state", "phase", "epoch", "miningGraceSeconds",
+                    "miningNotBeforeMs", "diagnosticsBusy", "draining",
+                )
+                if key in status
+            }
+            config = status.get("config") if isinstance(status.get("config"), dict) else {}
+            if isinstance(config.get("mode"), str):
+                payload["mode"] = str(config["mode"])[:24]
+            payload["attestedAtMs"] = _now_ms()
+            lease = status.get("lease") if isinstance(status.get("lease"), dict) else {}
+            if lease:
+                payload["lease"] = {
+                    key: lease.get(key)
+                    for key in ("holder", "workId", "state", "deadlineMs", "warmDeadlineMs", "registrationDeadlineMs")
+                    if key in lease
+                }
+            metrics = status.get("metrics") if isinstance(status.get("metrics"), dict) else {}
+            if metrics:
+                payload["metrics"] = {
+                    key: metrics.get(key)
+                    for key in (
+                        "leaseConflicts", "staleTokenRejections", "snapshotSaves", "snapshotSaveErrors",
+                        "snapshotRestores", "snapshotRestoreErrors", "snapshotSkippedDirtyEviction",
+                        "snapshotSkippedKeySwitch", "llamaStarts", "llamaStops", "comfyEvictions",
+                        "miningRevocations", "recoveryCount",
+                    )
+                    if key in metrics and isinstance(metrics.get(key), (int, float))
+                }
+            cache = status.get("cache") if isinstance(status.get("cache"), dict) else {}
+            if cache:
+                payload["cache"] = {
+                    key: cache.get(key)
+                    for key in (
+                        "entries", "bytes", "quotaBytes", "minFreeBytes", "freeBytes", "ttlSeconds",
+                        "bytesPerOccupiedToken",
+                    )
+                    if key in cache and isinstance(cache.get(key), (int, float))
+                }
+            llama = status.get("llama") if isinstance(status.get("llama"), dict) else {}
+            if llama:
+                payload["llama"] = {
+                    key: llama.get(key) for key in ("pid", "running")
+                    if key in llama and isinstance(llama.get(key), (bool, int))
+                }
+            memory = status.get("memory") if isinstance(status.get("memory"), dict) else {}
+            if memory:
+                payload["memory"] = {
+                    key: memory.get(key) for key in ("totalBytes", "availableBytes")
+                    if key in memory and isinstance(memory.get(key), (int, float))
+                }
+            gpu_processes = status.get("gpuProcesses") if isinstance(status.get("gpuProcesses"), list) else []
+            payload["gpuProcesses"] = [
+                {"pid": int(item["pid"]), "usedBytes": int(item["usedBytes"])}
+                for item in gpu_processes[:32]
+                if isinstance(item, dict) and isinstance(item.get("pid"), (int, float)) and
+                isinstance(item.get("usedBytes"), (int, float))
+            ]
+            return payload
+        except Exception as exc:
+            return {
+                "configured": True,
+                "supported": None,
+                "error": str(exc)[:500],
+            }
+
     def _collect_agent_runtime_payload(self, full: bool = True, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if body is None:
             held_leases = self._collect_active_leases()
@@ -6338,6 +7274,7 @@ class DependencyAgent:
                 **({"memoryTelemetry": memory_telemetry} if memory_telemetry else {}),
                 **({"comfyRuntime": comfy_runtime} if comfy_runtime else {}),
                 "idleMining": self._idle_prl_miner.snapshot(),
+                "gpuCoordinator": self._gpu_coordinator_runtime_snapshot(),
                 "agentVersion": AGENT_VERSION,
                 "capabilities": {
                     "dependencyChannel": True,
@@ -6345,6 +7282,7 @@ class DependencyAgent:
                     "hybridOutputUploadsV1": True,
                     "dependencyDeleteFiles": True,
                     "idlePrlMining": True,
+                    "gpuCoordinatorLeases": True,
                     "miningOnly": bool(self.mining_only),
                     "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
                 },
@@ -6380,6 +7318,9 @@ class DependencyAgent:
         queue_summary = body.get("queueSummary")
         if isinstance(queue_summary, dict) and queue_summary:
             agent_control["queueSummary"] = queue_summary
+        gpu_coordinator = body.get("gpuCoordinator")
+        if isinstance(gpu_coordinator, dict) and gpu_coordinator:
+            agent_control["gpuCoordinator"] = gpu_coordinator
         if full:
             capabilities = {
                 "dependencyChannel": True,
@@ -6425,6 +7366,8 @@ class DependencyAgent:
             hot_agent_control["comfyRuntime"] = agent_control.get("comfyRuntime")
         if "queueSummary" in agent_control:
             hot_agent_control["queueSummary"] = agent_control.get("queueSummary")
+        if "gpuCoordinator" in agent_control:
+            hot_agent_control["gpuCoordinator"] = agent_control.get("gpuCoordinator")
         if full:
             hot_agent_control.update({
                 "localReadinessFile": agent_control.get("localReadinessFile"),
@@ -10502,6 +11445,7 @@ class DependencyAgent:
                     "attemptEpoch": lease.attempt_epoch,
                     "stage": lease.stage,
                     **({"readyAgeMs": max(0, _now_ms() - int(lease.ready_at_ms))} if int(lease.ready_at_ms or 0) > 0 and lease.stage == "ready" else {}),
+                    **({"gpuRetryAfterMs": int(lease.gpu_retry_after_ms)} if int(lease.gpu_retry_after_ms or 0) > _now_ms() and lease.stage == "ready" else {}),
                     **({"uploadWorkerQueueMs": max(0, _now_ms() - int(lease.upload_enqueued_at_ms))} if int(lease.upload_enqueued_at_ms or 0) > 0 and lease.stage == "uploading" else {}),
                 }
             )
@@ -10786,14 +11730,44 @@ class DependencyAgent:
 
     def _pop_next_ready_lease(self) -> Optional[AgentExecuteLease]:
         with self._lock:
-            while self._ready_agent_item_ids:
+            candidates = len(self._ready_agent_item_ids)
+            now_ms = _now_ms()
+            while self._ready_agent_item_ids and candidates > 0:
+                candidates -= 1
                 item_id = self._ready_agent_item_ids.popleft()
                 lease = self._active_exec_by_item.get(item_id)
                 if not lease or lease.stage != "ready":
                     continue
+                if int(lease.gpu_retry_after_ms or 0) > now_ms:
+                    self._ready_agent_item_ids.append(item_id)
+                    continue
                 lease.stage = "preparing_prompt"
+                lease.gpu_retry_after_ms = 0
                 return lease
         return None
+
+    def _defer_ready_lease_for_gpu_coordinator(
+        self,
+        lease: AgentExecuteLease,
+        retry_after_seconds: float,
+        reason: str,
+    ) -> None:
+        retry_ms = int(max(0.25, min(60.0, float(retry_after_seconds))) * 1000)
+        with self._lock:
+            active = self._active_exec_by_item.get(lease.item_id)
+            if active is None:
+                return
+            active.stage = "ready"
+            active.gpu_retry_after_ms = _now_ms() + retry_ms
+            self._enqueue_ready_locked(active)
+        logging.info(
+            "Deferred Comfy execution for GPU coordinator itemId=%s jobId=%s retryMs=%d reason=%s",
+            lease.item_id,
+            lease.job_id,
+            retry_ms,
+            reason,
+        )
+        self._request_agent_queue_poll()
 
     def _drain_ready_agent_leases(self) -> int:
         if self._agent_execute_executor is None:
@@ -10825,6 +11799,7 @@ class DependencyAgent:
 
     def _cleanup_agent_lease(self, lease: AgentExecuteLease) -> None:
         tmp_root = Path(lease.tmp_root) if isinstance(lease.tmp_root, str) and lease.tmp_root else None
+        self._release_comfy_gpu_lease(lease, "execute_job_cleanup", keep_warm=False)
         self._finish_active_lease(lease.item_id)
         self._resume_idle_prl_mining_if_idle("execute_job_complete")
         self._request_agent_queue_poll()
@@ -11668,10 +12643,70 @@ class DependencyAgent:
     def _agent_handle_prl_miner_command(self, item: Dict[str, Any]) -> None:
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         action = str(payload.get("action") or "").strip().lower()
+        item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
+        lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
         try:
+            if action == "start" and self._gpu_coordinator.configured:
+                prepared_payload = {**payload, "forceRestart": True}
+                try:
+                    # DNS/TLS checks, download/install/checksum and stray cleanup
+                    # happen before the coordinator begins its five-second
+                    # STARTING registration window.
+                    prepared = self._idle_prl_miner.prepare_gated(prepared_payload)
+                except Exception as exc:
+                    if item_id and lease_id:
+                        self._agent_ack(
+                            item_id,
+                            lease_id,
+                            "command_failed",
+                            error_code=(
+                                "prl_network_preflight_failed"
+                                if isinstance(exc, PrlNetworkPreflightError)
+                                else "prl_miner_failed"
+                            ),
+                            error_message=str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS],
+                        )
+                    return
+                if not self._acquire_mining_gpu_lease("prl_miner_start_command"):
+                    # The backend command expresses desired state. Preserve it
+                    # locally and acknowledge acceptance; the idle loop retries
+                    # admission without starting an unleased miner.
+                    self._idle_prl_miner.defer_start(payload, "gpu_coordinator_busy")
+                    if item_id and lease_id:
+                        self._agent_ack(item_id, lease_id, "command_succeeded")
+                    return
+                gate_path = ""
+                try:
+                    gated = self._idle_prl_miner.start_gated(prepared)
+                    gate_path = str(gated.get("gatePath") or "")
+                    self._register_mining_process_with_gpu_coordinator()
+                    self._idle_prl_miner.release_start_gate(gate_path)
+                    if item_id and lease_id:
+                        self._agent_ack(item_id, lease_id, "command_succeeded")
+                except Exception as exc:
+                    self._idle_prl_miner.cancel_gated_start("mining_process_registration_failed")
+                    self._idle_prl_miner.defer_start(payload, "gpu_coordinator_fenced_during_start")
+                    self._release_mining_gpu_lease("prl_miner_start_exception")
+                    # Fencing/foreground races preserve desired state and retry
+                    # locally; preparation failures above remain command errors.
+                    if item_id and lease_id:
+                        self._agent_ack(item_id, lease_id, "command_succeeded")
+                    logging.info("Deferred gated PRL miner launch after fencing race: %s", exc)
+                return
             if action == "start":
                 self._free_local_comfy_for_idle_prl_mining("prl_miner_start_command")
-            self._idle_prl_miner.handle_command(item, self._agent_ack)
+            command_item = item
+            if action == "stop" and self._gpu_coordinator.configured:
+                command_item = dict(item)
+                command_item["payload"] = {**payload, "forceStop": True}
+            self._idle_prl_miner.handle_command(command_item, self._agent_ack)
+            if action == "stop":
+                self._release_mining_gpu_lease("prl_miner_stop_command")
+        except Exception:
+            if action == "start":
+                self._idle_prl_miner.stop_if_running("mining_process_registration_failed")
+                self._release_mining_gpu_lease("prl_miner_start_exception")
+            raise
         finally:
             self._force_idle_prl_runtime_refresh("prl_miner_command")
 
@@ -13409,6 +14444,24 @@ class DependencyAgent:
                 return
 
             self._stop_idle_prl_mining_for_work("execute_job")
+            try:
+                lease.gpu_coordinator_lease = self._acquire_gpu_lease(
+                    "comfy",
+                    lease.job_id,
+                    metadata_provider=self._comfy_gpu_process_metadata,
+                )
+            except GPUCoordinatorBusy as exc:
+                self._defer_ready_lease_for_gpu_coordinator(
+                    lease,
+                    exc.retry_after_seconds,
+                    str(exc),
+                )
+                retain_lease = True
+                return
+            except GPUCoordinatorUnavailable as exc:
+                self._defer_ready_lease_for_gpu_coordinator(lease, 5.0, str(exc))
+                retain_lease = True
+                return
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 prefetched_inputs = list(active.prefetched_inputs) if active else list(lease.prefetched_inputs)
