@@ -2936,6 +2936,172 @@ def _storyboard_geometry(duration, source_width, source_height):
     return frame_count, columns, rows, frame_width, frame_height
 
 
+def _analysis_frame_geometry(source_width, source_height):
+    width = min(160, max(2, int(source_width)))
+    height = max(2, round(width * int(source_height) / max(1, int(source_width)) / 2) * 2)
+    return width, height
+
+
+def _decode_analysis_frames(source, source_width, source_height, duration, fps=10):
+    width, height = _analysis_frame_geometry(source_width, source_height)
+    sample_duration = min(max(0.001, float(duration)), 1.600001)
+    frame_limit = min(16, max(1, int(math.ceil(float(duration) * fps))))
+    raw = subprocess.run(
+        [
+            FFMPEG_BIN, "-v", "error", "-i", source, "-t", f"{sample_duration:.6f}",
+            "-vf", (
+                f"fps={fps}:start_time=0,scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,format=rgb24"
+            ),
+            "-frames:v", str(frame_limit),
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ],
+        capture_output=True,
+        check=True,
+    ).stdout
+    frame_size = width * height * 3
+    frame_count = len(raw) // frame_size
+    frames = np.frombuffer(raw[:frame_count * frame_size], dtype=np.uint8).reshape(
+        frame_count, height, width, 3,
+    )
+    return frames, width, height
+
+
+def _decode_analysis_reference(source, width, height):
+    raw = subprocess.run(
+        [
+            FFMPEG_BIN, "-v", "error", "-i", source,
+            "-vf", (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,format=rgb24"
+            ),
+            "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ],
+        capture_output=True,
+        check=True,
+    ).stdout
+    frame_size = width * height * 3
+    if len(raw) < frame_size:
+        raise ValueError("reference_image_url did not resolve to an image frame")
+    return np.frombuffer(raw[:frame_size], dtype=np.uint8).reshape(height, width, 3)
+
+
+def _global_translation(previous, current, max_shift=4):
+    height, width = previous.shape
+    candidates = sorted(
+        ((dx, dy) for dy in range(-max_shift, max_shift + 1) for dx in range(-max_shift, max_shift + 1)),
+        key=lambda pair: (pair[0] * pair[0] + pair[1] * pair[1], abs(pair[0]), abs(pair[1])),
+    )
+    best = None
+    for dx, dy in candidates:
+        x0, x1 = max(0, dx), min(width, width + dx)
+        y0, y1 = max(0, dy), min(height, height + dy)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        prior = previous[y0:y1, x0:x1]
+        shifted = current[y0 - dy:y1 - dy, x0 - dx:x1 - dx]
+        error = float(np.mean(np.abs(prior - shifted)))
+        candidate = (error, dx * dx + dy * dy, dx, dy)
+        if best is None or candidate < best:
+            best = candidate
+    _, _, dx, dy = best or (0.0, 0, 0, 0)
+    return dx, dy, math.hypot(dx, dy)
+
+
+def _early_visual_metrics(frames, fps=10, reference=None):
+    if not len(frames):
+        return {
+            "sampleRateFps": fps, "windowSeconds": 0.0, "samples": [],
+            "peakChangeEnergy": 0.0, "peakChangeTimeSeconds": 0.0,
+            "globalMotionScore": 0.0, "lockedCameraScore": 1.0,
+        }
+    normalized = frames.astype(np.float32) / 255.0
+    luma = np.tensordot(normalized, np.asarray(RGB_LUMA_WEIGHTS, dtype=np.float32), axes=([3], [0]))
+    first = normalized[0]
+    reference_normalized = reference.astype(np.float32) / 255.0 if reference is not None else None
+    samples = []
+    for index, frame in enumerate(normalized):
+        change = 0.0 if index == 0 else float(np.mean(np.abs(frame - normalized[index - 1])))
+        first_similarity = 1.0 - float(np.mean(np.abs(frame - first)))
+        dx, dy, motion = (0, 0, 0.0) if index == 0 else _global_translation(luma[index - 1], luma[index])
+        sample = {
+            "timeSeconds": round(index / float(fps), 6),
+            "changeEnergy": round(max(0.0, min(1.0, change)), 6),
+            "firstFrameSimilarity": round(max(0.0, min(1.0, first_similarity)), 6),
+            "globalMotionPixels": round(motion, 6),
+            "globalMotionX": dx,
+            "globalMotionY": dy,
+        }
+        if reference_normalized is not None:
+            similarity = 1.0 - float(np.mean(np.abs(frame - reference_normalized)))
+            sample["referenceSimilarity"] = round(max(0.0, min(1.0, similarity)), 6)
+        samples.append(sample)
+    peak_change = max(samples, key=lambda row: row["changeEnergy"])
+    peak_motion = max(samples, key=lambda row: row["globalMotionPixels"])
+    mean_motion = float(np.mean([row["globalMotionPixels"] for row in samples[1:]])) if len(samples) > 1 else 0.0
+    result = {
+        "sampleRateFps": fps,
+        "windowSeconds": samples[-1]["timeSeconds"],
+        "samples": samples,
+        "peakChangeEnergy": peak_change["changeEnergy"],
+        "peakChangeTimeSeconds": peak_change["timeSeconds"],
+        "minimumFirstFrameSimilarity": min(row["firstFrameSimilarity"] for row in samples),
+        "peakGlobalMotionPixels": peak_motion["globalMotionPixels"],
+        "peakGlobalMotionTimeSeconds": peak_motion["timeSeconds"],
+        "globalMotionScore": round(min(1.0, mean_motion / 4.0), 6),
+        "lockedCameraScore": round(max(0.0, 1.0 - min(1.0, mean_motion / 4.0)), 6),
+    }
+    if reference_normalized is not None:
+        minimum = min(samples, key=lambda row: row["referenceSimilarity"])
+        result.update({
+            "minimumReferenceSimilarity": minimum["referenceSimilarity"],
+            "minimumReferenceSimilarityTimeSeconds": minimum["timeSeconds"],
+            "peakReferenceDeviation": round(1.0 - minimum["referenceSimilarity"], 6),
+            "peakReferenceDeviationTimeSeconds": minimum["timeSeconds"],
+        })
+    return result
+
+
+def _audio_end_window_metrics(samples, sample_rate=48000, points_per_second=20, window_seconds=1.5):
+    if not samples.size:
+        return {
+            "startSeconds": 0.0, "endSeconds": 0.0, "windowSeconds": 0.0,
+            "pointsPerSecond": points_per_second, "samples": [], "peak": 0.0, "rms": 0.0,
+            "peakTimeSeconds": 0.0, "peakRms": 0.0, "peakRmsTimeSeconds": 0.0,
+            "terminal250msPeak": 0.0, "terminal250msRms": 0.0,
+        }
+    end_seconds = samples.size / float(sample_rate)
+    window_sample_count = min(samples.size, max(1, int(round(window_seconds * sample_rate))))
+    start_sample = samples.size - window_sample_count
+    window = samples[start_sample:]
+    block_size = max(1, int(round(sample_rate / float(points_per_second))))
+    series = []
+    for offset in range(0, window.size, block_size):
+        block = window[offset:offset + block_size]
+        series.append({
+            "timeSeconds": round((start_sample + offset) / float(sample_rate), 6),
+            "peak": round(float(np.max(np.abs(block))), 6),
+            "rms": round(float(np.sqrt(np.mean(np.square(block)))), 6),
+        })
+    terminal = samples[-min(samples.size, max(1, int(round(0.25 * sample_rate)))):]
+    peak_sample = max(series, key=lambda row: row["peak"])
+    peak_rms_sample = max(series, key=lambda row: row["rms"])
+    return {
+        "startSeconds": round(start_sample / float(sample_rate), 6),
+        "endSeconds": round(end_seconds, 6),
+        "windowSeconds": round(window.size / float(sample_rate), 6),
+        "pointsPerSecond": points_per_second,
+        "samples": series,
+        "peak": round(float(np.max(np.abs(window))), 6),
+        "rms": round(float(np.sqrt(np.mean(np.square(window)))), 6),
+        "peakTimeSeconds": peak_sample["timeSeconds"],
+        "peakRms": peak_rms_sample["rms"],
+        "peakRmsTimeSeconds": peak_rms_sample["timeSeconds"],
+        "terminal250msPeak": round(float(np.max(np.abs(terminal))), 6),
+        "terminal250msRms": round(float(np.sqrt(np.mean(np.square(terminal)))), 6),
+    }
+
+
 class FCSAnalyzeVideo:
     """Create deterministic proxy, storyboard, waveform, and metadata artifacts."""
 
@@ -2947,7 +3113,10 @@ class FCSAnalyzeVideo:
                 "source_fingerprint": ("STRING", {"default": ""}),
                 "filename_prefix": ("STRING", {"default": "video_analysis"}),
                 "save_output": ("BOOLEAN", {"default": True}),
-            }
+            },
+            "optional": {
+                "reference_image_url": ("STRING", {"default": ""}),
+            },
         }
 
     RETURN_TYPES = ("VHS_FILENAMES",)
@@ -2956,7 +3125,9 @@ class FCSAnalyzeVideo:
     CATEGORY = "Furgen"
     FUNCTION = "analyze_video"
 
-    def analyze_video(self, source_video_url, source_fingerprint, filename_prefix, save_output):
+    def analyze_video(
+        self, source_video_url, source_fingerprint, filename_prefix, save_output, reference_image_url="",
+    ):
         source = _resolve_video_entry(source_video_url)
         details = _probe_video_details(source)
         folder, subfolder, stem, paths = _output_bundle(
@@ -2966,6 +3137,15 @@ class FCSAnalyzeVideo:
         )
         del folder
         duration = max(0.001, float(details["duration_seconds"]))
+        early_frames, analysis_width, analysis_height = _decode_analysis_frames(
+            source, details["width"], details["height"], duration,
+        )
+        reference_source = None
+        reference_frame = None
+        if str(reference_image_url or "").strip():
+            reference_source = _resolve_video_entry(reference_image_url)
+            reference_frame = _decode_analysis_reference(reference_source, analysis_width, analysis_height)
+        visual_stability = _early_visual_metrics(early_frames, reference=reference_frame)
         subprocess.run(
             [
                 FFMPEG_BIN, "-y", "-v", "error", "-i", source,
@@ -2995,6 +3175,7 @@ class FCSAnalyzeVideo:
 
         peaks, rms = [], []
         loudness = {}
+        audio_end_window = _audio_end_window_metrics(np.asarray([], dtype=np.float32))
         if details["has_audio"]:
             pcm = subprocess.run(
                 [FFMPEG_BIN, "-v", "error", "-i", source, "-vn", "-ac", "1", "-ar", "48000", "-f", "s16le", "-"],
@@ -3002,6 +3183,8 @@ class FCSAnalyzeVideo:
                 check=True,
             ).stdout
             samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+            samples = samples[:max(1, int(round(duration * 48000)))]
+            audio_end_window = _audio_end_window_metrics(samples)
             block = 2400
             for start in range(0, samples.size, block):
                 segment = samples[start:start + block]
@@ -3032,7 +3215,10 @@ class FCSAnalyzeVideo:
             f"{source}|{details['width']}x{details['height']}|{details['duration_seconds']:.6f}|{details['frame_count']}".encode()
         ).hexdigest()
         advisory = str(source_fingerprint or "").strip()
-        cache_key = hashlib.sha256(f"video-analysis-v1|{canonical_fingerprint}|{advisory}".encode()).hexdigest()
+        reference_fingerprint = hashlib.sha256(reference_frame.tobytes()).hexdigest() if reference_frame is not None else ""
+        cache_key = hashlib.sha256(
+            f"video-analysis-v2|{canonical_fingerprint}|{advisory}|{reference_fingerprint}".encode()
+        ).hexdigest()
         base_names = {key: os.path.basename(value) for key, value in paths.items()}
         cues = [
             {
@@ -3046,7 +3232,7 @@ class FCSAnalyzeVideo:
             for index in range(frame_count)
         ]
         manifest = {
-            "version": 1,
+            "version": 2,
             "cacheKey": cache_key,
             "sourceFingerprint": advisory or None,
             "canonicalSourceFingerprint": canonical_fingerprint,
@@ -3066,7 +3252,15 @@ class FCSAnalyzeVideo:
                 "filename": base_names["storyboard"], "columns": columns, "rows": rows,
                 "frameWidth": storyboard_width, "frameHeight": frame_height, "cues": cues,
             },
-            "waveform": {"pointsPerSecond": 20, "sampleRate": 48000, "channels": 1, "peaks": peaks, "rms": rms, **loudness},
+            "visualStability": {
+                "analysisWidth": analysis_width, "analysisHeight": analysis_height,
+                "referenceFingerprint": reference_fingerprint or None,
+                **visual_stability,
+            },
+            "waveform": {
+                "pointsPerSecond": 20, "sampleRate": 48000, "channels": 1,
+                "peaks": peaks, "rms": rms, "endWindow": audio_end_window, **loudness,
+            },
             "cors": {"allowOrigin": "*"},
         }
         with open(paths["analysis"], "w", encoding="utf-8") as handle:
@@ -3104,6 +3298,88 @@ def _ducking_compressor_options(depth_db):
     # FFmpeg's dry/wet mix creates an exact lower gain bound: even when the
     # compressed branch reaches silence, the dry branch retains minimum_gain.
     return depth, 1.0 - minimum_gain
+
+
+def _precision_render_failure_detail(stderr, entries, soundtrack=None):
+    detail = str(stderr or "FFmpeg precision render failed")
+    sensitive_values = [entry.get("path") for entry in entries]
+    if soundtrack:
+        sensitive_values.append(soundtrack.get("_path") or soundtrack.get("sourceAudioUrl"))
+    for value in sorted((str(value) for value in sensitive_values if value), key=len, reverse=True):
+        detail = detail.replace(value, "<media>")
+    detail = re.sub(r"(?:https?://|file:/{2,3})[^\s\]\[(){}<>]+", "<media>", detail)
+    detail = re.sub(r"(?<![\w.-])/(?:[^\s\]\[(){}<>]+/)*[^\s\]\[(){}<>]*", "<media>", detail)
+    detail = " ".join(detail.split())[:1600]
+    boundary_number = None
+    match = re.search(r"\b(?:v|a|vx|ax|vleft|vright|aleft|aright)(\d+)\b", detail)
+    if match:
+        candidate = int(match.group(1))
+        if 1 <= candidate < len(entries):
+            boundary_number = candidate
+    if boundary_number is None:
+        candidates = [
+            index for index, entry in enumerate(entries[:-1], start=1)
+            if float(entry.get("_xfade") or 0.0) > 0
+        ]
+        if len(candidates) == 1 and ("xfade" in detail.lower() or "acrossfade" in detail.lower()):
+            boundary_number = candidates[0]
+    signature = json.dumps({
+        "detail": detail,
+        "boundaries": [round(float(entry.get("_xfade") or 0.0), 6) for entry in entries[:-1]],
+    }, sort_keys=True)
+    diagnostic_id = f"precision-{hashlib.sha256(signature.encode('utf-8')).hexdigest()[:12]}"
+    return {
+        "code": "precision_render_failed",
+        "message": "Video assembly failed while rendering the precision timeline.",
+        "diagnosticId": diagnostic_id,
+        "boundaryNumber": boundary_number,
+        "detail": detail,
+    }
+
+
+def _v4_framing_animation(framing, duration, frame_rate):
+    animation = framing.get("animation")
+    if not isinstance(animation, dict):
+        return None
+
+    def finite_number(key, default, minimum, maximum):
+        try:
+            value = float(animation.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        if not math.isfinite(value):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    easing = animation.get("easing", "linear")
+    if easing not in ("linear", "ease_in_out"):
+        raise ValueError("framing.animation.easing must be linear or ease_in_out")
+    start_fraction = finite_number("startFraction", 0.0, 0.0, 1.0)
+    end_fraction = finite_number("endFraction", 1.0, 0.0, 1.0)
+    minimum_window = min(1.0, 1.0 / max(float(frame_rate) * float(duration), 1.0))
+    if end_fraction <= start_fraction:
+        if start_fraction >= 1.0:
+            start_fraction = max(0.0, 1.0 - minimum_window)
+            end_fraction = 1.0
+        else:
+            end_fraction = min(1.0, start_fraction + minimum_window)
+    return {
+        "endPanX": finite_number("endPanX", framing.get("panX", 0.5), 0.0, 1.0),
+        "endPanY": finite_number("endPanY", framing.get("panY", 0.5), 0.0, 1.0),
+        "endZoom": finite_number("endZoom", framing.get("zoom", 1.0), 1.0, 3.0),
+        "startFraction": start_fraction,
+        "endFraction": end_fraction,
+        "easing": easing,
+    }
+
+
+def _v4_interpolated_expression(start, end, animation, duration):
+    start_seconds = animation["startFraction"] * duration
+    window_seconds = max(1e-6, (animation["endFraction"] - animation["startFraction"]) * duration)
+    progress = f"min(1,max(0,(t-{start_seconds:.9f})/{window_seconds:.9f}))"
+    if animation["easing"] == "ease_in_out":
+        progress = f"({progress})*({progress})*(3-2*({progress}))"
+    return f"{start:.9f}+({end:.9f}-{start:.9f})*({progress})"
 
 
 class FCSConcatVideosV4(FCSConcatVideosV3):
@@ -3189,6 +3465,7 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             pan_x = max(0.0, min(1.0, float(framing.get("panX", 0.5))))
             pan_y = max(0.0, min(1.0, float(framing.get("panY", 0.5))))
             zoom = max(1.0, min(3.0, float(framing.get("zoom", 1.0))))
+            animation = _v4_framing_animation(framing, duration, frame_rate)
             if mode == "fit" and framing.get("fitBackground", "black") == "blur":
                 filters.append(f"[{index}:v]{','.join(base_filters)},split=2[v{index}bg0][v{index}fg0]")
                 filters.append(
@@ -3199,23 +3476,42 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
                     f"[v{index}fg0]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease[v{index}fg]"
                 )
                 filters.append(
-                    f"[v{index}bg][v{index}fg]overlay=(W-w)/2:(H-h)/2,format={pix_fmt},setsar=1[v{index}]"
+                    f"[v{index}bg][v{index}fg]overlay=(W-w)/2:(H-h)/2,format={pix_fmt},setsar=1,settb=AVTB[v{index}]"
                 )
             elif mode == "fit":
                 base_filters.extend([
                     f"scale={output_width}:{output_height}:force_original_aspect_ratio=decrease",
                     f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2:black",
-                    f"format={pix_fmt}", "setsar=1",
+                    f"format={pix_fmt}", "setsar=1", "settb=AVTB",
                 ])
                 filters.append(f"[{index}:v]{','.join(base_filters)}[v{index}]")
             else:
-                scale_width = max(output_width, int(round(output_width * zoom / 2.0) * 2))
-                scale_height = max(output_height, int(round(output_height * zoom / 2.0) * 2))
-                base_filters.extend([
-                    f"scale={scale_width}:{scale_height}:force_original_aspect_ratio=increase",
-                    f"crop={output_width}:{output_height}:(iw-ow)*{pan_x:.6f}:(ih-oh)*{pan_y:.6f}",
-                    f"format={pix_fmt}", "setsar=1",
-                ])
+                if animation and mode in ("fill", "custom"):
+                    zoom_expression = _v4_interpolated_expression(
+                        zoom, animation["endZoom"], animation, duration,
+                    )
+                    pan_x_expression = _v4_interpolated_expression(
+                        pan_x, animation["endPanX"], animation, duration,
+                    )
+                    pan_y_expression = _v4_interpolated_expression(
+                        pan_y, animation["endPanY"], animation, duration,
+                    )
+                    base_filters.extend([
+                        f"scale=w='trunc(max({output_width},{output_width}*({zoom_expression}))/2)*2':"
+                        f"h='trunc(max({output_height},{output_height}*({zoom_expression}))/2)*2':"
+                        "force_original_aspect_ratio=increase:eval=frame",
+                        f"crop={output_width}:{output_height}:"
+                        f"x='(iw-ow)*({pan_x_expression})':y='(ih-oh)*({pan_y_expression})'",
+                        f"format={pix_fmt}", "setsar=1", "settb=AVTB",
+                    ])
+                else:
+                    scale_width = max(output_width, int(round(output_width * zoom / 2.0) * 2))
+                    scale_height = max(output_height, int(round(output_height * zoom / 2.0) * 2))
+                    base_filters.extend([
+                        f"scale={scale_width}:{scale_height}:force_original_aspect_ratio=increase",
+                        f"crop={output_width}:{output_height}:(iw-ow)*{pan_x:.6f}:(ih-oh)*{pan_y:.6f}",
+                        f"format={pix_fmt}", "setsar=1", "settb=AVTB",
+                    ])
                 filters.append(f"[{index}:v]{','.join(base_filters)}[v{index}]")
 
             audio = entry.get("audio") or {}
@@ -3230,10 +3526,19 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
                     audio_filters.append(f"afade=t=in:st=0:d={fade_in:.6f}")
                 if fade_out:
                     audio_filters.append(f"afade=t=out:st={max(0.0, duration - fade_out):.6f}:d={fade_out:.6f}")
-                audio_filters.extend(["aresample=48000", "aformat=sample_fmts=fltp:channel_layouts=stereo"])
+                audio_filters.extend([
+                    "aresample=48000:async=0:first_pts=0",
+                    "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+                    "asetpts=PTS-STARTPTS",
+                ])
                 filters.append(f"[{index}:a]{','.join(audio_filters)}[a{index}]")
             else:
-                filters.append(f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration:.6f}[a{index}]")
+                filters.append(
+                    f"anullsrc=channel_layout=stereo:sample_rate=48000:d={duration:.6f},"
+                    "aresample=48000:async=0:first_pts=0,"
+                    "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                    f"asetpts=PTS-STARTPTS[a{index}]"
+                )
 
         cur_v, cur_a = "[v0]", "[a0]"
         timeline_duration = float(entries[0]["_output_duration"])
@@ -3241,27 +3546,52 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
         for index in range(1, len(entries)):
             fade = float(entries[index - 1].get("_xfade") or 0.0)
             out_v, out_a = f"[vx{index}]", f"[ax{index}]"
+            left_v, right_v = f"[vleft{index}]", f"[vright{index}]"
+            left_a, right_a = f"[aleft{index}]", f"[aright{index}]"
+            filters.append(f"{cur_v}settb=AVTB,setpts=PTS-STARTPTS{left_v}")
+            filters.append(f"[v{index}]settb=AVTB,setpts=PTS-STARTPTS{right_v}")
+            filters.append(f"{cur_a}asettb=1/48000,asetpts=PTS-STARTPTS{left_a}")
+            filters.append(f"[a{index}]asettb=1/48000,asetpts=PTS-STARTPTS{right_a}")
             if fade:
                 filters.append(
-                    f"{cur_v}[v{index}]xfade=transition=fade:duration={fade:.6f}:"
-                    f"offset={max(0.0, timeline_duration - fade):.6f}{out_v}"
+                    f"{left_v}{right_v}xfade=transition=fade:duration={fade:.6f}:"
+                    f"offset={max(0.0, timeline_duration - fade):.6f},"
+                    f"settb=AVTB,setpts=PTS-STARTPTS{out_v}"
                 )
-                filters.append(f"{cur_a}[a{index}]acrossfade=d={fade:.6f}:c1={curve}:c2={curve}{out_a}")
+                filters.append(
+                    f"{left_a}{right_a}acrossfade=d={fade:.6f}:c1={curve}:c2={curve},"
+                    "asettb=1/48000,"
+                    "aresample=48000:async=0:first_pts=0,"
+                    "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                    f"asetpts=PTS-STARTPTS{out_a}"
+                )
                 timeline_duration += float(entries[index]["_output_duration"]) - fade
             else:
-                filters.append(f"{cur_v}[v{index}]concat=n=2:v=1:a=0{out_v}")
-                filters.append(f"{cur_a}[a{index}]concat=n=2:v=0:a=1{out_a}")
+                filters.append(
+                    f"{left_v}{right_v}concat=n=2:v=1:a=0,"
+                    f"settb=AVTB,setpts=PTS-STARTPTS{out_v}"
+                )
+                filters.append(
+                    f"{left_a}{right_a}concat=n=2:v=0:a=1,asettb=1/48000,"
+                    "aresample=48000:async=0:first_pts=0,"
+                    "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                    f"asetpts=PTS-STARTPTS{out_a}"
+                )
                 timeline_duration += float(entries[index]["_output_duration"])
             cur_v, cur_a = out_v, out_a
-        filters.append(f"{cur_v}null[v]")
+        filters.append(f"{cur_v}fps={frame_rate},format={pix_fmt},setsar=1,settb=AVTB[v]")
 
         final_audio = cur_a
         if soundtrack:
             music_index = len(entries)
-            ffmpeg_inputs.extend(["-i", _resolve_video_entry(soundtrack.get("sourceAudioUrl"))])
+            soundtrack["_path"] = _resolve_video_entry(soundtrack.get("sourceAudioUrl"))
+            ffmpeg_inputs.extend(["-i", soundtrack["_path"]])
             music_start = max(0.0, float(soundtrack.get("trimStartSeconds") or 0.0))
             music_end = soundtrack.get("trimEndSeconds")
-            music_filters = [f"atrim=start={music_start:.6f}" + (f":end={float(music_end):.6f}" if music_end else ""), "asetpts=PTS-STARTPTS", "aresample=48000"]
+            music_filters = [
+                f"atrim=start={music_start:.6f}" + (f":end={float(music_end):.6f}" if music_end else ""),
+                "asetpts=PTS-STARTPTS", "aresample=48000:async=0:first_pts=0",
+            ]
             if soundtrack.get("loop"):
                 selected_duration = max(0.001, float(music_end or (music_start + timeline_duration)) - music_start)
                 music_filters.append(f"aloop=loop=-1:size={max(1, int(round(selected_duration * 48000)))}")
@@ -3278,7 +3608,10 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             if offset:
                 delay = int(round(offset * 1000))
                 music_filters.append(f"adelay={delay}|{delay}")
-            music_filters.extend([f"apad=whole_dur={timeline_duration:.6f}", f"atrim=end={timeline_duration:.6f}", "aformat=sample_fmts=fltp:channel_layouts=stereo"])
+            music_filters.extend([
+                f"apad=whole_dur={timeline_duration:.6f}", f"atrim=end={timeline_duration:.6f}",
+                "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo", "asetpts=PTS-STARTPTS",
+            ])
             filters.append(f"[{music_index}:a]{','.join(music_filters)}[music]")
             ducking = soundtrack.get("ducking") or {}
             music_label = "[music]"
@@ -3292,10 +3625,19 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
                 )
                 music_label = "[ducked]"
                 main_label = "[mainmix]"
-            filters.append(f"{main_label}{music_label}amix=inputs=2:duration=first:normalize=0[a]")
+            filters.append(
+                f"{main_label}{music_label}amix=inputs=2:duration=first:normalize=0,"
+                "asettb=1/48000,aresample=48000:async=0:first_pts=0,"
+                "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                "asetpts=PTS-STARTPTS[a]"
+            )
             final_audio = "[a]"
         else:
-            filters.append(f"{cur_a}anull[a]")
+            filters.append(
+                f"{cur_a}asettb=1/48000,aresample=48000:async=0:first_pts=0,"
+                "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                "asetpts=PTS-STARTPTS[a]"
+            )
             final_audio = "[a]"
 
         command = [
@@ -3304,8 +3646,15 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             "-crf", str(crf), "-pix_fmt", pix_fmt, "-r", str(frame_rate),
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", audio_path,
         ]
-        subprocess.run(command, check=True)
-        subprocess.run([FFMPEG_BIN, "-y", "-v", "error", "-i", audio_path, "-an", "-c:v", "copy", base_path], check=True)
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            subprocess.run(
+                [FFMPEG_BIN, "-y", "-v", "error", "-i", audio_path, "-an", "-c:v", "copy", base_path],
+                check=True, capture_output=True, text=True,
+            )
+        except subprocess.CalledProcessError as error:
+            failure = _precision_render_failure_detail(error.stderr, entries, soundtrack)
+            raise RuntimeError(json.dumps(failure, sort_keys=True)) from None
 
 
 NODE_CLASS_MAPPINGS = {
