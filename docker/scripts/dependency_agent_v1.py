@@ -84,6 +84,8 @@ Optional knobs:
   - DM_GPU_COORDINATOR_REQUIRED   (fail closed when coordinator discovery is unavailable; default: false)
   - DM_GPU_COORDINATOR_TOKEN      (optional bearer token for loopback coordinator requests)
   - DM_GPU_COORDINATOR_LEASE_TTL_SECONDS (renewable coordinator lease TTL; default: 60)
+  - GPU_ADMISSION_MODE           (off, shadow, or enforcing; default: off)
+  - DM_GPU_ADMISSION_MAX_DEPTH   (shared foreground queue bound; default: 64)
   - DM_COMFY_FULL_TRIM_MEM_AVAILABLE_GIB (full Comfy cache trim threshold; default: 24)
   - DM_COMFY_FULL_TRIM_MEMORY_PSI_AVG10 (full Comfy cache trim PSI avg10 threshold; default: 5)
   - DM_MINING_ONLY                (set to 1 for PRL mining-only instances; skips Comfy probes and job execution)
@@ -141,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.144"
+AGENT_VERSION = "dm-agent-py/0.10.145"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -2803,11 +2805,15 @@ class GPUCoordinatorLease:
     pid: Optional[int] = None
     process_start_time: Optional[int] = None
     process_group_id: Optional[int] = None
+    admission_ticket_id: Optional[str] = None
+    admission_claim_token: Optional[str] = None
+    admission_heartbeat_at_ms: int = 0
     metadata_provider: Optional[Callable[[], Dict[str, Any]]] = field(default=None, repr=False)
     renew_stop: threading.Event = field(default_factory=threading.Event, repr=False)
     lost: threading.Event = field(default_factory=threading.Event, repr=False)
     renew_thread: Optional[threading.Thread] = field(default=None, repr=False)
     released: bool = False
+    release_confirmed: bool = False
     released_reason: str = ""
     released_keep_warm: bool = False
     release_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -2932,13 +2938,24 @@ class GPUCoordinatorClient:
             self._status_cache_at_ms = now_ms
         return {"configured": True, "supported": True, **payload}
 
-    def acquire(self, holder: str, work_id: str, ttl_ms: int) -> Optional[GPUCoordinatorLease]:
+    def acquire(
+        self,
+        holder: str,
+        work_id: str,
+        ttl_ms: int,
+        admission_claim_id: Optional[str] = None,
+    ) -> Optional[GPUCoordinatorLease]:
         if not self._ensure_supported():
             return None
         status, payload, headers = self._request(
             "POST",
             "/v1/gpu/leases/acquire",
-            body={"holder": holder, "workId": work_id, "ttlMs": int(ttl_ms)},
+            body={
+                "holder": holder,
+                "workId": work_id,
+                "ttlMs": int(ttl_ms),
+                **({"admissionClaimId": admission_claim_id} if admission_claim_id else {}),
+            },
             timeout_seconds=10.0,
         )
         if status in self.BUSY_STATUSES:
@@ -3047,6 +3064,8 @@ class AgentExecuteLease:
     upload_started_at_ms: int = 0
     gpu_retry_after_ms: int = 0
     gpu_coordinator_lease: Optional[GPUCoordinatorLease] = None
+    gpu_admission_ticket_id: Optional[str] = None
+    gpu_admission_claim_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -4715,6 +4734,19 @@ class DependencyAgent:
         self.gpu_coordinator_lease_ttl_ms = int(
             max(15.0, min(3600.0, _env_float("DM_GPU_COORDINATOR_LEASE_TTL_SECONDS", 60.0))) * 1000
         )
+        self.gpu_admission_mode = (_env_str("GPU_ADMISSION_MODE") or "off").strip().lower()
+        if self.gpu_admission_mode not in ("off", "shadow", "enforcing"):
+            raise RuntimeError("GPU_ADMISSION_MODE must be off, shadow, or enforcing")
+        self.gpu_admission_max_depth = max(1, min(256, _env_int("DM_GPU_ADMISSION_MAX_DEPTH", 64)))
+        self.gpu_admission_ticket_stale_ms = int(
+            max(5.0, min(120.0, _env_float("DM_GPU_ADMISSION_TICKET_STALE_SECONDS", 20.0))) * 1000
+        )
+        self.gpu_admission_recovery_ms = int(
+            max(10.0, min(300.0, _env_float("DM_GPU_ADMISSION_RECOVERY_SECONDS", 45.0))) * 1000
+        )
+        self.gpu_admission_heartbeat_seconds = max(
+            1.0, min(20.0, _env_float("DM_GPU_ADMISSION_HEARTBEAT_SECONDS", 5.0))
+        )
         self._gpu_coordinator = GPUCoordinatorClient(
             coordinator_url,
             required=coordinator_required,
@@ -5454,6 +5486,19 @@ class DependencyAgent:
                     try:
                         self._refresh_gpu_lease_metadata(lease)
                         self._renew_gpu_lease_with_reconcile(lease)
+                        if (
+                            lease.admission_ticket_id
+                            and lease.admission_claim_token
+                            and _now_ms() - int(lease.admission_heartbeat_at_ms or 0)
+                            >= int(self.gpu_admission_heartbeat_seconds * 1000)
+                        ):
+                            if not self._heartbeat_comfy_gpu_admission(
+                                lease.admission_ticket_id,
+                                lease.admission_claim_token,
+                            ):
+                                lease.lost.set()
+                                raise GPUCoordinatorUnavailable("FIFO GPU admission claim was fenced")
+                            lease.admission_heartbeat_at_ms = _now_ms()
                         break
                     except Exception as exc:
                         if lease.lost.is_set():
@@ -5606,10 +5651,28 @@ class DependencyAgent:
         holder: str,
         work_id: str,
         metadata_provider: Optional[Callable[[], Dict[str, Any]]] = None,
+        admission_ticket_id: Optional[str] = None,
+        admission_claim_token: Optional[str] = None,
     ) -> Optional[GPUCoordinatorLease]:
-        lease = self._gpu_coordinator.acquire(holder, work_id, self.gpu_coordinator_lease_ttl_ms)
+        handoff_deadline = time.monotonic() + (10.0 if admission_claim_token else 0.0)
+        while True:
+            try:
+                lease = self._gpu_coordinator.acquire(
+                    holder,
+                    work_id,
+                    self.gpu_coordinator_lease_ttl_ms,
+                    admission_claim_id=admission_claim_token,
+                )
+                break
+            except GPUCoordinatorBusy:
+                if not admission_claim_token or time.monotonic() >= handoff_deadline:
+                    raise
+                time.sleep(min(0.25, max(0.01, handoff_deadline - time.monotonic())))
         if lease is not None:
             lease.metadata_provider = metadata_provider
+            lease.admission_ticket_id = admission_ticket_id
+            lease.admission_claim_token = admission_claim_token
+            lease.admission_heartbeat_at_ms = _now_ms()
             self._refresh_gpu_lease_metadata(lease)
         self._start_gpu_lease_renewal(lease)
         if lease is not None:
@@ -5627,12 +5690,12 @@ class DependencyAgent:
         lease: Optional[GPUCoordinatorLease],
         reason: str,
         keep_warm: bool = False,
-    ) -> None:
+    ) -> bool:
         if lease is None:
-            return
+            return True
         with lease.release_lock:
             if lease.released:
-                return
+                return lease.release_confirmed
             lease.released = True
             lease.released_reason = str(reason or "work_complete")[:160]
             lease.released_keep_warm = bool(keep_warm)
@@ -5650,6 +5713,8 @@ class DependencyAgent:
                 reason,
                 keep_warm,
             )
+            lease.release_confirmed = True
+            return True
         except Exception as exc:
             logging.warning(
                 "GPU coordinator lease release failed holder=%s workId=%s epoch=%d: %s",
@@ -5658,15 +5723,28 @@ class DependencyAgent:
                 lease.epoch,
                 exc,
             )
+            return False
 
     def _release_comfy_gpu_lease(self, lease: AgentExecuteLease, reason: str, keep_warm: bool = True) -> None:
         coordinator_lease = lease.gpu_coordinator_lease
         lease.gpu_coordinator_lease = None
-        self._release_gpu_lease(coordinator_lease, reason, keep_warm=keep_warm)
+        local_release_confirmed = self._release_gpu_lease(coordinator_lease, reason, keep_warm=keep_warm)
+        if local_release_confirmed:
+            self._release_comfy_gpu_admission(lease, reason)
+        elif lease.gpu_admission_claim_token:
+            logging.error(
+                "Leaving FIFO admission claim for fenced recovery because the local coordinator release was not confirmed: "
+                "ticket=%s jobId=%s",
+                lease.gpu_admission_ticket_id,
+                lease.job_id,
+            )
 
     def _acquire_mining_gpu_lease(self, reason: str) -> bool:
         if not self._gpu_coordinator.configured:
             return True
+        if self._gpu_admission_has_foreground_work():
+            self._mining_gpu_retry_after_ms = _now_ms() + 1_000
+            return False
         if _now_ms() < self._mining_gpu_retry_after_ms:
             return False
         with self._mining_gpu_lease_lock:
@@ -6693,6 +6771,278 @@ class DependencyAgent:
             raise ApiError(int(getattr(e, "code", 500) or 500), raw) from None
         except (urllib.error.URLError, socket.timeout, TimeoutError, http.client.HTTPException) as e:
             raise NetworkError(url, e) from None
+
+    def _gpu_admission_root_path(self) -> str:
+        server_type = (self.server_type or "").strip()
+        if not server_type or not re.fullmatch(r"[A-Za-z0-9_-]{1,96}", server_type):
+            raise RuntimeError("A valid SERVER_TYPE is required for GPU admission")
+        return f"/gpuAdmission/{server_type}"
+
+    def _gpu_admission_prune(self, raw: Any, now_ms: int) -> Dict[str, Any]:
+        root = dict(raw) if isinstance(raw, dict) else {}
+        tickets_raw = root.get("tickets") if isinstance(root.get("tickets"), dict) else {}
+        tickets: Dict[str, Any] = {}
+        for ticket_id, ticket_value in tickets_raw.items():
+            if not isinstance(ticket_value, dict):
+                continue
+            ticket = dict(ticket_value)
+            expires_at_ms = int(ticket.get("expiresAtMs") or 0)
+            heartbeat_at_ms = int(ticket.get("heartbeatAtMs") or 0)
+            is_active = str(ticket.get("state") or "") == "active"
+            is_parked_async = ticket.get("holder") == "inference_async" and ticket.get("attached") is not True
+            if expires_at_ms > now_ms and (
+                is_active or is_parked_async or now_ms - heartbeat_at_ms <= self.gpu_admission_ticket_stale_ms
+            ):
+                tickets[str(ticket_id)] = ticket
+        root["tickets"] = tickets
+        return root
+
+    def _gpu_admission_transaction(
+        self,
+        mutate: Callable[[Dict[str, Any]], Tuple[Optional[Dict[str, Any]], Any]],
+        attempts: int = 24,
+    ) -> Any:
+        if not self._coordination:
+            raise RuntimeError("RTDB coordination is unavailable for GPU admission")
+        root_path = self._gpu_admission_root_path()
+        for attempt in range(max(1, attempts)):
+            raw, etag = self._coordination_get_json_with_etag(root_path, timeout_seconds=10.0)
+            replacement, result = mutate(dict(raw) if isinstance(raw, dict) else {})
+            if replacement is None:
+                return result
+            if self._coordination_put_json_if_match(root_path, replacement, etag, timeout_seconds=10.0):
+                return result
+            _sleep_with_jitter(min(0.5, 0.02 * (2 ** min(5, attempt))), jitter_ratio=0.25)
+        raise RuntimeError("GPU admission transaction remained contended")
+
+    def _gpu_admission_ticket_key(self, lease: AgentExecuteLease) -> str:
+        identity = f"{self.instance_id or 'instance'}:{lease.item_id}"
+        return "comfy_" + base64.urlsafe_b64encode(identity.encode("utf-8")).decode("ascii").rstrip("=")
+
+    def _enqueue_comfy_gpu_admission(self, lease: AgentExecuteLease, estimated_duration_ms: int) -> Optional[str]:
+        if self.gpu_admission_mode != "enforcing":
+            return None
+        ticket_id = self._gpu_admission_ticket_key(lease)
+        now_ms = _now_ms()
+
+        def mutate(raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Any]:
+            root = self._gpu_admission_prune(raw, now_ms)
+            tickets = root["tickets"]
+            existing = tickets.get(ticket_id)
+            if isinstance(existing, dict):
+                existing["heartbeatAtMs"] = now_ms
+                existing["expiresAtMs"] = max(int(existing.get("expiresAtMs") or 0), now_ms + 3_600_000)
+                existing["attached"] = True
+                root["updatedAtMs"] = now_ms
+                root["revision"] = int(root.get("revision") or 0) + 1
+                return root, ticket_id
+            if len(tickets) >= self.gpu_admission_max_depth:
+                raise GPUCoordinatorBusy("GPU admission queue is full", 5.0)
+            sequence = int(root.get("nextSequence") or 0) + 1
+            root["nextSequence"] = sequence
+            tickets[ticket_id] = {
+                "ticketId": ticket_id,
+                "requestId": str(lease.job_id)[:128],
+                "holder": "comfy",
+                "sequence": sequence,
+                "enqueuedAtMs": now_ms,
+                "heartbeatAtMs": now_ms,
+                "expiresAtMs": now_ms + 3_600_000,
+                "estimatedDurationMs": max(1_000, min(3_600_000, int(estimated_duration_ms))),
+                "stream": False,
+                "attached": True,
+                "state": "waiting",
+            }
+            root["updatedAtMs"] = now_ms
+            root["revision"] = int(root.get("revision") or 0) + 1
+            return root, ticket_id
+
+        lease.gpu_admission_ticket_id = self._gpu_admission_transaction(mutate)
+        return lease.gpu_admission_ticket_id
+
+    def _recover_gpu_admission_if_locally_idle(self) -> bool:
+        try:
+            coordinator_status = self._gpu_coordinator.status(max_age_ms=0)
+        except Exception as exc:
+            logging.warning("GPU admission recovery could not verify the local coordinator: %s", exc)
+            return False
+        if coordinator_status.get("diagnosticsBusy") is True:
+            return False
+        if isinstance(coordinator_status.get("lease"), dict):
+            return False
+        now_ms = _now_ms()
+
+        def mutate(raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Any]:
+            root = self._gpu_admission_prune(raw, now_ms)
+            active = root.get("active")
+            if not isinstance(active, dict) or active.get("state") != "recovering":
+                return None, False
+            if now_ms - int(active.get("heartbeatAtMs") or 0) < self.gpu_admission_recovery_ms:
+                return None, False
+            ticket_id = str(active.get("ticketId") or "")
+            root["active"] = None
+            root["tickets"].pop(ticket_id, None)
+            root["updatedAtMs"] = now_ms
+            root["revision"] = int(root.get("revision") or 0) + 1
+            return root, True
+
+        recovered = bool(self._gpu_admission_transaction(mutate))
+        if recovered:
+            logging.warning("Recovered a stale GPU admission claim after verifying the local coordinator was idle")
+        return recovered
+
+    def _wait_for_comfy_gpu_admission(self, lease: AgentExecuteLease, estimated_duration_ms: int) -> Optional[str]:
+        ticket_id = self._enqueue_comfy_gpu_admission(lease, estimated_duration_ms)
+        if ticket_id is None:
+            return None
+        last_heartbeat_ms = 0
+        while not self._stop.is_set():
+            if self._is_cancel_requested(lease):
+                self._release_comfy_gpu_admission(lease, "cancelled_while_waiting")
+                raise RuntimeError("Cancellation requested while waiting for GPU admission")
+            now_ms = _now_ms()
+            should_heartbeat = now_ms - last_heartbeat_ms >= int(self.gpu_admission_heartbeat_seconds * 1000)
+            saw_recovering = False
+
+            def mutate(raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Any]:
+                nonlocal saw_recovering
+                root = self._gpu_admission_prune(raw, now_ms)
+                tickets = root["tickets"]
+                ticket = tickets.get(ticket_id)
+                if not isinstance(ticket, dict):
+                    return None, None
+                active = root.get("active")
+                if isinstance(active, dict):
+                    if active.get("ticketId") == ticket_id:
+                        return None, str(active.get("claimToken") or "") or None
+                    if now_ms - int(active.get("heartbeatAtMs") or 0) >= self.gpu_admission_recovery_ms:
+                        if active.get("state") != "recovering":
+                            active["state"] = "recovering"
+                            root["active"] = active
+                            root["updatedAtMs"] = now_ms
+                            root["revision"] = int(root.get("revision") or 0) + 1
+                            saw_recovering = True
+                            return root, None
+                        saw_recovering = True
+                    if should_heartbeat:
+                        ticket["heartbeatAtMs"] = now_ms
+                        root["updatedAtMs"] = now_ms
+                        root["revision"] = int(root.get("revision") or 0) + 1
+                        return root, None
+                    return None, None
+                eligible = sorted(
+                    (
+                        row for row in tickets.values()
+                        if isinstance(row, dict) and row.get("attached") is True and row.get("state") == "waiting"
+                    ),
+                    key=lambda row: (int(row.get("sequence") or 0), str(row.get("ticketId") or "")),
+                )
+                if not eligible or eligible[0].get("ticketId") != ticket_id:
+                    if should_heartbeat:
+                        ticket["heartbeatAtMs"] = now_ms
+                        root["updatedAtMs"] = now_ms
+                        root["revision"] = int(root.get("revision") or 0) + 1
+                        return root, None
+                    return None, None
+                claim_token = uuid.uuid4().hex
+                ticket["state"] = "active"
+                ticket["heartbeatAtMs"] = now_ms
+                root["active"] = {
+                    "ticketId": ticket_id,
+                    "requestId": str(ticket.get("requestId") or ""),
+                    "holder": "comfy",
+                    "sequence": int(ticket.get("sequence") or 0),
+                    "claimToken": claim_token,
+                    "claimedAtMs": now_ms,
+                    "heartbeatAtMs": now_ms,
+                    "state": "active",
+                }
+                root["updatedAtMs"] = now_ms
+                root["revision"] = int(root.get("revision") or 0) + 1
+                return root, claim_token
+
+            claim_token = self._gpu_admission_transaction(mutate)
+            if claim_token:
+                lease.gpu_admission_claim_token = str(claim_token)
+                logging.info("Claimed FIFO GPU admission ticket=%s jobId=%s", ticket_id, lease.job_id)
+                return lease.gpu_admission_claim_token
+            if saw_recovering:
+                self._recover_gpu_admission_if_locally_idle()
+            if should_heartbeat:
+                last_heartbeat_ms = now_ms
+            self._stop.wait(0.5)
+        self._release_comfy_gpu_admission(lease, "agent_stopping")
+        raise RuntimeError("Agent stopped while waiting for GPU admission")
+
+    def _heartbeat_comfy_gpu_admission(self, ticket_id: str, claim_token: str) -> bool:
+        now_ms = _now_ms()
+
+        def mutate(raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Any]:
+            root = self._gpu_admission_prune(raw, now_ms)
+            active = root.get("active")
+            ticket = root["tickets"].get(ticket_id)
+            if not isinstance(active, dict) or not isinstance(ticket, dict):
+                return None, False
+            if active.get("ticketId") != ticket_id or active.get("claimToken") != claim_token:
+                return None, False
+            active["heartbeatAtMs"] = now_ms
+            active["state"] = "active"
+            ticket["heartbeatAtMs"] = now_ms
+            root["updatedAtMs"] = now_ms
+            root["revision"] = int(root.get("revision") or 0) + 1
+            return root, True
+
+        return bool(self._gpu_admission_transaction(mutate))
+
+    def _release_comfy_gpu_admission(self, lease: AgentExecuteLease, reason: str) -> None:
+        ticket_id = lease.gpu_admission_ticket_id
+        claim_token = lease.gpu_admission_claim_token
+        lease.gpu_admission_ticket_id = None
+        lease.gpu_admission_claim_token = None
+        if not ticket_id or self.gpu_admission_mode != "enforcing":
+            return
+        now_ms = _now_ms()
+
+        def mutate(raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Any]:
+            root = self._gpu_admission_prune(raw, now_ms)
+            active = root.get("active")
+            if claim_token and isinstance(active, dict) and (
+                active.get("ticketId") != ticket_id or active.get("claimToken") != claim_token
+            ):
+                return None, False
+            root["tickets"].pop(ticket_id, None)
+            if isinstance(active, dict) and active.get("ticketId") == ticket_id:
+                elapsed_ms = max(1, now_ms - int(active.get("claimedAtMs") or now_ms))
+                previous_ms = int(root.get("serviceEwmaMs") or elapsed_ms)
+                root["serviceEwmaMs"] = round(previous_ms * 0.8 + elapsed_ms * 0.2)
+                root["active"] = None
+            root["updatedAtMs"] = now_ms
+            root["revision"] = int(root.get("revision") or 0) + 1
+            return root, True
+
+        try:
+            self._gpu_admission_transaction(mutate)
+            logging.info("Released FIFO GPU admission ticket=%s jobId=%s reason=%s", ticket_id, lease.job_id, reason)
+        except Exception as exc:
+            logging.error("Failed releasing FIFO GPU admission ticket=%s jobId=%s: %s", ticket_id, lease.job_id, exc)
+
+    def _gpu_admission_has_foreground_work(self) -> bool:
+        if self.gpu_admission_mode != "enforcing":
+            return False
+        if not self._coordination:
+            return True
+        try:
+            raw = self._coordination_get_json(self._gpu_admission_root_path(), timeout_seconds=5.0)
+            root = self._gpu_admission_prune(raw, _now_ms())
+            if isinstance(root.get("active"), dict):
+                return True
+            return any(
+                isinstance(ticket, dict) and ticket.get("attached") is True
+                for ticket in root.get("tickets", {}).values()
+            )
+        except Exception as exc:
+            logging.warning("Failing closed on mining because GPU admission state is unavailable: %s", exc)
+            return True
 
     def _coordination_queue_item_path(self, root_path: str, encoded_key: str) -> str:
         root = self._normalize_coordination_path(root_path) or ""
@@ -14560,25 +14910,9 @@ class DependencyAgent:
                 terminal_sent = True
                 return
 
-            self._stop_idle_prl_mining_for_work("execute_job")
-            try:
-                lease.gpu_coordinator_lease = self._acquire_gpu_lease(
-                    "comfy",
-                    lease.job_id,
-                    metadata_provider=self._comfy_gpu_process_metadata,
-                )
-            except GPUCoordinatorBusy as exc:
-                self._defer_ready_lease_for_gpu_coordinator(
-                    lease,
-                    exc.retry_after_seconds,
-                    str(exc),
-                )
-                retain_lease = True
-                return
-            except GPUCoordinatorUnavailable as exc:
-                self._defer_ready_lease_for_gpu_coordinator(lease, 5.0, str(exc))
-                retain_lease = True
-                return
+            # Finish all disk/dependency/input preparation before entering the
+            # shared FIFO. A Comfy job becomes admission-eligible only when its
+            # next meaningful step needs the GPU.
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 prefetched_inputs = list(active.prefetched_inputs) if active else list(lease.prefetched_inputs)
@@ -14594,6 +14928,34 @@ class DependencyAgent:
 
             workflow = self._parse_workflow_from_payload(lease.payload)
             self._ensure_runtime_assets_for_workflow(workflow)
+
+            try:
+                admission_claim_token = self._wait_for_comfy_gpu_admission(
+                    lease,
+                    estimated_duration_ms=max(1, execution_timeout_sec) * 1000,
+                )
+                self._stop_idle_prl_mining_for_work("execute_job")
+                lease.gpu_coordinator_lease = self._acquire_gpu_lease(
+                    "comfy",
+                    lease.job_id,
+                    metadata_provider=self._comfy_gpu_process_metadata,
+                    admission_ticket_id=lease.gpu_admission_ticket_id,
+                    admission_claim_token=admission_claim_token,
+                )
+            except GPUCoordinatorBusy as exc:
+                self._release_comfy_gpu_admission(lease, "gpu_handoff_busy")
+                self._defer_ready_lease_for_gpu_coordinator(
+                    lease,
+                    exc.retry_after_seconds,
+                    str(exc),
+                )
+                retain_lease = True
+                return
+            except GPUCoordinatorUnavailable as exc:
+                self._release_comfy_gpu_admission(lease, "gpu_handoff_unavailable")
+                self._defer_ready_lease_for_gpu_coordinator(lease, 5.0, str(exc))
+                retain_lease = True
+                return
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 execute_started_at_ms = _now_ms()
