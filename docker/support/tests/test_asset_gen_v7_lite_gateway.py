@@ -33,6 +33,17 @@ def load_gateway():
     return module
 
 
+class SupportScriptContractTests(unittest.TestCase):
+    def test_dependency_watchdog_persists_coordinator_fail_closed_settings(self):
+        source = (SUPPORT_DIR / "asset_gen_v5_lite.sh").read_text(encoding="utf-8")
+        persist_start = source.index("function dependency_manager_persist_agent_env()")
+        persist_end = source.index("function dependency_manager_render_watchdog()", persist_start)
+        persist_block = source[persist_start:persist_end]
+
+        self.assertIn("DM_GPU_COORDINATOR_URL", persist_block)
+        self.assertIn("DM_GPU_COORDINATOR_REQUIRED", persist_block)
+
+
 class BackendState:
     def __init__(self):
         self.sleeping = True

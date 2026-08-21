@@ -2768,6 +2768,8 @@ function dependency_manager_persist_agent_env() {
         DM_AGENT_WATCHDOG_LOG_PATH \
         DM_AGENT_WATCHDOG_PID_PATH \
         DM_AGENT_WATCHDOG_SECONDS \
+        DM_GPU_COORDINATOR_URL \
+        DM_GPU_COORDINATOR_REQUIRED \
         HF_TOKEN \
         CIVITAI_TOKEN \
         COMFYUI_ARGS \
