@@ -141,7 +141,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.143"
+AGENT_VERSION = "dm-agent-py/0.10.144"
+RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -4866,6 +4867,9 @@ class DependencyAgent:
         self.agent_update_check_seconds = max(30.0, _env_float("DM_AGENT_UPDATE_CHECK_SECONDS", 60.0))
         self.self_script_path = Path(os.path.abspath(sys.argv[0] if sys.argv and sys.argv[0] else __file__))
         self.self_env_path = Path(_env_str("DM_AGENT_ENV_PATH") or str(self.workspace / "dependency_agent.env"))
+        self._runtime_env_delivery_id = ""
+        self._runtime_env_applied_keys: List[str] = []
+        self._runtime_env_next_fetch_ms = 0
         self.self_marker_path = Path(
             _env_str("DM_AGENT_MARKER_PATH") or f"{_env_str('DM_AGENT_PID_PATH') or str(self.workspace / 'dependency_agent.pid')}.launch"
         )
@@ -10795,6 +10799,89 @@ class DependencyAgent:
         except Exception as exc:
             logging.warning("Failed persisting dependency agent launch marker for watchdog: %s", exc)
 
+    def _apply_runtime_env_delivery(self, raw: Any, source: str) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        delivery_id = raw.get("deliveryId")
+        env = raw.get("env")
+        if not isinstance(delivery_id, str) or not re.match(r"^[A-Za-z0-9_-]{16,128}$", delivery_id.strip()):
+            return False
+        if not isinstance(env, dict):
+            return False
+        updates: Dict[str, str] = {}
+        for key in RUNTIME_ENV_DELIVERY_KEYS:
+            value = env.get(key)
+            if isinstance(value, str) and value.strip():
+                updates[key] = value
+        if "HF_TOKEN" not in updates:
+            return False
+
+        existing: List[str] = []
+        try:
+            if self.self_env_path.exists():
+                existing = self.self_env_path.read_text("utf-8", errors="replace").splitlines()
+        except Exception as exc:
+            logging.warning("Failed reading dependency agent env for runtime delivery: %s", exc)
+            return False
+        export_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
+        kept = []
+        for line in existing:
+            match = export_re.match(line)
+            if match and match.group(1) in updates:
+                continue
+            kept.append(line)
+        for key in sorted(updates):
+            kept.append(f"export {key}={shlex.quote(updates[key])}")
+        next_text = "\n".join(kept).rstrip() + "\n"
+        try:
+            self.self_env_path.parent.mkdir(parents=True, exist_ok=True)
+            current_text = self.self_env_path.read_text("utf-8", errors="replace") if self.self_env_path.exists() else None
+            if current_text != next_text:
+                tmp_env = self.self_env_path.parent / f".{self.self_env_path.name}.{uuid.uuid4().hex}.tmp"
+                tmp_env.write_text(next_text, "utf-8")
+                os.chmod(tmp_env, 0o600)
+                os.replace(str(tmp_env), str(self.self_env_path))
+        except Exception as exc:
+            logging.warning("Failed persisting authenticated runtime env delivery: %s", exc)
+            return False
+
+        for key, value in updates.items():
+            os.environ[key] = value
+        self.hf_token = updates.get("HF_TOKEN") or self.hf_token
+        self.civitai_token = updates.get("CIVITAI_TOKEN") or self.civitai_token
+        self._runtime_env_delivery_id = delivery_id.strip()
+        self._runtime_env_applied_keys = sorted(updates)
+        logging.info(
+            "Applied authenticated runtime env delivery from %s: deliveryId=%s keys=%s",
+            source,
+            self._runtime_env_delivery_id,
+            ",".join(self._runtime_env_applied_keys),
+        )
+        return True
+
+    def _maybe_fetch_runtime_env_delivery(self, source: str) -> None:
+        if self._runtime_env_delivery_id:
+            return
+        if not self._resolved_instance_id or not self._agent_access_token:
+            return
+        now_ms = _now_ms()
+        if now_ms < int(self._runtime_env_next_fetch_ms):
+            return
+        self._runtime_env_next_fetch_ms = now_ms + 30_000
+        try:
+            resp = self._agent_api(
+                "GET",
+                "/agent/runtime-env",
+                query={"instanceId": self._resolved_instance_id},
+                timeout_seconds=30.0,
+                use_token=True,
+                include_secret=False,
+            )
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            self._apply_runtime_env_delivery(data.get("runtimeEnvDelivery"), source)
+        except Exception as exc:
+            logging.warning("Authenticated runtime env delivery fetch failed: %s", exc)
+
     def _maybe_queue_self_update(self, raw: Any, source: str) -> None:
         if not self.self_update_enabled:
             return
@@ -11206,6 +11293,7 @@ class DependencyAgent:
         self._agent_channel_supported = True
         self._set_coordination_from_response(data, "/agent/register")
         self._apply_agent_runtime_config(data.get("agentRuntimeConfig"), "/agent/register")
+        self._maybe_fetch_runtime_env_delivery("/agent/register")
         self._maybe_queue_self_update(data.get("agentUpdate"), "/agent/register")
         self._last_agent_update_check_ms = _now_ms()
         logging.info(
@@ -11524,6 +11612,8 @@ class DependencyAgent:
         if not self._resolved_instance_id or not self._agent_access_token:
             return {}
 
+        self._maybe_fetch_runtime_env_delivery("/agent/heartbeat")
+
         held_leases = self._collect_active_leases()
         local_comfy = True if self.mining_only else self._local_comfy_reachable()
         readiness_present = True if self.mining_only else self._local_readiness_file_present()
@@ -11575,6 +11665,9 @@ class DependencyAgent:
                 "miningOnly": bool(self.mining_only),
                 "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
                 "comfyRestartIsolationMode": self._comfy_restart_isolation_mode(),
+                "runtimeEnvDeliveryV1": True,
+                "runtimeEnvDeliveryId": self._runtime_env_delivery_id,
+                "runtimeEnvAppliedKeys": list(self._runtime_env_applied_keys),
             },
         }
         now_ms = _now_ms()
