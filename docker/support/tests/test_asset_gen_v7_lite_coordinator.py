@@ -566,6 +566,41 @@ class CoordinatorLeaseTest(unittest.TestCase):
             coordinator._free_comfy(preserve_cache=True)
             self.assertEqual(len(http.free_payloads), 1)
 
+    def test_comfy_release_accepts_verified_process_baseline_below_configured_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, http = self.make_coordinator(directory)
+            coordinator.comfy_release_vram_max_bytes = 2 * 1024**3
+            coordinator._gpu_processes = lambda *_args, **_kwargs: [
+                {"pid": 1, "usedBytes": 1024**3, "cmdline": "python ComfyUI/main.py", "cwd": "/workspace/ComfyUI"},
+            ]
+            coordinator._free_comfy(preserve_cache=True)
+            self.assertEqual(len(http.free_payloads), 1)
+
+    def test_same_inference_warm_reuse_skips_redundant_comfy_eviction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory, enforcing=True)
+            coordinator.lease = {
+                "holder": "inference", "workId": "first", "state": "WARM",
+                "deadlineMs": int(time.time() * 1000) + 60_000,
+                "warmDeadlineMs": int(time.time() * 1000) + 30_000,
+                "metadata": {},
+            }
+            coordinator.llama_running = lambda: True
+            coordinator._free_comfy = mock.Mock(side_effect=AssertionError("must not evict Comfy on warm KV reuse"))
+            lease = coordinator.acquire("inference", "second", 60_000)
+            self.assertEqual(lease["epoch"], coordinator.epoch)
+            coordinator._free_comfy.assert_not_called()
+
+    def test_failed_transition_resets_granting_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory, enforcing=True)
+            coordinator._free_comfy = mock.Mock(side_effect=RuntimeError("baseline not released"))
+            with self.assertRaisesRegex(RuntimeError, "baseline not released"):
+                coordinator.acquire("inference", "request", 60_000)
+            self.assertEqual(coordinator.state, "IDLE")
+            self.assertEqual(coordinator.phase, "IDLE")
+            self.assertIsNone(coordinator.lease)
+
     def test_comfy_release_fails_closed_when_gpu_probe_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator, _ = self.make_coordinator(directory)

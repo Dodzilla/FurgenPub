@@ -371,6 +371,7 @@ class GPUCoordinator:
         snapshot_write=True,
         snapshot_restore=True,
         mining_grace_seconds=30,
+        comfy_release_vram_max_bytes=2 * 1024**3,
     ):
         self.llama_base_url = llama_base_url.rstrip("/")
         self.comfy_base_url = comfy_base_url.rstrip("/")
@@ -387,6 +388,7 @@ class GPUCoordinator:
         self.snapshot_write = bool(snapshot_write)
         self.snapshot_restore = bool(snapshot_restore)
         self.mining_grace_seconds = max(30, int(mining_grace_seconds))
+        self.comfy_release_vram_max_bytes = max(0, int(comfy_release_vram_max_bytes))
         self.mining_stop_durations_ms = []
         self.lock = threading.RLock()
         self.lease_condition = threading.Condition(self.lock)
@@ -877,7 +879,7 @@ class GPUCoordinator:
             used_bytes = self._comfy_gpu_bytes()
             if used_bytes is None:
                 return False, False
-            if used_bytes <= 512 * 1024**2:
+            if used_bytes <= self.comfy_release_vram_max_bytes:
                 return True, True
             time.sleep(0.25)
         return False, True
@@ -1155,26 +1157,41 @@ class GPUCoordinator:
                         evicted_holder = existing["holder"]
                         self._evict_warm(existing["holder"])
                         comfy_verified_free = evicted_holder == "comfy"
+                    elif holder == "inference":
+                        # The prior inference transition already verified Comfy
+                        # release. Preserve that proof for same-owner warm KV
+                        # reuse instead of probing/evicting Comfy again.
+                        comfy_verified_free = True
                     self.lease = None
                 else:
                     self.metrics["leaseConflicts"] += 1
                     raise LeaseConflict(f"GPU is active for {existing['holder']}")
             self.state = "GRANTING"
             self.phase = "GRANTING"
-            if holder == "inference" and self.enforce_transitions:
-                if not comfy_verified_free:
-                    self._free_comfy(preserve_cache=True)
-                self._ensure_llama()
-            elif holder == "inference" and self.llama_argv and not self.llama_running():
-                # Shadow mode normally observes the legacy sleeping server,
-                # but can restart it after crash recovery reset it.
-                self._ensure_llama()
-            elif holder in {"comfy", "mining"} and self.enforce_transitions:
-                if self.llama_running():
-                    self._stop_llama()
-                if holder == "mining":
+            try:
+                if holder == "inference" and self.enforce_transitions:
                     if not comfy_verified_free:
                         self._free_comfy(preserve_cache=True)
+                    self._ensure_llama()
+                elif holder == "inference" and self.llama_argv and not self.llama_running():
+                    # Shadow mode normally observes the legacy sleeping server,
+                    # but can restart it after crash recovery reset it.
+                    self._ensure_llama()
+                elif holder in {"comfy", "mining"} and self.enforce_transitions:
+                    if self.llama_running():
+                        self._stop_llama()
+                    if holder == "mining":
+                        if not comfy_verified_free:
+                            self._free_comfy(preserve_cache=True)
+            except Exception:
+                # A failed transition must never strand the coordinator in a
+                # synthetic GRANTING state with no fenced owner.
+                self.lease = None
+                self.state = "IDLE"
+                self.phase = "IDLE"
+                self._persist_journal()
+                self.lease_condition.notify_all()
+                raise
             token = uuid.uuid4().hex
             deadline = int(time.time() * 1000) + ttl_ms
             lease_state = "STARTING" if holder == "mining" else "ACTIVE"

@@ -158,6 +158,7 @@ def get_coordinator():
             snapshot_write=SNAPSHOT_WRITE_ENABLED,
             snapshot_restore=SNAPSHOT_RESTORE_ENABLED,
             mining_grace_seconds=int(os.environ.get("GPU_MINING_GRACE_SECONDS", "30")),
+            comfy_release_vram_max_bytes=int(os.environ.get("GPU_COMFY_RELEASE_VRAM_MAX_BYTES", str(2 * 1024**3))),
         )
     return COORDINATOR
 
