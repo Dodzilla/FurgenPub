@@ -224,9 +224,11 @@ def health_payload():
     return statuses
 
 
-def cache_response_headers(request_id, cache_state):
+def cache_response_headers(request_id, cache_state, restore_pending=False):
     classification = cache_state.get("classification", "unkeyed")
-    if cache_state.get("restoreFailed"):
+    if restore_pending and classification == "restored":
+        status = "restore_pending"
+    elif cache_state.get("restoreFailed"):
         status = "error"
     elif cache_state.get("skipped"):
         status = "ineligible"
@@ -241,6 +243,8 @@ def cache_response_headers(request_id, cache_state):
         "resident": "warm",
         "restored": "restored",
     }.get(classification, "cold")
+    if restore_pending and classification == "restored":
+        residency = "cold"
     return {
         "X-Furgen-Request-Complete-Id": request_id,
         "X-Furgen-Gpu-Release-Id": request_id,
@@ -272,6 +276,20 @@ def cache_metadata_from_response(response_payload):
         "cachedTokens": cached_tokens,
         "coldPrefillMs": max(0, round(cold_prefill_ms)),
     }
+
+
+def record_cache_observation(cache_handle, cache_state, response_payload):
+    metadata = cache_metadata_from_response(response_payload)
+    metadata["classification"] = cache_state.get("classification")
+    result = get_coordinator().mark_cache_dirty(cache_handle, metadata) or {}
+    if result.get("restoreIneffective"):
+        cache_state.update({
+            "classification": "cold",
+            "restored": False,
+            "restoreFailed": True,
+            "skipped": "restore_ineffective",
+        })
+    return metadata
 
 
 def observe_stream_chunk(parse_buffer, observation, chunk):
@@ -551,7 +569,9 @@ class Handler(JsonHandler):
                 self.send_header("Content-Type", content_type)
                 self.send_header("Cache-Control", "no-cache, no-transform")
                 self.send_header("X-Accel-Buffering", "no")
-                for header, value in cache_response_headers(request_id, cache_state).items():
+                # Streaming headers precede final usage telemetry, so a loaded
+                # snapshot remains unverified until the terminal usage event.
+                for header, value in cache_response_headers(request_id, cache_state, restore_pending=True).items():
                     self.send_header(header, value)
                 self.send_header("Connection", "close")
                 self.end_headers()
@@ -582,9 +602,7 @@ class Handler(JsonHandler):
                 response_ready_ms = round((time.monotonic() - started_at) * 1000)
                 set_release(request_id, "draining", response_ready_ms=response_ready_ms)
                 if cache_handle and 200 <= status < 300 and COORDINATOR_MODE == "enforcing":
-                    metadata = cache_metadata_from_response(stream_observation)
-                    metadata["classification"] = cache_state.get("classification")
-                    get_coordinator().mark_cache_dirty(cache_handle, metadata)
+                    record_cache_observation(cache_handle, cache_state, stream_observation)
             else:
                 status, content_type, response_body = http_request(
                     f"{LLAMA_BASE_URL}/v1/chat/completions",
@@ -608,9 +626,7 @@ class Handler(JsonHandler):
                         response_body = json_response_bytes(response_payload)
                 if cache_handle and 200 <= status < 300 and COORDINATOR_MODE == "enforcing":
                     response_payload = response_payload if isinstance(response_payload, dict) else {}
-                    metadata = cache_metadata_from_response(response_payload)
-                    metadata["classification"] = cache_state.get("classification")
-                    get_coordinator().mark_cache_dirty(cache_handle, metadata)
+                    record_cache_observation(cache_handle, cache_state, response_payload)
                 self.send_bytes(
                     status,
                     content_type,

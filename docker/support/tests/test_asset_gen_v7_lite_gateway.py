@@ -250,6 +250,39 @@ class GatewayTest(unittest.TestCase):
             else:
                 os.environ["QWEN_PREFILL_ESTIMATE_MS_PER_TOKEN"] = original
 
+    def test_ineffective_restore_is_reported_as_a_cold_error(self):
+        class Coordinator:
+            def mark_cache_dirty(self, _handle, _metadata):
+                return {"restoreIneffective": True}
+
+        original = self.gateway.get_coordinator
+        self.gateway.get_coordinator = lambda: Coordinator()
+        cache_state = {"classification": "restored", "restored": True}
+        try:
+            self.gateway.record_cache_observation(
+                "v1." + "a" * 64,
+                cache_state,
+                {
+                    "usage": {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 0}},
+                    "timings": {"prompt_ms": 50},
+                },
+            )
+        finally:
+            self.gateway.get_coordinator = original
+        headers = self.gateway.cache_response_headers("request-restore", cache_state)
+        self.assertEqual(headers["X-Furgen-Prompt-Cache-Status"], "error")
+        self.assertEqual(headers["X-Furgen-Inference-Residency"], "cold")
+        self.assertEqual(cache_state["skipped"], "restore_ineffective")
+
+    def test_streaming_restore_headers_remain_pending_until_usage(self):
+        cache_state = {"classification": "restored", "restored": True}
+        pending = self.gateway.cache_response_headers("request-stream-restore", cache_state, restore_pending=True)
+        verified = self.gateway.cache_response_headers("request-nonstream-restore", cache_state)
+        self.assertEqual(pending["X-Furgen-Prompt-Cache-Status"], "restore_pending")
+        self.assertEqual(pending["X-Furgen-Inference-Residency"], "cold")
+        self.assertEqual(verified["X-Furgen-Prompt-Cache-Status"], "restored")
+        self.assertEqual(verified["X-Furgen-Inference-Residency"], "restored")
+
     def test_split_sse_usage_and_timings_are_observed_for_stream_cache(self):
         observation = {}
         buffer = self.gateway.observe_stream_chunk(

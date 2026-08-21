@@ -794,6 +794,82 @@ class CoordinatorLeaseTest(unittest.TestCase):
             self.assertIsNotNone(store.peek(handle))
             self.assertEqual(coordinator.prepare_cache(handle).get("skipped"), "restore_backoff")
 
+    def test_successful_slot_load_without_cached_tokens_is_backed_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SnapshotStore(directory, "fp", min_free_bytes=0)
+            handle = "v1." + "7" * 64
+            temporary = store.temporary_filename(handle)
+            (Path(directory) / temporary).write_bytes(b"valid-slot")
+            store.commit(handle, temporary, {
+                "promptTokens": 1000,
+                "coldPrefillMs": 1000,
+                "restoreMs": 10,
+                "reuseProbability": 0.3,
+            })
+            coordinator = GPUCoordinator(
+                "http://127.0.0.1:8081", "http://127.0.0.1:8188", FakeHttp(directory), store,
+                snapshot_restore=True,
+            )
+            self.assertEqual(coordinator.prepare_cache(handle)["classification"], "restored")
+            result = coordinator.mark_cache_dirty(handle, {
+                "classification": "restored",
+                "promptTokens": 1000,
+                "cachedTokens": 0,
+                "coldPrefillMs": 1000,
+            })
+            self.assertTrue(result["restoreIneffective"])
+            self.assertEqual(coordinator.metrics["snapshotRestoreIneffective"], 1)
+            self.assertGreater(coordinator.current_cache_metadata["restoreBackoffUntil"], time.time())
+            self.assertEqual(coordinator.current_cache_metadata["reuseHits"], 0)
+
+    def test_ineffective_restore_backoff_disk_failure_never_fails_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory, enforcing=True)
+            coordinator.current_cache_handle = "v1." + "6" * 64
+            coordinator.current_cache_metadata = {"reuseObservations": 1, "reuseHits": 1}
+            coordinator.snapshot_store.record_restore_failure = mock.Mock(side_effect=OSError("disk failure"))
+            result = coordinator.mark_cache_dirty(coordinator.current_cache_handle, {
+                "classification": "restored",
+                "promptTokens": 1000,
+                "cachedTokens": 0,
+                "coldPrefillMs": 1000,
+            })
+            self.assertTrue(result["restoreIneffective"])
+            self.assertEqual(coordinator.metrics["snapshotRestoreErrors"], 1)
+
+    def test_backoff_survives_cold_refill_and_snapshot_rewrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SnapshotStore(directory, "fp", min_free_bytes=0)
+            handle = "v1." + "5" * 64
+            temporary = store.temporary_filename(handle)
+            (Path(directory) / temporary).write_bytes(b"valid-slot")
+            store.commit(handle, temporary, {
+                "promptTokens": 1000,
+                "coldPrefillMs": 1000,
+                "restoreMs": 10,
+                "reuseProbability": 0.3,
+            })
+            store.record_restore_failure(handle, now=time.time())
+            coordinator = GPUCoordinator(
+                "http://127.0.0.1:8081", "http://127.0.0.1:8188", FakeHttp(directory), store,
+                snapshot_write=True, snapshot_restore=True,
+            )
+            state = coordinator.prepare_cache(handle)
+            self.assertEqual(state.get("skipped"), "restore_backoff")
+            original_backoff = coordinator.current_cache_metadata["restoreBackoffUntil"]
+            coordinator.mark_cache_dirty(handle, {
+                "classification": "cold",
+                "promptTokens": 1000,
+                "cachedTokens": 0,
+                "coldPrefillMs": 1000,
+            })
+            self.assertIsNotNone(coordinator.save_current_snapshot())
+            rewritten = store.peek(handle)
+            self.assertEqual(rewritten["restoreBackoffUntil"], original_backoff)
+            coordinator.current_cache_handle = None
+            coordinator.current_cache_metadata = {}
+            self.assertEqual(coordinator.prepare_cache(handle).get("skipped"), "restore_backoff")
+
     def test_stop_never_signals_pid_after_start_time_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator, _ = self.make_coordinator(directory)

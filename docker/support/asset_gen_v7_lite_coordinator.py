@@ -420,6 +420,7 @@ class GPUCoordinator:
             "snapshotSaveErrors": 0,
             "snapshotRestores": 0,
             "snapshotRestoreErrors": 0,
+            "snapshotRestoreIneffective": 0,
             "snapshotSkippedDirtyEviction": 0,
             "snapshotSkippedKeySwitch": 0,
             "llamaStarts": 0,
@@ -1389,6 +1390,10 @@ class GPUCoordinator:
                 self._erase_llama_slot()
                 return {"classification": "cold", "restored": False}
             if float(entry.get("restoreBackoffUntil", 0)) > time.time():
+                # Retain the persisted failure policy while cold-prefilling.
+                # A later snapshot write must not erase the backoff and cause
+                # alternating keys to pay restore plus cold-prefill repeatedly.
+                self.current_cache_metadata = dict(entry)
                 self._erase_llama_slot()
                 return {"classification": "cold", "restored": False, "skipped": "restore_backoff"}
             estimated_cold = float(entry.get("coldPrefillMs", 0))
@@ -1448,16 +1453,46 @@ class GPUCoordinator:
 
     def mark_cache_dirty(self, handle, metadata):
         if not handle:
-            return
+            return {"restoreIneffective": False}
+        metadata = dict(metadata or {})
         with self.lock:
             self.current_cache_handle = handle
             previous_cold_prefill_ms = float(self.current_cache_metadata.get("coldPrefillMs", 0))
-            observed_cold_prefill_ms = float((metadata or {}).get("coldPrefillMs", 0))
-            self.current_cache_metadata.update(metadata or {})
+            observed_cold_prefill_ms = float(metadata.get("coldPrefillMs", 0))
+            restore_ineffective = (
+                metadata.get("classification") == "restored"
+                and int(metadata.get("promptTokens", 0)) > 0
+                and int(metadata.get("cachedTokens", 0)) <= 0
+            )
+            if restore_ineffective:
+                # A successful llama slot-load is not sufficient evidence that
+                # the model can reuse it. Hybrid/recurrent layouts may accept
+                # the file and then force a complete prompt prefill. Persist a
+                # bounded backoff and report a miss instead of repeatedly
+                # paying restore plus cold-prefill latency.
+                try:
+                    self.snapshot_store.record_restore_failure(handle)
+                    refreshed = self.snapshot_store.peek(handle)
+                    if refreshed:
+                        self.current_cache_metadata.update(refreshed)
+                except Exception:
+                    # Cache policy persistence is best-effort and must never
+                    # turn a successfully generated response into a failure.
+                    self.metrics["snapshotRestoreErrors"] += 1
+                observations = max(1, int(self.current_cache_metadata.get("reuseObservations", 1)))
+                hits = max(0, int(self.current_cache_metadata.get("reuseHits", 1)) - 1)
+                self.current_cache_metadata.update({
+                    "reuseObservations": observations,
+                    "reuseHits": hits,
+                    "reuseProbability": (3 + hits) / (10 + observations),
+                })
+                self.metrics["snapshotRestoreIneffective"] += 1
+            self.current_cache_metadata.update(metadata)
             self.current_cache_metadata["coldPrefillMs"] = max(previous_cold_prefill_ms, observed_cold_prefill_ms)
             self.current_cache_metadata.setdefault("reuseProbability", 0.3)
             self.cache_dirty = True
             self.cache_generation += 1
+            return {"restoreIneffective": restore_ineffective}
 
     def _snapshot_beneficial(self):
         metadata = self.current_cache_metadata
