@@ -218,7 +218,11 @@ PY
 
 assert_restart_quiescent() {
     local coordinator_status drain_response queue_status gateway_pid
-    drain_response="$(curl -fsS --max-time 20 -X POST -H 'Content-Type: application/json' -d '{}' \
+    # A failed warm-owner eviction can still atomically set draining=true
+    # before returning 503. Preserve that response and let the status fence
+    # below decide whether active work is gone instead of mistaking it for a
+    # legacy coordinator with no drain endpoint.
+    drain_response="$(curl -sS --max-time 20 -X POST -H 'Content-Type: application/json' -d '{}' \
         "http://127.0.0.1:${GPU_COORDINATOR_PORT:-8189}/v1/gpu/drain" 2>/dev/null || true)"
     if [[ -n "${drain_response}" ]]; then
         local drained=0
