@@ -23,6 +23,12 @@ REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 GPU_LOCK = threading.Lock()
 RELEASES_LOCK = threading.Lock()
 RELEASES = {}
+REQUIRED_TOOL_CAPABILITIES = (
+    "supports_tools",
+    "supports_tool_calls",
+    "supports_object_arguments",
+    "supports_parallel_tool_calls",
+)
 
 
 def http_request(url, method="GET", payload=None, timeout=10, authorize_backend=False):
@@ -36,6 +42,18 @@ def http_request(url, method="GET", payload=None, timeout=10, authorize_backend=
             return response.status, response.headers.get("Content-Type", "application/json"), response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.headers.get("Content-Type", "application/json"), error.read()
+
+
+def open_http_response(url, method="GET", payload=None, timeout=10, authorize_backend=False):
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if authorize_backend and API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        return error
 
 
 def json_response_bytes(payload):
@@ -53,13 +71,19 @@ def free_comfy_models():
         raise RuntimeError(f"ComfyUI /free returned {status}: {body[:500]!r}")
 
 
-def llama_is_sleeping():
+def llama_props():
     status, _, body = http_request(f"{LLAMA_BASE_URL}/props", timeout=10, authorize_backend=True)
     if status < 200 or status >= 300:
-        return False
+        return None
     try:
-        props = json.loads(body)
+        return json.loads(body)
     except json.JSONDecodeError:
+        return None
+
+
+def llama_is_sleeping():
+    props = llama_props()
+    if not props:
         return False
     return bool(props.get("is_sleeping") or props.get("sleeping"))
 
@@ -115,14 +139,17 @@ def health_payload():
         statuses["llama"] = llama_status == 200
     except Exception:
         statuses["llama"] = False
-    statuses["sleeping"] = llama_is_sleeping() if statuses["llama"] else False
+    props = llama_props() if statuses["llama"] else None
+    capabilities = props.get("chat_template_caps", {}) if isinstance(props, dict) else {}
+    statuses["tool_calling"] = all(capabilities.get(name) is True for name in REQUIRED_TOOL_CAPABILITIES)
+    statuses["sleeping"] = bool(props and (props.get("is_sleeping") or props.get("sleeping")))
     statuses["gpu_busy"] = GPU_LOCK.locked()
-    statuses["ready"] = statuses["comfyui"] and statuses["llama"]
+    statuses["ready"] = statuses["comfyui"] and statuses["llama"] and statuses["tool_calling"]
     return statuses
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FurgenQwenGateway/2.0"
+    server_version = "FurgenQwenGateway/3.0"
 
     def log_message(self, fmt, *args):
         print(f"{self.log_date_time_string()} {self.client_address[0]} {fmt % args}", flush=True)
@@ -198,10 +225,6 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_json(400, {"error": {"message": "Invalid JSON.", "code": "invalid_json"}})
             return
-        if request_payload.get("stream") is True:
-            self.send_json(400, {"error": {"message": "Streaming is not supported.", "code": "stream_unsupported"}})
-            return
-
         if not GPU_LOCK.acquire(blocking=False):
             self.send_json(429, {"error": {"message": "GPU is busy.", "code": "gpu_busy"}})
             return
@@ -211,22 +234,54 @@ class Handler(BaseHTTPRequestHandler):
         try:
             free_comfy_models()
             set_release(request_id, "inference")
-            status, content_type, response_body = http_request(
-                f"{LLAMA_BASE_URL}/v1/chat/completions",
-                method="POST",
-                payload=request_payload,
-                timeout=UPSTREAM_TIMEOUT_SECONDS,
-                authorize_backend=True,
-            )
-            response_ready_ms = round((time.monotonic() - started_at) * 1000)
-            set_release(request_id, "draining", response_ready_ms=response_ready_ms)
-            self.send_bytes(
-                status,
-                content_type,
-                response_body,
-                headers={"X-Furgen-Gpu-Release-Id": request_id},
-            )
-            response_sent = True
+            if request_payload.get("stream") is True:
+                backend = open_http_response(
+                    f"{LLAMA_BASE_URL}/v1/chat/completions",
+                    method="POST",
+                    payload=request_payload,
+                    timeout=UPSTREAM_TIMEOUT_SECONDS,
+                    authorize_backend=True,
+                )
+                status = getattr(backend, "status", None) or getattr(backend, "code", 502)
+                content_type = backend.headers.get("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-cache, no-transform")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("X-Furgen-Gpu-Release-Id", request_id)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.flush()
+                response_sent = True
+                try:
+                    read_chunk = getattr(backend, "read1", backend.read)
+                    while True:
+                        chunk = read_chunk(16 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                finally:
+                    backend.close()
+                response_ready_ms = round((time.monotonic() - started_at) * 1000)
+                set_release(request_id, "draining", response_ready_ms=response_ready_ms)
+            else:
+                status, content_type, response_body = http_request(
+                    f"{LLAMA_BASE_URL}/v1/chat/completions",
+                    method="POST",
+                    payload=request_payload,
+                    timeout=UPSTREAM_TIMEOUT_SECONDS,
+                    authorize_backend=True,
+                )
+                response_ready_ms = round((time.monotonic() - started_at) * 1000)
+                set_release(request_id, "draining", response_ready_ms=response_ready_ms)
+                self.send_bytes(
+                    status,
+                    content_type,
+                    response_body,
+                    headers={"X-Furgen-Gpu-Release-Id": request_id},
+                )
+                response_sent = True
             slept = force_llama_sleep()
             release_completed_ms = round((time.monotonic() - started_at) * 1000)
             if slept:
@@ -247,8 +302,12 @@ class Handler(BaseHTTPRequestHandler):
                     sleeping=False,
                 )
         except Exception as error:
-            force_llama_sleep()
-            set_release(request_id, "error", code="gateway_failure", detail=str(error)[:500])
+            slept = force_llama_sleep()
+            code = "client_disconnected" if isinstance(error, (BrokenPipeError, ConnectionResetError)) else "gateway_failure"
+            if slept:
+                set_release(request_id, "safe", code=code, request_failed=True, sleeping=True)
+            else:
+                set_release(request_id, "error", code="gpu_release_failed", request_failed=True, sleeping=False)
             if not response_sent:
                 self.send_json(502, {"error": {"message": "Inference gateway failure.", "code": "gateway_failure", "detail": str(error)}})
         finally:
