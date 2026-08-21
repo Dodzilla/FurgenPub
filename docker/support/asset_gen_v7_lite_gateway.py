@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from asset_gen_v7_lite_coordinator import (
@@ -33,6 +34,11 @@ COORDINATOR_PORT = int(os.environ.get("GPU_COORDINATOR_PORT", "8189"))
 COORDINATOR_MODE = os.environ.get("GPU_COORDINATOR_MODE", "shadow").strip().lower()
 if COORDINATOR_MODE not in {"shadow", "enforcing", "legacy"}:
     raise RuntimeError("GPU_COORDINATOR_MODE must be shadow, enforcing, or legacy")
+ADMISSION_MODE = os.environ.get("GPU_ADMISSION_MODE", "off").strip().lower()
+if ADMISSION_MODE not in {"off", "shadow", "enforcing"}:
+    raise RuntimeError("GPU_ADMISSION_MODE must be off, shadow, or enforcing")
+ADMIT_MAX_WAIT_SECONDS = max(0.0, min(60.0, float(os.environ.get("QWEN_ADMIT_MAX_WAIT_SECONDS", "10"))))
+MAX_GATEWAY_WAITERS = max(1, min(64, int(os.environ.get("QWEN_MAX_WAITERS", "4"))))
 
 
 def bool_env(name, default=False):
@@ -54,8 +60,13 @@ COORDINATOR_STATE_FILE = os.environ.get("GPU_COORDINATOR_STATE_FILE", "/workspac
 COORDINATOR_EPOCH_FILE = os.environ.get("GPU_COORDINATOR_EPOCH_FILE", "/workspace/logs/asset_gen_v7_lite_coordinator.epoch")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 GPU_LOCK = threading.Lock()
+ADMIT_SEMAPHORE = threading.BoundedSemaphore(MAX_GATEWAY_WAITERS)
 RELEASES_LOCK = threading.Lock()
 RELEASES = {}
+INFLIGHT_LOCK = threading.Lock()
+INFLIGHT = {}
+CANCELLED_REQUESTS = {}
+GATEWAY_BOOT_ID = uuid.uuid4().hex
 COORDINATOR = None
 COORDINATOR_LOCK_STREAM = None
 REQUIRED_TOOL_CAPABILITIES = (
@@ -187,6 +198,7 @@ def set_release(request_id, phase, **values):
             **previous,
             **values,
             "request_id": request_id,
+            "gateway_boot_id": GATEWAY_BOOT_ID,
             "phase": phase,
             "updated_at": now,
         }
@@ -200,6 +212,52 @@ def get_release(request_id):
     with RELEASES_LOCK:
         value = RELEASES.get(request_id)
         return dict(value) if value else None
+
+
+def register_inflight(request_id, backend):
+    with INFLIGHT_LOCK:
+        cancelled = request_id in CANCELLED_REQUESTS
+        if not cancelled:
+            INFLIGHT[request_id] = backend
+    if cancelled:
+        backend.close()
+        raise ConnectionResetError("request was cancelled before upstream registration")
+
+
+def unregister_inflight(request_id, backend=None):
+    with INFLIGHT_LOCK:
+        current = INFLIGHT.get(request_id)
+        if backend is None or current is backend:
+            INFLIGHT.pop(request_id, None)
+
+
+def cancel_inflight(request_id):
+    with INFLIGHT_LOCK:
+        cutoff = time.monotonic() - RELEASE_TTL_SECONDS
+        for stale_id in [key for key, cancelled_at in CANCELLED_REQUESTS.items() if cancelled_at < cutoff]:
+            CANCELLED_REQUESTS.pop(stale_id, None)
+        backend = INFLIGHT.get(request_id)
+        CANCELLED_REQUESTS[request_id] = time.monotonic()
+    if backend is None:
+        # The cancellation marker is intentionally registered even before an
+        # upstream socket exists, so retries and early disconnects are
+        # idempotently accepted and a later registration is closed at once.
+        return True
+    try:
+        backend.close()
+    finally:
+        unregister_inflight(request_id, backend)
+    return True
+
+
+def request_was_cancelled(request_id):
+    with INFLIGHT_LOCK:
+        return request_id in CANCELLED_REQUESTS
+
+
+def clear_cancelled(request_id):
+    with INFLIGHT_LOCK:
+        CANCELLED_REQUESTS.pop(request_id, None)
 
 
 def health_payload():
@@ -229,6 +287,11 @@ def health_payload():
         "snapshotRestore": SNAPSHOT_RESTORE_ENABLED,
         "state": coordinator_status["state"],
         "inferenceReadiness": inference_readiness,
+    }
+    statuses["admission"] = {
+        "mode": ADMISSION_MODE,
+        "maxWaitSeconds": ADMIT_MAX_WAIT_SECONDS,
+        "maxWaiters": MAX_GATEWAY_WAITERS,
     }
     if statuses["llama"]:
         inference_ready = statuses["tool_calling"]
@@ -264,6 +327,7 @@ def cache_response_headers(request_id, cache_state, restore_pending=False):
     return {
         "X-Furgen-Request-Complete-Id": request_id,
         "X-Furgen-Gpu-Release-Id": request_id,
+        "X-Furgen-Gateway-Boot-Id": GATEWAY_BOOT_ID,
         "X-Furgen-Prompt-Cache-Status": status,
         "X-Furgen-Inference-Residency": residency,
     }
@@ -366,6 +430,7 @@ class JsonHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Furgen-Gateway-Boot-Id", GATEWAY_BOOT_ID)
         for key, value in (headers or {}).items():
             self.send_header(key, str(value))
         self.end_headers()
@@ -417,8 +482,13 @@ class CoordinatorHandler(JsonHandler):
                 self.send_json(200, coordinator.begin_drain())
                 return
             if self.path == "/v1/gpu/leases/acquire":
+                admission_claim_id = str(payload.get("admissionClaimId") or "").strip()
+                holder = str(payload.get("holder", ""))
+                if ADMISSION_MODE == "enforcing" and holder in {"inference", "comfy"} and not REQUEST_ID_RE.fullmatch(admission_claim_id):
+                    self.send_json(409, {"error": {"code": "admission_claim_required", "message": "A valid admission claim is required."}})
+                    return
                 lease = coordinator.acquire(
-                    str(payload.get("holder", "")),
+                    holder,
                     str(payload.get("workId", "")),
                     int(payload.get("ttlMs") or 60_000),
                     metadata=payload.get("metadata") or {
@@ -498,6 +568,24 @@ class Handler(JsonHandler):
                 "draining": status["draining"],
             })
             return
+        if self.path == "/v1/gpu/admission-recovery":
+            coordinator_status = get_coordinator().status()
+            local_lease = coordinator_status.get("lease") if isinstance(coordinator_status, dict) else None
+            lease_state = str(local_lease.get("state") or "") if isinstance(local_lease, dict) else ""
+            diagnostics_busy = coordinator_status.get("diagnosticsBusy") is True
+            safe_to_clear = (
+                not GPU_LOCK.locked()
+                and not diagnostics_busy
+                and (not isinstance(local_lease, dict) or lease_state == "WARM")
+            )
+            self.send_json(200, {
+                "gatewayBootId": GATEWAY_BOOT_ID,
+                "safeToClearAdmission": safe_to_clear,
+                "coordinatorState": coordinator_status.get("state"),
+                "leaseState": lease_state or None,
+                "diagnosticsBusy": diagnostics_busy,
+            })
+            return
         if self.path.startswith("/v1/gpu/releases/"):
             request_id = self.path.removeprefix("/v1/gpu/releases/")
             if not REQUEST_ID_RE.fullmatch(request_id):
@@ -508,6 +596,16 @@ class Handler(JsonHandler):
                 self.send_json(404, {"error": {"message": "Release state not found.", "code": "release_not_found"}})
                 return
             self.send_json(200, release)
+            return
+        if self.path == "/v1/slots":
+            with INFLIGHT_LOCK:
+                inflight = len(INFLIGHT)
+            self.send_json(200, {
+                "total": 1,
+                "busy": 1 if GPU_LOCK.locked() else 0,
+                "inflight": inflight,
+                "admissionMode": ADMISSION_MODE,
+            })
             return
         if self.path not in ("/v1/models", "/metrics", "/props"):
             self.send_json(404, {"error": {"message": "Not found", "code": "not_found"}})
@@ -521,10 +619,23 @@ class Handler(JsonHandler):
             self.send_json(502, {"error": {"message": "Inference backend unavailable.", "code": "backend_unavailable", "detail": str(error)}})
 
     def do_POST(self):
-        if self.path != "/v1/chat/completions":
+        if self.path not in {"/v1/chat/completions", "/v1/cancel"}:
             self.send_json(404, {"error": {"message": "Not found", "code": "not_found"}})
             return
         if not self.authorized():
+            return
+        if self.path == "/v1/cancel":
+            try:
+                payload = self.read_json()
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_json(400, {"error": {"message": str(error), "code": "invalid_request"}})
+                return
+            request_id = str(payload.get("request_id") or "").strip()
+            if not REQUEST_ID_RE.fullmatch(request_id):
+                self.send_json(400, {"error": {"message": "A valid request_id is required.", "code": "request_id_required"}})
+                return
+            cancelled = cancel_inflight(request_id)
+            self.send_json(200, {"request_id": request_id, "cancelled": cancelled})
             return
         request_id = self.headers.get("X-Furgen-Request-Id", "").strip()
         if not REQUEST_ID_RE.fullmatch(request_id):
@@ -547,8 +658,21 @@ class Handler(JsonHandler):
         # Never leak caller-selected keys to llama.cpp. Functions sends only an
         # opaque, tenant-scoped HMAC in the private header above.
         request_payload.pop("prompt_cache_key", None)
-        if not GPU_LOCK.acquire(blocking=False):
-            self.send_json(429, {"error": {"message": "GPU is busy.", "code": "gpu_busy"}})
+        admission_claim_id = self.headers.get("X-Furgen-Admission-Claim-Id", "").strip()
+        if ADMISSION_MODE == "enforcing" and not REQUEST_ID_RE.fullmatch(admission_claim_id):
+            self.send_json(409, {"error": {"message": "A valid admission claim is required.", "code": "admission_claim_required"}})
+            return
+        if not ADMIT_SEMAPHORE.acquire(blocking=False):
+            status = 503 if ADMISSION_MODE == "enforcing" else 429
+            code = "gpu_handoff_failed" if ADMISSION_MODE == "enforcing" else "queue_full"
+            self.send_json(status, {"error": {"message": "The bounded gateway handoff is unavailable.", "code": code}}, headers={"Retry-After": "1"})
+            return
+        lock_wait = ADMIT_MAX_WAIT_SECONDS if ADMISSION_MODE == "enforcing" else 0
+        if not GPU_LOCK.acquire(timeout=lock_wait):
+            ADMIT_SEMAPHORE.release()
+            status = 503 if ADMISSION_MODE == "enforcing" else 429
+            code = "gpu_handoff_failed" if ADMISSION_MODE == "enforcing" else "queue_timeout"
+            self.send_json(status, {"error": {"message": "The gateway handoff wait expired.", "code": code}}, headers={"Retry-After": "1"})
             return
         response_sent = False
         started_at = time.monotonic()
@@ -557,7 +681,17 @@ class Handler(JsonHandler):
         set_release(request_id, "preparing", started_at=time.time())
         try:
             if COORDINATOR_MODE in {"enforcing", "shadow"}:
-                coordinator_lease = get_coordinator().acquire("inference", request_id, UPSTREAM_TIMEOUT_SECONDS * 1000 + 60_000)
+                handoff_deadline = time.monotonic() + ADMIT_MAX_WAIT_SECONDS
+                while True:
+                    try:
+                        coordinator_lease = get_coordinator().acquire(
+                            "inference", request_id, UPSTREAM_TIMEOUT_SECONDS * 1000 + 60_000
+                        )
+                        break
+                    except LeaseConflict:
+                        if ADMISSION_MODE != "enforcing" or time.monotonic() >= handoff_deadline:
+                            raise
+                        time.sleep(min(0.25, max(0.01, handoff_deadline - time.monotonic())))
                 if COORDINATOR_MODE == "enforcing":
                     cache_state = get_coordinator().prepare_cache(cache_handle)
                     request_payload["id_slot"] = 0
@@ -579,12 +713,14 @@ class Handler(JsonHandler):
                     timeout=UPSTREAM_TIMEOUT_SECONDS,
                     authorize_backend=True,
                 )
+                register_inflight(request_id, backend)
                 status = getattr(backend, "status", None) or getattr(backend, "code", 502)
                 content_type = backend.headers.get("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Cache-Control", "no-cache, no-transform")
                 self.send_header("X-Accel-Buffering", "no")
+                self.send_header("X-Furgen-Gateway-Boot-Id", GATEWAY_BOOT_ID)
                 # Streaming headers precede final usage telemetry, so a loaded
                 # snapshot remains unverified until the terminal usage event.
                 for header, value in cache_response_headers(request_id, cache_state, restore_pending=True).items():
@@ -614,19 +750,28 @@ class Handler(JsonHandler):
                         self.wfile.write(stream_redaction_buffer)
                         self.wfile.flush()
                 finally:
+                    unregister_inflight(request_id, backend)
                     backend.close()
                 response_ready_ms = round((time.monotonic() - started_at) * 1000)
                 set_release(request_id, "draining", response_ready_ms=response_ready_ms)
                 if cache_handle and 200 <= status < 300 and COORDINATOR_MODE == "enforcing":
                     record_cache_observation(cache_handle, cache_state, stream_observation)
             else:
-                status, content_type, response_body = http_request(
+                backend = open_http_response(
                     f"{LLAMA_BASE_URL}/v1/chat/completions",
                     method="POST",
                     payload=request_payload,
                     timeout=UPSTREAM_TIMEOUT_SECONDS,
                     authorize_backend=True,
                 )
+                register_inflight(request_id, backend)
+                try:
+                    status = getattr(backend, "status", None) or getattr(backend, "code", 502)
+                    content_type = backend.headers.get("Content-Type", "application/json")
+                    response_body = backend.read()
+                finally:
+                    unregister_inflight(request_id, backend)
+                    backend.close()
                 response_ready_ms = round((time.monotonic() - started_at) * 1000)
                 set_release(request_id, "draining", response_ready_ms=response_ready_ms)
                 response_payload = None
@@ -678,11 +823,12 @@ class Handler(JsonHandler):
                 else:
                     set_release(request_id, "error", code="gpu_release_failed", response_ready_ms=response_ready_ms, release_completed_ms=release_completed_ms, sleeping=False)
         except LeaseConflict as error:
-            set_release(request_id, "error", code=error.code, request_failed=True)
+            code = "gpu_handoff_failed" if ADMISSION_MODE == "enforcing" else error.code
+            set_release(request_id, "error", code=code, request_failed=True)
             if not response_sent:
-                self.send_json(503, {"error": {"message": str(error), "code": error.code}}, headers={"Retry-After": "5"})
+                self.send_json(503, {"error": {"message": str(error), "code": code}}, headers={"Retry-After": "5"})
         except Exception as error:
-            if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            if request_was_cancelled(request_id) or isinstance(error, (BrokenPipeError, ConnectionResetError)):
                 code = "client_disconnected"
             elif isinstance(error, CoordinatorError):
                 code = "gpu_handoff_failed"
@@ -691,7 +837,10 @@ class Handler(JsonHandler):
             if coordinator_lease and COORDINATOR_MODE in {"enforcing", "shadow"}:
                 try:
                     released = get_coordinator().release(
-                        coordinator_lease["fencingToken"], coordinator_lease["epoch"], keep_warm=False, reason=code
+                        coordinator_lease["fencingToken"],
+                        coordinator_lease["epoch"],
+                        keep_warm=code == "client_disconnected" and WARM_RESIDENCY_ENABLED,
+                        reason=code,
                     )
                     slept = True if COORDINATOR_MODE == "enforcing" else force_llama_sleep()
                     if slept:
@@ -712,7 +861,9 @@ class Handler(JsonHandler):
                 headers = {"Retry-After": "5"} if code == "gpu_handoff_failed" else None
                 self.send_json(status, {"error": {"message": message, "code": code, "detail": str(error)}}, headers=headers)
         finally:
+            clear_cancelled(request_id)
             GPU_LOCK.release()
+            ADMIT_SEMAPHORE.release()
 
 
 def main():

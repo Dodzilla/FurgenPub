@@ -42,6 +42,8 @@ class SupportScriptContractTests(unittest.TestCase):
 
         self.assertIn("DM_GPU_COORDINATOR_URL", persist_block)
         self.assertIn("DM_GPU_COORDINATOR_REQUIRED", persist_block)
+        self.assertIn("GPU_ADMISSION_MODE", persist_block)
+        self.assertIn("DM_GPU_ADMISSION_MAX_DEPTH", persist_block)
 
 
 class BackendState:
@@ -270,6 +272,51 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(payload["mode"], "legacy")
         self.assertFalse(payload["enforcing"])
         self.assertIsInstance(payload["epoch"], int)
+
+    def test_admission_recovery_fails_closed_while_coordinator_diagnostics_are_busy(self):
+        class Coordinator:
+            @staticmethod
+            def status():
+                return {"state": "IDLE", "lease": None, "diagnosticsBusy": True}
+
+        original_get_coordinator = self.gateway.get_coordinator
+        self.gateway.get_coordinator = lambda: Coordinator()
+        try:
+            status, _, body = self.request("/v1/gpu/admission-recovery")
+            payload = json.loads(body)
+            self.assertEqual(status, 200)
+            self.assertFalse(payload["safeToClearAdmission"])
+            self.assertTrue(payload["diagnosticsBusy"])
+        finally:
+            self.gateway.get_coordinator = original_get_coordinator
+
+    def test_enforcing_admission_rejects_requests_without_a_claim(self):
+        original_mode = self.gateway.ADMISSION_MODE
+        self.gateway.ADMISSION_MODE = "enforcing"
+        try:
+            request = urllib.request.Request(
+                self.base_url + "/v1/chat/completions",
+                data=json.dumps({"model": "qwen", "messages": [{"role": "user", "content": "hello"}]}).encode(),
+                headers={
+                    "Authorization": "Bearer test-instance-key",
+                    "Content-Type": "application/json",
+                    "X-Furgen-Request-Id": "request-without-admission",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(caught.exception.code, 409)
+            self.assertEqual(json.loads(caught.exception.read())["error"]["code"], "admission_claim_required")
+        finally:
+            self.gateway.ADMISSION_MODE = original_mode
+
+    def test_release_acknowledgements_are_gateway_boot_identified(self):
+        self.gateway.set_release("request-boot-id", "request_complete", gpu_released=True, request_complete=True)
+        status, headers, body = self.request("/v1/gpu/releases/request-boot-id")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["X-Furgen-Gateway-Boot-Id"], self.gateway.GATEWAY_BOOT_ID)
+        self.assertEqual(json.loads(body)["gateway_boot_id"], self.gateway.GATEWAY_BOOT_ID)
 
     def test_cache_metadata_prefers_llama_prompt_timing(self):
         metadata = self.gateway.cache_metadata_from_response({
