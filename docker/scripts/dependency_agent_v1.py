@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.145"
+AGENT_VERSION = "dm-agent-py/0.10.146"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -8141,7 +8141,19 @@ class DependencyAgent:
         except Exception:
             pass
 
+    def _gpu_coordinator_ready_for_readiness(self) -> bool:
+        """Require the configured fail-closed coordinator before advertising capacity."""
+        if not self._gpu_coordinator.configured or not self._gpu_coordinator.required:
+            return True
+        try:
+            status = self._gpu_coordinator.status(max_age_ms=0)
+            return status.get("supported") is True and status.get("draining") is not True
+        except GPUCoordinatorError:
+            return False
+
     def _write_local_readiness_file(self) -> None:
+        if not self._gpu_coordinator_ready_for_readiness():
+            raise RuntimeError("Refusing to write readiness marker while the required GPU coordinator is unavailable")
         if hasattr(self, "_state"):
             contract = self._local_node_contract_runtime(force=True)
             if contract.get("ready") is not True:
@@ -8323,6 +8335,8 @@ class DependencyAgent:
             return False
         if self._video_gen_v2_bootstrap_gate_active():
             return False
+        if not self._gpu_coordinator_ready_for_readiness():
+            return False
         with self._lock:
             if self._agent_maintenance_inflight or self._active_maintenance_by_item:
                 return False
@@ -8382,6 +8396,9 @@ class DependencyAgent:
     def _local_readiness_file_present(self) -> bool:
         try:
             if not self._local_readiness_file_path().exists():
+                return False
+            if not self._gpu_coordinator_ready_for_readiness():
+                self._remove_local_readiness_file()
                 return False
             if not self._video_gen_v2_sageattention_runtime_ready():
                 return False
