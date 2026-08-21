@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.141"
+AGENT_VERSION = "dm-agent-py/0.10.142"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -1015,6 +1015,24 @@ def collect_cgroup_memory_telemetry(cgroup_root: Path = Path("/sys/fs/cgroup")) 
         else:
             telemetry["peakSource"] = "memory.peak"
     return telemetry if any(key in telemetry for key in fields) else {}
+
+
+def collect_ssh_host_key_sha256(ssh_dir: Path = Path("/etc/ssh")) -> List[str]:
+    """Return OpenSSH SHA-256 fingerprints for locally served host public keys."""
+    fingerprints: List[str] = []
+    for path in sorted(ssh_dir.glob("ssh_host_*_key.pub")):
+        try:
+            parts = path.read_text(encoding="utf-8").strip().split()
+            if len(parts) < 2:
+                continue
+            key_blob = base64.b64decode(parts[1], validate=True)
+            digest = base64.b64encode(hashlib.sha256(key_blob).digest()).decode("ascii").rstrip("=")
+            fingerprint = f"SHA256:{digest}"
+            if fingerprint not in fingerprints:
+                fingerprints.append(fingerprint)
+        except (OSError, TypeError, ValueError):
+            continue
+    return fingerprints
 
 
 def _now_iso() -> str:
@@ -7521,6 +7539,9 @@ class DependencyAgent:
             "inputCacheBytesUsed": int(body.get("inputCacheBytesUsed") or 0),
             "inputCacheMaxBytes": int(body.get("inputCacheMaxBytes") or 0),
             "inputCacheInventoryTruncated": body.get("inputCacheInventoryTruncated") is True,
+            "sshHostKeySha256": sorted([
+                str(value) for value in body.get("sshHostKeySha256", []) if isinstance(value, str)
+            ]),
             "idleMining": idle_signature,
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -11518,6 +11539,7 @@ class DependencyAgent:
         stage_counts = self._agent_stage_counts_payload()
         memory_telemetry = collect_cgroup_memory_telemetry()
         comfy_runtime = {} if self.mining_only else self._comfy_runtime_snapshot()
+        ssh_host_key_sha256 = collect_ssh_host_key_sha256()
 
         body: Dict[str, Any] = {
             "schemaVersion": 1,
@@ -11541,6 +11563,7 @@ class DependencyAgent:
             "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
             **({"memoryTelemetry": memory_telemetry} if memory_telemetry else {}),
             **({"comfyRuntime": comfy_runtime} if comfy_runtime else {}),
+            **({"sshHostKeySha256": ssh_host_key_sha256} if ssh_host_key_sha256 else {}),
             "idleMining": self._idle_prl_miner.snapshot(),
             "agentVersion": AGENT_VERSION,
             "capabilities": {
