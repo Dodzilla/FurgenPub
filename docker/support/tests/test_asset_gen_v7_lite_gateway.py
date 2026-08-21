@@ -311,6 +311,33 @@ class GatewayTest(unittest.TestCase):
         finally:
             self.gateway.ADMISSION_MODE = original_mode
 
+    def test_enforcing_admission_rejects_a_revoked_currently_well_formed_claim(self):
+        original_mode = self.gateway.ADMISSION_MODE
+        original_validate = self.gateway.validate_admission_claim
+        self.gateway.ADMISSION_MODE = "enforcing"
+        self.gateway.validate_admission_claim = lambda *_args: False
+        try:
+            request = urllib.request.Request(
+                self.base_url + "/v1/chat/completions",
+                data=json.dumps({"model": "qwen", "messages": [{"role": "user", "content": "hello"}]}).encode(),
+                headers={
+                    "Authorization": "Bearer test-instance-key",
+                    "Content-Type": "application/json",
+                    "X-Furgen-Request-Id": "request-revoked",
+                    "X-Furgen-Admission-Claim-Id": "claim-revoked",
+                    "X-Furgen-Admission-Ticket-Id": "ticket-revoked",
+                    "X-Furgen-Admission-Server-Type": "asset_gen_v7_lite",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(caught.exception.code, 409)
+            self.assertEqual(json.loads(caught.exception.read())["error"]["code"], "admission_claim_revoked")
+        finally:
+            self.gateway.ADMISSION_MODE = original_mode
+            self.gateway.validate_admission_claim = original_validate
+
     def test_release_acknowledgements_are_gateway_boot_identified(self):
         self.gateway.set_release("request-boot-id", "request_complete", gpu_released=True, request_complete=True)
         status, headers, body = self.request("/v1/gpu/releases/request-boot-id")

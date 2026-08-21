@@ -39,6 +39,11 @@ if ADMISSION_MODE not in {"off", "shadow", "enforcing"}:
     raise RuntimeError("GPU_ADMISSION_MODE must be off, shadow, or enforcing")
 ADMIT_MAX_WAIT_SECONDS = max(0.0, min(60.0, float(os.environ.get("QWEN_ADMIT_MAX_WAIT_SECONDS", "10"))))
 MAX_GATEWAY_WAITERS = max(1, min(64, int(os.environ.get("QWEN_MAX_WAITERS", "4"))))
+ADMISSION_VALIDATION_URL = os.environ.get(
+    "GPU_ADMISSION_VALIDATION_URL",
+    "https://us-central1-furgencontentserver.cloudfunctions.net/inferenceApi/v1/internal/admission/validate",
+).strip()
+SERVER_TYPE = os.environ.get("SERVER_TYPE", "asset_gen_v7_lite").strip()
 
 
 def bool_env(name, default=False):
@@ -104,6 +109,28 @@ def open_http_response(url, method="GET", payload=None, timeout=10, authorize_ba
 
 def json_response_bytes(payload):
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def validate_admission_claim(server_type, ticket_id, claim_token, request_id):
+    if not ADMISSION_VALIDATION_URL:
+        raise RuntimeError("GPU admission validation URL is not configured")
+    status, _, body = http_request(
+        ADMISSION_VALIDATION_URL,
+        method="POST",
+        payload={
+            "server_type": server_type,
+            "ticket_id": ticket_id,
+            "claim_token": claim_token,
+            "request_id": request_id,
+        },
+        timeout=5,
+        authorize_backend=True,
+    )
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    return status == 200 and payload.get("valid") is True
 
 
 def free_comfy_models(preserve_cache=False):
@@ -459,8 +486,25 @@ class CoordinatorHandler(JsonHandler):
         if not self._loopback():
             self.send_json(403, {"error": {"code": "loopback_required", "message": "Coordinator is loopback only."}})
             return
-        if self.path != "/v1/gpu/status":
+        if self.path not in {"/v1/gpu/status", "/v1/gpu/admission-recovery"}:
             self.send_json(404, {"error": {"code": "not_found", "message": "Not found"}})
+            return
+        if self.path == "/v1/gpu/admission-recovery":
+            coordinator_status = get_coordinator().status()
+            local_lease = coordinator_status.get("lease") if isinstance(coordinator_status, dict) else None
+            lease_state = str(local_lease.get("state") or "") if isinstance(local_lease, dict) else ""
+            diagnostics_busy = coordinator_status.get("diagnosticsBusy") is True
+            safe_to_clear = (
+                not GPU_LOCK.locked()
+                and not diagnostics_busy
+                and (not isinstance(local_lease, dict) or lease_state == "WARM")
+            )
+            self.send_json(200, {
+                "safeToClearAdmission": safe_to_clear,
+                "coordinatorState": coordinator_status.get("state"),
+                "leaseState": lease_state or None,
+                "diagnosticsBusy": diagnostics_busy,
+            })
             return
         status = get_coordinator().status()
         status["config"] = {
@@ -483,10 +527,29 @@ class CoordinatorHandler(JsonHandler):
                 return
             if self.path == "/v1/gpu/leases/acquire":
                 admission_claim_id = str(payload.get("admissionClaimId") or "").strip()
+                admission_ticket_id = str(payload.get("admissionTicketId") or "").strip()
                 holder = str(payload.get("holder", ""))
                 if ADMISSION_MODE == "enforcing" and holder in {"inference", "comfy"} and not REQUEST_ID_RE.fullmatch(admission_claim_id):
                     self.send_json(409, {"error": {"code": "admission_claim_required", "message": "A valid admission claim is required."}})
                     return
+                if ADMISSION_MODE == "enforcing" and holder == "comfy":
+                    work_id = str(payload.get("workId", "")).strip()
+                    if not REQUEST_ID_RE.fullmatch(admission_ticket_id) or not REQUEST_ID_RE.fullmatch(work_id):
+                        self.send_json(409, {"error": {"code": "admission_claim_required", "message": "A complete Comfy admission claim is required."}})
+                        return
+                    try:
+                        admission_valid = validate_admission_claim(
+                            SERVER_TYPE,
+                            admission_ticket_id,
+                            admission_claim_id,
+                            work_id,
+                        )
+                    except Exception as error:
+                        self.send_json(503, {"error": {"code": "admission_validation_failed", "message": str(error)}})
+                        return
+                    if not admission_valid:
+                        self.send_json(409, {"error": {"code": "admission_claim_revoked", "message": "The Comfy admission claim is no longer current."}})
+                        return
                 lease = coordinator.acquire(
                     holder,
                     str(payload.get("workId", "")),
@@ -659,9 +722,29 @@ class Handler(JsonHandler):
         # opaque, tenant-scoped HMAC in the private header above.
         request_payload.pop("prompt_cache_key", None)
         admission_claim_id = self.headers.get("X-Furgen-Admission-Claim-Id", "").strip()
-        if ADMISSION_MODE == "enforcing" and not REQUEST_ID_RE.fullmatch(admission_claim_id):
-            self.send_json(409, {"error": {"message": "A valid admission claim is required.", "code": "admission_claim_required"}})
-            return
+        admission_ticket_id = self.headers.get("X-Furgen-Admission-Ticket-Id", "").strip()
+        admission_server_type = self.headers.get("X-Furgen-Admission-Server-Type", "").strip()
+        if ADMISSION_MODE == "enforcing":
+            if not all(REQUEST_ID_RE.fullmatch(value) for value in (
+                admission_claim_id,
+                admission_ticket_id,
+                admission_server_type,
+            )):
+                self.send_json(409, {"error": {"message": "A valid admission claim is required.", "code": "admission_claim_required"}})
+                return
+            try:
+                admission_valid = validate_admission_claim(
+                    admission_server_type,
+                    admission_ticket_id,
+                    admission_claim_id,
+                    request_id,
+                )
+            except Exception as error:
+                self.send_json(503, {"error": {"message": "Admission claim validation failed.", "code": "admission_validation_failed", "detail": str(error)}})
+                return
+            if not admission_valid:
+                self.send_json(409, {"error": {"message": "The admission claim is no longer current.", "code": "admission_claim_revoked"}})
+                return
         if not ADMIT_SEMAPHORE.acquire(blocking=False):
             status = 503 if ADMISSION_MODE == "enforcing" else 429
             code = "gpu_handoff_failed" if ADMISSION_MODE == "enforcing" else "queue_full"
