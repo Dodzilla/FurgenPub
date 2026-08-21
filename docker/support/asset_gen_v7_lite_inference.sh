@@ -21,8 +21,11 @@ LLAMA_PORT="8081"
 GATEWAY_PORT="8080"
 LOG_DIR="${WORKSPACE}/logs"
 GATEWAY_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_gateway.py"
+SNAPSHOT_PATH="${QWEN_SNAPSHOT_PATH:-${WORKSPACE}/cache/qwen-slots}"
+GPU_COORDINATOR_MODE="${GPU_COORDINATOR_MODE:-shadow}"
 
-mkdir -p "${LOG_DIR}" "$(dirname "${MODEL_PATH}")" "${WORKSPACE}/src"
+mkdir -p "${LOG_DIR}" "$(dirname "${MODEL_PATH}")" "${WORKSPACE}/src" "${SNAPSHOT_PATH}"
+chmod 700 "${SNAPSHOT_PATH}"
 
 if [[ -z "${INFERENCE_INSTANCE_API_KEY:-}" ]]; then
     echo "ERROR: INFERENCE_INSTANCE_API_KEY is required." >&2
@@ -162,25 +165,144 @@ ensure_comfy_running() {
     return 1
 }
 
-stop_previous() {
-    for pid_file in "${LOG_DIR}/asset_gen_v7_lite_llama.pid" "${LOG_DIR}/asset_gen_v7_lite_gateway.pid" "${LOG_DIR}/asset_gen_v7_lite_model_cache.pid"; do
-        if [[ -f "${pid_file}" ]]; then
-            local pid
-            pid="$(cat "${pid_file}" 2>/dev/null || true)"
-            if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
-                kill "${pid}" || true
-                sleep 2
+process_start_time() {
+    local pid="$1"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+    awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null
+}
+
+process_identity_matches() {
+    local pid="$1" expected_start_time="$2"
+    [[ -n "${expected_start_time}" ]] || return 1
+    [[ "$(process_start_time "${pid}" || true)" == "${expected_start_time}" ]]
+}
+
+assert_restart_quiescent() {
+    local coordinator_status drain_response queue_status gateway_pid
+    drain_response="$(curl -fsS --max-time 20 -X POST -H 'Content-Type: application/json' -d '{}' \
+        "http://127.0.0.1:${GPU_COORDINATOR_PORT:-8189}/v1/gpu/drain" 2>/dev/null || true)"
+    if [[ -n "${drain_response}" ]]; then
+        local drained=0
+        for _ in $(seq 1 900); do
+            coordinator_status="$(curl -fsS --max-time 3 \
+                "http://127.0.0.1:${GPU_COORDINATOR_PORT:-8189}/v1/gpu/status" 2>/dev/null || true)"
+            if [[ -n "${coordinator_status}" ]] && python3 -c '
+import json, sys
+status = json.load(sys.stdin)
+lease = status.get("lease") if isinstance(status.get("lease"), dict) else {}
+state = str(lease.get("state") or "").upper()
+raise SystemExit(0 if status.get("draining") is True and status.get("diagnosticsBusy") is not True and state not in {"ACTIVE", "RECOVERING", "STARTING"} else 42)
+' <<<"${coordinator_status}"; then
+                drained=1
+                break
             fi
+            sleep 1
+        done
+        if [[ "${drained}" != "1" ]]; then
+            echo "ERROR: coordinator did not drain active GPU work before restart." >&2
+            return 1
         fi
-    done
+    else
+        gateway_pid="$(cat "${LOG_DIR}/asset_gen_v7_lite_gateway.pid" 2>/dev/null || true)"
+        if [[ "${gateway_pid}" =~ ^[0-9]+$ ]] && kill -0 "${gateway_pid}" 2>/dev/null; then
+            echo "ERROR: refusing an in-place legacy gateway upgrade without a coordinator drain fence; recycle the idle worker." >&2
+            return 1
+        fi
+    fi
+    if [[ "${GPU_COORDINATOR_MODE}" == "enforcing" && -z "${drain_response}" ]]; then
+        echo "ERROR: refusing enforcing-mode restart without a loopback coordinator drain fence." >&2
+        return 1
+    fi
+
+    queue_status="$(curl -fsS --max-time 3 \
+        "${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}/queue" 2>/dev/null || true)"
+    if [[ -z "${queue_status}" ]] || ! python3 -c '
+import json, sys
+queue = json.load(sys.stdin)
+running = queue.get("queue_running") or []
+pending = queue.get("queue_pending") or []
+raise SystemExit(0 if not running and not pending else 42)
+' <<<"${queue_status}"; then
+        echo "ERROR: refusing inference restart while ComfyUI queue state is active, pending, or unknown." >&2
+        return 1
+    fi
+}
+
+stop_previous() {
+    local gateway_pid_file="${LOG_DIR}/asset_gen_v7_lite_gateway.pid"
+    local gateway_start_file="${gateway_pid_file}.start"
+    local llama_pid_file="${LOG_DIR}/asset_gen_v7_lite_llama.pid"
+    local llama_start_file="${llama_pid_file}.start"
+    local pid expected_start_time
+    # Quiesce the owner first; otherwise its coordinator can observe a stopped
+    # llama and restart it while provisioning is trying to replace processes.
+    pid="$(cat "${gateway_pid_file}" 2>/dev/null || true)"
+    if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+        expected_start_time="$(cat "${gateway_start_file}" 2>/dev/null || true)"
+        if process_identity_matches "${pid}" "${expected_start_time}" && \
+            tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null | grep -Fq "${GATEWAY_SCRIPT}"; then
+            kill "${pid}" || true
+            for _ in $(seq 1 50); do
+                process_identity_matches "${pid}" "${expected_start_time}" || break
+                sleep 0.1
+            done
+            if process_identity_matches "${pid}" "${expected_start_time}"; then
+                kill -9 "${pid}" || true
+                for _ in $(seq 1 50); do
+                    process_identity_matches "${pid}" "${expected_start_time}" || break
+                    sleep 0.1
+                done
+            fi
+            if process_identity_matches "${pid}" "${expected_start_time}"; then
+                echo "ERROR: prior inference gateway did not exit." >&2
+                return 1
+            fi
+        else
+            echo "ERROR: refusing to signal stale or non-gateway PID ${pid}." >&2
+            return 1
+        fi
+    fi
+    pid="$(cat "${llama_pid_file}" 2>/dev/null || true)"
+    if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+        expected_start_time="$(cat "${llama_start_file}" 2>/dev/null || true)"
+        if process_identity_matches "${pid}" "${expected_start_time}" && \
+            tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null | grep -q 'llama-server'; then
+            local pgid
+            pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ' || true)"
+            if [[ "${pgid}" == "${pid}" ]]; then kill -TERM -- "-${pgid}" || true; else kill "${pid}" || true; fi
+            for _ in $(seq 1 100); do
+                process_identity_matches "${pid}" "${expected_start_time}" || break
+                sleep 0.1
+            done
+            if process_identity_matches "${pid}" "${expected_start_time}"; then
+                if [[ "${pgid}" == "${pid}" ]]; then kill -KILL -- "-${pgid}" || true; else kill -9 "${pid}" || true; fi
+                for _ in $(seq 1 50); do
+                    process_identity_matches "${pid}" "${expected_start_time}" || break
+                    sleep 0.1
+                done
+            fi
+            if process_identity_matches "${pid}" "${expected_start_time}"; then
+                echo "ERROR: prior llama process did not exit." >&2
+                return 1
+            fi
+        else
+            echo "ERROR: refusing to signal stale non-llama PID ${pid}." >&2
+            return 1
+        fi
+    fi
+    rm -f "${gateway_pid_file}" "${gateway_start_file}" "${llama_pid_file}" "${llama_start_file}"
 }
 
 launch() {
     ensure_comfy_running
-    curl -fsS -X POST -H 'Content-Type: application/json' \
-        -d '{"unload_models":true,"free_memory":true}' \
-        "${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}/free" >/dev/null
+    assert_restart_quiescent
     stop_previous
+    # The quiescence checks above prove no active lease can need adoption.
+    # Retain the separately persisted epoch so every old fence remains stale.
+    rm -f "${GPU_COORDINATOR_STATE_FILE:-${LOG_DIR}/asset_gen_v7_lite_coordinator.json}"
+    curl -fsS -X POST -H 'Content-Type: application/json' \
+        -d '{"unload_models":true,"free_memory":false}' \
+        "${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}/free" >/dev/null
     local llama_dir
     llama_dir="$(dirname "${LLAMA_SERVER}")"
     export LD_LIBRARY_PATH="${llama_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -188,7 +310,12 @@ launch() {
     # Q5 model and projector into the Linux page cache instead; this worker has
     # ample host RAM and mmap reloads can then avoid worker-disk I/O.
     vmtouch -t "${MODEL_PATH}" "${VISION_PATH}"
-    nohup "${LLAMA_SERVER}" \
+    local sleep_args=()
+    if [[ "${GPU_COORDINATOR_MODE}" != "enforcing" ]]; then
+        # Shadow and legacy retain the proven safety behavior during rollout.
+        sleep_args=(--sleep-idle-seconds 1)
+    fi
+    nohup setsid "${LLAMA_SERVER}" \
         --host 127.0.0.1 \
         --port "${LLAMA_PORT}" \
         --model "${MODEL_PATH}" \
@@ -209,13 +336,15 @@ launch() {
         --cache-prompt \
         --cont-batching \
         --jinja \
-        --sleep-idle-seconds 1 \
+        --slot-save-path "${SNAPSHOT_PATH}" \
+        "${sleep_args[@]}" \
         --spec-type draft-mtp \
         --spec-draft-n-max 1 \
         --reasoning-format deepseek \
         --api-key "${INFERENCE_INSTANCE_API_KEY}" \
         >>"${LOG_DIR}/asset_gen_v7_lite_llama.log" 2>&1 &
     echo $! > "${LOG_DIR}/asset_gen_v7_lite_llama.pid"
+    process_start_time "$!" > "${LOG_DIR}/asset_gen_v7_lite_llama.pid.start"
 
     local healthy=0
     for _ in $(seq 1 240); do
@@ -234,6 +363,24 @@ launch() {
     nohup env \
         QWEN_GATEWAY_PORT="${GATEWAY_PORT}" \
         QWEN_LLAMA_BASE_URL="http://127.0.0.1:${LLAMA_PORT}" \
+        GPU_COORDINATOR_PORT="${GPU_COORDINATOR_PORT:-8189}" \
+        GPU_COORDINATOR_MODE="${GPU_COORDINATOR_MODE}" \
+        GPU_COORDINATOR_STATE_FILE="${GPU_COORDINATOR_STATE_FILE:-${LOG_DIR}/asset_gen_v7_lite_coordinator.json}" \
+        GPU_COORDINATOR_EPOCH_FILE="${GPU_COORDINATOR_EPOCH_FILE:-${LOG_DIR}/asset_gen_v7_lite_coordinator.epoch}" \
+        GPU_MINING_GRACE_SECONDS="${GPU_MINING_GRACE_SECONDS:-30}" \
+        WARM_RESIDENCY_ENABLED="${WARM_RESIDENCY_ENABLED:-false}" \
+        SNAPSHOT_WRITE_ENABLED="${SNAPSHOT_WRITE_ENABLED:-false}" \
+        SNAPSHOT_RESTORE_ENABLED="${SNAPSHOT_RESTORE_ENABLED:-false}" \
+        QWEN_SNAPSHOT_PATH="${SNAPSHOT_PATH}" \
+        QWEN_SNAPSHOT_TTL_SECONDS="${QWEN_SNAPSHOT_TTL_SECONDS:-172800}" \
+        QWEN_SNAPSHOT_QUOTA_BYTES="${QWEN_SNAPSHOT_QUOTA_BYTES:-51539607552}" \
+        QWEN_SNAPSHOT_MIN_FREE_BYTES="${QWEN_SNAPSHOT_MIN_FREE_BYTES:-21474836480}" \
+        QWEN_SNAPSHOT_MAX_ENTRY_BYTES="${QWEN_SNAPSHOT_MAX_ENTRY_BYTES:-17179869184}" \
+        QWEN_SNAPSHOT_FINGERPRINT="${QWEN_SNAPSHOT_FINGERPRINT:-fmt=llama-slot-v1:model=${MODEL_SHA256}:mmproj=${VISION_SHA256}:llama=${LLAMA_CPP_COMMIT}:tokenizer=model-embedded:chat=jinja-model-embedded:quant=q5_k_m:ctx=131072:slots=1:kvk=q8_0:kvv=q8_0:ngl=999:load=mmap:rope=model-default:yarn=model-default:flash=on:batch=2048:ubatch=512:cont=on:image-max=4096:mtmd-batch=4096:spec=mtp1:reasoning=deepseek:layout=v1}" \
+        QWEN_PREFILL_ESTIMATE_MS_PER_TOKEN="${QWEN_PREFILL_ESTIMATE_MS_PER_TOKEN:-0.5}" \
+        QWEN_LLAMA_PID_FILE="${LOG_DIR}/asset_gen_v7_lite_llama.pid" \
+        QWEN_LLAMA_LOG_FILE="${LOG_DIR}/asset_gen_v7_lite_llama.log" \
+        QWEN_LLAMA_COMMAND_FILE="${QWEN_LLAMA_COMMAND_FILE:-${LOG_DIR}/asset_gen_v7_lite_llama_command.json}" \
         QWEN_SLEEP_POLL_SECONDS="0.1" \
         QWEN_MAX_BODY_BYTES="$((32 * 1024 * 1024))" \
         INFERENCE_INSTANCE_API_KEY="${INFERENCE_INSTANCE_API_KEY}" \
@@ -241,9 +388,14 @@ launch() {
         python3 "${GATEWAY_SCRIPT}" \
         >>"${LOG_DIR}/asset_gen_v7_lite_gateway.log" 2>&1 &
     echo $! > "${LOG_DIR}/asset_gen_v7_lite_gateway.pid"
+    process_start_time "$!" > "${LOG_DIR}/asset_gen_v7_lite_gateway.pid.start"
 
     for _ in $(seq 1 60); do
         if curl -fsS "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null 2>&1; then
+            if [[ "${GPU_COORDINATOR_MODE}" == "enforcing" ]]; then
+                curl -fsS "http://127.0.0.1:${GPU_COORDINATOR_PORT:-8189}/v1/gpu/status" >/dev/null
+                return 0
+            fi
             for _ in $(seq 1 30); do
                 if curl -fsS -H "Authorization: Bearer ${INFERENCE_INSTANCE_API_KEY}" \
                     "http://127.0.0.1:${LLAMA_PORT}/props" 2>/dev/null | \

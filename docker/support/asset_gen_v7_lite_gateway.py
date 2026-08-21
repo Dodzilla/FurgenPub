@@ -3,11 +3,19 @@
 import json
 import os
 import re
+import fcntl
 import threading
 import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from asset_gen_v7_lite_coordinator import (
+    GPUCoordinator,
+    LeaseConflict,
+    SnapshotStore,
+    StaleLease,
+)
 
 GATEWAY_HOST = os.environ.get("QWEN_GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.environ.get("QWEN_GATEWAY_PORT", "8080"))
@@ -19,10 +27,36 @@ SLEEP_TIMEOUT_SECONDS = int(os.environ.get("QWEN_SLEEP_TIMEOUT_SECONDS", "30"))
 SLEEP_POLL_SECONDS = float(os.environ.get("QWEN_SLEEP_POLL_SECONDS", "0.1"))
 MAX_BODY_BYTES = int(os.environ.get("QWEN_MAX_BODY_BYTES", str(32 * 1024 * 1024)))
 RELEASE_TTL_SECONDS = int(os.environ.get("QWEN_RELEASE_TTL_SECONDS", "900"))
+COORDINATOR_HOST = "127.0.0.1"
+COORDINATOR_PORT = int(os.environ.get("GPU_COORDINATOR_PORT", "8189"))
+COORDINATOR_MODE = os.environ.get("GPU_COORDINATOR_MODE", "shadow").strip().lower()
+if COORDINATOR_MODE not in {"shadow", "enforcing", "legacy"}:
+    raise RuntimeError("GPU_COORDINATOR_MODE must be shadow, enforcing, or legacy")
+
+
+def bool_env(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+WARM_RESIDENCY_ENABLED = bool_env("WARM_RESIDENCY_ENABLED", False)
+SNAPSHOT_WRITE_ENABLED = bool_env("SNAPSHOT_WRITE_ENABLED", False)
+SNAPSHOT_RESTORE_ENABLED = bool_env("SNAPSHOT_RESTORE_ENABLED", False)
+SNAPSHOT_PATH = os.environ.get("QWEN_SNAPSHOT_PATH", "/workspace/cache/qwen-slots")
+SNAPSHOT_FINGERPRINT = os.environ.get("QWEN_SNAPSHOT_FINGERPRINT", "unconfigured")
+LLAMA_PID_FILE = os.environ.get("QWEN_LLAMA_PID_FILE", "/workspace/logs/asset_gen_v7_lite_llama.pid")
+LLAMA_LOG_FILE = os.environ.get("QWEN_LLAMA_LOG_FILE", "/workspace/logs/asset_gen_v7_lite_llama.log")
+LLAMA_COMMAND_FILE = os.environ.get("QWEN_LLAMA_COMMAND_FILE", "/workspace/logs/asset_gen_v7_lite_llama_command.json")
+COORDINATOR_STATE_FILE = os.environ.get("GPU_COORDINATOR_STATE_FILE", "/workspace/logs/asset_gen_v7_lite_coordinator.json")
+COORDINATOR_EPOCH_FILE = os.environ.get("GPU_COORDINATOR_EPOCH_FILE", "/workspace/logs/asset_gen_v7_lite_coordinator.epoch")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 GPU_LOCK = threading.Lock()
 RELEASES_LOCK = threading.Lock()
 RELEASES = {}
+COORDINATOR = None
+COORDINATOR_LOCK_STREAM = None
 REQUIRED_TOOL_CAPABILITIES = (
     "supports_tools",
     "supports_tool_calls",
@@ -60,11 +94,11 @@ def json_response_bytes(payload):
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
-def free_comfy_models():
+def free_comfy_models(preserve_cache=False):
     status, _, body = http_request(
         f"{COMFY_BASE_URL}/free",
         method="POST",
-        payload={"unload_models": True, "free_memory": True},
+        payload={"unload_models": True, "free_memory": not preserve_cache},
         timeout=30,
     )
     if status < 200 or status >= 300:
@@ -97,6 +131,37 @@ def force_llama_sleep():
     return False
 
 
+def get_coordinator():
+    global COORDINATOR
+    if COORDINATOR is None:
+        store = SnapshotStore(
+            SNAPSHOT_PATH,
+            SNAPSHOT_FINGERPRINT,
+            ttl_seconds=int(os.environ.get("QWEN_SNAPSHOT_TTL_SECONDS", str(48 * 3600))),
+            quota_bytes=int(os.environ.get("QWEN_SNAPSHOT_QUOTA_BYTES", str(48 * 1024**3))),
+            min_free_bytes=int(os.environ.get("QWEN_SNAPSHOT_MIN_FREE_BYTES", str(20 * 1024**3))),
+            max_entry_bytes=int(os.environ.get("QWEN_SNAPSHOT_MAX_ENTRY_BYTES", str(16 * 1024**3))),
+        )
+        COORDINATOR = GPUCoordinator(
+            LLAMA_BASE_URL,
+            COMFY_BASE_URL,
+            http_request,
+            store,
+            llama_pid_file=LLAMA_PID_FILE,
+            llama_log_file=LLAMA_LOG_FILE,
+            llama_command_file=LLAMA_COMMAND_FILE,
+            state_file=COORDINATOR_STATE_FILE,
+            epoch_file=COORDINATOR_EPOCH_FILE,
+            enabled=COORDINATOR_MODE != "legacy",
+            enforce_transitions=COORDINATOR_MODE == "enforcing",
+            warm_residency=WARM_RESIDENCY_ENABLED,
+            snapshot_write=SNAPSHOT_WRITE_ENABLED,
+            snapshot_restore=SNAPSHOT_RESTORE_ENABLED,
+            mining_grace_seconds=int(os.environ.get("GPU_MINING_GRACE_SECONDS", "30")),
+        )
+    return COORDINATOR
+
+
 def prune_releases(now=None):
     now = time.time() if now is None else now
     cutoff = now - RELEASE_TTL_SECONDS
@@ -109,14 +174,15 @@ def set_release(request_id, phase, **values):
     now = time.time()
     with RELEASES_LOCK:
         previous = RELEASES.get(request_id, {})
-        RELEASES[request_id] = {
+        merged = {
             **previous,
             **values,
             "request_id": request_id,
             "phase": phase,
-            "safe": phase == "safe",
             "updated_at": now,
         }
+        merged["safe"] = phase == "safe" or (phase == "request_complete" and merged.get("gpu_released") is True)
+        RELEASES[request_id] = merged
     prune_releases(now)
 
 
@@ -144,13 +210,120 @@ def health_payload():
     statuses["tool_calling"] = all(capabilities.get(name) is True for name in REQUIRED_TOOL_CAPABILITIES)
     statuses["sleeping"] = bool(props and (props.get("is_sleeping") or props.get("sleeping")))
     statuses["gpu_busy"] = GPU_LOCK.locked()
-    statuses["ready"] = statuses["comfyui"] and statuses["llama"] and statuses["tool_calling"]
+    coordinator = get_coordinator()
+    statuses["coordinator"] = {
+        "mode": COORDINATOR_MODE,
+        "warmResidency": WARM_RESIDENCY_ENABLED,
+        "snapshotWrite": SNAPSHOT_WRITE_ENABLED,
+        "snapshotRestore": SNAPSHOT_RESTORE_ENABLED,
+        "state": coordinator.quick_status()["state"],
+    }
+    llama_available = statuses["llama"] or (COORDINATOR_MODE != "legacy" and coordinator.llama_argv)
+    statuses["ready"] = statuses["comfyui"] and llama_available and (statuses["tool_calling"] or not statuses["llama"])
     return statuses
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "FurgenQwenGateway/3.0"
+def cache_response_headers(request_id, cache_state):
+    classification = cache_state.get("classification", "unkeyed")
+    if cache_state.get("restoreFailed"):
+        status = "error"
+    elif cache_state.get("skipped"):
+        status = "ineligible"
+    else:
+        status = {
+            "resident": "hit",
+            "restored": "restored",
+            "cold": "miss",
+            "unkeyed": "disabled",
+        }.get(classification, "disabled")
+    residency = {
+        "resident": "warm",
+        "restored": "restored",
+    }.get(classification, "cold")
+    return {
+        "X-Furgen-Request-Complete-Id": request_id,
+        "X-Furgen-Gpu-Release-Id": request_id,
+        "X-Furgen-Prompt-Cache-Status": status,
+        "X-Furgen-Inference-Residency": residency,
+    }
 
+
+def cache_metadata_from_response(response_payload):
+    response_payload = response_payload if isinstance(response_payload, dict) else {}
+    usage = response_payload.get("usage", {})
+    usage = usage if isinstance(usage, dict) else {}
+    details = usage.get("prompt_tokens_details", {})
+    details = details if isinstance(details, dict) else {}
+    timings = response_payload.get("timings", {})
+    timings = timings if isinstance(timings, dict) else {}
+    prompt_tokens = int(usage.get("prompt_tokens") or timings.get("prompt_n") or 0)
+    cached_tokens = int(details.get("cached_tokens") or timings.get("cache_n") or 0)
+    uncached_tokens = max(0, prompt_tokens - cached_tokens)
+    prompt_ms = float(timings.get("prompt_ms") or 0)
+    if prompt_ms <= 0 and uncached_tokens:
+        prompt_ms = uncached_tokens * float(os.environ.get("QWEN_PREFILL_ESTIMATE_MS_PER_TOKEN", "0.5"))
+    if uncached_tokens > 0 and prompt_ms > 0:
+        cold_prefill_ms = prompt_ms / uncached_tokens * max(1, prompt_tokens)
+    else:
+        cold_prefill_ms = prompt_tokens * float(os.environ.get("QWEN_PREFILL_ESTIMATE_MS_PER_TOKEN", "0.5"))
+    return {
+        "promptTokens": prompt_tokens,
+        "cachedTokens": cached_tokens,
+        "coldPrefillMs": max(0, round(cold_prefill_ms)),
+    }
+
+
+def observe_stream_chunk(parse_buffer, observation, chunk):
+    parse_buffer += chunk
+    while b"\n" in parse_buffer:
+        raw_line, parse_buffer = parse_buffer.split(b"\n", 1)
+        if not raw_line.startswith(b"data:"):
+            continue
+        raw_data = raw_line[5:].strip()
+        if not raw_data or raw_data == b"[DONE]":
+            continue
+        try:
+            event = json.loads(raw_data)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(event, dict):
+            if isinstance(event.get("usage"), dict):
+                observation["usage"] = event["usage"]
+            if isinstance(event.get("timings"), dict):
+                observation["timings"] = event["timings"]
+    # A normal llama SSE line is small. Never let malformed/non-SSE upstream
+    # data create an unbounded side buffer while the response is relayed.
+    if len(parse_buffer) > 2 * 1024 * 1024:
+        parse_buffer = b""
+    return parse_buffer
+
+
+def redact_unkeyed_stream_chunk(parse_buffer, chunk):
+    parse_buffer += chunk
+    output = bytearray()
+    while b"\n" in parse_buffer:
+        raw_line, parse_buffer = parse_buffer.split(b"\n", 1)
+        rendered = raw_line
+        if raw_line.startswith(b"data:"):
+            raw_data = raw_line[5:].strip()
+            if raw_data and raw_data != b"[DONE]":
+                try:
+                    event = json.loads(raw_data)
+                except (TypeError, ValueError):
+                    event = None
+                usage = event.get("usage") if isinstance(event, dict) else None
+                details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+                if isinstance(details, dict) and "cached_tokens" in details:
+                    details.pop("cached_tokens", None)
+                    rendered = b"data: " + json_response_bytes(event)
+        output.extend(rendered + b"\n")
+    if len(parse_buffer) > 2 * 1024 * 1024:
+        output.extend(parse_buffer)
+        parse_buffer = b""
+    return parse_buffer, bytes(output)
+
+
+class JsonHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"{self.log_date_time_string()} {self.client_address[0]} {fmt % args}", flush=True)
 
@@ -167,6 +340,102 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, status, payload, headers=None):
         self.send_bytes(status, "application/json", json_response_bytes(payload), headers=headers)
 
+    def read_json(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0 or length > MAX_BODY_BYTES:
+            raise ValueError("request body is empty or too large")
+        return json.loads(self.rfile.read(length))
+
+
+class CoordinatorHandler(JsonHandler):
+    """Loopback-only dependency-agent contract, served on port 8189."""
+
+    server_version = "FurgenGPUCoordinator/1.0"
+
+    def _loopback(self):
+        return self.client_address[0] in {"127.0.0.1", "::1"}
+
+    def do_GET(self):
+        if not self._loopback():
+            self.send_json(403, {"error": {"code": "loopback_required", "message": "Coordinator is loopback only."}})
+            return
+        if self.path != "/v1/gpu/status":
+            self.send_json(404, {"error": {"code": "not_found", "message": "Not found"}})
+            return
+        status = get_coordinator().status()
+        status["config"] = {
+            "mode": COORDINATOR_MODE,
+            "warmResidencyEnabled": WARM_RESIDENCY_ENABLED,
+            "snapshotWriteEnabled": SNAPSHOT_WRITE_ENABLED,
+            "snapshotRestoreEnabled": SNAPSHOT_RESTORE_ENABLED,
+        }
+        self.send_json(200, status)
+
+    def do_POST(self):
+        if not self._loopback():
+            self.send_json(403, {"error": {"code": "loopback_required", "message": "Coordinator is loopback only."}})
+            return
+        try:
+            payload = self.read_json()
+            coordinator = get_coordinator()
+            if self.path == "/v1/gpu/drain":
+                self.send_json(200, coordinator.begin_drain())
+                return
+            if self.path == "/v1/gpu/leases/acquire":
+                lease = coordinator.acquire(
+                    str(payload.get("holder", "")),
+                    str(payload.get("workId", "")),
+                    int(payload.get("ttlMs") or 60_000),
+                    metadata=payload.get("metadata") or {
+                        key: payload[key] for key in ("pid", "processStartTime", "processGroupId") if key in payload
+                    },
+                )
+                self.send_json(200, {"lease": lease, **lease})
+                return
+            if self.path == "/v1/gpu/reconcile":
+                lease = coordinator.reconcile(
+                    str(payload.get("holder", "")),
+                    str(payload.get("workId", "")),
+                    metadata=payload.get("metadata") or {},
+                )
+                self.send_json(200, {"lease": lease, **lease})
+                return
+            match = re.fullmatch(r"/v1/gpu/leases/([A-Fa-f0-9]{32})/(renew|release)", self.path)
+            if not match:
+                self.send_json(404, {"error": {"code": "not_found", "message": "Not found"}})
+                return
+            token, action = match.groups()
+            if action == "renew":
+                lease = coordinator.renew(
+                    token,
+                    int(payload.get("epoch") or 0),
+                    int(payload.get("ttlMs") or 60_000),
+                    metadata=payload.get("metadata") or {
+                        key: payload[key] for key in ("pid", "processStartTime", "processGroupId") if key in payload
+                    },
+                )
+                self.send_json(200, {"lease": lease, **lease})
+            else:
+                result = coordinator.release(
+                    token,
+                    int(payload.get("epoch") or 0),
+                    keep_warm=bool(payload.get("keepWarm", True)),
+                    reason=payload.get("reason"),
+                )
+                self.send_json(200, result)
+        except LeaseConflict as error:
+            self.send_json(409, {"error": {"code": error.code, "message": str(error)}}, headers={"Retry-After": str(error.retry_after)})
+        except StaleLease as error:
+            self.send_json(409, {"error": {"code": error.code, "message": str(error)}})
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            self.send_json(400, {"error": {"code": "invalid_request", "message": str(error)}})
+        except Exception as error:
+            self.send_json(503, {"error": {"code": "coordinator_failure", "message": str(error)}})
+
+
+class Handler(JsonHandler):
+    server_version = "FurgenQwenGateway/4.0"
+
     def authorized(self):
         if not API_KEY:
             self.send_json(503, {"error": {"message": "Instance API key is not configured.", "code": "instance_key_unconfigured"}})
@@ -182,6 +451,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200 if payload["ready"] else 503, payload)
             return
         if not self.authorized():
+            return
+        if self.path == "/v1/gpu/coordinator-attestation":
+            coordinator = get_coordinator()
+            status = coordinator.quick_status()
+            self.send_json(200, {
+                "mode": COORDINATOR_MODE,
+                "enforcing": COORDINATOR_MODE == "enforcing" and coordinator.enforce_transitions,
+                "epoch": status["epoch"],
+                "state": status["state"],
+                "draining": status["draining"],
+            })
             return
         if self.path.startswith("/v1/gpu/releases/"):
             request_id = self.path.removeprefix("/v1/gpu/releases/")
@@ -225,14 +505,36 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_json(400, {"error": {"message": "Invalid JSON.", "code": "invalid_json"}})
             return
+        cache_handle = self.headers.get("X-Furgen-Prompt-Cache-Handle", "").strip() or None
+        if cache_handle and not re.fullmatch(r"[A-Za-z0-9_-]{1,16}\.[a-f0-9]{64}", cache_handle):
+            self.send_json(400, {"error": {"message": "Invalid prompt cache handle.", "code": "prompt_cache_handle_invalid"}})
+            return
+        # Never leak caller-selected keys to llama.cpp. Functions sends only an
+        # opaque, tenant-scoped HMAC in the private header above.
+        request_payload.pop("prompt_cache_key", None)
         if not GPU_LOCK.acquire(blocking=False):
             self.send_json(429, {"error": {"message": "GPU is busy.", "code": "gpu_busy"}})
             return
         response_sent = False
         started_at = time.monotonic()
+        coordinator_lease = None
+        cache_state = {"classification": "unkeyed", "restored": False}
         set_release(request_id, "preparing", started_at=time.time())
         try:
-            free_comfy_models()
+            if COORDINATOR_MODE in {"enforcing", "shadow"}:
+                coordinator_lease = get_coordinator().acquire("inference", request_id, UPSTREAM_TIMEOUT_SECONDS * 1000 + 60_000)
+                if COORDINATOR_MODE == "enforcing":
+                    cache_state = get_coordinator().prepare_cache(cache_handle)
+                    request_payload["id_slot"] = 0
+                    request_payload["cache_prompt"] = True
+                    if cache_handle and request_payload.get("stream") is True:
+                        stream_options = request_payload.setdefault("stream_options", {})
+                        if isinstance(stream_options, dict):
+                            stream_options["include_usage"] = True
+                else:
+                    free_comfy_models(preserve_cache=True)
+            else:
+                free_comfy_models(preserve_cache=False)
             set_release(request_id, "inference")
             if request_payload.get("stream") is True:
                 backend = open_http_response(
@@ -248,23 +550,40 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", content_type)
                 self.send_header("Cache-Control", "no-cache, no-transform")
                 self.send_header("X-Accel-Buffering", "no")
-                self.send_header("X-Furgen-Gpu-Release-Id", request_id)
+                for header, value in cache_response_headers(request_id, cache_state).items():
+                    self.send_header(header, value)
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.flush()
                 response_sent = True
+                stream_observation = {}
+                stream_parse_buffer = b""
+                stream_redaction_buffer = b""
                 try:
                     read_chunk = getattr(backend, "read1", backend.read)
                     while True:
                         chunk = read_chunk(16 * 1024)
                         if not chunk:
                             break
-                        self.wfile.write(chunk)
+                        if cache_handle and COORDINATOR_MODE == "enforcing":
+                            stream_parse_buffer = observe_stream_chunk(stream_parse_buffer, stream_observation, chunk)
+                        output_chunk = chunk
+                        if not cache_handle:
+                            stream_redaction_buffer, output_chunk = redact_unkeyed_stream_chunk(stream_redaction_buffer, chunk)
+                        if output_chunk:
+                            self.wfile.write(output_chunk)
+                            self.wfile.flush()
+                    if stream_redaction_buffer:
+                        self.wfile.write(stream_redaction_buffer)
                         self.wfile.flush()
                 finally:
                     backend.close()
                 response_ready_ms = round((time.monotonic() - started_at) * 1000)
                 set_release(request_id, "draining", response_ready_ms=response_ready_ms)
+                if cache_handle and 200 <= status < 300 and COORDINATOR_MODE == "enforcing":
+                    metadata = cache_metadata_from_response(stream_observation)
+                    metadata["classification"] = cache_state.get("classification")
+                    get_coordinator().mark_cache_dirty(cache_handle, metadata)
             else:
                 status, content_type, response_body = http_request(
                     f"{LLAMA_BASE_URL}/v1/chat/completions",
@@ -275,39 +594,80 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 response_ready_ms = round((time.monotonic() - started_at) * 1000)
                 set_release(request_id, "draining", response_ready_ms=response_ready_ms)
+                response_payload = None
+                try:
+                    response_payload = json.loads(response_body)
+                except (TypeError, ValueError):
+                    pass
+                if not cache_handle and isinstance(response_payload, dict):
+                    usage_for_redaction = response_payload.get("usage")
+                    details_for_redaction = usage_for_redaction.get("prompt_tokens_details") if isinstance(usage_for_redaction, dict) else None
+                    if isinstance(details_for_redaction, dict):
+                        details_for_redaction.pop("cached_tokens", None)
+                        response_body = json_response_bytes(response_payload)
+                if cache_handle and 200 <= status < 300 and COORDINATOR_MODE == "enforcing":
+                    response_payload = response_payload if isinstance(response_payload, dict) else {}
+                    metadata = cache_metadata_from_response(response_payload)
+                    metadata["classification"] = cache_state.get("classification")
+                    get_coordinator().mark_cache_dirty(cache_handle, metadata)
                 self.send_bytes(
                     status,
                     content_type,
                     response_body,
-                    headers={"X-Furgen-Gpu-Release-Id": request_id},
+                    headers=cache_response_headers(request_id, cache_state),
                 )
                 response_sent = True
-            slept = force_llama_sleep()
             release_completed_ms = round((time.monotonic() - started_at) * 1000)
-            if slept:
+            if COORDINATOR_MODE in {"enforcing", "shadow"}:
+                released = get_coordinator().release(
+                    coordinator_lease["fencingToken"],
+                    coordinator_lease["epoch"],
+                    keep_warm=WARM_RESIDENCY_ENABLED,
+                    reason="request_complete",
+                )
+                if COORDINATOR_MODE == "shadow" and not force_llama_sleep():
+                    set_release(request_id, "error", code="gpu_release_failed", request_failed=False, sleeping=False)
+                    return
                 set_release(
                     request_id,
-                    "safe",
+                    "request_complete",
                     response_ready_ms=response_ready_ms,
                     release_completed_ms=release_completed_ms,
-                    sleeping=True,
+                    request_complete=True,
+                    gpu_released=released["gpuReleased"],
+                    sleeping=not get_coordinator().llama_running() if COORDINATOR_MODE == "enforcing" else True,
+                    cache=cache_state,
                 )
             else:
-                set_release(
-                    request_id,
-                    "error",
-                    code="gpu_release_failed",
-                    response_ready_ms=response_ready_ms,
-                    release_completed_ms=release_completed_ms,
-                    sleeping=False,
-                )
+                slept = force_llama_sleep()
+                if slept:
+                    set_release(request_id, "request_complete", response_ready_ms=response_ready_ms, release_completed_ms=release_completed_ms, request_complete=True, gpu_released=True, sleeping=True)
+                else:
+                    set_release(request_id, "error", code="gpu_release_failed", response_ready_ms=response_ready_ms, release_completed_ms=release_completed_ms, sleeping=False)
+        except LeaseConflict as error:
+            set_release(request_id, "error", code=error.code, request_failed=True)
+            if not response_sent:
+                self.send_json(503, {"error": {"message": str(error), "code": error.code}}, headers={"Retry-After": "5"})
         except Exception as error:
-            slept = force_llama_sleep()
             code = "client_disconnected" if isinstance(error, (BrokenPipeError, ConnectionResetError)) else "gateway_failure"
-            if slept:
-                set_release(request_id, "safe", code=code, request_failed=True, sleeping=True)
+            if coordinator_lease and COORDINATOR_MODE in {"enforcing", "shadow"}:
+                try:
+                    released = get_coordinator().release(
+                        coordinator_lease["fencingToken"], coordinator_lease["epoch"], keep_warm=False, reason=code
+                    )
+                    slept = True if COORDINATOR_MODE == "enforcing" else force_llama_sleep()
+                    if slept:
+                        set_release(request_id, "request_complete", code=code, request_failed=True, request_complete=True, gpu_released=released["gpuReleased"], sleeping=COORDINATOR_MODE == "shadow")
+                    else:
+                        set_release(request_id, "error", code="gpu_release_failed", request_failed=True, sleeping=False)
+                except Exception:
+                    set_release(request_id, "error", code="gpu_release_failed", request_failed=True)
             else:
-                set_release(request_id, "error", code="gpu_release_failed", request_failed=True, sleeping=False)
+                slept = force_llama_sleep()
+                if slept:
+                    set_release(request_id, "request_complete", code=code, request_failed=True, request_complete=True, sleeping=True, gpu_released=True)
+                else:
+                    set_release(request_id, "error", code="gpu_release_failed", request_failed=True, sleeping=False)
             if not response_sent:
                 self.send_json(502, {"error": {"message": "Inference gateway failure.", "code": "gateway_failure", "detail": str(error)}})
         finally:
@@ -315,8 +675,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global COORDINATOR_LOCK_STREAM
     if not API_KEY:
         raise SystemExit("INFERENCE_INSTANCE_API_KEY is required")
+    lock_path = os.environ.get("GPU_COORDINATOR_LOCK_FILE", "/workspace/logs/asset_gen_v7_lite_coordinator.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    COORDINATOR_LOCK_STREAM = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(COORDINATOR_LOCK_STREAM.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise SystemExit("another GPU coordinator already owns the worker lock") from error
+    get_coordinator()
+    coordinator_server = ThreadingHTTPServer((COORDINATOR_HOST, COORDINATOR_PORT), CoordinatorHandler)
+    coordinator_thread = threading.Thread(target=coordinator_server.serve_forever, daemon=True)
+    coordinator_thread.start()
+    print(f"GPU coordinator listening on {COORDINATOR_HOST}:{COORDINATOR_PORT} ({COORDINATOR_MODE})", flush=True)
     server = ThreadingHTTPServer((GATEWAY_HOST, GATEWAY_PORT), Handler)
     print(f"Qwen gateway listening on {GATEWAY_HOST}:{GATEWAY_PORT}", flush=True)
     server.serve_forever()

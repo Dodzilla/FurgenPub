@@ -13,6 +13,7 @@ export FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubuserc
 BASE_SCRIPT="${WORKSPACE}/asset_gen_v5_lite.sh"
 INFERENCE_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_inference.sh"
 GATEWAY_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_gateway.py"
+COORDINATOR_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_coordinator.py"
 READINESS_PATH="${DM_COMFYUI_DIR}/input/${DM_LOCAL_READINESS_FILE}"
 MODEL_PATH="${DM_COMFYUI_DIR}/models/llm/Qwen3.8-27B-Uncensored-Q5_K_M.gguf"
 VISION_PATH="${DM_COMFYUI_DIR}/models/llm/Qwen3.8-27B-Uncensored-vision-f16.gguf"
@@ -61,6 +62,14 @@ fi
 
 ensure_comfy_core
 rm -f "${READINESS_PATH}"
+# Preserve Comfy's CPU node/object cache while allowing model VRAM to be
+# revoked by the local coordinator.  Normalize old service config safely.
+export COMFYUI_ARGS="${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header}"
+COMFYUI_ARGS="${COMFYUI_ARGS// --cache-none/}"
+COMFYUI_ARGS="${COMFYUI_ARGS//--cache-none/}"
+COMFYUI_ARGS="$(printf '%s\n' "${COMFYUI_ARGS}" | sed -E 's/(^|[[:space:]])--cache-ram([[:space:]]+[0-9.]+){0,2}//g')"
+COMFYUI_ARGS="${COMFYUI_ARGS} --cache-ram 16 40"
+export COMFYUI_ARGS
 env SERVER_TYPE="${SERVER_TYPE}" DM_LOCAL_READINESS_FILE="${DM_LOCAL_READINESS_FILE}" \
     COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT}" \
     ASSET_GEN_V5_IGNORED_BUNDLE_IDS="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS}" \
@@ -86,6 +95,7 @@ fi
 
 download_support_file asset_gen_v7_lite_inference.sh "${INFERENCE_SCRIPT}"
 download_support_file asset_gen_v7_lite_gateway.py "${GATEWAY_SCRIPT}"
+download_support_file asset_gen_v7_lite_coordinator.py "${COORDINATOR_SCRIPT}"
 bash "${INFERENCE_SCRIPT}"
 
 curl -fsS "${DM_LOCAL_COMFY_BASE_URL}/system_stats" >/dev/null

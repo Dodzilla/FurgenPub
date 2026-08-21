@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 import socket
+import sys
 import threading
 import time
 import unittest
@@ -17,6 +18,11 @@ MODULE_PATH = SUPPORT_DIR / "asset_gen_v7_lite_gateway.py"
 
 def load_gateway():
     os.environ["INFERENCE_INSTANCE_API_KEY"] = "test-instance-key"
+    os.environ["GPU_COORDINATOR_MODE"] = "legacy"
+    os.environ["QWEN_SNAPSHOT_PATH"] = "/tmp/furgen-qwen-gateway-tests"
+    os.environ["GPU_COORDINATOR_STATE_FILE"] = "/tmp/furgen-qwen-gateway-tests-coordinator.json"
+    os.environ["GPU_COORDINATOR_EPOCH_FILE"] = "/tmp/furgen-qwen-gateway-tests-coordinator.epoch"
+    sys.path.insert(0, str(SUPPORT_DIR))
     spec = importlib.util.spec_from_file_location("asset_gen_v7_lite_gateway_test", MODULE_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -144,11 +150,13 @@ class GatewayTest(unittest.TestCase):
         self.backend.shutdown()
         self.backend.server_close()
 
-    def request(self, path, method="GET", payload=None, request_id=None):
+    def request(self, path, method="GET", payload=None, request_id=None, cache_handle=None):
         body = None if payload is None else json.dumps(payload).encode()
         headers = {"Authorization": "Bearer test-instance-key", "Content-Type": "application/json"}
         if request_id:
             headers["X-Furgen-Request-Id"] = request_id
+        if cache_handle:
+            headers["X-Furgen-Prompt-Cache-Handle"] = cache_handle
         request = urllib.request.Request(self.base_url + path, data=body, headers=headers, method=method)
         with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, dict(response.headers), response.read()
@@ -188,9 +196,78 @@ class GatewayTest(unittest.TestCase):
         finally:
             self.gateway.REQUIRED_TOOL_CAPABILITIES = original
 
+    def test_request_complete_is_not_safe_while_gpu_remains_warm(self):
+        self.gateway.set_release(
+            "request-warm",
+            "request_complete",
+            request_complete=True,
+            gpu_released=False,
+        )
+        release = self.gateway.get_release("request-warm")
+        self.assertTrue(release["request_complete"])
+        self.assertFalse(release["safe"])
+        self.assertFalse(release["gpu_released"])
+
+    def test_authenticated_coordinator_attestation_reports_live_mode(self):
+        status, _, body = self.request("/v1/gpu/coordinator-attestation")
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["mode"], "legacy")
+        self.assertFalse(payload["enforcing"])
+        self.assertIsInstance(payload["epoch"], int)
+
+    def test_cache_metadata_prefers_llama_prompt_timing(self):
+        metadata = self.gateway.cache_metadata_from_response({
+            "usage": {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 25}},
+            "timings": {"prompt_ms": 321.4},
+        })
+        self.assertEqual(metadata["promptTokens"], 100)
+        self.assertEqual(metadata["cachedTokens"], 25)
+        self.assertEqual(metadata["coldPrefillMs"], 429)
+
+    def test_cache_metadata_uses_calibrated_prefill_fallback(self):
+        original = os.environ.get("QWEN_PREFILL_ESTIMATE_MS_PER_TOKEN")
+        os.environ["QWEN_PREFILL_ESTIMATE_MS_PER_TOKEN"] = "2.5"
+        try:
+            metadata = self.gateway.cache_metadata_from_response({
+                "usage": {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 20}},
+            })
+            self.assertEqual(metadata["coldPrefillMs"], 250)
+        finally:
+            if original is None:
+                os.environ.pop("QWEN_PREFILL_ESTIMATE_MS_PER_TOKEN", None)
+            else:
+                os.environ["QWEN_PREFILL_ESTIMATE_MS_PER_TOKEN"] = original
+
+    def test_split_sse_usage_and_timings_are_observed_for_stream_cache(self):
+        observation = {}
+        buffer = self.gateway.observe_stream_chunk(
+            b"",
+            observation,
+            b'data: {"usage":{"prompt_tokens":80,"prompt_tokens_details":{"cached_tokens":20}},',
+        )
+        buffer = self.gateway.observe_stream_chunk(
+            buffer,
+            observation,
+            b'"timings":{"prompt_ms":42.5}}\n\ndata: [DONE]\n\n',
+        )
+        self.assertEqual(buffer, b"")
+        self.assertEqual(observation["usage"]["prompt_tokens"], 80)
+        self.assertEqual(observation["timings"]["prompt_ms"], 42.5)
+
+    def test_unkeyed_stream_redacts_cached_token_usage(self):
+        buffer, output = self.gateway.redact_unkeyed_stream_chunk(
+            b"",
+            b'data: {"usage":{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":8}}}\n\n',
+        )
+        self.assertEqual(buffer, b"")
+        self.assertNotIn(b"cached_tokens", output)
+        self.assertIn(b'"prompt_tokens":10', output)
+
     def test_non_streaming_function_call_is_forwarded_and_released(self):
         payload = {
             "model": "qwen",
+            "prompt_cache_key": "must-not-reach-worker-backend",
             "messages": [{"role": "user", "content": "Look up 7"}],
             "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
             "tool_choice": "required",
@@ -200,9 +277,15 @@ class GatewayTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(headers["X-Furgen-Gpu-Release-Id"], "request-nonstream")
+        self.assertEqual(headers["X-Furgen-Request-Complete-Id"], "request-nonstream")
+        self.assertEqual(headers["X-Furgen-Prompt-Cache-Status"], "disabled")
+        self.assertEqual(headers["X-Furgen-Inference-Residency"], "cold")
         self.assertEqual(json.loads(body)["choices"][0]["finish_reason"], "tool_calls")
         self.assertEqual(self.state.last_payload["tools"][0]["function"]["name"], "lookup")
-        self.assertTrue(self.wait_for_safe_release("request-nonstream")["safe"])
+        self.assertNotIn("prompt_cache_key", self.state.last_payload)
+        release = self.wait_for_safe_release("request-nonstream")
+        self.assertTrue(release["safe"])
+        self.assertEqual(release["phase"], "request_complete")
 
     def test_lock_contention_returns_busy_without_forwarding(self):
         self.gateway.GPU_LOCK.acquire()
@@ -223,6 +306,46 @@ class GatewayTest(unittest.TestCase):
             self.assertIsNone(self.state.last_payload)
         finally:
             self.gateway.GPU_LOCK.release()
+
+    def test_rejects_non_hmac_prompt_cache_handle(self):
+        request = urllib.request.Request(
+            self.base_url + "/v1/chat/completions",
+            data=json.dumps({"model": "qwen", "messages": [{"role": "user", "content": "hello"}]}).encode(),
+            headers={
+                "Authorization": "Bearer test-instance-key",
+                "Content-Type": "application/json",
+                "X-Furgen-Request-Id": "request-cache-invalid",
+                "X-Furgen-Prompt-Cache-Handle": "raw-caller-cache-key",
+            },
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(caught.exception.code, 400)
+
+    def test_accepts_configurable_cache_key_id_and_rejects_traversal(self):
+        status, _, _ = self.request(
+            "/v1/chat/completions",
+            method="POST",
+            payload={"model": "qwen", "messages": [{"role": "user", "content": "hello"}]},
+            request_id="request-cache-v2",
+            cache_handle="v2." + "a" * 64,
+        )
+        self.assertEqual(status, 200)
+        request = urllib.request.Request(
+            self.base_url + "/v1/chat/completions",
+            data=json.dumps({"model": "qwen", "messages": [{"role": "user", "content": "hello"}]}).encode(),
+            headers={
+                "Authorization": "Bearer test-instance-key",
+                "Content-Type": "application/json",
+                "X-Furgen-Request-Id": "request-cache-traversal",
+                "X-Furgen-Prompt-Cache-Handle": "../v2." + "a" * 64,
+            },
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(caught.exception.code, 400)
 
     def test_sleep_failure_keeps_release_unsafe(self):
         self.state.sleep_after_response = False
@@ -253,6 +376,7 @@ class GatewayTest(unittest.TestCase):
         self.assertIn(b"data: [DONE]", body)
         release = self.wait_for_safe_release("request-stream")
         self.assertTrue(release["safe"])
+        self.assertEqual(release["phase"], "request_complete")
         self.assertTrue(release["sleeping"])
 
     def test_stream_disconnect_cancels_backend_and_releases_gpu(self):
