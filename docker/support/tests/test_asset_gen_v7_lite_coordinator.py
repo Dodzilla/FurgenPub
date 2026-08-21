@@ -576,6 +576,48 @@ class CoordinatorLeaseTest(unittest.TestCase):
             coordinator._free_comfy(preserve_cache=True)
             self.assertEqual(len(http.free_payloads), 1)
 
+    def test_live_comfy_baseline_is_accepted_by_three_gib_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, http = self.make_coordinator(directory)
+            live_baseline = 2_724_200_448
+            coordinator.comfy_release_vram_max_bytes = 3 * 1024**3
+            coordinator.comfy_idle_baseline_bytes = live_baseline
+            coordinator.comfy_release_vram_headroom_bytes = 512 * 1024**2
+            coordinator._gpu_processes = lambda *_args, **_kwargs: [
+                {"pid": 1, "usedBytes": live_baseline, "cmdline": "python ComfyUI/main.py", "cwd": "/workspace/ComfyUI"},
+            ]
+            coordinator._free_comfy(preserve_cache=True)
+            self.assertEqual(len(http.free_payloads), 1)
+            self.assertEqual(coordinator._effective_comfy_release_vram_max_bytes(), 3 * 1024**3)
+
+    def test_calibrated_baseline_headroom_rejects_retained_model_below_hard_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory)
+            coordinator.comfy_release_vram_max_bytes = 4 * 1024**3
+            coordinator.comfy_idle_baseline_bytes = 2 * 1024**3
+            coordinator.comfy_release_vram_headroom_bytes = 256 * 1024**2
+            coordinator._gpu_processes = lambda *_args, **_kwargs: [
+                {"pid": 1, "usedBytes": 3 * 1024**3, "cmdline": "python ComfyUI/main.py", "cwd": "/workspace/ComfyUI"},
+            ]
+            released, probe_ok = coordinator._wait_for_comfy_vram_release(0.01)
+            self.assertFalse(released)
+            self.assertTrue(probe_ok)
+            self.assertEqual(coordinator._effective_comfy_release_vram_max_bytes(), 2304 * 1024**2)
+
+    def test_stopped_llama_readiness_requires_vram_handoff_precondition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory, enforcing=True)
+            coordinator.llama_argv = ["/workspace/bin/llama-server", "--model", "/workspace/model.gguf"]
+            coordinator.llama_running = lambda: False
+            coordinator.comfy_release_vram_max_bytes = 3 * 1024**3
+            used = {"bytes": 3500 * 1024**2}
+            coordinator._gpu_processes = lambda *_args, **_kwargs: [
+                {"pid": 1, "usedBytes": used["bytes"], "cmdline": "python ComfyUI/main.py", "cwd": "/workspace/ComfyUI"},
+            ]
+            self.assertEqual(coordinator.inference_readiness()["reason"], "comfy_vram_not_released")
+            used["bytes"] = 2598 * 1024**2
+            self.assertTrue(coordinator.inference_readiness()["ready"])
+
     def test_comfy_vram_probe_excludes_only_verified_llama_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator, _ = self.make_coordinator(directory)

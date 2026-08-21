@@ -371,7 +371,9 @@ class GPUCoordinator:
         snapshot_write=True,
         snapshot_restore=True,
         mining_grace_seconds=30,
-        comfy_release_vram_max_bytes=2 * 1024**3,
+        comfy_release_vram_max_bytes=3 * 1024**3,
+        comfy_idle_baseline_bytes=None,
+        comfy_release_vram_headroom_bytes=512 * 1024**2,
     ):
         self.llama_base_url = llama_base_url.rstrip("/")
         self.comfy_base_url = comfy_base_url.rstrip("/")
@@ -389,6 +391,12 @@ class GPUCoordinator:
         self.snapshot_restore = bool(snapshot_restore)
         self.mining_grace_seconds = max(30, int(mining_grace_seconds))
         self.comfy_release_vram_max_bytes = max(0, int(comfy_release_vram_max_bytes))
+        self.comfy_idle_baseline_bytes = (
+            max(0, int(comfy_idle_baseline_bytes))
+            if comfy_idle_baseline_bytes is not None else None
+        )
+        self.comfy_release_vram_headroom_bytes = max(0, int(comfy_release_vram_headroom_bytes))
+        self.last_transition_error = None
         self.mining_stop_durations_ms = []
         self.lock = threading.RLock()
         self.lease_condition = threading.Condition(self.lock)
@@ -872,7 +880,25 @@ class GPUCoordinator:
                 raise CoordinatorError("GPU process probe failed after full ComfyUI release")
             if released:
                 return
-        raise CoordinatorError("ComfyUI retained GPU memory after free request")
+        used_bytes = self._comfy_gpu_bytes()
+        error = CoordinatorError("ComfyUI retained GPU memory after free request")
+        self.last_transition_error = {
+            "code": "comfy_vram_not_released",
+            "message": str(error),
+            "observedBytes": used_bytes,
+            "allowedBytes": self._effective_comfy_release_vram_max_bytes(),
+            "atMs": int(time.time() * 1000),
+        }
+        raise error
+
+    def _effective_comfy_release_vram_max_bytes(self):
+        limit = self.comfy_release_vram_max_bytes
+        if self.comfy_idle_baseline_bytes is not None:
+            limit = min(
+                limit,
+                self.comfy_idle_baseline_bytes + self.comfy_release_vram_headroom_bytes,
+            )
+        return limit
 
     def _wait_for_comfy_vram_release(self, timeout_seconds):
         deadline = time.monotonic() + timeout_seconds
@@ -880,7 +906,8 @@ class GPUCoordinator:
             used_bytes = self._comfy_gpu_bytes()
             if used_bytes is None:
                 return False, False
-            if used_bytes <= self.comfy_release_vram_max_bytes:
+            if used_bytes <= self._effective_comfy_release_vram_max_bytes():
+                self.last_transition_error = None
                 return True, True
             time.sleep(0.25)
         return False, True
@@ -930,6 +957,47 @@ class GPUCoordinator:
             for item in processes
             if self._is_comfy_gpu_process(item)
         )
+
+    def inference_readiness(self):
+        """Report whether a stopped llama can safely begin its GPU transition."""
+        llama_running = self.llama_running()
+        configured = bool(self.llama_argv)
+        used_bytes = self._comfy_gpu_bytes()
+        allowed_bytes = self._effective_comfy_release_vram_max_bytes()
+        lease = self.lease if isinstance(self.lease, dict) else {}
+        holder = lease.get("holder")
+        lease_state = str(lease.get("state") or "").upper()
+        foreground_busy = holder in FOREGROUND and lease_state in {"ACTIVE", "RECOVERING", "STARTING"}
+        if llama_running:
+            ready = True
+            reason = "llama_running"
+        elif not configured:
+            ready = False
+            reason = "llama_command_unavailable"
+        elif foreground_busy:
+            ready = False
+            reason = "gpu_busy"
+        elif used_bytes is None:
+            ready = False
+            reason = "gpu_process_probe_failed"
+        elif used_bytes > allowed_bytes:
+            ready = False
+            reason = "comfy_vram_not_released"
+        else:
+            ready = True
+            reason = "restart_preconditions_satisfied"
+        return {
+            "ready": ready,
+            "reason": reason,
+            "llamaConfigured": configured,
+            "llamaRunning": llama_running,
+            "comfyUsedBytes": used_bytes,
+            "comfyIdleBaselineBytes": self.comfy_idle_baseline_bytes,
+            "comfyReleaseHeadroomBytes": self.comfy_release_vram_headroom_bytes,
+            "comfyReleaseMaxBytes": self.comfy_release_vram_max_bytes,
+            "comfyReleaseEffectiveMaxBytes": allowed_bytes,
+            "lastTransitionError": self.last_transition_error,
+        }
 
     def _is_comfy_gpu_process(self, item):
         cmdline = str(item.get("cmdline", "")).lower()
@@ -1693,5 +1761,6 @@ class GPUCoordinator:
             "gpuProcesses": self._gpu_processes(timeout_seconds=1),
             "memory": self._memory_status(),
             "cache": self.snapshot_store.status(),
+            "inferenceReadiness": self.inference_readiness(),
         })
         return result

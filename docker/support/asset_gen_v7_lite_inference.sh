@@ -177,6 +177,45 @@ process_identity_matches() {
     [[ "$(process_start_time "${pid}" || true)" == "${expected_start_time}" ]]
 }
 
+calibrate_comfy_gpu_baseline() {
+    python3 - <<'PY'
+import os
+from pathlib import Path
+import subprocess
+import time
+
+samples = []
+for _ in range(5):
+    result = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        raise SystemExit(1)
+    used = 0
+    for row in result.stdout.splitlines():
+        if not row.strip():
+            continue
+        raw_pid, raw_mib = row.split(",", 1)
+        pid = int(raw_pid.strip())
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace").lower()
+            cwd = os.readlink(f"/proc/{pid}/cwd").lower()
+        except OSError:
+            continue
+        if "comfyui" in cmdline or "comfyui" in cwd:
+            used += int(raw_mib.strip()) * 1024**2
+    samples.append(used)
+    time.sleep(0.25)
+if not samples:
+    raise SystemExit(1)
+print(max(samples[-3:]))
+PY
+}
+
 assert_restart_quiescent() {
     local coordinator_status drain_response queue_status gateway_pid
     drain_response="$(curl -fsS --max-time 20 -X POST -H 'Content-Type: application/json' -d '{}' \
@@ -301,8 +340,29 @@ launch() {
     # Retain the separately persisted epoch so every old fence remains stale.
     rm -f "${GPU_COORDINATOR_STATE_FILE:-${LOG_DIR}/asset_gen_v7_lite_coordinator.json}"
     curl -fsS -X POST -H 'Content-Type: application/json' \
-        -d '{"unload_models":true,"free_memory":false}' \
+        -d '{"unload_models":true,"free_memory":true}' \
         "${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}/free" >/dev/null
+    local comfy_idle_baseline
+    local comfy_release_max
+    comfy_release_max="${GPU_COMFY_RELEASE_VRAM_MAX_BYTES:-3221225472}"
+    if [[ ! "${comfy_release_max}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: GPU_COMFY_RELEASE_VRAM_MAX_BYTES must be an integer byte count." >&2
+        return 1
+    fi
+    comfy_idle_baseline="${GPU_COMFY_IDLE_BASELINE_BYTES:-}"
+    if [[ -z "${comfy_idle_baseline}" ]]; then
+        comfy_idle_baseline="$(calibrate_comfy_gpu_baseline || true)"
+    fi
+    if [[ ! "${comfy_idle_baseline}" =~ ^[0-9]+$ ]]; then
+        echo "WARNING: Comfy VRAM baseline calibration failed; using the absolute release ceiling." >&2
+        comfy_idle_baseline=""
+    else
+        echo "Calibrated idle Comfy VRAM baseline: ${comfy_idle_baseline} bytes."
+        if (( comfy_idle_baseline > comfy_release_max )); then
+            echo "ERROR: idle Comfy VRAM baseline ${comfy_idle_baseline} exceeds hard ceiling ${comfy_release_max}." >&2
+            return 1
+        fi
+    fi
     local llama_dir
     llama_dir="$(dirname "${LLAMA_SERVER}")"
     export LD_LIBRARY_PATH="${llama_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -368,7 +428,9 @@ launch() {
         GPU_COORDINATOR_STATE_FILE="${GPU_COORDINATOR_STATE_FILE:-${LOG_DIR}/asset_gen_v7_lite_coordinator.json}" \
         GPU_COORDINATOR_EPOCH_FILE="${GPU_COORDINATOR_EPOCH_FILE:-${LOG_DIR}/asset_gen_v7_lite_coordinator.epoch}" \
         GPU_MINING_GRACE_SECONDS="${GPU_MINING_GRACE_SECONDS:-30}" \
-        GPU_COMFY_RELEASE_VRAM_MAX_BYTES="${GPU_COMFY_RELEASE_VRAM_MAX_BYTES:-2147483648}" \
+        GPU_COMFY_RELEASE_VRAM_MAX_BYTES="${comfy_release_max}" \
+        GPU_COMFY_IDLE_BASELINE_BYTES="${comfy_idle_baseline}" \
+        GPU_COMFY_RELEASE_VRAM_HEADROOM_BYTES="${GPU_COMFY_RELEASE_VRAM_HEADROOM_BYTES:-536870912}" \
         WARM_RESIDENCY_ENABLED="${WARM_RESIDENCY_ENABLED:-false}" \
         SNAPSHOT_WRITE_ENABLED="${SNAPSHOT_WRITE_ENABLED:-false}" \
         SNAPSHOT_RESTORE_ENABLED="${SNAPSHOT_RESTORE_ENABLED:-false}" \

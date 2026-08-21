@@ -207,6 +207,50 @@ class GatewayTest(unittest.TestCase):
         finally:
             self.gateway.REQUIRED_TOOL_CAPABILITIES = original
 
+    def test_health_does_not_treat_saved_llama_command_as_ready_after_failed_handoff(self):
+        class Coordinator:
+            llama_argv = ["/workspace/bin/llama-server"]
+
+            @staticmethod
+            def quick_status():
+                return {"state": "IDLE"}
+
+            @staticmethod
+            def inference_readiness():
+                return {
+                    "ready": False,
+                    "reason": "comfy_vram_not_released",
+                    "llamaConfigured": True,
+                    "llamaRunning": False,
+                    "comfyUsedBytes": 3_500 * 1024**2,
+                    "comfyReleaseEffectiveMaxBytes": 3 * 1024**3,
+                }
+
+        original_mode = self.gateway.COORDINATOR_MODE
+        original_http = self.gateway.http_request
+        original_get_coordinator = self.gateway.get_coordinator
+        self.gateway.COORDINATOR_MODE = "enforcing"
+        self.gateway.get_coordinator = lambda: Coordinator()
+
+        def health_http(url, **_kwargs):
+            if url.endswith("/system_stats"):
+                return 200, "application/json", b"{}"
+            raise OSError("llama stopped")
+
+        self.gateway.http_request = health_http
+        try:
+            payload = self.gateway.health_payload()
+            self.assertFalse(payload["ready"])
+            self.assertFalse(payload["llama"])
+            self.assertEqual(
+                payload["coordinator"]["inferenceReadiness"]["reason"],
+                "comfy_vram_not_released",
+            )
+        finally:
+            self.gateway.COORDINATOR_MODE = original_mode
+            self.gateway.http_request = original_http
+            self.gateway.get_coordinator = original_get_coordinator
+
     def test_request_complete_is_not_safe_while_gpu_remains_warm(self):
         self.gateway.set_release(
             "request-warm",

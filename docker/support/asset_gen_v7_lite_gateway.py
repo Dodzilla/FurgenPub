@@ -11,6 +11,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from asset_gen_v7_lite_coordinator import (
+    CoordinatorError,
     GPUCoordinator,
     LeaseConflict,
     SnapshotStore,
@@ -158,7 +159,14 @@ def get_coordinator():
             snapshot_write=SNAPSHOT_WRITE_ENABLED,
             snapshot_restore=SNAPSHOT_RESTORE_ENABLED,
             mining_grace_seconds=int(os.environ.get("GPU_MINING_GRACE_SECONDS", "30")),
-            comfy_release_vram_max_bytes=int(os.environ.get("GPU_COMFY_RELEASE_VRAM_MAX_BYTES", str(2 * 1024**3))),
+            comfy_release_vram_max_bytes=int(os.environ.get("GPU_COMFY_RELEASE_VRAM_MAX_BYTES", str(3 * 1024**3))),
+            comfy_idle_baseline_bytes=(
+                int(os.environ["GPU_COMFY_IDLE_BASELINE_BYTES"])
+                if os.environ.get("GPU_COMFY_IDLE_BASELINE_BYTES") else None
+            ),
+            comfy_release_vram_headroom_bytes=int(
+                os.environ.get("GPU_COMFY_RELEASE_VRAM_HEADROOM_BYTES", str(512 * 1024**2))
+            ),
         )
     return COORDINATOR
 
@@ -212,15 +220,23 @@ def health_payload():
     statuses["sleeping"] = bool(props and (props.get("is_sleeping") or props.get("sleeping")))
     statuses["gpu_busy"] = GPU_LOCK.locked()
     coordinator = get_coordinator()
+    coordinator_status = coordinator.quick_status()
+    inference_readiness = coordinator.inference_readiness()
     statuses["coordinator"] = {
         "mode": COORDINATOR_MODE,
         "warmResidency": WARM_RESIDENCY_ENABLED,
         "snapshotWrite": SNAPSHOT_WRITE_ENABLED,
         "snapshotRestore": SNAPSHOT_RESTORE_ENABLED,
-        "state": coordinator.quick_status()["state"],
+        "state": coordinator_status["state"],
+        "inferenceReadiness": inference_readiness,
     }
-    llama_available = statuses["llama"] or (COORDINATOR_MODE != "legacy" and coordinator.llama_argv)
-    statuses["ready"] = statuses["comfyui"] and llama_available and (statuses["tool_calling"] or not statuses["llama"])
+    if statuses["llama"]:
+        inference_ready = statuses["tool_calling"]
+    elif COORDINATOR_MODE == "enforcing":
+        inference_ready = inference_readiness["ready"]
+    else:
+        inference_ready = False
+    statuses["ready"] = statuses["comfyui"] and inference_ready
     return statuses
 
 
@@ -666,7 +682,12 @@ class Handler(JsonHandler):
             if not response_sent:
                 self.send_json(503, {"error": {"message": str(error), "code": error.code}}, headers={"Retry-After": "5"})
         except Exception as error:
-            code = "client_disconnected" if isinstance(error, (BrokenPipeError, ConnectionResetError)) else "gateway_failure"
+            if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+                code = "client_disconnected"
+            elif isinstance(error, CoordinatorError):
+                code = "gpu_handoff_failed"
+            else:
+                code = "gateway_failure"
             if coordinator_lease and COORDINATOR_MODE in {"enforcing", "shadow"}:
                 try:
                     released = get_coordinator().release(
@@ -686,7 +707,10 @@ class Handler(JsonHandler):
                 else:
                     set_release(request_id, "error", code="gpu_release_failed", request_failed=True, sleeping=False)
             if not response_sent:
-                self.send_json(502, {"error": {"message": "Inference gateway failure.", "code": "gateway_failure", "detail": str(error)}})
+                status = 503 if code == "gpu_handoff_failed" else 502
+                message = "GPU handoff failed." if code == "gpu_handoff_failed" else "Inference gateway failure."
+                headers = {"Retry-After": "5"} if code == "gpu_handoff_failed" else None
+                self.send_json(status, {"error": {"message": message, "code": code, "detail": str(error)}}, headers=headers)
         finally:
             GPU_LOCK.release()
 
