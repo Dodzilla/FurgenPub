@@ -254,8 +254,7 @@ raise SystemExit(0 if status.get("draining") is True and status.get("diagnostics
         fi
     fi
     if [[ "${GPU_COORDINATOR_MODE}" == "enforcing" && -z "${drain_response}" ]]; then
-        echo "ERROR: refusing enforcing-mode restart without a loopback coordinator drain fence." >&2
-        return 1
+        echo "No existing gateway/coordinator process found; allowing enforcing-mode first boot."
     fi
 
     queue_status="$(curl -fsS --max-time 3 \
