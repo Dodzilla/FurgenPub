@@ -576,6 +576,31 @@ class CoordinatorLeaseTest(unittest.TestCase):
             coordinator._free_comfy(preserve_cache=True)
             self.assertEqual(len(http.free_payloads), 1)
 
+    def test_comfy_vram_probe_excludes_only_verified_llama_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory)
+            coordinator.llama_pid = 22
+            coordinator.llama_start_time = "llama-start"
+            coordinator._gpu_processes = lambda *_args, **_kwargs: [
+                {"pid": 11, "usedBytes": 512 * 1024**2, "cmdline": "python main.py", "cwd": "/workspace/ComfyUI"},
+                {"pid": 22, "usedBytes": 25 * 1024**3, "cmdline": "llama-server", "cwd": "/workspace/ComfyUI"},
+            ]
+            coordinator._process_matches = lambda pid, start: pid == 22 and start == "llama-start"
+            self.assertEqual(coordinator._comfy_gpu_bytes(), 512 * 1024**2)
+
+    def test_comfy_recovery_never_targets_verified_llama_with_comfy_cwd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory)
+            coordinator.llama_pid = 22
+            coordinator.llama_start_time = "llama-start"
+            coordinator._gpu_processes = lambda *_args, **_kwargs: [
+                {"pid": 22, "usedBytes": 25 * 1024**3, "cmdline": "llama-server", "cwd": "/workspace/ComfyUI"},
+            ]
+            coordinator._process_matches = lambda pid, start: pid == 22 and start == "llama-start"
+            with mock.patch("os.kill") as kill:
+                coordinator._terminate_comfy_gpu_processes()
+            kill.assert_not_called()
+
     def test_same_inference_warm_reuse_skips_redundant_comfy_eviction(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator, _ = self.make_coordinator(directory, enforcing=True)

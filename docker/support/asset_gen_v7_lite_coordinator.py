@@ -928,8 +928,22 @@ class GPUCoordinator:
         return sum(
             item["usedBytes"]
             for item in processes
-            if "comfyui" in item["cmdline"].lower() or "comfyui" in item.get("cwd", "").lower()
+            if self._is_comfy_gpu_process(item)
         )
+
+    def _is_comfy_gpu_process(self, item):
+        cmdline = str(item.get("cmdline", "")).lower()
+        cwd = str(item.get("cwd", "")).lower()
+        if "comfyui" not in cmdline and "comfyui" not in cwd:
+            return False
+        pid = int(item.get("pid") or 0)
+        # The inference launcher can inherit /workspace/ComfyUI as its cwd.
+        # Exclude only the exact fenced llama identity; a reused/stale PID is
+        # still treated as Comfy and fails closed through normal verification.
+        if pid and pid == self.llama_pid and self.llama_start_time is not None:
+            if self._process_matches(pid, self.llama_start_time):
+                return False
+        return True
 
     def _terminate_comfy_gpu_processes(self):
         processes = self._gpu_processes()
@@ -938,7 +952,7 @@ class GPUCoordinator:
         target_pids = [
             int(item["pid"])
             for item in processes
-            if "comfyui" in item["cmdline"].lower() or "comfyui" in item.get("cwd", "").lower()
+            if self._is_comfy_gpu_process(item)
         ]
         targets = []
         for pid in target_pids:
