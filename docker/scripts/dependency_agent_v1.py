@@ -2938,12 +2938,27 @@ class GPUCoordinatorClient:
             self._status_cache_at_ms = now_ms
         return {"configured": True, "supported": True, **payload}
 
+    def admission_recovery_status(self) -> Dict[str, Any]:
+        if not self._ensure_supported():
+            return {"configured": True, "supported": False, "safeToClearAdmission": False}
+        status, payload, _headers = self._request(
+            "GET",
+            "/v1/gpu/admission-recovery",
+            timeout_seconds=2.0,
+        )
+        if status < 200 or status >= 300:
+            raise GPUCoordinatorUnavailable(
+                f"GPU coordinator admission recovery probe failed (status={status})"
+            )
+        return {"configured": True, "supported": True, **payload}
+
     def acquire(
         self,
         holder: str,
         work_id: str,
         ttl_ms: int,
         admission_claim_id: Optional[str] = None,
+        admission_ticket_id: Optional[str] = None,
     ) -> Optional[GPUCoordinatorLease]:
         if not self._ensure_supported():
             return None
@@ -2955,6 +2970,7 @@ class GPUCoordinatorClient:
                 "workId": work_id,
                 "ttlMs": int(ttl_ms),
                 **({"admissionClaimId": admission_claim_id} if admission_claim_id else {}),
+                **({"admissionTicketId": admission_ticket_id} if admission_ticket_id else {}),
             },
             timeout_seconds=10.0,
         )
@@ -5662,6 +5678,7 @@ class DependencyAgent:
                     work_id,
                     self.gpu_coordinator_lease_ttl_ms,
                     admission_claim_id=admission_claim_token,
+                    admission_ticket_id=admission_ticket_id,
                 )
                 break
             except GPUCoordinatorBusy:
@@ -5763,6 +5780,12 @@ class DependencyAgent:
             except GPUCoordinatorUnavailable as exc:
                 self._mining_gpu_retry_after_ms = _now_ms() + 2_000
                 logging.debug("Idle PRL mining coordinator unavailable reason=%s: %s", reason, exc)
+                return False
+            # Close the read/acquire race: foreground work can enqueue after
+            # the first RTDB check but before the local mining lease commits.
+            if self._gpu_admission_has_foreground_work():
+                self._mining_gpu_retry_after_ms = _now_ms() + 1_000
+                self._release_gpu_lease(lease, "foreground_enqueued_during_mining_handoff", keep_warm=False)
                 return False
             if lease is None:
                 return True
@@ -6862,13 +6885,11 @@ class DependencyAgent:
 
     def _recover_gpu_admission_if_locally_idle(self) -> bool:
         try:
-            coordinator_status = self._gpu_coordinator.status(max_age_ms=0)
+            coordinator_status = self._gpu_coordinator.admission_recovery_status()
         except Exception as exc:
             logging.warning("GPU admission recovery could not verify the local coordinator: %s", exc)
             return False
-        if coordinator_status.get("diagnosticsBusy") is True:
-            return False
-        if isinstance(coordinator_status.get("lease"), dict):
+        if coordinator_status.get("safeToClearAdmission") is not True:
             return False
         now_ms = _now_ms()
 
