@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.142"
+AGENT_VERSION = "dm-agent-py/0.10.143"
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -7211,7 +7211,8 @@ class DependencyAgent:
                     key: metrics.get(key)
                     for key in (
                         "leaseConflicts", "staleTokenRejections", "snapshotSaves", "snapshotSaveErrors",
-                        "snapshotRestores", "snapshotRestoreErrors", "snapshotSkippedDirtyEviction",
+                        "snapshotRestores", "snapshotRestoreErrors", "snapshotRestoreIneffective",
+                        "snapshotSkippedDirtyEviction",
                         "snapshotSkippedKeySwitch", "llamaStarts", "llamaStops", "comfyEvictions",
                         "miningRevocations", "recoveryCount",
                     )
