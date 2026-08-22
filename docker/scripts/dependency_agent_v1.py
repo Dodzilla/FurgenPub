@@ -146,7 +146,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.150"
+AGENT_VERSION = "dm-agent-py/0.10.151"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -12300,6 +12300,7 @@ class DependencyAgent:
             **({"comfyRuntime": comfy_runtime} if comfy_runtime else {}),
             **({"sshHostKeySha256": ssh_host_key_sha256} if ssh_host_key_sha256 else {}),
             "idleMining": self._idle_prl_miner.snapshot(),
+            "gpuCoordinator": self._gpu_coordinator_runtime_snapshot(),
             "agentVersion": AGENT_VERSION,
             "capabilities": {
                 "dependencyChannel": True,
