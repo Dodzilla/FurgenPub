@@ -631,6 +631,28 @@ class CoordinatorLeaseTest(unittest.TestCase):
             )
             self.assertIsNone(coordinator.last_transition_error)
 
+    def test_recovery_full_free_rebaselines_post_workload_comfy_allocator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, http = self.make_coordinator(directory)
+            boot_baseline = 522_190_848
+            post_workload_baseline = 2_722_103_296
+            coordinator.comfy_release_vram_max_bytes = 3 * 1024**3
+            coordinator.comfy_idle_baseline_bytes = boot_baseline
+            coordinator.comfy_release_vram_headroom_bytes = 512 * 1024**2
+            coordinator._wait_for_comfy_vram_release = mock.Mock(return_value=(False, True))
+            coordinator._comfy_gpu_bytes = mock.Mock(return_value=post_workload_baseline)
+
+            coordinator._free_comfy(preserve_cache=False)
+
+            self.assertEqual(len(http.free_payloads), 1)
+            self.assertEqual(http.free_payloads[0], {"unload_models": True, "free_memory": True})
+            self.assertEqual(coordinator.comfy_idle_baseline_bytes, post_workload_baseline)
+            self.assertEqual(
+                coordinator.last_comfy_baseline_adjustment["adjustedBytes"],
+                post_workload_baseline,
+            )
+            self.assertIsNone(coordinator.last_transition_error)
+
     def test_full_free_does_not_rebaseline_comfy_above_hard_ceiling(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator, http = self.make_coordinator(directory)

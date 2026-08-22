@@ -881,27 +881,29 @@ class GPUCoordinator:
                 raise CoordinatorError("GPU process probe failed after full ComfyUI release")
             if released:
                 return
-            # Comfy's CUDA allocator can establish a larger persistent process
-            # baseline after its first real workflow than it had during boot
-            # calibration. A successful full /free is the strongest available
-            # proof that models and reclaimable allocator memory were released.
-            # Learn that post-workload baseline only inside the absolute hard
-            # ceiling; the ceiling remains the fail-closed retained-model fence.
-            used_bytes = self._comfy_gpu_bytes()
-            if used_bytes is not None and used_bytes <= self.comfy_release_vram_max_bytes:
-                previous_baseline = self.comfy_idle_baseline_bytes
-                adjusted_baseline = max(previous_baseline or 0, used_bytes)
-                if previous_baseline is None or adjusted_baseline > previous_baseline:
-                    self.comfy_idle_baseline_bytes = adjusted_baseline
-                    self.last_comfy_baseline_adjustment = {
-                        "previousBytes": previous_baseline,
-                        "adjustedBytes": adjusted_baseline,
-                        "hardCeilingBytes": self.comfy_release_vram_max_bytes,
-                        "atMs": int(time.time() * 1000),
-                    }
-                if used_bytes <= self._effective_comfy_release_vram_max_bytes():
-                    self.last_transition_error = None
-                    return
+        # Comfy's CUDA allocator can establish a larger persistent process
+        # baseline after its first real workflow than it had during boot
+        # calibration. At this point either the initial request was already a
+        # full free (preserve_cache=False), or the preserve-cache attempt was
+        # followed by a full free above. That acknowledgement is the strongest
+        # available proof that models and reclaimable allocator memory were
+        # released. Learn the post-workload baseline only inside the absolute
+        # hard ceiling; the ceiling remains the fail-closed retained-model fence.
+        used_bytes = self._comfy_gpu_bytes()
+        if used_bytes is not None and used_bytes <= self.comfy_release_vram_max_bytes:
+            previous_baseline = self.comfy_idle_baseline_bytes
+            adjusted_baseline = max(previous_baseline or 0, used_bytes)
+            if previous_baseline is None or adjusted_baseline > previous_baseline:
+                self.comfy_idle_baseline_bytes = adjusted_baseline
+                self.last_comfy_baseline_adjustment = {
+                    "previousBytes": previous_baseline,
+                    "adjustedBytes": adjusted_baseline,
+                    "hardCeilingBytes": self.comfy_release_vram_max_bytes,
+                    "atMs": int(time.time() * 1000),
+                }
+            if used_bytes <= self._effective_comfy_release_vram_max_bytes():
+                self.last_transition_error = None
+                return
         used_bytes = self._comfy_gpu_bytes()
         error = CoordinatorError("ComfyUI retained GPU memory after free request")
         self.last_transition_error = {
