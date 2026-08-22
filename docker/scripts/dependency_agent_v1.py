@@ -146,7 +146,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.148"
+AGENT_VERSION = "dm-agent-py/0.10.149"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -1614,6 +1614,77 @@ def sha256_file(
                         pass
                     last_progress_at = now
     return h.hexdigest()
+
+
+def huggingface_hub_download(
+    url: str,
+    dest_partial: Path,
+    auth_header: Optional[str],
+    expected_size_bytes: int = 0,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> None:
+    """Download a pinned Hugging Face /resolve/ URL through hf_xet when available."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path_parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+    try:
+        resolve_index = path_parts.index("resolve")
+    except ValueError as exc:
+        raise RuntimeError("Hugging Face URL is not a pinned /resolve/ URL") from exc
+    if host not in {"huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"}:
+        raise RuntimeError(f"Unsupported Hugging Face host: {host or 'missing'}")
+    if resolve_index < 2 or resolve_index + 2 >= len(path_parts):
+        raise RuntimeError("Hugging Face /resolve/ URL is missing repo, revision, or filename")
+
+    repo_id = "/".join(path_parts[:resolve_index])
+    revision = path_parts[resolve_index + 1]
+    filename = "/".join(path_parts[resolve_index + 2:])
+    token = auth_header[7:] if isinstance(auth_header, str) and auth_header.startswith("Bearer ") else None
+    cache_dir = Path(os.environ.get("DM_HF_CACHE_DIR") or (Path(os.environ.get("WORKSPACE", "/workspace")) / ".dm_hf_cache"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dest_partial.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from huggingface_hub import hf_hub_download as hf_download
+    except Exception as exc:
+        raise RuntimeError(f"huggingface_hub unavailable: {exc}") from exc
+
+    previous_high_performance = os.environ.get("HF_XET_HIGH_PERFORMANCE")
+    os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+    try:
+        cached_path = Path(hf_download(
+            repo_id=repo_id,
+            filename=filename,
+            revision=revision,
+            cache_dir=str(cache_dir),
+            token=token,
+        )).resolve()
+    finally:
+        if previous_high_performance is None:
+            os.environ.pop("HF_XET_HIGH_PERFORMANCE", None)
+        else:
+            os.environ["HF_XET_HIGH_PERFORMANCE"] = previous_high_performance
+
+    actual_size = int(cached_path.stat().st_size)
+    if expected_size_bytes > 0 and actual_size != int(expected_size_bytes):
+        raise RuntimeError(
+            f"Hugging Face cached file size mismatch: expected {expected_size_bytes}, got {actual_size}"
+        )
+
+    staged_link = dest_partial.with_name(f"{dest_partial.name}.hf-{uuid.uuid4().hex}")
+    try:
+        try:
+            os.link(cached_path, staged_link)
+        except OSError:
+            shutil.copyfile(cached_path, staged_link)
+        os.replace(staged_link, dest_partial)
+    finally:
+        try:
+            staged_link.unlink(missing_ok=True)
+        except Exception:
+            pass
+    if progress_cb:
+        progress_cb(actual_size, int(expected_size_bytes or actual_size))
 
 
 AGENT_VERSION_RE = re.compile(r'^\s*AGENT_VERSION\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
@@ -13867,13 +13938,29 @@ class DependencyAgent:
                             partial.unlink()
                     except Exception:
                         pass
-                    fallback_tool = "wget" if _command_exists("wget") else "python"
+                    fallback_tool = "huggingface_hub"
                     logging.warning(
                         "aria2 download failed validation for %s; retrying from zero with %s: %s",
                         dep_id,
                         fallback_tool,
                         str(aria2_error),
                     )
+                    try:
+                        huggingface_hub_download(
+                            url=url,
+                            dest_partial=partial,
+                            auth_header=auth_header,
+                            expected_size_bytes=int(expected_size_bytes),
+                            progress_cb=_progress_cb("downloading_fallback", "huggingface_hub"),
+                        )
+                    except Exception as huggingface_error:
+                        fallback_tool = "wget" if _command_exists("wget") else "python"
+                        logging.warning(
+                            "huggingface_hub fallback unavailable for %s; retrying with %s: %s",
+                            dep_id,
+                            fallback_tool,
+                            str(huggingface_error),
+                        )
                     if fallback_tool == "wget":
                         wget_download(
                             url=url,
@@ -13885,7 +13972,7 @@ class DependencyAgent:
                             debug=self.download_debug,
                             progress_cb=_progress_cb("downloading_fallback", "wget"),
                         )
-                    else:
+                    elif fallback_tool == "python":
                         http_download(
                             url=url,
                             dest_partial=partial,
