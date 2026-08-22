@@ -146,7 +146,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.151"
+AGENT_VERSION = "dm-agent-py/0.10.152"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -7731,6 +7731,9 @@ class DependencyAgent:
                 )
                 if key in status
             }
+            # Explicitly overwrite a prior transient coordinator error in the
+            # RTDB/Firestore merge patches once the status probe succeeds.
+            payload["error"] = ""
             config = status.get("config") if isinstance(status.get("config"), dict) else {}
             if isinstance(config.get("mode"), str):
                 payload["mode"] = str(config["mode"])[:24]
@@ -7743,6 +7746,7 @@ class DependencyAgent:
                     timeout_seconds=3.0,
                 )
                 payload["gatewayReady"] = gateway_status == 200 and gateway_payload.get("ready") is True
+                payload["gatewayError"] = ""
                 payload["gatewayBootId"] = str(gateway_payload.get("gatewayBootId") or "")[:64]
                 coordinator_health = gateway_payload.get("coordinator") if isinstance(gateway_payload.get("coordinator"), dict) else {}
                 inference_readiness = coordinator_health.get("inferenceReadiness") if isinstance(coordinator_health.get("inferenceReadiness"), dict) else {}
