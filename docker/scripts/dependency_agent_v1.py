@@ -73,7 +73,7 @@ Optional knobs:
   - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
   - DM_VIDEO_OUTPUT_QUALITY_GATE_ENABLED (decode + entropy gate before video upload; default: true on video server types)
   - DM_VIDEO_OUTPUT_MIN_NORMALIZED_LUMA_ENTROPY (median normalized luma entropy floor; default: 0.65)
-  - DM_VIDEO_OUTPUT_CORRUPTION_SIGNATURE_ENABLED (H3 oversaturation/weak-motion safety gate; default: true on video_minimax_h3 types)
+  - DM_VIDEO_OUTPUT_CORRUPTION_SIGNATURE_ENABLED (H3 oversaturation/weak-motion safety gate; default: true on video_gen_v4)
   - DM_VIDEO_OUTPUT_SUSPICIOUS_SATURATION_FLOOR (H3 signalstats SATAVG median floor; default: 27)
   - DM_VIDEO_OUTPUT_SUSPICIOUS_TEMPORAL_DIFF_CEILING (H3 signalstats YDIF median ceiling; default: 20)
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
@@ -146,7 +146,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.147"
+AGENT_VERSION = "dm-agent-py/0.10.148"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -4889,7 +4889,7 @@ class DependencyAgent:
         )
         self.video_output_corruption_signature_enabled = _env_bool(
             "DM_VIDEO_OUTPUT_CORRUPTION_SIGNATURE_ENABLED",
-            self.server_type.startswith("video_minimax_h3"),
+            self.server_type == "video_gen_v4" or self.server_type.startswith("video_minimax_h3"),
         )
         self.video_output_suspicious_saturation_floor = max(
             0.0,
