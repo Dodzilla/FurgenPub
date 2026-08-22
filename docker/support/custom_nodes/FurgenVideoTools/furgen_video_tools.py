@@ -1172,23 +1172,26 @@ class FurgenExposureAdjust:
         ):
             return (images,)
 
-        rgb = _image_rgb(images)
-        adjusted = rgb
-        if not _is_neutral(saturation, 1.0) and rgb.shape[-1] > 1:
-            luma = _luma(adjusted)
-            adjusted = luma + (adjusted - luma) * float(saturation)
-        if not _is_neutral(contrast, 1.0):
-            adjusted = (adjusted - 0.5) * float(contrast) + 0.5
-        if not _is_neutral(brightness_multiplier, 1.0):
-            adjusted = adjusted * float(brightness_multiplier)
-        if not _is_neutral(gamma, 1.0):
-            adjusted = adjusted.clamp(0.0, 1.0).pow(1.0 / float(gamma))
-
-        if images.shape[-1] == adjusted.shape[-1]:
-            out = adjusted
-        else:
-            out = torch.cat((adjusted, images[..., adjusted.shape[-1] :]), dim=-1)
-        return (out.clamp(0.0, 1.0),)
+        # IMAGE batches can contain hundreds of full-resolution video frames.
+        # Keep peak memory bounded to one output batch plus a small frame chunk
+        # instead of constructing several full-batch arithmetic temporaries.
+        with torch.no_grad():
+            output = torch.empty_like(images)
+            for start, end in _chunked_frame_ranges(images):
+                chunk = images[start:end]
+                rgb = _image_rgb(chunk)
+                adjusted = rgb
+                if not _is_neutral(saturation, 1.0) and rgb.shape[-1] > 1:
+                    luma = _luma(adjusted)
+                    adjusted = luma + (adjusted - luma) * float(saturation)
+                if not _is_neutral(contrast, 1.0):
+                    adjusted = (adjusted - 0.5) * float(contrast) + 0.5
+                if not _is_neutral(brightness_multiplier, 1.0):
+                    adjusted = adjusted * float(brightness_multiplier)
+                if not _is_neutral(gamma, 1.0):
+                    adjusted = adjusted.clamp(0.0, 1.0).pow(1.0 / float(gamma))
+                output[start:end] = _restore_channels(chunk, adjusted.clamp(0.0, 1.0))
+            return (output,)
 
 
 class FurgenGetImageRangeFromBatch:
@@ -1549,7 +1552,13 @@ class FurgenReferenceColorMatch:
                     "FLOAT",
                     {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
                 ),
-            }
+            },
+            "optional": {
+                "brightness_multiplier": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.01},
+                ),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -1557,41 +1566,56 @@ class FurgenReferenceColorMatch:
     FUNCTION = "match"
     CATEGORY = "Furgen/image"
 
-    def match(self, images, reference, mode, strength):
+    def match(self, images, reference, mode, strength, brightness_multiplier=1.0):
         if _is_neutral(strength, 0.0):
-            return (images,)
+            if _is_neutral(brightness_multiplier, 1.0):
+                return (images,)
 
-        rgb = _image_rgb(images)
-        ref_rgb = _image_rgb(reference).to(device=images.device, dtype=images.dtype)
-        if ref_rgb.shape[0] == 1 and rgb.shape[0] != 1:
-            ref_rgb = ref_rgb.expand(rgb.shape[0], -1, -1, -1)
-        elif ref_rgb.shape[0] != rgb.shape[0]:
-            ref_rgb = ref_rgb[:1].expand(rgb.shape[0], -1, -1, -1)
+        # Compute reference statistics once, then process a bounded number of
+        # frames at a time. This replaces the former full-batch expansion and
+        # keeps long RIFE-interpolated clips within ordinary worker RAM.
+        with torch.no_grad():
+            _image_rgb(images)
+            ref_rgb = _first_reference_rgb(reference, images)
+            eps = _eps_for(images)
+            output = torch.empty_like(images)
 
-        eps = torch.finfo(rgb.dtype).eps if rgb.dtype.is_floating_point else 1e-6
-        if mode == "rgb_mean_std":
-            src_mean = rgb.mean(dim=(1, 2), keepdim=True)
-            ref_mean = ref_rgb.mean(dim=(1, 2), keepdim=True)
-            src_std = rgb.std(dim=(1, 2), keepdim=True, unbiased=False).clamp_min(eps)
-            ref_std = ref_rgb.std(dim=(1, 2), keepdim=True, unbiased=False)
-            corrected = (rgb - src_mean) / src_std * ref_std + ref_mean
-        elif mode == "rgb_mean_only":
-            src_mean = rgb.mean(dim=(1, 2), keepdim=True)
-            ref_mean = ref_rgb.mean(dim=(1, 2), keepdim=True)
-            corrected = rgb + (ref_mean - src_mean)
-        elif mode == "luma_mean_std":
-            src_luma = _luma(rgb)
-            ref_luma = _luma(ref_rgb)
-            src_mean = src_luma.mean(dim=(1, 2), keepdim=True)
-            ref_mean = ref_luma.mean(dim=(1, 2), keepdim=True)
-            src_std = src_luma.std(dim=(1, 2), keepdim=True, unbiased=False).clamp_min(eps)
-            ref_std = ref_luma.std(dim=(1, 2), keepdim=True, unbiased=False)
-            corrected_luma = (src_luma - src_mean) / src_std * ref_std + ref_mean
-            corrected = rgb + (corrected_luma - src_luma)
-        else:
-            raise ValueError(f"unsupported color match mode: {mode}")
+            if mode == "rgb_mean_std":
+                ref_mean = ref_rgb.mean(dim=(1, 2), keepdim=True)
+                ref_std = ref_rgb.std(dim=(1, 2), keepdim=True, unbiased=False)
+            elif mode == "rgb_mean_only":
+                ref_mean = ref_rgb.mean(dim=(1, 2), keepdim=True)
+                ref_std = None
+            elif mode == "luma_mean_std":
+                ref_luma = _luma(ref_rgb)
+                ref_mean = ref_luma.mean(dim=(1, 2), keepdim=True)
+                ref_std = ref_luma.std(dim=(1, 2), keepdim=True, unbiased=False)
+            else:
+                raise ValueError(f"unsupported color match mode: {mode}")
 
-        return (_blend_and_restore_channels(images, corrected, strength),)
+            for start, end in _chunked_frame_ranges(images):
+                chunk = images[start:end]
+                rgb = _image_rgb(chunk)
+                if mode == "rgb_mean_std":
+                    src_mean = rgb.mean(dim=(1, 2), keepdim=True)
+                    src_std = rgb.std(dim=(1, 2), keepdim=True, unbiased=False).clamp_min(eps)
+                    corrected = (rgb - src_mean) / src_std * ref_std + ref_mean
+                elif mode == "rgb_mean_only":
+                    src_mean = rgb.mean(dim=(1, 2), keepdim=True)
+                    corrected = rgb + (ref_mean - src_mean)
+                else:
+                    src_luma = _luma(rgb)
+                    src_mean = src_luma.mean(dim=(1, 2), keepdim=True)
+                    src_std = src_luma.std(dim=(1, 2), keepdim=True, unbiased=False).clamp_min(eps)
+                    corrected_luma = (src_luma - src_mean) / src_std * ref_std + ref_mean
+                    corrected = rgb + (corrected_luma - src_luma)
+
+                blended = rgb + (corrected - rgb) * float(strength)
+                if not _is_neutral(brightness_multiplier, 1.0):
+                    blended = blended * float(brightness_multiplier)
+                output[start:end] = _restore_channels(chunk, blended.clamp(0.0, 1.0))
+
+            return (output,)
 
 
 class FurgenBoundaryGradeMatch:

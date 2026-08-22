@@ -194,6 +194,57 @@ def test_sanitize_audio_replaces_non_finite_samples_without_mutating_input():
     assert sanitized["waveform"].tolist() == [[[0.25, 0.0, 1.0, -1.0, 1.0]]]
 
 
+def test_reference_color_match_uses_bounded_chunks_and_folds_brightness(monkeypatch):
+    module = _load_furgen_video_tools()
+    module.torch.manual_seed(7)
+    images = module.torch.rand(7, 16, 20, 3)
+    reference = module.torch.rand(1, 16, 20, 3)
+    observed_ranges = []
+    original_ranges = module._chunked_frame_ranges
+
+    def recording_ranges(batch, chunk_size=None):
+        ranges = list(original_ranges(batch, chunk_size=chunk_size))
+        observed_ranges.extend(ranges)
+        yield from ranges
+
+    monkeypatch.setattr(module, "_chunked_frame_ranges", recording_ranges)
+    output, = module.FurgenReferenceColorMatch().match(
+        images,
+        reference,
+        "rgb_mean_std",
+        0.8,
+        brightness_multiplier=1.02,
+    )
+
+    src_mean = images.mean(dim=(1, 2), keepdim=True)
+    src_std = images.std(dim=(1, 2), keepdim=True, unbiased=False).clamp_min(module.torch.finfo(images.dtype).eps)
+    ref_mean = reference.mean(dim=(1, 2), keepdim=True)
+    ref_std = reference.std(dim=(1, 2), keepdim=True, unbiased=False)
+    corrected = (images - src_mean) / src_std * ref_std + ref_mean
+    expected = ((images + (corrected - images) * 0.8) * 1.02).clamp(0.0, 1.0)
+
+    assert module.torch.allclose(output, expected, atol=1e-6)
+    assert observed_ranges == [(0, 2), (2, 4), (4, 6), (6, 7)]
+
+
+def test_exposure_adjust_uses_bounded_frame_chunks(monkeypatch):
+    module = _load_furgen_video_tools()
+    images = module.torch.rand(7, 8, 8, 3)
+    observed_ranges = []
+    original_ranges = module._chunked_frame_ranges
+
+    def recording_ranges(batch, chunk_size=None):
+        ranges = list(original_ranges(batch, chunk_size=chunk_size))
+        observed_ranges.extend(ranges)
+        yield from ranges
+
+    monkeypatch.setattr(module, "_chunked_frame_ranges", recording_ranges)
+    output, = module.FurgenExposureAdjust().adjust(images, 1.02, 1.0, 1.0, 1.0)
+
+    assert module.torch.allclose(output, (images * 1.02).clamp(0.0, 1.0))
+    assert observed_ranges == [(0, 2), (2, 4), (4, 6), (6, 7)]
+
+
 def _make_test_video(
     path, size="96x64", duration=1.2, frequency=440, video_track_timescale=None, with_audio=True,
 ):
