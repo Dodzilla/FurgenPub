@@ -146,7 +146,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.149"
+AGENT_VERSION = "dm-agent-py/0.10.150"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -5659,6 +5659,7 @@ class DependencyAgent:
                                 lease.work_id,
                                 exc,
                             )
+                            self._handle_lost_gpu_lease(lease, "coordinator_lease_rejected")
                             return
                         with lease.identity_lock:
                             remaining_ms = int(lease.deadline_ms) - _now_ms()
@@ -5672,6 +5673,7 @@ class DependencyAgent:
                                 epoch,
                                 exc,
                             )
+                            self._handle_lost_gpu_lease(lease, "coordinator_lease_expired")
                             return
                         logging.warning(
                             "GPU coordinator lease renew failed; retrying holder=%s workId=%s remainingMs=%d: %s",
@@ -5933,6 +5935,29 @@ class DependencyAgent:
             lease = self._mining_gpu_lease
             self._mining_gpu_lease = None
         self._release_gpu_lease(lease, reason, keep_warm=False)
+
+    def _handle_lost_gpu_lease(self, lease: GPUCoordinatorLease, reason: str) -> None:
+        """Fail closed when a running miner loses its exact coordinator fence."""
+        if lease.holder != "mining":
+            return
+        lease.renew_stop.set()
+        with self._mining_gpu_lease_lock:
+            if self._mining_gpu_lease is lease:
+                self._mining_gpu_lease = None
+            self._mining_gpu_retry_after_ms = max(self._mining_gpu_retry_after_ms, _now_ms() + 2_000)
+        try:
+            self._idle_prl_miner.stop_if_running(reason)
+            logging.error(
+                "Stopped idle PRL miner after GPU coordinator lease loss workId=%s reason=%s",
+                lease.work_id,
+                reason,
+            )
+        except Exception as exc:
+            logging.critical(
+                "Failed to stop idle PRL miner after coordinator lease loss workId=%s: %s",
+                lease.work_id,
+                exc,
+            )
 
     def _register_mining_process_with_gpu_coordinator(self) -> None:
         if not self._gpu_coordinator.configured:
@@ -7190,6 +7215,8 @@ class DependencyAgent:
         try:
             raw = self._coordination_get_json(self._gpu_admission_root_path(), timeout_seconds=5.0)
             root = self._gpu_admission_prune(raw, _now_ms())
+            if root.get("durableDemandActive") is True:
+                return True
             if isinstance(root.get("active"), dict):
                 return True
             return any(
@@ -7708,7 +7735,58 @@ class DependencyAgent:
             if isinstance(config.get("mode"), str):
                 payload["mode"] = str(config["mode"])[:24]
             payload["attestedAtMs"] = _now_ms()
+            try:
+                gateway_status, gateway_payload = api_json(
+                    "GET",
+                    _env_str("DM_INFERENCE_GATEWAY_HEALTH_URL", "http://127.0.0.1:8080/health") or
+                    "http://127.0.0.1:8080/health",
+                    timeout_seconds=3.0,
+                )
+                payload["gatewayReady"] = gateway_status == 200 and gateway_payload.get("ready") is True
+                payload["gatewayBootId"] = str(gateway_payload.get("gatewayBootId") or "")[:64]
+                coordinator_health = gateway_payload.get("coordinator") if isinstance(gateway_payload.get("coordinator"), dict) else {}
+                inference_readiness = coordinator_health.get("inferenceReadiness") if isinstance(coordinator_health.get("inferenceReadiness"), dict) else {}
+                payload["inferenceReady"] = payload["gatewayReady"] and inference_readiness.get("ready") is True
+                if isinstance(inference_readiness.get("reason"), str):
+                    payload["inferenceReadinessReason"] = str(inference_readiness["reason"])[:80]
+            except Exception as exc:
+                payload["gatewayReady"] = False
+                payload["inferenceReady"] = False
+                payload["gatewayError"] = str(exc)[:500]
+            proc_root = Path("/proc")
+            if proc_root.is_dir():
+                agent_process_count = 0
+                watchdog_process_count = 0
+                for entry in proc_root.iterdir():
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+                        comm = (entry / "comm").read_text(encoding="utf-8", errors="replace").strip().lower()
+                    except OSError:
+                        continue
+                    # The watchdog launches the agent through `flock`, whose
+                    # command line also contains the Python script path. Count
+                    # only the Python interpreter so the supervisor is not
+                    # mistaken for a duplicate dependency-agent process.
+                    if "dependency_agent_v1.py" in cmdline and comm.startswith("python"):
+                        agent_process_count += 1
+                    if "dependency_agent_watchdog.sh" in cmdline:
+                        watchdog_process_count += 1
+                payload["agentProcessCount"] = agent_process_count
+                payload["watchdogProcessCount"] = watchdog_process_count
             lease = status.get("lease") if isinstance(status.get("lease"), dict) else {}
+            miner_snapshot = self._idle_prl_miner.snapshot()
+            miner_running = isinstance(miner_snapshot.get("pid"), int) and int(miner_snapshot["pid"]) > 0
+            matching_mining_lease = (
+                isinstance(lease, dict) and
+                str(lease.get("holder") or "").lower() == "mining" and
+                str(lease.get("state") or "").upper() in ("ACTIVE", "REGISTERING")
+            )
+            payload["miningLeaseInvariantOk"] = not miner_running or matching_mining_lease
+            if not payload["miningLeaseInvariantOk"]:
+                payload["inferenceReady"] = False
+                payload["inferenceReadinessReason"] = "unmanaged_mining_process"
             if lease:
                 payload["lease"] = {
                     key: lease.get(key)
