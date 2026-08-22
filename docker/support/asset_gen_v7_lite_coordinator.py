@@ -397,6 +397,7 @@ class GPUCoordinator:
         )
         self.comfy_release_vram_headroom_bytes = max(0, int(comfy_release_vram_headroom_bytes))
         self.last_transition_error = None
+        self.last_comfy_baseline_adjustment = None
         self.mining_stop_durations_ms = []
         self.lock = threading.RLock()
         self.lease_condition = threading.Condition(self.lock)
@@ -880,6 +881,27 @@ class GPUCoordinator:
                 raise CoordinatorError("GPU process probe failed after full ComfyUI release")
             if released:
                 return
+            # Comfy's CUDA allocator can establish a larger persistent process
+            # baseline after its first real workflow than it had during boot
+            # calibration. A successful full /free is the strongest available
+            # proof that models and reclaimable allocator memory were released.
+            # Learn that post-workload baseline only inside the absolute hard
+            # ceiling; the ceiling remains the fail-closed retained-model fence.
+            used_bytes = self._comfy_gpu_bytes()
+            if used_bytes is not None and used_bytes <= self.comfy_release_vram_max_bytes:
+                previous_baseline = self.comfy_idle_baseline_bytes
+                adjusted_baseline = max(previous_baseline or 0, used_bytes)
+                if previous_baseline is None or adjusted_baseline > previous_baseline:
+                    self.comfy_idle_baseline_bytes = adjusted_baseline
+                    self.last_comfy_baseline_adjustment = {
+                        "previousBytes": previous_baseline,
+                        "adjustedBytes": adjusted_baseline,
+                        "hardCeilingBytes": self.comfy_release_vram_max_bytes,
+                        "atMs": int(time.time() * 1000),
+                    }
+                if used_bytes <= self._effective_comfy_release_vram_max_bytes():
+                    self.last_transition_error = None
+                    return
         used_bytes = self._comfy_gpu_bytes()
         error = CoordinatorError("ComfyUI retained GPU memory after free request")
         self.last_transition_error = {
@@ -996,6 +1018,7 @@ class GPUCoordinator:
             "comfyReleaseHeadroomBytes": self.comfy_release_vram_headroom_bytes,
             "comfyReleaseMaxBytes": self.comfy_release_vram_max_bytes,
             "comfyReleaseEffectiveMaxBytes": allowed_bytes,
+            "lastComfyBaselineAdjustment": self.last_comfy_baseline_adjustment,
             "lastTransitionError": self.last_transition_error,
         }
 

@@ -604,6 +604,51 @@ class CoordinatorLeaseTest(unittest.TestCase):
             self.assertTrue(probe_ok)
             self.assertEqual(coordinator._effective_comfy_release_vram_max_bytes(), 2304 * 1024**2)
 
+    def test_full_free_rebaselines_post_workload_comfy_allocator_below_hard_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, http = self.make_coordinator(directory)
+            boot_baseline = 522_190_848
+            post_workload_baseline = 2_722_103_296
+            coordinator.comfy_release_vram_max_bytes = 3 * 1024**3
+            coordinator.comfy_idle_baseline_bytes = boot_baseline
+            coordinator.comfy_release_vram_headroom_bytes = 512 * 1024**2
+            coordinator._wait_for_comfy_vram_release = mock.Mock(side_effect=[(False, True), (False, True)])
+            coordinator._comfy_gpu_bytes = mock.Mock(return_value=post_workload_baseline)
+
+            coordinator._free_comfy(preserve_cache=True)
+
+            self.assertEqual(len(http.free_payloads), 2)
+            self.assertEqual(http.free_payloads[-1], {"unload_models": True, "free_memory": True})
+            self.assertEqual(coordinator.comfy_idle_baseline_bytes, post_workload_baseline)
+            self.assertEqual(
+                coordinator.last_comfy_baseline_adjustment,
+                {
+                    "previousBytes": boot_baseline,
+                    "adjustedBytes": post_workload_baseline,
+                    "hardCeilingBytes": 3 * 1024**3,
+                    "atMs": mock.ANY,
+                },
+            )
+            self.assertIsNone(coordinator.last_transition_error)
+
+    def test_full_free_does_not_rebaseline_comfy_above_hard_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, http = self.make_coordinator(directory)
+            boot_baseline = 512 * 1024**2
+            coordinator.comfy_release_vram_max_bytes = 3 * 1024**3
+            coordinator.comfy_idle_baseline_bytes = boot_baseline
+            coordinator.comfy_release_vram_headroom_bytes = 512 * 1024**2
+            coordinator._wait_for_comfy_vram_release = mock.Mock(side_effect=[(False, True), (False, True)])
+            coordinator._comfy_gpu_bytes = mock.Mock(return_value=4 * 1024**3)
+
+            with self.assertRaisesRegex(Exception, "ComfyUI retained GPU memory"):
+                coordinator._free_comfy(preserve_cache=True)
+
+            self.assertEqual(len(http.free_payloads), 2)
+            self.assertEqual(coordinator.comfy_idle_baseline_bytes, boot_baseline)
+            self.assertIsNone(coordinator.last_comfy_baseline_adjustment)
+            self.assertEqual(coordinator.last_transition_error["allowedBytes"], 1024**3)
+
     def test_stopped_llama_readiness_requires_vram_handoff_precondition(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator, _ = self.make_coordinator(directory, enforcing=True)
