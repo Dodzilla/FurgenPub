@@ -146,7 +146,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.152"
+AGENT_VERSION = "dm-agent-py/0.10.153"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -7791,12 +7791,11 @@ class DependencyAgent:
             if not payload["miningLeaseInvariantOk"]:
                 payload["inferenceReady"] = False
                 payload["inferenceReadinessReason"] = "unmanaged_mining_process"
-            if lease:
-                payload["lease"] = {
+            payload["lease"] = {
                     key: lease.get(key)
                     for key in ("holder", "workId", "state", "deadlineMs", "warmDeadlineMs", "registrationDeadlineMs")
                     if key in lease
-                }
+                } if lease else None
             metrics = status.get("metrics") if isinstance(status.get("metrics"), dict) else {}
             if metrics:
                 payload["metrics"] = {
