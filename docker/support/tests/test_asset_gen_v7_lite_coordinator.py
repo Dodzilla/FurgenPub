@@ -118,6 +118,41 @@ class CoordinatorLeaseTest(unittest.TestCase):
         coordinator._gpu_processes = lambda *_args, **_kwargs: []
         return coordinator, http
 
+    def test_completion_receipt_survives_coordinator_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "coordinator.json"
+            http = FakeHttp(directory)
+            store = SnapshotStore(directory, "fp", min_free_bytes=0)
+            first = GPUCoordinator(
+                "http://127.0.0.1:8081",
+                "http://127.0.0.1:8188",
+                http,
+                store,
+                state_file=state_file,
+                enabled=True,
+                enforce_transitions=False,
+            )
+            first.record_completion(
+                "request-restart",
+                safe=True,
+                gpu_released=True,
+                code="complete",
+            )
+            second = GPUCoordinator(
+                "http://127.0.0.1:8081",
+                "http://127.0.0.1:8188",
+                http,
+                store,
+                state_file=state_file,
+                enabled=True,
+                enforce_transitions=False,
+            )
+            receipt = second.get_completion("request-restart")
+            self.assertIsNotNone(receipt)
+            self.assertTrue(receipt["safe"])
+            self.assertTrue(receipt["gpu_released"])
+            self.assertEqual(receipt["code"], "complete")
+
     def test_llama_eviction_invalidates_resident_handle_but_restores_disk_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             http = FakeHttp(directory)

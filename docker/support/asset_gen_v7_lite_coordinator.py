@@ -407,6 +407,8 @@ class GPUCoordinator:
         self.state = "RECOVERING"
         self.phase = "RECOVERING"
         self.lease = None
+        previous_receipts = (previous_journal or {}).get("completionReceipts")
+        self.completion_receipts = dict(previous_receipts) if isinstance(previous_receipts, dict) else {}
         expected_llama_start = ((previous_journal or {}).get("llama") or {}).get("processStartTime")
         self.llama_pid = self._read_pid(expected_start_time=expected_llama_start)
         self.llama_process = None
@@ -517,6 +519,7 @@ class GPUCoordinator:
                 "processStartTime": self._process_start_time(self.llama_pid),
             },
             "miningNotBeforeMs": self.mining_not_before_ms,
+            "completionReceipts": self.completion_receipts,
         }
         temporary = self.state_file.with_name(f".{self.state_file.name}.{uuid.uuid4().hex}.tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1413,6 +1416,44 @@ class GPUCoordinator:
                 self.lease_condition.notify_all()
             self._persist_journal()
             return {"safe": not keep_warm, "requestComplete": True, "gpuReleased": not keep_warm, "state": self.state}
+
+    def record_completion(self, work_id, **values):
+        with self.lock:
+            now = time.time()
+            cutoff = now - 900
+            self.completion_receipts = {
+                key: value for key, value in self.completion_receipts.items()
+                if isinstance(value, dict) and float(value.get("updated_at", 0)) >= cutoff
+            }
+            receipt = {
+                **values,
+                "request_id": str(work_id),
+                "phase": "request_complete",
+                "request_complete": True,
+                "updated_at": now,
+                "epoch": self.epoch,
+            }
+            self.completion_receipts[str(work_id)] = receipt
+            if len(self.completion_receipts) > 256:
+                ordered = sorted(
+                    self.completion_receipts.items(),
+                    key=lambda item: float(item[1].get("updated_at", 0)),
+                    reverse=True,
+                )[:256]
+                self.completion_receipts = dict(ordered)
+            self._persist_journal()
+            return dict(receipt)
+
+    def get_completion(self, work_id):
+        with self.lock:
+            receipt = self.completion_receipts.get(str(work_id))
+            if not isinstance(receipt, dict):
+                return None
+            if time.time() - float(receipt.get("updated_at", 0)) > 900:
+                self.completion_receipts.pop(str(work_id), None)
+                self._persist_journal()
+                return None
+            return dict(receipt)
 
     def begin_drain(self):
         with self.lock:

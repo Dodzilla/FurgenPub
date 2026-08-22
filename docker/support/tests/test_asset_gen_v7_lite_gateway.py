@@ -6,6 +6,7 @@ import socket
 import sys
 import threading
 import time
+import tempfile
 import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -345,6 +346,29 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(headers["X-Furgen-Gateway-Boot-Id"], self.gateway.GATEWAY_BOOT_ID)
         self.assertEqual(json.loads(body)["gateway_boot_id"], self.gateway.GATEWAY_BOOT_ID)
 
+    def test_release_receipt_is_recovered_after_gateway_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.gateway.COORDINATOR_STATE_FILE = str(Path(directory) / "coordinator.json")
+            self.gateway.COORDINATOR_EPOCH_FILE = str(Path(directory) / "coordinator.epoch")
+            self.gateway.SNAPSHOT_PATH = str(Path(directory) / "snapshots")
+            self.gateway.COORDINATOR = None
+            self.gateway.set_release(
+                "request-gateway-restart",
+                "request_complete",
+                request_complete=True,
+                gpu_released=True,
+                sleeping=True,
+            )
+            with self.gateway.RELEASES_LOCK:
+                self.gateway.RELEASES.clear()
+            self.gateway.COORDINATOR = None
+
+            receipt = self.gateway.get_release("request-gateway-restart")
+
+            self.assertIsNotNone(receipt)
+            self.assertTrue(receipt["safe"])
+            self.assertTrue(receipt["request_complete"])
+
     def test_cache_metadata_prefers_llama_prompt_timing(self):
         metadata = self.gateway.cache_metadata_from_response({
             "usage": {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 25}},
@@ -448,6 +472,11 @@ class GatewayTest(unittest.TestCase):
         release = self.wait_for_safe_release("request-nonstream")
         self.assertTrue(release["safe"])
         self.assertEqual(release["phase"], "request_complete")
+        concurrency = self.gateway.stage_metrics_snapshot()
+        self.assertEqual(concurrency["gpuExecutions"], 0)
+        self.assertEqual(concurrency["gpuExecutionsMax"], 1)
+        self.assertEqual(concurrency["gpuExecutionsStarted"], 1)
+        self.assertEqual(concurrency["gpuExecutionsCompleted"], 1)
 
     def test_lock_contention_returns_busy_without_forwarding(self):
         self.gateway.GPU_LOCK.acquire()
@@ -466,6 +495,9 @@ class GatewayTest(unittest.TestCase):
                 urllib.request.urlopen(request, timeout=5)
             self.assertEqual(caught.exception.code, 429)
             self.assertIsNone(self.state.last_payload)
+            release = self.wait_for_safe_release("request-busy")
+            self.assertTrue(release["request_complete"])
+            self.assertEqual(release["code"], "queue_timeout")
         finally:
             self.gateway.GPU_LOCK.release()
 
@@ -512,12 +544,19 @@ class GatewayTest(unittest.TestCase):
     def test_sleep_failure_keeps_release_unsafe(self):
         self.state.sleep_after_response = False
         self.gateway.SLEEP_TIMEOUT_SECONDS = 0.05
-        self.request(
-            "/v1/chat/completions",
+        request = urllib.request.Request(
+            self.base_url + "/v1/chat/completions",
+            data=json.dumps({"model": "qwen", "messages": [{"role": "user", "content": "hello"}]}).encode(),
+            headers={
+                "Authorization": "Bearer test-instance-key",
+                "Content-Type": "application/json",
+                "X-Furgen-Request-Id": "request-no-sleep",
+            },
             method="POST",
-            payload={"model": "qwen", "messages": [{"role": "user", "content": "hello"}]},
-            request_id="request-no-sleep",
         )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(caught.exception.code, 503)
         release = self.wait_for_release_phase("request-no-sleep", "error")
         self.assertFalse(release["safe"])
         self.assertEqual(release["code"], "gpu_release_failed")

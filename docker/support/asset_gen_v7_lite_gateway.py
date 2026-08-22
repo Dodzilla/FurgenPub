@@ -66,6 +66,15 @@ COORDINATOR_EPOCH_FILE = os.environ.get("GPU_COORDINATOR_EPOCH_FILE", "/workspac
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 GPU_LOCK = threading.Lock()
 ADMIT_SEMAPHORE = threading.BoundedSemaphore(MAX_GATEWAY_WAITERS)
+STAGE_METRICS_LOCK = threading.Lock()
+STAGE_METRICS = {
+    "gatewayWaiters": 0,
+    "gatewayWaitersMax": 0,
+    "gpuExecutions": 0,
+    "gpuExecutionsMax": 0,
+    "gpuExecutionsStarted": 0,
+    "gpuExecutionsCompleted": 0,
+}
 RELEASES_LOCK = threading.Lock()
 RELEASES = {}
 INFLIGHT_LOCK = threading.Lock()
@@ -80,6 +89,21 @@ REQUIRED_TOOL_CAPABILITIES = (
     "supports_object_arguments",
     "supports_parallel_tool_calls",
 )
+
+
+def update_stage_metric(name, delta=0, maximum_name=None):
+    with STAGE_METRICS_LOCK:
+        STAGE_METRICS[name] = max(0, int(STAGE_METRICS.get(name, 0)) + int(delta))
+        if maximum_name:
+            STAGE_METRICS[maximum_name] = max(
+                int(STAGE_METRICS.get(maximum_name, 0)),
+                STAGE_METRICS[name],
+            )
+
+
+def stage_metrics_snapshot():
+    with STAGE_METRICS_LOCK:
+        return dict(STAGE_METRICS)
 
 
 def http_request(url, method="GET", payload=None, timeout=10, authorize_backend=False):
@@ -231,6 +255,10 @@ def set_release(request_id, phase, **values):
         }
         merged["safe"] = phase == "safe" or (phase == "request_complete" and merged.get("gpu_released") is True)
         RELEASES[request_id] = merged
+    if phase in {"request_complete", "safe"} or values.get("request_complete") is True:
+        persisted = get_coordinator().record_completion(request_id, **merged)
+        with RELEASES_LOCK:
+            RELEASES[request_id] = {**merged, **persisted, "gateway_boot_id": GATEWAY_BOOT_ID}
     prune_releases(now)
 
 
@@ -238,7 +266,10 @@ def get_release(request_id):
     prune_releases()
     with RELEASES_LOCK:
         value = RELEASES.get(request_id)
-        return dict(value) if value else None
+        if value:
+            return dict(value)
+    persisted = get_coordinator().get_completion(request_id)
+    return {**persisted, "gateway_boot_id": GATEWAY_BOOT_ID} if persisted else None
 
 
 def register_inflight(request_id, backend):
@@ -287,8 +318,59 @@ def clear_cancelled(request_id):
         CANCELLED_REQUESTS.pop(request_id, None)
 
 
+def record_safe_rejection(request_id, code):
+    try:
+        set_release(
+            request_id,
+            "request_complete",
+            code=code,
+            request_failed=True,
+            request_complete=True,
+            gpu_released=True,
+            sleeping=not get_coordinator().llama_running(),
+        )
+    except Exception as error:
+        print(f"Failed persisting safe rejection receipt request={request_id} code={code}: {error}", flush=True)
+
+
+def finalize_request_release(request_id, coordinator_lease, started_at, response_ready_ms, cache_state):
+    release_completed_ms = round((time.monotonic() - started_at) * 1000)
+    if COORDINATOR_MODE in {"enforcing", "shadow"}:
+        released = get_coordinator().release(
+            coordinator_lease["fencingToken"],
+            coordinator_lease["epoch"],
+            keep_warm=WARM_RESIDENCY_ENABLED,
+            reason="request_complete",
+        )
+        if COORDINATOR_MODE == "shadow" and not force_llama_sleep():
+            raise CoordinatorError("Inference backend did not sleep after request completion")
+        set_release(
+            request_id,
+            "request_complete",
+            response_ready_ms=response_ready_ms,
+            release_completed_ms=release_completed_ms,
+            request_complete=True,
+            gpu_released=released["gpuReleased"],
+            sleeping=not get_coordinator().llama_running() if COORDINATOR_MODE == "enforcing" else True,
+            cache=cache_state,
+        )
+        return
+    if not force_llama_sleep():
+        raise CoordinatorError("Inference backend did not sleep after request completion")
+    set_release(
+        request_id,
+        "request_complete",
+        response_ready_ms=response_ready_ms,
+        release_completed_ms=release_completed_ms,
+        request_complete=True,
+        gpu_released=True,
+        sleeping=True,
+        cache=cache_state,
+    )
+
+
 def health_payload():
-    statuses = {}
+    statuses = {"gatewayBootId": GATEWAY_BOOT_ID}
     try:
         comfy_status, _, _ = http_request(f"{COMFY_BASE_URL}/system_stats", timeout=5)
         statuses["comfyui"] = comfy_status == 200
@@ -314,12 +396,19 @@ def health_payload():
         "snapshotRestore": SNAPSHOT_RESTORE_ENABLED,
         "state": coordinator_status["state"],
         "inferenceReadiness": inference_readiness,
+        "metrics": coordinator_status.get("metrics", {}),
+        "lease": {
+            key: coordinator_status.get("lease", {}).get(key)
+            for key in ("holder", "workId", "state")
+            if isinstance(coordinator_status.get("lease"), dict) and key in coordinator_status["lease"]
+        },
     }
     statuses["admission"] = {
         "mode": ADMISSION_MODE,
         "maxWaitSeconds": ADMIT_MAX_WAIT_SECONDS,
         "maxWaiters": MAX_GATEWAY_WAITERS,
     }
+    statuses["concurrency"] = stage_metrics_snapshot()
     if statuses["llama"]:
         inference_ready = statuses["tool_calling"]
     elif COORDINATOR_MODE == "enforcing":
@@ -706,16 +795,19 @@ class Handler(JsonHandler):
             return
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length <= 0 or length > MAX_BODY_BYTES:
+            record_safe_rejection(request_id, "request_too_large")
             self.send_json(413, {"error": {"message": "Request body is empty or too large.", "code": "request_too_large"}})
             return
         body = self.rfile.read(length)
         try:
             request_payload = json.loads(body)
         except json.JSONDecodeError:
+            record_safe_rejection(request_id, "invalid_json")
             self.send_json(400, {"error": {"message": "Invalid JSON.", "code": "invalid_json"}})
             return
         cache_handle = self.headers.get("X-Furgen-Prompt-Cache-Handle", "").strip() or None
         if cache_handle and not re.fullmatch(r"[A-Za-z0-9_-]{1,16}\.[a-f0-9]{64}", cache_handle):
+            record_safe_rejection(request_id, "prompt_cache_handle_invalid")
             self.send_json(400, {"error": {"message": "Invalid prompt cache handle.", "code": "prompt_cache_handle_invalid"}})
             return
         # Never leak caller-selected keys to llama.cpp. Functions sends only an
@@ -730,6 +822,7 @@ class Handler(JsonHandler):
                 admission_ticket_id,
                 admission_server_type,
             )):
+                record_safe_rejection(request_id, "admission_claim_required")
                 self.send_json(409, {"error": {"message": "A valid admission claim is required.", "code": "admission_claim_required"}})
                 return
             try:
@@ -740,26 +833,36 @@ class Handler(JsonHandler):
                     request_id,
                 )
             except Exception as error:
+                record_safe_rejection(request_id, "admission_validation_failed")
                 self.send_json(503, {"error": {"message": "Admission claim validation failed.", "code": "admission_validation_failed", "detail": str(error)}})
                 return
             if not admission_valid:
+                record_safe_rejection(request_id, "admission_claim_revoked")
                 self.send_json(409, {"error": {"message": "The admission claim is no longer current.", "code": "admission_claim_revoked"}})
                 return
         if not ADMIT_SEMAPHORE.acquire(blocking=False):
             status = 503 if ADMISSION_MODE == "enforcing" else 429
             code = "gpu_handoff_failed" if ADMISSION_MODE == "enforcing" else "queue_full"
+            record_safe_rejection(request_id, code)
             self.send_json(status, {"error": {"message": "The bounded gateway handoff is unavailable.", "code": code}}, headers={"Retry-After": "1"})
             return
+        update_stage_metric("gatewayWaiters", 1, "gatewayWaitersMax")
         lock_wait = ADMIT_MAX_WAIT_SECONDS if ADMISSION_MODE == "enforcing" else 0
         if not GPU_LOCK.acquire(timeout=lock_wait):
+            update_stage_metric("gatewayWaiters", -1)
             ADMIT_SEMAPHORE.release()
             status = 503 if ADMISSION_MODE == "enforcing" else 429
             code = "gpu_handoff_failed" if ADMISSION_MODE == "enforcing" else "queue_timeout"
+            record_safe_rejection(request_id, code)
             self.send_json(status, {"error": {"message": "The gateway handoff wait expired.", "code": code}}, headers={"Retry-After": "1"})
             return
+        update_stage_metric("gatewayWaiters", -1)
+        update_stage_metric("gpuExecutions", 1, "gpuExecutionsMax")
+        update_stage_metric("gpuExecutionsStarted", 1)
         response_sent = False
         started_at = time.monotonic()
         coordinator_lease = None
+        release_finalized = False
         cache_state = {"classification": "unkeyed", "restored": False}
         set_release(request_id, "preparing", started_at=time.time())
         try:
@@ -871,6 +974,15 @@ class Handler(JsonHandler):
                 if cache_handle and 200 <= status < 300 and COORDINATOR_MODE == "enforcing":
                     response_payload = response_payload if isinstance(response_payload, dict) else {}
                     record_cache_observation(cache_handle, cache_state, response_payload)
+                finalize_request_release(
+                    request_id,
+                    coordinator_lease,
+                    started_at,
+                    response_ready_ms,
+                    cache_state,
+                )
+                coordinator_lease = None
+                release_finalized = True
                 self.send_bytes(
                     status,
                     content_type,
@@ -878,36 +990,19 @@ class Handler(JsonHandler):
                     headers=cache_response_headers(request_id, cache_state),
                 )
                 response_sent = True
-            release_completed_ms = round((time.monotonic() - started_at) * 1000)
-            if COORDINATOR_MODE in {"enforcing", "shadow"}:
-                released = get_coordinator().release(
-                    coordinator_lease["fencingToken"],
-                    coordinator_lease["epoch"],
-                    keep_warm=WARM_RESIDENCY_ENABLED,
-                    reason="request_complete",
-                )
-                if COORDINATOR_MODE == "shadow" and not force_llama_sleep():
-                    set_release(request_id, "error", code="gpu_release_failed", request_failed=False, sleeping=False)
-                    return
-                set_release(
+            if not release_finalized:
+                finalize_request_release(
                     request_id,
-                    "request_complete",
-                    response_ready_ms=response_ready_ms,
-                    release_completed_ms=release_completed_ms,
-                    request_complete=True,
-                    gpu_released=released["gpuReleased"],
-                    sleeping=not get_coordinator().llama_running() if COORDINATOR_MODE == "enforcing" else True,
-                    cache=cache_state,
+                    coordinator_lease,
+                    started_at,
+                    response_ready_ms,
+                    cache_state,
                 )
-            else:
-                slept = force_llama_sleep()
-                if slept:
-                    set_release(request_id, "request_complete", response_ready_ms=response_ready_ms, release_completed_ms=release_completed_ms, request_complete=True, gpu_released=True, sleeping=True)
-                else:
-                    set_release(request_id, "error", code="gpu_release_failed", response_ready_ms=response_ready_ms, release_completed_ms=release_completed_ms, sleeping=False)
+                coordinator_lease = None
+                release_finalized = True
         except LeaseConflict as error:
             code = "gpu_handoff_failed" if ADMISSION_MODE == "enforcing" else error.code
-            set_release(request_id, "error", code=code, request_failed=True)
+            record_safe_rejection(request_id, code)
             if not response_sent:
                 self.send_json(503, {"error": {"message": str(error), "code": code}}, headers={"Retry-After": "5"})
         except Exception as error:
@@ -945,6 +1040,8 @@ class Handler(JsonHandler):
                 self.send_json(status, {"error": {"message": message, "code": code, "detail": str(error)}}, headers=headers)
         finally:
             clear_cancelled(request_id)
+            update_stage_metric("gpuExecutions", -1)
+            update_stage_metric("gpuExecutionsCompleted", 1)
             GPU_LOCK.release()
             ADMIT_SEMAPHORE.release()
 
