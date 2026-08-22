@@ -71,8 +71,11 @@ Optional knobs:
   - DM_AGENT_API_RETRY_MAX_SECONDS (max agent API retry backoff; default: 20)
   - DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS (extra retries for terminal job events; default: 8)
   - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
-  - DM_VIDEO_OUTPUT_QUALITY_GATE_ENABLED (decode + entropy gate before video upload; default: true on video_gen_v4)
+  - DM_VIDEO_OUTPUT_QUALITY_GATE_ENABLED (decode + entropy gate before video upload; default: true on video server types)
   - DM_VIDEO_OUTPUT_MIN_NORMALIZED_LUMA_ENTROPY (median normalized luma entropy floor; default: 0.65)
+  - DM_VIDEO_OUTPUT_CORRUPTION_SIGNATURE_ENABLED (H3 oversaturation/weak-motion safety gate; default: true on video_minimax_h3 types)
+  - DM_VIDEO_OUTPUT_SUSPICIOUS_SATURATION_FLOOR (H3 signalstats SATAVG median floor; default: 27)
+  - DM_VIDEO_OUTPUT_SUSPICIOUS_TEMPORAL_DIFF_CEILING (H3 signalstats YDIF median ceiling; default: 20)
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_COMFY_NODE_TIMING_ENABLED  (capture native Comfy node-boundary timings; default: true on video_gen_v3/video_gen_v4)
   - DM_COMFY_NODE_TIMING_MAX_ROWS (maximum persisted slow-node rows per job; default/max: 64)
@@ -143,7 +146,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.146"
+AGENT_VERSION = "dm-agent-py/0.10.147"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -1335,14 +1338,17 @@ class OutputQualityValidationError(RuntimeError):
 def inspect_video_output_quality(
     video_path: Path,
     minimum_normalized_luma_entropy: float = 0.65,
+    suspicious_saturation_floor: Optional[float] = None,
+    suspicious_temporal_diff_ceiling: Optional[float] = None,
     ffmpeg_path: Optional[str] = None,
     timeout_seconds: float = 300.0,
 ) -> Dict[str, Any]:
     """Fully decode a video and reject the low-entropy garble seen on bad 5090 hosts.
 
-    The entropy filter samples at one frame per second while ffmpeg still
-    decodes the complete video. Requiring both the median and p90 sample to be
-    low avoids rejecting a normal video for one dark transition frame.
+    Entropy and signalstats sample at one frame per second while ffmpeg still
+    decodes the complete video. The optional composite signature catches the
+    persistently oversaturated, weakly changing output produced by the corrupt
+    H3 checkpoint incident without treating either property alone as a failure.
     """
     resolved_ffmpeg = ffmpeg_path or shutil.which("ffmpeg")
     if not resolved_ffmpeg:
@@ -1359,7 +1365,7 @@ def inspect_video_output_quality(
         "-map",
         "0:v:0",
         "-vf",
-        "fps=1,entropy,metadata=print",
+        "fps=1,signalstats,entropy,metadata=print",
         "-f",
         "null",
         "-",
@@ -1392,24 +1398,46 @@ def inspect_video_output_quality(
             "output_quality_probe_failed: ffmpeg emitted no normalized luma entropy samples",
         )
 
+    probe_output = f"{proc.stdout}\n{proc.stderr}"
+
+    def _median(values: List[float]) -> float:
+        ordered_values = sorted(values)
+        midpoint_value = len(ordered_values) // 2
+        return (
+            ordered_values[midpoint_value]
+            if len(ordered_values) % 2 == 1
+            else (ordered_values[midpoint_value - 1] + ordered_values[midpoint_value]) / 2.0
+        )
+
     ordered = sorted(entropy_values)
     sample_count = len(ordered)
-    midpoint = sample_count // 2
-    median = (
-        ordered[midpoint]
-        if sample_count % 2 == 1
-        else (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
-    )
+    median = _median(entropy_values)
     p90_index = max(0, min(sample_count - 1, int(math.ceil(sample_count * 0.90)) - 1))
     p90 = ordered[p90_index]
+    saturation_values = [
+        float(match.group(1))
+        for match in re.finditer(r"lavfi\.signalstats\.SATAVG=([0-9]+(?:\.[0-9]+)?)", probe_output)
+    ]
+    temporal_diff_values = [
+        float(match.group(1))
+        for match in re.finditer(r"lavfi\.signalstats\.YDIF=([0-9]+(?:\.[0-9]+)?)", probe_output)
+    ]
+    # signalstats emits YDIF=0 for the first sampled frame because there is no
+    # predecessor. Exclude only that bootstrap sample from the temporal median.
+    if temporal_diff_values and temporal_diff_values[0] == 0:
+        temporal_diff_values = temporal_diff_values[1:]
+    median_saturation = _median(saturation_values) if saturation_values else None
+    median_temporal_diff = _median(temporal_diff_values) if temporal_diff_values else None
     threshold = max(0.0, min(1.0, float(minimum_normalized_luma_entropy)))
     metrics = {
-        "gateVersion": "normalized_luma_entropy_v1",
+        "gateVersion": "video_signal_quality_v2",
         "sampleCount": sample_count,
         "medianNormalizedLumaEntropy": round(median, 6),
         "p90NormalizedLumaEntropy": round(p90, 6),
         "minimumNormalizedLumaEntropy": round(threshold, 6),
         "decodeVerified": True,
+        **({"medianSaturation": round(median_saturation, 6)} if median_saturation is not None else {}),
+        **({"medianTemporalDifference": round(median_temporal_diff, 6)} if median_temporal_diff is not None else {}),
     }
     if median < threshold and p90 < min(1.0, threshold + 0.08):
         raise OutputQualityValidationError(
@@ -1417,6 +1445,22 @@ def inspect_video_output_quality(
             f"(median={median:.4f}, p90={p90:.4f}, threshold={threshold:.4f})",
             metrics,
         )
+    if (
+        suspicious_saturation_floor is not None
+        and suspicious_temporal_diff_ceiling is not None
+        and median_saturation is not None
+        and median_temporal_diff is not None
+    ):
+        saturation_floor = max(0.0, float(suspicious_saturation_floor))
+        temporal_ceiling = max(0.0, float(suspicious_temporal_diff_ceiling))
+        metrics["suspiciousSaturationFloor"] = round(saturation_floor, 6)
+        metrics["suspiciousTemporalDifferenceCeiling"] = round(temporal_ceiling, 6)
+        if median_saturation >= saturation_floor and median_temporal_diff <= temporal_ceiling:
+            raise OutputQualityValidationError(
+                "output_quality_validation_failed: generated video matches the corrupt H3 visual signature "
+                f"(medianSaturation={median_saturation:.4f}, medianTemporalDifference={median_temporal_diff:.4f})",
+                metrics,
+            )
     return metrics
 
 
@@ -2743,6 +2787,11 @@ class LocalState:
     lru: Dict[str, Dict[str, Any]]
     # Download retry schedule: depId -> {itemId, resolved, attempts, nextAttemptAtMs, lastError, lastAttemptAtMs}
     retry: Dict[str, Dict[str, Any]]
+    # depId -> durable proof for the exact file bytes that were accepted.
+    # The stat fingerprint makes normal job admission cheap; the first use in
+    # every agent process re-hashes the file so silent on-disk corruption cannot
+    # survive an agent restart.
+    verified: Dict[str, Dict[str, Any]]
     # Custom-node classes that a successful bundle install proved were
     # available. Every later ComfyUI restart must re-prove this contract before
     # the worker can restore its readiness marker.
@@ -2758,6 +2807,7 @@ class LocalState:
             failed=set(),
             lru={},
             retry={},
+            verified={},
             node_bundle_verify_class_types=set(),
             node_bundle_verify_class_types_by_bundle={},
         )
@@ -4831,11 +4881,23 @@ class DependencyAgent:
         self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
         self.video_output_quality_gate_enabled = _env_bool(
             "DM_VIDEO_OUTPUT_QUALITY_GATE_ENABLED",
-            self.server_type == "video_gen_v4",
+            self.server_type.startswith("video_"),
         )
         self.video_output_min_normalized_luma_entropy = max(
             0.0,
             min(1.0, _env_float("DM_VIDEO_OUTPUT_MIN_NORMALIZED_LUMA_ENTROPY", 0.65)),
+        )
+        self.video_output_corruption_signature_enabled = _env_bool(
+            "DM_VIDEO_OUTPUT_CORRUPTION_SIGNATURE_ENABLED",
+            self.server_type.startswith("video_minimax_h3"),
+        )
+        self.video_output_suspicious_saturation_floor = max(
+            0.0,
+            _env_float("DM_VIDEO_OUTPUT_SUSPICIOUS_SATURATION_FLOOR", 27.0),
+        )
+        self.video_output_suspicious_temporal_diff_ceiling = max(
+            0.0,
+            _env_float("DM_VIDEO_OUTPUT_SUSPICIOUS_TEMPORAL_DIFF_CEILING", 20.0),
         )
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         # Post-job Comfy recycle is opt-in only. video_gen_v4 previously
@@ -4933,6 +4995,7 @@ class DependencyAgent:
 
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._dependency_verification_lock = threading.Lock()
         # A ComfyUI restart is a process-level operation shared by every agent
         # worker. Keep the restart and readiness wait in one critical section so
         # concurrent execute workers cannot issue overlapping supervisor restarts.
@@ -4946,6 +5009,7 @@ class DependencyAgent:
         self._resolved_instance_id: Optional[str] = None
         self._profile: Dict[str, Any] = {}
         self._downloading: Set[str] = set()
+        self._session_hash_verified_dep_ids: Set[str] = set()
         self._download_activity: Dict[str, DownloadActivity] = {}
         self._state: LocalState = self._load_state()
         self._dynamic_bytes_used = 0
@@ -10853,6 +10917,8 @@ class DependencyAgent:
 
             self._state.installed_dynamic.discard(dep_id)
             self._state.failed.discard(dep_id)
+            self._state.verified.pop(dep_id, None)
+            self._session_hash_verified_dep_ids.discard(dep_id)
             freed += int(size)
             evicted += 1
             logging.info("Evicted dynamic dependency %s (%d bytes): %s", dep_id, size, dest_rel)
@@ -10945,6 +11011,30 @@ class DependencyAgent:
                             "lastError": last_err or "",
                             "lastAttemptAtMs": max(0, last_attempt),
                         }
+            verified_raw = data.get("verified") if isinstance(data, dict) else None
+            verified: Dict[str, Dict[str, Any]] = {}
+            if isinstance(verified_raw, dict):
+                for dep_id, entry in verified_raw.items():
+                    if not isinstance(dep_id, str) or not dep_id or not isinstance(entry, dict):
+                        continue
+                    dest_rel = entry.get("destRelativePath")
+                    sha256_value = entry.get("sha256")
+                    size_bytes = entry.get("sizeBytes")
+                    mtime_ns = entry.get("mtimeNs")
+                    verified_at_ms = entry.get("verifiedAtMs")
+                    if not isinstance(dest_rel, str) or not dest_rel:
+                        continue
+                    if not isinstance(size_bytes, int) or size_bytes < 0:
+                        continue
+                    if not isinstance(mtime_ns, int) or mtime_ns < 0:
+                        continue
+                    verified[dep_id] = {
+                        "destRelativePath": dest_rel,
+                        "sha256": sha256_value.lower() if isinstance(sha256_value, str) else "",
+                        "sizeBytes": size_bytes,
+                        "mtimeNs": mtime_ns,
+                        "verifiedAtMs": verified_at_ms if isinstance(verified_at_ms, int) else 0,
+                    }
             node_bundle_verify_class_types = set(
                 class_type
                 for class_type in data.get("node_bundle_verify_class_types", [])
@@ -10970,6 +11060,7 @@ class DependencyAgent:
                 failed=failed,
                 lru=lru,
                 retry=retry,
+                verified=verified,
                 node_bundle_verify_class_types=node_bundle_verify_class_types,
                 node_bundle_verify_class_types_by_bundle=node_bundle_verify_class_types_by_bundle,
             )
@@ -10984,6 +11075,7 @@ class DependencyAgent:
             "failed": sorted(self._state.failed),
             "lru": self._state.lru,
             "retry": self._state.retry,
+            "verified": self._state.verified,
             "node_bundle_verify_class_types": sorted(self._state.node_bundle_verify_class_types),
             "node_bundle_verify_class_types_by_bundle": {
                 bundle_id: sorted(class_types)
@@ -11518,6 +11610,21 @@ class DependencyAgent:
             "diskDiagnostics": self._disk_diagnostics_payload(),
             "dynamicBytesUsed": dynamic_bytes_used,
         }
+        if state == "succeeded":
+            dep_id = item.get("depId")
+            with self._lock:
+                verification = self._state.verified.get(dep_id) if isinstance(dep_id, str) else None
+            if isinstance(verification, dict):
+                body["verification"] = {
+                    "algorithm": "sha256" if verification.get("sha256") else "size",
+                    "sha256": verification.get("sha256") or None,
+                    "sizeBytes": verification.get("sizeBytes"),
+                    "mtimeNs": str(verification.get("mtimeNs")) if verification.get("mtimeNs") is not None else None,
+                    "verifiedAtMs": verification.get("verifiedAtMs"),
+                    "destRelativePath": verification.get("destRelativePath"),
+                    "finalPathVerified": True,
+                    "agentVersion": AGENT_VERSION,
+                }
         if error:
             body["error"] = error[:MAX_AGENT_ERROR_MESSAGE_CHARS]
         status, response = api_json(
@@ -12314,11 +12421,138 @@ class DependencyAgent:
             except Exception:
                 pass
 
+    def _invalidate_dependency_verification_locked(self, dep_id: str, mark_failed: bool = False) -> None:
+        self._state.verified.pop(dep_id, None)
+        self._session_hash_verified_dep_ids.discard(dep_id)
+        self._state.installed_static.discard(dep_id)
+        self._state.installed_dynamic.discard(dep_id)
+        previous_lru = self._state.lru.pop(dep_id, None)
+        previous_size = previous_lru.get("sizeBytes") if isinstance(previous_lru, dict) else 0
+        if isinstance(previous_size, int) and previous_size > 0:
+            self._dynamic_bytes_used = max(0, int(getattr(self, "_dynamic_bytes_used", 0)) - previous_size)
+        if mark_failed:
+            self._state.failed.add(dep_id)
+
+    def _record_dependency_verification_locked(
+        self,
+        dep_id: str,
+        dest_rel: str,
+        dest_abs: Path,
+        sha256_value: str,
+    ) -> Dict[str, Any]:
+        stat_result = dest_abs.stat()
+        record = {
+            "destRelativePath": dest_rel,
+            "sha256": str(sha256_value or "").strip().lower(),
+            "sizeBytes": int(stat_result.st_size),
+            "mtimeNs": int(stat_result.st_mtime_ns),
+            "verifiedAtMs": _now_ms(),
+        }
+        self._state.verified[dep_id] = record
+        self._session_hash_verified_dep_ids.add(dep_id)
+        return dict(record)
+
+    @staticmethod
+    def _verification_record_matches_stat(record: Dict[str, Any], dest_rel: str, stat_result: os.stat_result) -> bool:
+        return (
+            record.get("destRelativePath") == dest_rel
+            and record.get("sizeBytes") == int(stat_result.st_size)
+            and record.get("mtimeNs") == int(stat_result.st_mtime_ns)
+        )
+
+    def _verify_resolved_dependency_file(
+        self,
+        item: Dict[str, Any],
+        *,
+        require_full_hash: bool,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
+        dep_id = item.get("depId")
+        resolved = item.get("resolved")
+        if not isinstance(dep_id, str) or not dep_id or not isinstance(resolved, dict):
+            return False
+        dest_rel = resolved.get("destRelativePath")
+        if not isinstance(dest_rel, str) or not dest_rel:
+            return False
+        dest_abs = safe_join(self.comfyui_dir, dest_rel)
+        expected_size_raw = resolved.get("expectedSizeBytes")
+        expected_size = int(expected_size_raw) if isinstance(expected_size_raw, (int, float)) and expected_size_raw > 0 else 0
+        expected_sha = str(resolved.get("sha256") or "").strip().lower()
+
+        verification_lock = getattr(self, "_dependency_verification_lock", None)
+        if verification_lock is None:
+            verification_lock = threading.Lock()
+            self._dependency_verification_lock = verification_lock
+        with verification_lock:
+            try:
+                stat_result = dest_abs.stat()
+            except OSError:
+                with self._lock:
+                    self._invalidate_dependency_verification_locked(dep_id)
+                    self._save_state()
+                return False
+            if not dest_abs.is_file() or (expected_size > 0 and int(stat_result.st_size) != expected_size):
+                with self._lock:
+                    self._invalidate_dependency_verification_locked(dep_id)
+                    self._save_state()
+                return False
+
+            with self._lock:
+                record = self._state.verified.get(dep_id)
+                record_matches = isinstance(record, dict) and self._verification_record_matches_stat(record, dest_rel, stat_result)
+                sha_matches_record = isinstance(record, dict) and str(record.get("sha256") or "").lower() == expected_sha
+                session_verified = dep_id in self._session_hash_verified_dep_ids
+            if record_matches and sha_matches_record and (not expected_sha or not require_full_hash or session_verified):
+                return True
+
+            actual_sha = sha256_file(dest_abs, progress_cb=progress_cb) if expected_sha else ""
+            if expected_sha and actual_sha.lower() != expected_sha:
+                logging.error(
+                    "Dependency integrity check failed: depId=%s expected=%s got=%s path=%s",
+                    dep_id,
+                    expected_sha,
+                    actual_sha,
+                    str(dest_abs),
+                )
+                with self._lock:
+                    self._invalidate_dependency_verification_locked(dep_id, mark_failed=True)
+                    self._save_state()
+                return False
+
+            with self._lock:
+                self._record_dependency_verification_locked(dep_id, dest_rel, dest_abs, actual_sha or expected_sha)
+                self._save_state()
+            return True
+
+    def _verified_installed_dep_ids_for_execution(self, required_dep_ids: Iterable[str]) -> Set[str]:
+        ready: Set[str] = set()
+        for dep_id in dict.fromkeys(required_dep_ids):
+            if not isinstance(dep_id, str) or not dep_id:
+                continue
+            with self._lock:
+                installed = dep_id in self._state.installed_static or dep_id in self._state.installed_dynamic
+                record = self._state.verified.get(dep_id)
+                downloading = dep_id in self._downloading
+            if not installed or downloading or not isinstance(record, dict):
+                continue
+            item = {
+                "depId": dep_id,
+                "resolved": {
+                    "destRelativePath": record.get("destRelativePath"),
+                    "expectedSizeBytes": record.get("sizeBytes"),
+                    "sha256": record.get("sha256"),
+                },
+            }
+            if self._verify_resolved_dependency_file(item, require_full_hash=True):
+                ready.add(dep_id)
+        return ready
+
     def _current_installed_dep_ids(self) -> Set[str]:
         with self._lock:
             self._reconcile_lru_locked()
             out = set(self._state.installed_static)
             out.update(self._state.installed_dynamic)
+            out.difference_update(self._downloading)
         return out
 
     def _comfy_api_json(
@@ -13540,6 +13774,12 @@ class DependencyAgent:
                         self._state.failed.discard(dep_id)
                         self._state.retry.pop(dep_id, None)
                         self._downloading.discard(dep_id)
+                        self._record_dependency_verification_locked(
+                            dep_id,
+                            dest_rel,
+                            dest_abs,
+                            actual_existing,
+                        )
                         self._save_state()
                     self._clear_download_activity(dep_id)
                     return
@@ -13573,6 +13813,12 @@ class DependencyAgent:
                         self._state.failed.discard(dep_id)
                         self._state.retry.pop(dep_id, None)
                         self._downloading.discard(dep_id)
+                        self._record_dependency_verification_locked(
+                            dep_id,
+                            dest_rel,
+                            dest_abs,
+                            "",
+                        )
                         self._save_state()
                     self._clear_download_activity(dep_id)
                     return
@@ -13708,7 +13954,50 @@ class DependencyAgent:
             self._clear_download_activity(dep_id)
             raise
 
+        # Make the accepted bytes durable before advertising them. Hashing the
+        # partial caught transfer corruption, but the old path trusted the rename
+        # itself and immediately marked the dependency installed. Re-open and
+        # hash the final path after fsync/rename so the installed marker proves
+        # the exact bytes ComfyUI will read.
+        with partial.open("rb") as partial_handle:
+            os.fsync(partial_handle.fileno())
         os.replace(str(partial), str(dest_abs))
+        try:
+            directory_fd = os.open(str(dest_abs.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as fsync_error:
+            logging.warning("Dependency directory fsync failed for %s: %s", dep_id, fsync_error)
+
+        final_actual_sha = ""
+        if isinstance(sha256_expected, str) and sha256_expected:
+            final_actual_sha = sha256_file(
+                dest_abs,
+                progress_cb=_progress_cb("verifying_final_path", "local"),
+            )
+            if final_actual_sha.lower() != sha256_expected.lower():
+                try:
+                    dest_abs.unlink()
+                except OSError:
+                    pass
+                with self._lock:
+                    self._invalidate_dependency_verification_locked(dep_id, mark_failed=True)
+                    self._downloading.discard(dep_id)
+                    self._save_state()
+                raise RuntimeError(
+                    f"final path sha256 mismatch for {dep_id}: expected {sha256_expected}, got {final_actual_sha}"
+                )
+        elif expected_size_bytes > 0 and int(dest_abs.stat().st_size) != expected_size_bytes:
+            final_size_bytes = int(dest_abs.stat().st_size)
+            try:
+                dest_abs.unlink()
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"final path size mismatch for {dep_id}: expected {expected_size_bytes}, got {final_size_bytes}"
+            )
 
         should_heartbeat = False
         with self._lock:
@@ -13723,6 +14012,12 @@ class DependencyAgent:
             self._state.failed.discard(dep_id)
             self._state.retry.pop(dep_id, None)
             self._downloading.discard(dep_id)
+            self._record_dependency_verification_locked(
+                dep_id,
+                dest_rel,
+                dest_abs,
+                final_actual_sha,
+            )
 
             policy = self._dynamic_policy()
             if policy.get("enabled"):
@@ -13749,16 +14044,7 @@ class DependencyAgent:
         dest_rel = resolved.get("destRelativePath")
         if not isinstance(dest_rel, str) or not dest_rel:
             raise RuntimeError("Touch queue item missing resolved destination path")
-        dest_abs = safe_join(self.comfyui_dir, dest_rel)
-        expected_size = resolved.get("expectedSizeBytes")
-        expected_size_bytes = int(expected_size) if isinstance(expected_size, (int, float)) and expected_size > 0 else 0
-        file_is_present = dest_abs.is_file()
-        if file_is_present and expected_size_bytes > 0:
-            try:
-                file_is_present = int(dest_abs.stat().st_size) == expected_size_bytes
-            except OSError:
-                file_is_present = False
-        return not file_is_present
+        return not self._verify_resolved_dependency_file(item, require_full_hash=True)
 
     def _touch_item(self, item: Dict[str, Any]) -> None:
         dep_id = item.get("depId")
@@ -13832,6 +14118,8 @@ class DependencyAgent:
             self._state.failed.discard(dep_id)
             self._state.retry.pop(dep_id, None)
             self._downloading.discard(dep_id)
+            self._state.verified.pop(dep_id, None)
+            self._session_hash_verified_dep_ids.discard(dep_id)
             self._save_state()
 
         logging.info(
@@ -13885,7 +14173,12 @@ class DependencyAgent:
 
             if dep_id:
                 with self._lock:
+                    # Fail closed while replacement bytes are in flight. The old
+                    # implementation left the dependency advertised as installed,
+                    # so a job could race a repair download and use corrupt bytes.
+                    self._invalidate_dependency_verification_locked(dep_id)
                     self._downloading.add(dep_id)
+                    self._save_state()
                 resolved = item.get("resolved") if isinstance(item.get("resolved"), dict) else {}
                 expected_size_raw = resolved.get("expectedSizeBytes") if isinstance(resolved, dict) else None
                 expected_size_bytes = int(expected_size_raw) if isinstance(expected_size_raw, (int, float)) and expected_size_raw > 0 else 0
@@ -14111,14 +14404,24 @@ class DependencyAgent:
         metrics = inspect_video_output_quality(
             local_output,
             minimum_normalized_luma_entropy=self.video_output_min_normalized_luma_entropy,
+            suspicious_saturation_floor=(
+                self.video_output_suspicious_saturation_floor
+                if self.video_output_corruption_signature_enabled else None
+            ),
+            suspicious_temporal_diff_ceiling=(
+                self.video_output_suspicious_temporal_diff_ceiling
+                if self.video_output_corruption_signature_enabled else None
+            ),
             timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
         )
         logging.info(
-            "Video output quality gate passed: file=%s samples=%s medianEntropy=%s p90Entropy=%s",
+            "Video output quality gate passed: file=%s samples=%s medianEntropy=%s p90Entropy=%s medianSaturation=%s medianTemporalDifference=%s",
             os.path.basename(filename),
             metrics.get("sampleCount"),
             metrics.get("medianNormalizedLumaEntropy"),
             metrics.get("p90NormalizedLumaEntropy"),
+            metrics.get("medianSaturation"),
+            metrics.get("medianTemporalDifference"),
         )
         return metrics
 
@@ -14400,8 +14703,8 @@ class DependencyAgent:
                         terminal_sent = True
                         return
 
-                    installed = self._current_installed_dep_ids()
-                    missing = [dep for dep in required_dep_ids if dep not in installed]
+                    verified = self._verified_installed_dep_ids_for_execution(required_dep_ids)
+                    missing = [dep for dep in required_dep_ids if dep not in verified]
                     if not missing:
                         break
 
@@ -14853,8 +15156,8 @@ class DependencyAgent:
                         terminal_sent = True
                         return
 
-                    installed = self._current_installed_dep_ids()
-                    missing = [dep for dep in required_dep_ids if dep not in installed]
+                    verified = self._verified_installed_dep_ids_for_execution(required_dep_ids)
+                    missing = [dep for dep in required_dep_ids if dep not in verified]
                     if not missing:
                         break
 
