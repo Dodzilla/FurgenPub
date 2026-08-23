@@ -71,11 +71,6 @@ Optional knobs:
   - DM_AGENT_API_RETRY_MAX_SECONDS (max agent API retry backoff; default: 20)
   - DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS (extra retries for terminal job events; default: 8)
   - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
-  - DM_VIDEO_OUTPUT_QUALITY_GATE_ENABLED (decode + entropy gate before video upload; default: true on video server types)
-  - DM_VIDEO_OUTPUT_MIN_NORMALIZED_LUMA_ENTROPY (median normalized luma entropy floor; default: 0.65)
-  - DM_VIDEO_OUTPUT_CORRUPTION_SIGNATURE_ENABLED (H3 oversaturation/weak-motion safety gate; default: true on video_gen_v4)
-  - DM_VIDEO_OUTPUT_SUSPICIOUS_SATURATION_FLOOR (H3 signalstats SATAVG median floor; default: 27)
-  - DM_VIDEO_OUTPUT_SUSPICIOUS_TEMPORAL_DIFF_CEILING (H3 signalstats YDIF median ceiling; default: 20)
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_COMFY_NODE_TIMING_ENABLED  (capture native Comfy node-boundary timings; default: true on video_gen_v3/video_gen_v4)
   - DM_COMFY_NODE_TIMING_MAX_ROWS (maximum persisted slow-node rows per job; default/max: 64)
@@ -146,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.153"
+AGENT_VERSION = "dm-agent-py/0.10.154"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
@@ -1325,143 +1320,6 @@ class NetworkError(RuntimeError):
         self.url = _safe_url_for_logs(url)
         self.reason = reason
         super().__init__(f"Network error calling {self.url}: {reason}")
-
-
-class OutputQualityValidationError(RuntimeError):
-    """A generated media artifact decoded but failed the customer-safety gate."""
-
-    def __init__(self, message: str, metrics: Optional[Dict[str, Any]] = None) -> None:
-        super().__init__(message)
-        self.metrics = metrics or {}
-
-
-def inspect_video_output_quality(
-    video_path: Path,
-    minimum_normalized_luma_entropy: float = 0.65,
-    suspicious_saturation_floor: Optional[float] = None,
-    suspicious_temporal_diff_ceiling: Optional[float] = None,
-    ffmpeg_path: Optional[str] = None,
-    timeout_seconds: float = 300.0,
-) -> Dict[str, Any]:
-    """Fully decode a video and reject the low-entropy garble seen on bad 5090 hosts.
-
-    Entropy and signalstats sample at one frame per second while ffmpeg still
-    decodes the complete video. The optional composite signature catches the
-    persistently oversaturated, weakly changing output produced by the corrupt
-    H3 checkpoint incident without treating either property alone as a failure.
-    """
-    resolved_ffmpeg = ffmpeg_path or shutil.which("ffmpeg")
-    if not resolved_ffmpeg:
-        raise OutputQualityValidationError("output_quality_probe_unavailable: ffmpeg was not found")
-
-    command = [
-        resolved_ffmpeg,
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "info",
-        "-i",
-        str(video_path),
-        "-map",
-        "0:v:0",
-        "-vf",
-        "fps=1,signalstats,entropy,metadata=print",
-        "-f",
-        "null",
-        "-",
-    ]
-    try:
-        proc = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=max(30.0, float(timeout_seconds)),
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise OutputQualityValidationError(f"output_quality_probe_failed: {exc}") from exc
-
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "ffmpeg decode failed").strip()[-500:]
-        raise OutputQualityValidationError(f"output_video_decode_failed: {detail}")
-
-    entropy_values = [
-        float(match.group(1))
-        for match in re.finditer(
-            r"lavfi\.entropy\.normalized_entropy\.normal\.Y=([0-9]+(?:\.[0-9]+)?)",
-            f"{proc.stdout}\n{proc.stderr}",
-        )
-    ]
-    if not entropy_values:
-        raise OutputQualityValidationError(
-            "output_quality_probe_failed: ffmpeg emitted no normalized luma entropy samples",
-        )
-
-    probe_output = f"{proc.stdout}\n{proc.stderr}"
-
-    def _median(values: List[float]) -> float:
-        ordered_values = sorted(values)
-        midpoint_value = len(ordered_values) // 2
-        return (
-            ordered_values[midpoint_value]
-            if len(ordered_values) % 2 == 1
-            else (ordered_values[midpoint_value - 1] + ordered_values[midpoint_value]) / 2.0
-        )
-
-    ordered = sorted(entropy_values)
-    sample_count = len(ordered)
-    median = _median(entropy_values)
-    p90_index = max(0, min(sample_count - 1, int(math.ceil(sample_count * 0.90)) - 1))
-    p90 = ordered[p90_index]
-    saturation_values = [
-        float(match.group(1))
-        for match in re.finditer(r"lavfi\.signalstats\.SATAVG=([0-9]+(?:\.[0-9]+)?)", probe_output)
-    ]
-    temporal_diff_values = [
-        float(match.group(1))
-        for match in re.finditer(r"lavfi\.signalstats\.YDIF=([0-9]+(?:\.[0-9]+)?)", probe_output)
-    ]
-    # signalstats emits YDIF=0 for the first sampled frame because there is no
-    # predecessor. Exclude only that bootstrap sample from the temporal median.
-    if temporal_diff_values and temporal_diff_values[0] == 0:
-        temporal_diff_values = temporal_diff_values[1:]
-    median_saturation = _median(saturation_values) if saturation_values else None
-    median_temporal_diff = _median(temporal_diff_values) if temporal_diff_values else None
-    threshold = max(0.0, min(1.0, float(minimum_normalized_luma_entropy)))
-    metrics = {
-        "gateVersion": "video_signal_quality_v2",
-        "sampleCount": sample_count,
-        "medianNormalizedLumaEntropy": round(median, 6),
-        "p90NormalizedLumaEntropy": round(p90, 6),
-        "minimumNormalizedLumaEntropy": round(threshold, 6),
-        "decodeVerified": True,
-        **({"medianSaturation": round(median_saturation, 6)} if median_saturation is not None else {}),
-        **({"medianTemporalDifference": round(median_temporal_diff, 6)} if median_temporal_diff is not None else {}),
-    }
-    if median < threshold and p90 < min(1.0, threshold + 0.08):
-        raise OutputQualityValidationError(
-            "output_quality_validation_failed: generated video is visually low-entropy/garbled "
-            f"(median={median:.4f}, p90={p90:.4f}, threshold={threshold:.4f})",
-            metrics,
-        )
-    if (
-        suspicious_saturation_floor is not None
-        and suspicious_temporal_diff_ceiling is not None
-        and median_saturation is not None
-        and median_temporal_diff is not None
-    ):
-        saturation_floor = max(0.0, float(suspicious_saturation_floor))
-        temporal_ceiling = max(0.0, float(suspicious_temporal_diff_ceiling))
-        metrics["suspiciousSaturationFloor"] = round(saturation_floor, 6)
-        metrics["suspiciousTemporalDifferenceCeiling"] = round(temporal_ceiling, 6)
-        if median_saturation >= saturation_floor and median_temporal_diff <= temporal_ceiling:
-            raise OutputQualityValidationError(
-                "output_quality_validation_failed: generated video matches the corrupt H3 visual signature "
-                f"(medianSaturation={median_saturation:.4f}, medianTemporalDifference={median_temporal_diff:.4f})",
-                metrics,
-            )
-    return metrics
 
 
 def _json_loads_or_none(text: str) -> Optional[Any]:
@@ -4950,26 +4808,6 @@ class DependencyAgent:
         )
         self.agent_terminal_event_retry_attempts = max(1, min(20, _env_int("DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS", 8)))
         self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
-        self.video_output_quality_gate_enabled = _env_bool(
-            "DM_VIDEO_OUTPUT_QUALITY_GATE_ENABLED",
-            self.server_type.startswith("video_"),
-        )
-        self.video_output_min_normalized_luma_entropy = max(
-            0.0,
-            min(1.0, _env_float("DM_VIDEO_OUTPUT_MIN_NORMALIZED_LUMA_ENTROPY", 0.65)),
-        )
-        self.video_output_corruption_signature_enabled = _env_bool(
-            "DM_VIDEO_OUTPUT_CORRUPTION_SIGNATURE_ENABLED",
-            self.server_type == "video_gen_v4" or self.server_type.startswith("video_minimax_h3"),
-        )
-        self.video_output_suspicious_saturation_floor = max(
-            0.0,
-            _env_float("DM_VIDEO_OUTPUT_SUSPICIOUS_SATURATION_FLOOR", 27.0),
-        )
-        self.video_output_suspicious_temporal_diff_ceiling = max(
-            0.0,
-            _env_float("DM_VIDEO_OUTPUT_SUSPICIOUS_TEMPORAL_DIFF_CEILING", 20.0),
-        )
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
         # Post-job Comfy recycle is opt-in only. video_gen_v4 previously
         # defaulted on, and its Vast template baked
@@ -14565,35 +14403,6 @@ class DependencyAgent:
             return idx, row
         return None
 
-    def _validate_local_output_quality(self, filename: str, local_output: Path) -> Optional[Dict[str, Any]]:
-        if not self.video_output_quality_gate_enabled:
-            return None
-        if Path(filename).suffix.lower() not in (".mp4", ".mov", ".mkv", ".webm", ".m4v"):
-            return None
-        metrics = inspect_video_output_quality(
-            local_output,
-            minimum_normalized_luma_entropy=self.video_output_min_normalized_luma_entropy,
-            suspicious_saturation_floor=(
-                self.video_output_suspicious_saturation_floor
-                if self.video_output_corruption_signature_enabled else None
-            ),
-            suspicious_temporal_diff_ceiling=(
-                self.video_output_suspicious_temporal_diff_ceiling
-                if self.video_output_corruption_signature_enabled else None
-            ),
-            timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
-        )
-        logging.info(
-            "Video output quality gate passed: file=%s samples=%s medianEntropy=%s p90Entropy=%s medianSaturation=%s medianTemporalDifference=%s",
-            os.path.basename(filename),
-            metrics.get("sampleCount"),
-            metrics.get("medianNormalizedLumaEntropy"),
-            metrics.get("p90NormalizedLumaEntropy"),
-            metrics.get("medianSaturation"),
-            metrics.get("medianTemporalDifference"),
-        )
-        return metrics
-
     def _upload_output_artifact(
         self,
         lease: AgentExecuteLease,
@@ -15110,7 +14919,6 @@ class DependencyAgent:
                 )
                 bytes_written = int(local_output.stat().st_size)
                 sha256_sum = sha256_file(local_output)
-                quality_validation = self._validate_local_output_quality(filename, local_output)
                 out_meta = self._upload_output_artifact(
                     lease,
                     target,
@@ -15119,8 +14927,6 @@ class DependencyAgent:
                     bytes_written,
                     sha256_sum,
                 )
-                if quality_validation is not None:
-                    out_meta["qualityValidation"] = quality_validation
                 uploaded_outputs.append(out_meta)
                 try:
                     emit_best_effort("output_uploaded", out_meta)
@@ -15150,10 +14956,6 @@ class DependencyAgent:
                 event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
                 err_code = "cancel_requested" if event_type == "job_cancelled" else "execution_error"
                 error_text = str(e)
-                if event_type == "job_failed" and isinstance(e, OutputQualityValidationError):
-                    err_code = "output_quality_validation_failed"
-                    if e.metrics:
-                        error_text = f"{error_text}; metrics={json.dumps(e.metrics, sort_keys=True)}"
                 node_contract: Optional[Dict[str, Any]] = None
                 if event_type == "job_failed" and (
                     "missing_node_type" in error_text.lower()
@@ -15737,7 +15539,6 @@ class DependencyAgent:
                 hash_started_ms = _now_ms()
                 sha256_sum = sha256_file(local_output)
                 hash_ms = max(0, _now_ms() - hash_started_ms)
-                quality_validation = self._validate_local_output_quality(filename, local_output)
                 out_meta = self._upload_output_artifact(
                     lease,
                     target,
@@ -15746,8 +15547,6 @@ class DependencyAgent:
                     bytes_written,
                     sha256_sum,
                 )
-                if quality_validation is not None:
-                    out_meta["qualityValidation"] = quality_validation
                 timing = out_meta.get("uploadTiming") if isinstance(out_meta.get("uploadTiming"), dict) else {}
                 out_meta["uploadTiming"] = {
                     **timing,
@@ -15799,14 +15598,8 @@ class DependencyAgent:
             terminal_sent = True
         except Exception as e:
             if not terminal_sent:
-                error_code = (
-                    "output_quality_validation_failed"
-                    if isinstance(e, OutputQualityValidationError)
-                    else "upload_error"
-                )
+                error_code = "upload_error"
                 error_text = str(e)
-                if isinstance(e, OutputQualityValidationError) and e.metrics:
-                    error_text = f"{error_text}; metrics={json.dumps(e.metrics, sort_keys=True)}"
                 payload: Dict[str, Any] = {
                     "errorCode": error_code,
                     "errorMessage": error_text[:MAX_AGENT_ERROR_MESSAGE_CHARS],
