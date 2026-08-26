@@ -80,6 +80,33 @@ def _apply_known_inverse_grade(reference, gain, cb, cr):
     return np.clip(_linear_to_srgb(source_linear), 0.0, 1.0).astype(np.float32)
 
 
+def _pan_drift_frames(reference, count=24):
+    targets = []
+    sources = []
+    for index in range(count):
+        target = cv2.warpAffine(
+            reference,
+            np.float32([[1.0, 0.0, index * 1.8], [0.0, 1.0, index * 0.4]]),
+            (reference.shape[1], reference.shape[0]),
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        targets.append(target)
+        sources.append(
+            _apply_known_inverse_grade(
+                target, 1.0 + 0.0045 * index,
+                0.00042 * index, -0.00035 * index,
+            )
+        )
+    return sources, targets
+
+
+def _chroma_bias_error(output, targets):
+    output_color = _linear_to_ycbcr(_srgb_to_linear(output.detach().cpu().numpy()))
+    target_color = _linear_to_ycbcr(_srgb_to_linear(np.stack(targets)))
+    frame_bias = (output_color[..., 1:3] - target_color[..., 1:3]).mean(axis=(1, 2))
+    return float(np.mean(np.linalg.norm(frame_bias, axis=1)))
+
+
 def _run(node, images, reference, **overrides):
     options = {
         "reference_mode": "external_anchor",
@@ -152,6 +179,35 @@ def test_drift_ramp_is_corrected_against_keyframe_without_pairwise_accumulation(
     assert abs(float(output_luma[-1] / output_luma[0]) - 1.0) < abs(float(input_luma[-1] / input_luma[0]) - 1.0) * 0.35
 
 
+def test_persistent_pan_chroma_drift_beats_legacy_gate_without_pumping(module):
+    reference = _texture(seed=101)
+    sources, targets = _pan_drift_frames(reference)
+    images = torch.from_numpy(np.stack(sources))
+    reference_tensor = torch.from_numpy(reference)[None]
+
+    candidate = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50,
+    )
+    legacy = module.FurgenAdaptiveExposureMatch().match(
+        images, reference_tensor, 0.75, 0.82, 1.22, 0.02, 0.98, 0.75,
+    )[0]
+    legacy = module.FurgenColorTransferMatch().match(
+        legacy, reference_tensor, "ycbcr_mean_std", 0.60, 0.10, 0.35,
+        0.50, 0.60, 1.40, 0.80,
+    )[0]
+
+    candidate_error = _chroma_bias_error(candidate, targets)
+    legacy_error = _chroma_bias_error(legacy, targets)
+    assert 1.0 - candidate_error / legacy_error >= 0.20
+
+    source_color = _linear_to_ycbcr(_srgb_to_linear(images.numpy()))
+    output_color = _linear_to_ycbcr(_srgb_to_linear(candidate.numpy()))
+    applied_grade = (output_color[..., 1:3] - source_color[..., 1:3]).mean(axis=(1, 2))
+    second_difference = np.linalg.norm(np.diff(applied_grade, n=2, axis=0), axis=1)
+    assert float(second_difference.max(initial=0.0)) < 0.003
+
+
 def test_clean_homographic_pan_keeps_neutral_grade(module):
     reference = _texture(seed=31, height=144, width=192)
     node = module.FurgenSceneAwareColorStabilize()
@@ -172,6 +228,27 @@ def test_clean_homographic_pan_keeps_neutral_grade(module):
             analysis_width=192, preserve_highlights=0.0,
         )
         assert torch.allclose(output[0], torch.from_numpy(moved), atol=2e-6)
+
+
+def test_clean_pan_noise_does_not_activate_persistent_chroma(module):
+    reference = _texture(seed=35)
+    node = module.FurgenSceneAwareColorStabilize()
+    key = node._analyze(cv2, torch.from_numpy(reference), 160)
+    history = []
+    for index in range(8):
+        moved = cv2.warpAffine(
+            reference,
+            np.float32([[1.0, 0.0, index * 1.8], [0.0, 1.0, index * 0.4]]),
+            (160, 128),
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        estimate = node._estimate(cv2, key, node._analyze(cv2, torch.from_numpy(moved), 160))
+        history.append((index, estimate["raw_cb"], estimate["raw_cr"]))
+        assert abs(estimate["raw_cb"]) <= node.CHROMA_NEUTRAL_BAND
+        assert abs(estimate["raw_cr"]) <= node.CHROMA_NEUTRAL_BAND
+        assert estimate["cb"] == 0.0
+        assert estimate["cr"] == 0.0
+    assert not node._persistent_chroma_trend(history)
 
 
 def test_clean_mild_zoom_stays_inside_neutrality_gate(module):
@@ -240,6 +317,27 @@ def test_hard_cut_does_not_carry_the_previous_palette(module):
     assert torch.allclose(output[4], images[4], atol=2e-5)
 
 
+def test_hard_cut_resets_active_chroma_trend(module):
+    reference = _texture(seed=45)
+    drifted, _ = _pan_drift_frames(reference, count=8)
+    second = np.zeros_like(reference)
+    for x in range(0, second.shape[1], 12):
+        second[:, x:x + 5] = (0.12, 0.70, 0.22)
+    for y in range(6, second.shape[0], 24):
+        cv2.rectangle(
+            second, (0, y), (second.shape[1] - 1, y + 4),
+            (0.05, 0.18, 0.85), -1,
+        )
+    images = torch.from_numpy(np.stack((*drifted, second, second, second)))
+
+    output = _run(
+        module.FurgenSceneAwareColorStabilize(), images,
+        torch.from_numpy(reference)[None], temporal_smoothing=0.50,
+    )
+
+    assert torch.allclose(output[8:], images[8:], atol=2e-5)
+
+
 def test_localized_orb_matches_cannot_veto_a_similarly_textured_hard_cut(module):
     rng = np.random.default_rng(200)
     shared_patch = rng.random((56, 56, 3), dtype=np.float32) * 0.60 + 0.20
@@ -281,6 +379,29 @@ def test_persistent_stable_geometry_lighting_jump_is_not_undone(module):
     # The first jump coasts and the second rebases; neither is pulled back to the old exposure.
     assert torch.mean(torch.abs(output[2] - images[2])).item() < 2e-5
     assert torch.mean(torch.abs(output[3] - images[3])).item() < 2e-5
+
+
+def test_persistent_lighting_rebase_clears_chroma_trend_history(module, monkeypatch):
+    reference = _texture(seed=49)
+    drifted, _ = _pan_drift_frames(reference, count=7)
+    brighter = np.clip(
+        _linear_to_srgb(_srgb_to_linear(drifted[-1]) * 1.30), 0.0, 1.0,
+    ).astype(np.float32)
+    images = torch.from_numpy(np.stack((*drifted, *([brighter] * 8))))
+    node = module.FurgenSceneAwareColorStabilize()
+    history_lengths = []
+    original = node._persistent_chroma_trend
+
+    def record(history):
+        history_lengths.append(len(history))
+        return original(history)
+
+    monkeypatch.setattr(node, "_persistent_chroma_trend", record)
+    _run(node, images, torch.from_numpy(reference)[None], temporal_smoothing=0.50)
+
+    assert max(history_lengths) >= node.CHROMA_TREND_MIN_SAMPLES
+    peak = history_lengths.index(max(history_lengths))
+    assert 1 in history_lengths[peak + 1:]
 
 
 def test_feature_poor_track_loss_is_finite_and_neutral(module):
@@ -440,6 +561,42 @@ def test_full_resolution_processing_is_one_frame_at_a_time(module, monkeypatch):
 
     assert output.shape == images.shape
     assert batch_sizes == [1] * 12
+
+
+def test_coast_promotes_last_locked_frame_not_low_confidence_current(module, monkeypatch):
+    node = module.FurgenSceneAwareColorStabilize()
+    seen_keys = []
+
+    def analyze(_cv2, frame, _analysis_width, target_size=None):
+        return {
+            "index": int(round(float(frame[0, 0, 0]) * 10.0)),
+            "width": 4,
+            "height": 4,
+        }
+
+    def estimate(_cv2, key, current):
+        seen_keys.append((current["index"], key["index"]))
+        locked = current["index"] <= 2 or current["index"] == 6
+        return {
+            "gain": 1.0, "cb": 0.0, "cr": 0.0,
+            "raw_cb": 0.0, "raw_cr": 0.0,
+            "ratio": 1.0 if locked else 0.25,
+            "coverage": 0.8 if locked else 0.1,
+            "count": node.MIN_PATCHES if locked else 4,
+        }
+
+    monkeypatch.setattr(node, "_analyze", analyze)
+    monkeypatch.setattr(node, "_estimate", estimate)
+    monkeypatch.setattr(node, "_is_cut", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(node, "_apply", lambda frame, *_args, **_kwargs: frame.clone())
+    images = torch.stack(
+        [torch.full((4, 4, 3), index / 10.0, dtype=torch.float32) for index in range(7)]
+    )
+    reference = torch.full((1, 4, 4, 3), 0.9, dtype=torch.float32)
+
+    _run(node, images, reference, analysis_width=96)
+
+    assert (6, 2) in seen_keys
 
 
 def test_zero_wet_dry_is_a_true_passthrough(module):

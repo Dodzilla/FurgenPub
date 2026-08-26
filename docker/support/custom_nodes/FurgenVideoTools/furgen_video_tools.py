@@ -2069,6 +2069,14 @@ class FurgenSceneAwareColorStabilize:
     MIN_ZNCC = 0.75
     LOCK_RATIO = 0.40
     COAST_RATIO = 0.15
+    CHROMA_NEUTRAL_BAND = 0.003
+    CHROMA_TREND_HISTORY = 7
+    CHROMA_TREND_MIN_SAMPLES = 5
+    CHROMA_TREND_MIN_RANGE = 0.0015
+    CHROMA_TREND_MIN_CORRELATION = 0.90
+    CHROMA_TREND_MIN_CONSISTENCY = 0.75
+    CHROMA_TREND_MIN_STEP = 0.00005
+    CHROMA_TREND_MAX_STEP = 0.002
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -2286,10 +2294,43 @@ class FurgenSceneAwareColorStabilize:
         return np.abs(values - median) <= max(float(floor), 3.0 * 1.4826 * mad)
 
     @classmethod
+    def _persistent_chroma_trend(cls, history):
+        if len(history) < cls.CHROMA_TREND_MIN_SAMPLES:
+            return False
+        recent = history[-cls.CHROMA_TREND_HISTORY:]
+        frame_indexes = np.asarray([entry[0] for entry in recent], dtype=np.float32)
+
+        def channel_is_consistent(position):
+            values = np.asarray([entry[position] for entry in recent], dtype=np.float32)
+            if float(np.ptp(values)) < cls.CHROMA_TREND_MIN_RANGE:
+                return False
+            correlation = float(np.corrcoef(frame_indexes, values)[0, 1])
+            if not np.isfinite(correlation) or abs(correlation) < cls.CHROMA_TREND_MIN_CORRELATION:
+                return False
+            deltas = np.diff(values)
+            significant = deltas[np.abs(deltas) > 1e-5]
+            if significant.size < cls.CHROMA_TREND_MIN_SAMPLES - 1:
+                return False
+            consistency = max(float(np.mean(significant > 0.0)), float(np.mean(significant < 0.0)))
+            median_step = float(np.median(np.abs(significant)))
+            return (
+                consistency >= cls.CHROMA_TREND_MIN_CONSISTENCY
+                and cls.CHROMA_TREND_MIN_STEP <= median_step <= cls.CHROMA_TREND_MAX_STEP
+            )
+
+        # Requiring coherent evidence in both chroma axes rejects resampling
+        # noise and composition changes while admitting slow model color drift.
+        return channel_is_consistent(1) and channel_is_consistent(2)
+
+    @classmethod
     def _estimate(cls, cv2, key, current):
         points, radius = cls._grid(key)
         total = len(points)
-        neutral = {"gain": 1.0, "cb": 0.0, "cr": 0.0, "ratio": 0.0, "coverage": 0.0, "count": 0}
+        neutral = {
+            "gain": 1.0, "cb": 0.0, "cr": 0.0,
+            "raw_cb": 0.0, "raw_cr": 0.0,
+            "ratio": 0.0, "coverage": 0.0, "count": 0,
+        }
         if not total or key["luma"].shape != current["luma"].shape:
             return neutral
         tracked, track_valid = cls._track(cv2, key, current, points)
@@ -2332,20 +2373,23 @@ class FurgenSceneAwareColorStabilize:
         gain = float(np.exp(np.median(log_gains[keep])))
         cb = float(np.median(chroma[keep, 0]))
         cr = float(np.median(chroma[keep, 1]))
+        raw_cb, raw_cr = cb, cr
         # Sub-percent estimates are dominated by resampling and local-content
         # differences during pans/zooms.  A deadband prevents those geometric
         # changes from becoming visible exposure or hue pumping; true drift is
         # still measured directly against the keyframe and crosses the band.
         if abs(math.log(max(gain, 1e-6))) < math.log(1.0075):
             gain = 1.0
-        if abs(cb) <= 0.003:
+        if abs(cb) <= cls.CHROMA_NEUTRAL_BAND:
             cb = 0.0
-        if abs(cr) <= 0.003:
+        if abs(cr) <= cls.CHROMA_NEUTRAL_BAND:
             cr = 0.0
         return {
             "gain": gain,
             "cb": cb,
             "cr": cr,
+            "raw_cb": raw_cb,
+            "raw_cr": raw_cr,
             "ratio": float(keep.sum()) / max(1, total),
             "coverage": coverage,
             "count": int(keep.sum()),
@@ -2461,6 +2505,11 @@ class FurgenSceneAwareColorStabilize:
                 base_cb = base_cr = smooth_cb = smooth_cr = 0.0
                 coast_frames = lighting_frames = 0
                 pending = None
+                chroma_trend_active = False
+                chroma_history = []
+                last_lock_analysis = key
+                last_lock_required_grade = (smooth_gain, smooth_cb, smooth_cr)
+                locked_since_key = False
                 output = torch.empty_like(images)
                 for index in range(int(images.shape[0])):
                     if reference_mode == "first_stable_frame" and index < stable_index:
@@ -2489,12 +2538,36 @@ class FurgenSceneAwareColorStabilize:
                         base_cb = base_cr = smooth_cb = smooth_cr = 0.0
                         coast_frames = lighting_frames = 0
                         pending = None
+                        chroma_trend_active = False
+                        chroma_history = []
+                        last_lock_analysis = current
+                        last_lock_required_grade = (smooth_gain, smooth_cb, smooth_cr)
+                        locked_since_key = False
                         locked_once = True
                     elif ratio >= self.LOCK_RATIO and estimate["count"] >= self.MIN_PATCHES:
+                        raw_measured_cb = max(
+                            -max_chroma,
+                            min(max_chroma, base_cb + base_gain * float(estimate["raw_cb"])),
+                        )
+                        raw_measured_cr = max(
+                            -max_chroma,
+                            min(max_chroma, base_cr + base_gain * float(estimate["raw_cr"])),
+                        )
+                        chroma_history.append((index, raw_measured_cb, raw_measured_cr))
+                        if len(chroma_history) > self.CHROMA_TREND_HISTORY:
+                            del chroma_history[:-self.CHROMA_TREND_HISTORY]
+                        if not chroma_trend_active and self._persistent_chroma_trend(chroma_history):
+                            chroma_trend_active = True
                         measured = (
                             max(lo, min(hi, base_gain * float(estimate["gain"]))),
-                            max(-max_chroma, min(max_chroma, base_cb + base_gain * float(estimate["cb"]))),
-                            max(-max_chroma, min(max_chroma, base_cr + base_gain * float(estimate["cr"]))),
+                            raw_measured_cb if chroma_trend_active else max(
+                                -max_chroma,
+                                min(max_chroma, base_cb + base_gain * float(estimate["cb"])),
+                            ),
+                            raw_measured_cr if chroma_trend_active else max(
+                                -max_chroma,
+                                min(max_chroma, base_cr + base_gain * float(estimate["cr"])),
+                            ),
                         )
                         if not locked_once:
                             # Establishing the external anchor is initialization,
@@ -2503,6 +2576,13 @@ class FurgenSceneAwareColorStabilize:
                             locked_once = True
                             coast_frames = lighting_frames = 0
                             pending = None
+                            last_lock_analysis = current
+                            last_lock_required_grade = (
+                                (measured[0], raw_measured_cb, raw_measured_cr)
+                                if chroma_trend_active
+                                else (smooth_gain, smooth_cb, smooth_cr)
+                            )
+                            locked_since_key = True
                             output[index:index + 1] = self._apply(
                                 images[index:index + 1], smooth_gain, smooth_cb, smooth_cr,
                                 correct_chroma, wet_dry, preserve_highlights,
@@ -2522,6 +2602,11 @@ class FurgenSceneAwareColorStabilize:
                                 base_gain, base_cb, base_cr = smooth_gain, smooth_cb, smooth_cr
                                 lighting_frames = 0
                                 pending = None
+                                chroma_trend_active = False
+                                chroma_history = []
+                                last_lock_analysis = current
+                                last_lock_required_grade = (smooth_gain, smooth_cb, smooth_cr)
+                                locked_since_key = False
                         else:
                             lighting_frames = 0
                             pending = None
@@ -2533,14 +2618,32 @@ class FurgenSceneAwareColorStabilize:
                             smooth_cb += max(-color_step, min(color_step, target_cb - smooth_cb))
                             smooth_cr += max(-color_step, min(color_step, target_cr - smooth_cr))
                             coast_frames = 0
+                            last_lock_analysis = current
+                            last_lock_required_grade = (
+                                (measured[0], raw_measured_cb, raw_measured_cr)
+                                if chroma_trend_active
+                                else (smooth_gain, smooth_cb, smooth_cr)
+                            )
+                            locked_since_key = True
                     else:
                         # COAST holds the last grade; sustained loss promotes a raw keyframe.
                         lighting_frames = 0
                         pending = None
                         coast_frames += 1
                         if coast_frames >= 3:
-                            key = current
-                            base_gain, base_cb, base_cr = smooth_gain, smooth_cb, smooth_cr
+                            if locked_since_key:
+                                key = last_lock_analysis
+                                base_gain, base_cb, base_cr = last_lock_required_grade
+                            else:
+                                # With no reliable lock in this keyframe span,
+                                # fall back to a neutral current-frame rebase.
+                                key = current
+                                base_gain, base_cb, base_cr = smooth_gain, smooth_cb, smooth_cr
+                                chroma_trend_active = False
+                            chroma_history = []
+                            last_lock_analysis = key
+                            last_lock_required_grade = (base_gain, base_cb, base_cr)
+                            locked_since_key = False
                             coast_frames = 0
                     phase = f"frame_{index}_apply"
                     output[index:index + 1] = self._apply(
