@@ -2058,6 +2058,431 @@ class FurgenColorTransferMatch:
             raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
 
 
+class FurgenSceneAwareColorStabilize:
+    """Keyframe-relative exposure/chroma stabilization for moving video."""
+
+    REFERENCE_MODES = ("external_anchor", "first_stable_frame")
+    GRID_COLUMNS = 9
+    GRID_ROWS = 7
+    MIN_PATCHES = 24
+    MIN_COVERAGE = 0.25
+    MIN_ZNCC = 0.75
+    LOCK_RATIO = 0.40
+    COAST_RATIO = 0.15
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "reference": ("IMAGE",),
+            "reference_mode": (list(cls.REFERENCE_MODES), {"default": "external_anchor"}),
+            "wet_dry": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "gain_min": ("FLOAT", {"default": 0.90, "min": 0.10, "max": 4.0, "step": 0.01}),
+            "gain_max": ("FLOAT", {"default": 1.12, "min": 0.10, "max": 4.0, "step": 0.01}),
+            "correct_chroma": ("BOOLEAN", {"default": True}),
+            "max_chroma_offset": ("FLOAT", {"default": 0.020, "min": 0.0, "max": 0.25, "step": 0.001}),
+            "temporal_smoothing": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 0.99, "step": 0.01}),
+            "cut_sensitivity": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "analysis_width": ("INT", {"default": 320, "min": 96, "max": 1024, "step": 8}),
+            "preserve_highlights": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01}),
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "stabilize"
+    CATEGORY = "Furgen/image"
+
+    @staticmethod
+    def _srgb_to_linear_np(rgb):
+        rgb = np.clip(rgb.astype(np.float32, copy=False), 0.0, 1.0)
+        return np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4).astype(np.float32)
+
+    @staticmethod
+    def _linear_luma_np(rgb):
+        return (rgb[..., 0] * 0.2126 + rgb[..., 1] * 0.7152 + rgb[..., 2] * 0.0722).astype(np.float32)
+
+    @classmethod
+    def _linear_ycbcr_np(cls, rgb):
+        y = cls._linear_luma_np(rgb)
+        return np.stack((y, (rgb[..., 2] - y) / 1.8556, (rgb[..., 0] - y) / 1.5748), axis=-1).astype(np.float32)
+
+    @classmethod
+    def _analysis_from_linear(cls, cv2, linear_rgb):
+        luma = cls._linear_luma_np(linear_rgb)
+        lo, hi = np.percentile(luma, (2.0, 98.0))
+        normalized = np.clip((luma - lo) / max(float(hi - lo), 1e-5), 0.0, 1.0)
+        gray = cv2.equalizeHist(np.rint(normalized * 255.0).astype(np.uint8))
+        return {
+            "rgb": linear_rgb,
+            "luma": luma,
+            "gray": gray,
+            "height": int(luma.shape[0]),
+            "width": int(luma.shape[1]),
+        }
+
+    @classmethod
+    def _analyze(cls, cv2, frame, analysis_width, target_size=None):
+        rgb_tensor = frame[..., : min(3, frame.shape[-1])].detach().float().clamp(0.0, 1.0)
+        if rgb_tensor.shape[-1] < 3:
+            rgb_tensor = rgb_tensor[..., :1].expand(-1, -1, 3)
+        height, width = int(rgb_tensor.shape[0]), int(rgb_tensor.shape[1])
+        if target_size is None:
+            target_width = min(width, max(96, int(analysis_width)))
+            target_height = max(48, int(round(height * target_width / max(1, width))))
+        else:
+            target_width, target_height = target_size
+        if (target_width, target_height) != (width, height):
+            mode = "area" if target_width <= width and target_height <= height else "bilinear"
+            interpolation_options = {} if mode == "area" else {"align_corners": False}
+            rgb_tensor = F.interpolate(
+                rgb_tensor.permute(2, 0, 1).unsqueeze(0),
+                size=(target_height, target_width),
+                mode=mode,
+                **interpolation_options,
+            )[0].permute(1, 2, 0)
+        rgb = rgb_tensor.cpu().numpy()
+        return cls._analysis_from_linear(cv2, cls._srgb_to_linear_np(rgb))
+
+    @classmethod
+    def _grid(cls, analysis):
+        height, width = analysis["luma"].shape
+        radius = max(3, min(9, int(round(min(height, width) / 32.0))))
+        margin = radius + 3
+        if height <= margin * 2 or width <= margin * 2:
+            return np.empty((0, 1, 2), dtype=np.float32), radius
+        xs = np.linspace(margin, width - margin - 1, cls.GRID_COLUMNS, dtype=np.float32)
+        ys = np.linspace(margin, height - margin - 1, cls.GRID_ROWS, dtype=np.float32)
+        return np.array([(x, y) for y in ys for x in xs], dtype=np.float32).reshape(-1, 1, 2), radius
+
+    @staticmethod
+    def _coarse_affine(cv2, key, current):
+        orb = cv2.ORB_create(nfeatures=1200, fastThreshold=7)
+        key_points, key_desc = orb.detectAndCompute(key["gray"], None)
+        cur_points, cur_desc = orb.detectAndCompute(current["gray"], None)
+        if key_desc is None or cur_desc is None or len(key_points) < 8 or len(cur_points) < 8:
+            return None
+        matches = sorted(cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(key_desc, cur_desc), key=lambda match: match.distance)
+        if len(matches) < 8:
+            return None
+        matches = matches[: min(240, len(matches))]
+        key_xy = np.float32([key_points[match.queryIdx].pt for match in matches]).reshape(-1, 1, 2)
+        cur_xy = np.float32([cur_points[match.trainIdx].pt for match in matches]).reshape(-1, 1, 2)
+        affine, inliers = cv2.estimateAffinePartial2D(
+            key_xy, cur_xy, method=cv2.RANSAC, ransacReprojThreshold=2.5,
+            maxIters=1500, confidence=0.995,
+        )
+        if affine is None or inliers is None or int(inliers.sum()) < 8:
+            return None
+        return affine.astype(np.float32)
+
+    @staticmethod
+    def _lk(cv2, key, current, points, initial=None):
+        if not len(points):
+            return points.copy(), np.zeros((0,), dtype=bool)
+        options = {
+            "winSize": (21, 21), "maxLevel": 3,
+            "criteria": (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        }
+        guess = initial.astype(np.float32, copy=True) if initial is not None else None
+        flags = cv2.OPTFLOW_USE_INITIAL_FLOW if initial is not None else 0
+        forward, status_f, _ = cv2.calcOpticalFlowPyrLK(key["gray"], current["gray"], points, guess, flags=flags, **options)
+        if forward is None or status_f is None:
+            return points.copy(), np.zeros((len(points),), dtype=bool)
+        backward, status_b, _ = cv2.calcOpticalFlowPyrLK(current["gray"], key["gray"], forward, None, **options)
+        if backward is None or status_b is None:
+            return forward, np.zeros((len(points),), dtype=bool)
+        error = np.linalg.norm(backward.reshape(-1, 2) - points.reshape(-1, 2), axis=1)
+        xy = forward.reshape(-1, 2)
+        valid = status_f.reshape(-1).astype(bool) & status_b.reshape(-1).astype(bool) & np.isfinite(error) & (error <= 1.5)
+        valid &= (xy[:, 0] >= 0) & (xy[:, 0] < current["width"]) & (xy[:, 1] >= 0) & (xy[:, 1] < current["height"])
+        return forward.astype(np.float32), valid
+
+    @classmethod
+    def _track(cls, cv2, key, current, points):
+        tracked, valid = cls._lk(cv2, key, current, points)
+        if int(valid.sum()) >= cls.MIN_PATCHES:
+            return tracked, valid
+        affine = cls._coarse_affine(cv2, key, current)
+        if affine is None:
+            return tracked, valid
+        xy = points.reshape(-1, 2)
+        homogeneous = np.concatenate((xy, np.ones((len(xy), 1), dtype=np.float32)), axis=1)
+        initial = (homogeneous @ affine.T).reshape(-1, 1, 2)
+        fallback, fallback_valid = cls._lk(cv2, key, current, points, initial)
+        return (fallback, fallback_valid) if int(fallback_valid.sum()) > int(valid.sum()) else (tracked, valid)
+
+    @staticmethod
+    def _patch(cv2, values, center, radius):
+        size = radius * 2 + 1
+        return cv2.getRectSubPix(values, (size, size), (float(center[0]), float(center[1])))
+
+    @staticmethod
+    def _zncc(left, right):
+        left = left.reshape(-1).astype(np.float32)
+        right = right.reshape(-1).astype(np.float32)
+        left -= float(left.mean())
+        right -= float(right.mean())
+        denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+        return float(np.dot(left, right) / denominator) if denominator > 1e-8 else -1.0
+
+    @staticmethod
+    def _mad_mask(values, floor):
+        values = np.asarray(values, dtype=np.float32)
+        median = float(np.median(values))
+        mad = float(np.median(np.abs(values - median)))
+        return np.abs(values - median) <= max(float(floor), 3.0 * 1.4826 * mad)
+
+    @classmethod
+    def _estimate(cls, cv2, key, current):
+        points, radius = cls._grid(key)
+        total = len(points)
+        neutral = {"gain": 1.0, "cb": 0.0, "cr": 0.0, "ratio": 0.0, "coverage": 0.0, "count": 0}
+        if not total or key["luma"].shape != current["luma"].shape:
+            return neutral
+        tracked, track_valid = cls._track(cv2, key, current, points)
+        gains, chroma, accepted = [], [], []
+        for index in np.flatnonzero(track_valid):
+            key_xy, cur_xy = points[index, 0], tracked[index, 0]
+            key_y = cls._patch(cv2, key["luma"], key_xy, radius)
+            cur_y = cls._patch(cv2, current["luma"], cur_xy, radius)
+            if key_y is None or cur_y is None or key_y.shape != cur_y.shape:
+                continue
+            if float(key_y.std()) < 0.003 or float(cur_y.std()) < 0.003:
+                continue
+            midtone = (key_y > 0.01) & (key_y < 0.96) & (cur_y > 0.01) & (cur_y < 0.96)
+            if int(midtone.sum()) < int(midtone.size * 0.55) or cls._zncc(key_y, cur_y) < cls.MIN_ZNCC:
+                continue
+            gain = float(np.median(key_y[midtone]) / max(float(np.median(cur_y[midtone])), 1e-6))
+            if not np.isfinite(gain) or gain <= 0:
+                continue
+            key_rgb = cls._patch(cv2, key["rgb"], key_xy, radius)
+            cur_rgb = cls._patch(cv2, current["rgb"], cur_xy, radius)
+            key_color = cls._linear_ycbcr_np(key_rgb)
+            gained_color = cls._linear_ycbcr_np(cur_rgb * gain)
+            gains.append(gain)
+            chroma.append((float(np.median(key_color[..., 1] - gained_color[..., 1])), float(np.median(key_color[..., 2] - gained_color[..., 2]))))
+            accepted.append(cur_xy)
+        count = len(gains)
+        ratio = count / max(1, total)
+        coverage = 0.0
+        if count >= 3:
+            hull = cv2.convexHull(np.asarray(accepted, dtype=np.float32).reshape(-1, 1, 2))
+            coverage = float(cv2.contourArea(hull)) / max(1.0, float(current["width"] * current["height"]))
+        result = dict(neutral, ratio=ratio, coverage=coverage, count=count)
+        if count < cls.MIN_PATCHES or coverage < cls.MIN_COVERAGE:
+            return result
+        log_gains = np.log(np.asarray(gains, dtype=np.float32))
+        chroma = np.asarray(chroma, dtype=np.float32)
+        keep = cls._mad_mask(log_gains, 0.025) & cls._mad_mask(chroma[:, 0], 0.004) & cls._mad_mask(chroma[:, 1], 0.004)
+        if int(keep.sum()) < cls.MIN_PATCHES:
+            return dict(result, count=int(keep.sum()))
+        return {
+            "gain": float(np.exp(np.median(log_gains[keep]))),
+            "cb": float(np.median(chroma[keep, 0])),
+            "cr": float(np.median(chroma[keep, 1])),
+            "ratio": float(keep.sum()) / max(1, total),
+            "coverage": coverage,
+            "count": int(keep.sum()),
+        }
+
+    @classmethod
+    def _structure(cls, cv2, analysis):
+        gx = cv2.Sobel(analysis["luma"], cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(analysis["luma"], cv2.CV_32F, 0, 1, ksize=3)
+        magnitude, angle = cv2.cartToPolar(gx, gy)
+        bins = np.floor(angle * (12.0 / (2.0 * np.pi))).astype(np.int32) % 12
+        hist = np.bincount(bins.reshape(-1), weights=magnitude.reshape(-1), minlength=12).astype(np.float32)
+        return hist / max(float(hist.sum()), 1e-8), cv2.resize(analysis["luma"], (24, 24), interpolation=cv2.INTER_AREA)
+
+    @classmethod
+    def _is_cut(cls, cv2, key, current, ratio, sensitivity):
+        key_hist, key_thumb = cls._structure(cv2, key)
+        cur_hist, cur_thumb = cls._structure(cv2, current)
+        distance = float(cv2.compareHist(key_hist, cur_hist, cv2.HISTCMP_BHATTACHARYYA))
+        correlation = cls._zncc(key_thumb, cur_thumb)
+        threshold = 0.46 - 0.18 * max(0.0, min(1.0, float(sensitivity)))
+        # Large pans can exhaust the fixed grid while ORB still proves that the
+        # two frames share one geometry.  Do not mistake that for a shot cut.
+        if ratio < cls.COAST_RATIO and cls._coarse_affine(cv2, key, current) is not None:
+            return False
+        return bool(
+            (ratio < cls.COAST_RATIO and distance > threshold and correlation < 0.35)
+            or (distance > threshold + 0.16 and correlation < 0.05)
+        )
+
+    @classmethod
+    def _stable_index(cls, cv2, analyses):
+        scores = []
+        for index, candidate in enumerate(analyses):
+            neighbors = []
+            for other in (index - 1, index + 1):
+                if 0 <= other < len(analyses):
+                    estimate = cls._estimate(cv2, candidate, analyses[other])
+                    neighbors.append(estimate["ratio"] + min(0.25, estimate["coverage"]))
+            scores.append(float(np.mean(neighbors)) if neighbors else 0.0)
+        return int(np.argmax(np.asarray(scores, dtype=np.float32))) if scores else 0
+
+    @staticmethod
+    def _srgb_to_linear_torch(rgb):
+        return torch.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055).pow(2.4))
+
+    @staticmethod
+    def _linear_to_srgb_torch(rgb):
+        rgb = rgb.clamp_min(0.0)
+        return torch.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * rgb.pow(1.0 / 2.4) - 0.055)
+
+    @classmethod
+    def _apply(cls, frame, gain, cb, cr, correct_chroma, wet_dry, preserve_highlights):
+        source = _image_rgb(frame).float()
+        channels = int(source.shape[-1])
+        if channels >= 3:
+            linear = cls._srgb_to_linear_torch(source[..., :3].clamp(0.0, 1.0)) * float(gain)
+            if bool(correct_chroma):
+                ycbcr = _rgb_to_ycbcr(linear)
+                ycbcr[..., 1:2].add_(float(cb))
+                ycbcr[..., 2:3].add_(float(cr))
+                linear = _ycbcr_to_rgb(ycbcr)
+            corrected = cls._linear_to_srgb_torch(linear)
+            corrected = _apply_highlight_protection(source[..., :3], corrected, preserve_highlights)
+            if channels > 3:
+                corrected = torch.cat((corrected, source[..., 3:channels]), dim=-1)
+        else:
+            corrected = cls._linear_to_srgb_torch(cls._srgb_to_linear_torch(source.clamp(0.0, 1.0)) * float(gain))
+            corrected = _apply_highlight_protection(source, corrected, preserve_highlights)
+        blended = source.lerp(corrected, max(0.0, min(1.0, float(wet_dry)))).clamp(0.0, 1.0)
+        result = frame.clone()
+        result[..., :channels] = blended.to(dtype=frame.dtype)
+        return result
+
+    def stabilize(
+        self, images, reference, reference_mode, wet_dry, gain_min, gain_max,
+        correct_chroma, max_chroma_offset, temporal_smoothing, cut_sensitivity,
+        analysis_width, preserve_highlights,
+    ):
+        if _is_neutral(wet_dry, 0.0) or int(images.shape[0]) < 1:
+            return (images,)
+        try:
+            import cv2
+        except Exception as exc:
+            raise RuntimeError("FurgenSceneAwareColorStabilize requires cv2/opencv-python") from exc
+
+        phase = "validate"
+        try:
+            with torch.no_grad():
+                _image_rgb(images)
+                _image_rgb(reference)
+                if reference_mode not in self.REFERENCE_MODES:
+                    raise ValueError(f"unsupported reference mode: {reference_mode}")
+                lo, hi = sorted((float(gain_min), float(gain_max)))
+                max_chroma = max(0.0, float(max_chroma_offset))
+                smoothing = max(0.0, min(0.99, float(temporal_smoothing)))
+                initial_count = min(5, int(images.shape[0]))
+                analyses = [self._analyze(cv2, images[index], analysis_width) for index in range(initial_count)]
+                target_size = (analyses[0]["width"], analyses[0]["height"])
+                if reference_mode == "external_anchor":
+                    key = self._analyze(cv2, reference[0], analysis_width, target_size=target_size)
+                    stable_index = 0
+                    locked_once = False
+                else:
+                    stable_index = self._stable_index(cv2, analyses)
+                    key = analyses[stable_index]
+                    locked_once = True
+
+                base_gain = smooth_gain = 1.0
+                base_cb = base_cr = smooth_cb = smooth_cr = 0.0
+                coast_frames = lighting_frames = 0
+                pending = None
+                output = torch.empty_like(images)
+                for index in range(int(images.shape[0])):
+                    if reference_mode == "first_stable_frame" and index < stable_index:
+                        # Do not let an unstable T2V lead-in replace the selected
+                        # keyframe. Correct it only when direct overlap is strong.
+                        current = analyses[index]
+                        preroll = self._estimate(cv2, key, current)
+                        if preroll["ratio"] >= self.LOCK_RATIO and preroll["count"] >= self.MIN_PATCHES:
+                            preroll_gain = max(lo, min(hi, float(preroll["gain"])))
+                            preroll_cb = max(-max_chroma, min(max_chroma, float(preroll["cb"])))
+                            preroll_cr = max(-max_chroma, min(max_chroma, float(preroll["cr"])))
+                            output[index:index + 1] = self._apply(
+                                images[index:index + 1], preroll_gain, preroll_cb, preroll_cr,
+                                correct_chroma, wet_dry, preserve_highlights,
+                            )
+                        else:
+                            output[index:index + 1] = images[index:index + 1]
+                        continue
+                    phase = f"frame_{index}_analysis"
+                    current = analyses[index] if index < initial_count else self._analyze(cv2, images[index], analysis_width)
+                    estimate = self._estimate(cv2, key, current)
+                    ratio = float(estimate["ratio"])
+                    if self._is_cut(cv2, key, current, ratio, cut_sensitivity):
+                        key = current
+                        base_gain = smooth_gain = 1.0
+                        base_cb = base_cr = smooth_cb = smooth_cr = 0.0
+                        coast_frames = lighting_frames = 0
+                        pending = None
+                        locked_once = True
+                    elif ratio >= self.LOCK_RATIO and estimate["count"] >= self.MIN_PATCHES:
+                        measured = (
+                            max(lo, min(hi, base_gain * float(estimate["gain"]))),
+                            max(-max_chroma, min(max_chroma, base_cb + base_gain * float(estimate["cb"]))),
+                            max(-max_chroma, min(max_chroma, base_cr + base_gain * float(estimate["cr"]))),
+                        )
+                        if not locked_once:
+                            # Establishing the external anchor is initialization,
+                            # not a frame-to-frame change subject to EMA limiting.
+                            smooth_gain, smooth_cb, smooth_cr = measured
+                            locked_once = True
+                            coast_frames = lighting_frames = 0
+                            pending = None
+                            output[index:index + 1] = self._apply(
+                                images[index:index + 1], smooth_gain, smooth_cb, smooth_cr,
+                                correct_chroma, wet_dry, preserve_highlights,
+                            )
+                            continue
+                        abrupt = (
+                            abs(math.log(max(measured[0], 1e-6) / max(smooth_gain, 1e-6))) > 0.075
+                            or max(abs(measured[1] - smooth_cb), abs(measured[2] - smooth_cr)) > max(0.008, max_chroma * 0.60)
+                        )
+                        if ratio >= 0.55 and abrupt:
+                            same = pending is not None and abs(math.log(max(measured[0], 1e-6) / max(pending[0], 1e-6))) < 0.025 and abs(measured[1] - pending[1]) < 0.004 and abs(measured[2] - pending[2]) < 0.004
+                            lighting_frames = lighting_frames + 1 if same else 1
+                            pending = measured
+                            if lighting_frames >= 2:
+                                # A persistent jump with stable geometry is intentional lighting.
+                                key = current
+                                base_gain, base_cb, base_cr = smooth_gain, smooth_cb, smooth_cr
+                                lighting_frames = 0
+                                pending = None
+                        else:
+                            lighting_frames = 0
+                            pending = None
+                            target_gain = smooth_gain * smoothing + measured[0] * (1.0 - smoothing)
+                            smooth_gain += max(-0.04, min(0.04, target_gain - smooth_gain))
+                            color_step = max(0.002, min(0.01, max_chroma * 0.5))
+                            target_cb = smooth_cb * smoothing + measured[1] * (1.0 - smoothing)
+                            target_cr = smooth_cr * smoothing + measured[2] * (1.0 - smoothing)
+                            smooth_cb += max(-color_step, min(color_step, target_cb - smooth_cb))
+                            smooth_cr += max(-color_step, min(color_step, target_cr - smooth_cr))
+                            coast_frames = 0
+                    else:
+                        # COAST holds the last grade; sustained loss promotes a raw keyframe.
+                        lighting_frames = 0
+                        pending = None
+                        coast_frames += 1
+                        if coast_frames >= 3:
+                            key = current
+                            base_gain, base_cb, base_cr = smooth_gain, smooth_cb, smooth_cr
+                            coast_frames = 0
+                    phase = f"frame_{index}_apply"
+                    output[index:index + 1] = self._apply(
+                        images[index:index + 1], smooth_gain, smooth_cb, smooth_cr,
+                        correct_chroma, wet_dry, preserve_highlights,
+                    )
+                return (output,)
+        except Exception as exc:
+            raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
+
+
 class FurgenTemporalToneSmooth:
     @classmethod
     def INPUT_TYPES(cls):
@@ -3745,6 +4170,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenBoundaryGradeMatch": FurgenBoundaryGradeMatch,
     "FurgenAdaptiveExposureMatch": FurgenAdaptiveExposureMatch,
     "FurgenColorTransferMatch": FurgenColorTransferMatch,
+    "FurgenSceneAwareColorStabilize": FurgenSceneAwareColorStabilize,
     "FurgenTemporalToneSmooth": FurgenTemporalToneSmooth,
     "FurgenTemporalUnsharpMask": FurgenTemporalUnsharpMask,
     "FurgenLatentGuideTemporalMask": FurgenLatentGuideTemporalMask,
@@ -3770,6 +4196,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenBoundaryGradeMatch": "Furgen Boundary Grade Match",
     "FurgenAdaptiveExposureMatch": "Furgen Adaptive Exposure Match",
     "FurgenColorTransferMatch": "Furgen Color Transfer Match",
+    "FurgenSceneAwareColorStabilize": "Furgen Scene-Aware Color Stabilize",
     "FurgenTemporalToneSmooth": "Furgen Temporal Tone Smooth",
     "FurgenTemporalUnsharpMask": "Furgen Temporal Unsharp Mask",
     "FurgenLatentGuideTemporalMask": "Furgen Latent Guide Temporal Mask",
