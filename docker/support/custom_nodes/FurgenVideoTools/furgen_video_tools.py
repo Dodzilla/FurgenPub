@@ -2276,10 +2276,23 @@ class FurgenSceneAwareColorStabilize:
         keep = cls._mad_mask(log_gains, 0.025) & cls._mad_mask(chroma[:, 0], 0.004) & cls._mad_mask(chroma[:, 1], 0.004)
         if int(keep.sum()) < cls.MIN_PATCHES:
             return dict(result, count=int(keep.sum()))
+        gain = float(np.exp(np.median(log_gains[keep])))
+        cb = float(np.median(chroma[keep, 0]))
+        cr = float(np.median(chroma[keep, 1]))
+        # Sub-percent estimates are dominated by resampling and local-content
+        # differences during pans/zooms.  A deadband prevents those geometric
+        # changes from becoming visible exposure or hue pumping; true drift is
+        # still measured directly against the keyframe and crosses the band.
+        if abs(math.log(max(gain, 1e-6))) < math.log(1.0075):
+            gain = 1.0
+        if abs(cb) < 0.0005:
+            cb = 0.0
+        if abs(cr) < 0.0005:
+            cr = 0.0
         return {
-            "gain": float(np.exp(np.median(log_gains[keep]))),
-            "cb": float(np.median(chroma[keep, 0])),
-            "cr": float(np.median(chroma[keep, 1])),
+            "gain": gain,
+            "cb": cb,
+            "cr": cr,
             "ratio": float(keep.sum()) / max(1, total),
             "coverage": coverage,
             "count": int(keep.sum()),

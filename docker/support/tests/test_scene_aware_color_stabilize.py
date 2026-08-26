@@ -169,6 +169,26 @@ def test_clean_homographic_pan_keeps_neutral_grade(module):
         assert estimate["cr"] == pytest.approx(0.0, abs=0.003)
 
 
+def test_clean_mild_zoom_stays_inside_neutrality_gate(module):
+    reference = _texture(seed=37, height=144, width=192)
+    node = module.FurgenSceneAwareColorStabilize()
+    key = node._analyze(cv2, torch.from_numpy(reference), 192)
+    for scale, offset in ((1.02, 7.0), (1.04, 12.0)):
+        transform = np.float32([
+            [scale, 0.0, offset - (scale - 1.0) * 96.0],
+            [0.0, scale, offset * 0.25 - (scale - 1.0) * 72.0],
+        ])
+        moved = cv2.warpAffine(
+            reference, transform, (192, 144), borderMode=cv2.BORDER_REFLECT,
+        )
+        estimate = node._estimate(
+            cv2, key, node._analyze(cv2, torch.from_numpy(moved), 192),
+        )
+        assert abs(estimate["gain"] - 1.0) <= 0.005
+        assert abs(estimate["cb"]) <= 0.003
+        assert abs(estimate["cr"]) <= 0.003
+
+
 def test_hard_cut_does_not_carry_the_previous_palette(module):
     first = _texture(seed=43)
     second = np.zeros_like(first)
@@ -253,6 +273,71 @@ def test_dissolve_and_occlusion_remain_finite_without_two_frame_oscillation(modu
     deltas = torch.mean(torch.abs(output - images), dim=(1, 2, 3)).numpy()
     alternating = np.abs(np.diff(deltas, n=2))
     assert float(alternating.max(initial=0.0)) < 0.08
+
+
+def test_temporal_grade_damps_two_frame_exposure_oscillation(module):
+    reference = _texture(seed=74)
+    frames = [
+        _apply_known_inverse_grade(
+            reference, 1.04 + (0.006 if index % 2 else -0.006),
+            0.002 if index % 2 else -0.002, 0.0,
+        )
+        for index in range(24)
+    ]
+    images = torch.from_numpy(np.stack(frames))
+    output = _run(
+        module.FurgenSceneAwareColorStabilize(), images,
+        torch.from_numpy(reference)[None], temporal_smoothing=0.50,
+    )
+
+    def frame_luma(batch):
+        linear = _srgb_to_linear(batch.numpy())
+        return _linear_to_ycbcr(linear)[..., 0].mean(axis=(1, 2))
+
+    input_luma = frame_luma(images)
+    output_luma = frame_luma(output)
+    input_step = float(np.mean(np.abs(np.diff(input_luma))) / np.mean(input_luma))
+    output_step = float(np.mean(np.abs(np.diff(output_luma))) / np.mean(output_luma))
+    assert output_step < 0.01
+    assert output_step < input_step * 0.75
+
+
+def test_highlight_protection_does_not_increase_clipping(module):
+    reference = np.clip(_texture(seed=75) * 1.22, 0.0, 0.985).astype(np.float32)
+    source = _apply_known_inverse_grade(reference, 1.08, 0.0, 0.0)
+    images = torch.from_numpy(np.stack((source, source, source)))
+
+    output = _run(
+        module.FurgenSceneAwareColorStabilize(), images,
+        torch.from_numpy(reference)[None], preserve_highlights=0.75,
+    )
+
+    input_clipped = float((images[..., :3] >= 0.999).float().mean())
+    output_clipped = float((output[..., :3] >= 0.999).float().mean())
+    assert (output_clipped - input_clipped) * 100.0 <= 0.25
+
+
+def test_global_grade_preserves_gain_normalized_high_frequency_structure(module):
+    reference = _texture(seed=77)
+    source = _apply_known_inverse_grade(reference, 1.08, 0.012, -0.009)
+    images = torch.from_numpy(np.stack((source, source)))
+    output = _run(
+        module.FurgenSceneAwareColorStabilize(), images,
+        torch.from_numpy(reference)[None], preserve_highlights=0.0,
+    )
+
+    def normalized_highpass(frame):
+        linear = _srgb_to_linear(frame)
+        luma = _linear_to_ycbcr(linear)[..., 0]
+        luma = luma / max(float(luma.mean()), 1e-8)
+        return cv2.Laplacian(luma.astype(np.float32), cv2.CV_32F)
+
+    source_highpass = normalized_highpass(source)
+    output_highpass = normalized_highpass(output[0].numpy())
+    energy_ratio = float(np.mean(output_highpass ** 2) / np.mean(source_highpass ** 2))
+    correlation = float(np.corrcoef(source_highpass.ravel(), output_highpass.ravel())[0, 1])
+    assert 0.95 <= energy_ratio <= 1.05
+    assert correlation >= 0.999
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
