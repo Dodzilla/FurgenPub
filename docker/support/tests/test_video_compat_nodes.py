@@ -181,6 +181,43 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FCSAnalyzeVideo" in module.NODE_CLASS_MAPPINGS
 
 
+def test_remote_media_is_staged_once_with_bounded_retries(tmp_path, monkeypatch):
+    module = _load_furgen_video_tools()
+    monkeypatch.setattr(module.folder_paths, "get_temp_directory", lambda: str(tmp_path))
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        output = command[command.index("--output") + 1]
+        Path(output).write_bytes(b"remote-media")
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    source = "https://media.example/video.mp4?token=private"
+    first = module._materialize_remote_media(source)
+    second = module._materialize_remote_media(source)
+
+    assert first == second
+    assert Path(first).read_bytes() == b"remote-media"
+    assert len(calls) == 1
+    assert calls[0][0][calls[0][0].index("--retry") + 1] == "12"
+    assert source in calls[0][0]
+
+
+def test_remote_media_staging_failure_does_not_expose_source_url(tmp_path, monkeypatch):
+    module = _load_furgen_video_tools()
+    monkeypatch.setattr(module.folder_paths, "get_temp_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        module.subprocess, "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(returncode=28, stderr="private-url"),
+    )
+
+    with pytest.raises(RuntimeError, match="bounded retries") as error:
+        module._materialize_remote_media("https://media.example/video.mp4?token=private")
+
+    assert "token=private" not in str(error.value)
+
+
 def test_sanitize_audio_replaces_non_finite_samples_without_mutating_input():
     module = _load_furgen_video_tools()
     waveform = module.torch.tensor([[[0.25, float("nan"), float("inf"), float("-inf"), 2.0]]])

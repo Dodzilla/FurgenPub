@@ -4,6 +4,8 @@ import math
 import os
 import re
 import subprocess
+import tempfile
+import urllib.parse
 from pathlib import Path
 
 import folder_paths
@@ -18,6 +20,7 @@ FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 FCS_SEAM_REPAIR_NONE = "none"
 FCS_SEAM_REPAIR_BLEND2_AFTER_TRIM = "blend2_after_trim"
 FCS_SEAM_REPAIR_BLEND2_AFTER_CONCAT = "blend2_after_concat"
+REMOTE_MEDIA_CACHE_MAX_BYTES = 12 * 1024 * 1024 * 1024
 
 
 RGB_LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
@@ -36,6 +39,51 @@ def _resolve_video_entry(value: str) -> str:
     if _is_url(candidate) or os.path.isabs(candidate):
         return candidate
     return folder_paths.get_annotated_filepath(candidate)
+
+
+def _prune_remote_media_cache(cache_dir: Path, preserve: Path) -> None:
+    files = [path for path in cache_dir.iterdir() if path.is_file() and path != preserve]
+    total = preserve.stat().st_size + sum(path.stat().st_size for path in files)
+    for path in sorted(files, key=lambda item: item.stat().st_mtime):
+        if total <= REMOTE_MEDIA_CACHE_MAX_BYTES:
+            break
+        size = path.stat().st_size
+        path.unlink(missing_ok=True)
+        total -= size
+
+
+def _materialize_remote_media(value: str) -> str:
+    source = _resolve_video_entry(value)
+    if not _is_url(source):
+        return source
+    parsed = urllib.parse.urlsplit(source)
+    suffix = Path(parsed.path).suffix if Path(parsed.path).suffix else ".media"
+    cache_dir = Path(folder_paths.get_temp_directory()) / "furgen_remote_media"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target = cache_dir / f"{hashlib.sha256(source.encode('utf-8')).hexdigest()}{suffix[:12]}"
+    if target.is_file() and target.stat().st_size > 0:
+        target.touch()
+        return str(target)
+    descriptor, temporary = tempfile.mkstemp(prefix=f"{target.name}.", suffix=".part", dir=cache_dir)
+    os.close(descriptor)
+    try:
+        result = subprocess.run(
+            [
+                "curl", "--fail", "--location", "--silent", "--show-error",
+                "--retry", "12", "--retry-all-errors", "--retry-delay", "2",
+                "--retry-max-time", "600", "--connect-timeout", "20", "--max-time", "720",
+                "--output", temporary, source,
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 or os.path.getsize(temporary) <= 0:
+            raise RuntimeError("Remote media staging failed after bounded retries.")
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    _prune_remote_media_cache(cache_dir, target)
+    return str(target)
 
 
 def _parse_video_entries(video_entries: str) -> list[str]:
@@ -3152,7 +3200,7 @@ class FCSAnalyzeVideo:
     def analyze_video(
         self, source_video_url, source_fingerprint, filename_prefix, save_output, reference_image_url="",
     ):
-        source = _resolve_video_entry(source_video_url)
+        source = _materialize_remote_media(source_video_url)
         details = _probe_video_details(source)
         folder, subfolder, stem, paths = _output_bundle(
             filename_prefix,
@@ -3167,7 +3215,7 @@ class FCSAnalyzeVideo:
         reference_source = None
         reference_frame = None
         if str(reference_image_url or "").strip():
-            reference_source = _resolve_video_entry(reference_image_url)
+            reference_source = _materialize_remote_media(reference_image_url)
             reference_frame = _decode_analysis_reference(reference_source, analysis_width, analysis_height)
         visual_stability = _early_visual_metrics(early_frames, reference=reference_frame)
         subprocess.run(
@@ -3434,7 +3482,7 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
         if not entries:
             raise ValueError("edit_manifest.clips must contain at least one clip")
         for entry in entries:
-            entry["path"] = _resolve_video_entry(entry.get("sourceVideoUrl"))
+            entry["path"] = _materialize_remote_media(entry.get("sourceVideoUrl"))
         probes = [_probe_video(entry["path"]) for entry in entries]
         for entry, probe in zip(entries, probes):
             start, end, duration = _v4_clip_duration(entry, probe)
@@ -3608,7 +3656,7 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
         final_audio = cur_a
         if soundtrack:
             music_index = len(entries)
-            soundtrack["_path"] = _resolve_video_entry(soundtrack.get("sourceAudioUrl"))
+            soundtrack["_path"] = _materialize_remote_media(soundtrack.get("sourceAudioUrl"))
             ffmpeg_inputs.extend(["-i", soundtrack["_path"]])
             music_start = max(0.0, float(soundtrack.get("trimStartSeconds") or 0.0))
             music_end = soundtrack.get("trimEndSeconds")
