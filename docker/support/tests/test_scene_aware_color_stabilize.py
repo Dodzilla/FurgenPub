@@ -165,8 +165,13 @@ def test_clean_homographic_pan_keeps_neutral_grade(module):
         )
         estimate = node._estimate(cv2, key, node._analyze(cv2, torch.from_numpy(moved), 192))
         assert estimate["gain"] == pytest.approx(1.0, abs=0.005)
-        assert estimate["cb"] == pytest.approx(0.0, abs=0.003)
-        assert estimate["cr"] == pytest.approx(0.0, abs=0.003)
+        assert estimate["cb"] == 0.0
+        assert estimate["cr"] == 0.0
+        output = _run(
+            node, torch.from_numpy(moved)[None], torch.from_numpy(reference)[None],
+            analysis_width=192, preserve_highlights=0.0,
+        )
+        assert torch.allclose(output[0], torch.from_numpy(moved), atol=2e-6)
 
 
 def test_clean_mild_zoom_stays_inside_neutrality_gate(module):
@@ -185,8 +190,38 @@ def test_clean_mild_zoom_stays_inside_neutrality_gate(module):
             cv2, key, node._analyze(cv2, torch.from_numpy(moved), 192),
         )
         assert abs(estimate["gain"] - 1.0) <= 0.005
-        assert abs(estimate["cb"]) <= 0.003
-        assert abs(estimate["cr"]) <= 0.003
+        assert estimate["cb"] == 0.0
+        assert estimate["cr"] == 0.0
+        output = _run(
+            node, torch.from_numpy(moved)[None], torch.from_numpy(reference)[None],
+            analysis_width=192, preserve_highlights=0.0,
+        )
+        assert torch.allclose(output[0], torch.from_numpy(moved), atol=2e-6)
+
+
+def test_large_pan_keeps_shared_shot_grade_through_coast_and_rebase(module):
+    reference = _texture(seed=41)
+    targets = []
+    sources = []
+    for offset in (0, 20, 40, 60):
+        target = cv2.warpAffine(
+            reference,
+            np.float32([[1.0, 0.0, offset], [0.0, 1.0, offset * 0.2]]),
+            (reference.shape[1], reference.shape[0]),
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        targets.append(target)
+        sources.append(_apply_known_inverse_grade(target, 1.08, 0.0, 0.0))
+    images = torch.from_numpy(np.stack(sources))
+
+    output = _run(
+        module.FurgenSceneAwareColorStabilize(), images,
+        torch.from_numpy(reference)[None], analysis_width=160,
+        preserve_highlights=0.0,
+    )
+
+    target_batch = torch.from_numpy(np.stack(targets))
+    assert torch.mean(torch.abs(output - target_batch)).item() < 0.003
 
 
 def test_hard_cut_does_not_carry_the_previous_palette(module):
@@ -203,6 +238,37 @@ def test_hard_cut_does_not_carry_the_previous_palette(module):
 
     assert torch.allclose(output[3], images[3], atol=2e-5)
     assert torch.allclose(output[4], images[4], atol=2e-5)
+
+
+def test_localized_orb_matches_cannot_veto_a_similarly_textured_hard_cut(module):
+    rng = np.random.default_rng(200)
+    shared_patch = rng.random((56, 56, 3), dtype=np.float32) * 0.60 + 0.20
+    first = np.full((128, 160, 3), 0.12, dtype=np.float32)
+    second = np.full_like(first, 0.12)
+    for x in range(4, 160, 12):
+        first[:, x:x + 4] = (0.70, 0.15, 0.12)
+    for y in range(4, 128, 12):
+        second[y:y + 4, :] = (0.12, 0.65, 0.18)
+    first[:56, :56] = shared_patch
+    second[:56, :56] = shared_patch
+
+    node = module.FurgenSceneAwareColorStabilize()
+    key = node._analyze(cv2, torch.from_numpy(first), 160)
+    current = node._analyze(cv2, torch.from_numpy(second), 160)
+    estimate = node._estimate(cv2, key, current)
+    affine = node._coarse_affine_details(cv2, key, current)
+    assert estimate["ratio"] < node.COAST_RATIO
+    assert affine is not None and affine["inlier_count"] >= 8
+    assert affine["coverage"] < 0.18
+    assert not node._strong_affine_cut_veto(affine)
+    assert node._is_cut(cv2, key, current, estimate["ratio"], 0.50)
+
+    drifted = _apply_known_inverse_grade(first, 1.09, 0.01, -0.008)
+    images = torch.from_numpy(np.stack((drifted, drifted, second, second, second, second)))
+    output = _run(node, images, torch.from_numpy(first)[None], analysis_width=160)
+
+    # A missed cut would COAST then promote while carrying the old 1.09 grade.
+    assert torch.allclose(output[2:], images[2:], atol=2e-5)
 
 
 def test_persistent_stable_geometry_lighting_jump_is_not_undone(module):

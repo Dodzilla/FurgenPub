@@ -2155,7 +2155,7 @@ class FurgenSceneAwareColorStabilize:
         return np.array([(x, y) for y in ys for x in xs], dtype=np.float32).reshape(-1, 1, 2), radius
 
     @staticmethod
-    def _coarse_affine(cv2, key, current):
+    def _coarse_affine_details(cv2, key, current):
         orb = cv2.ORB_create(nfeatures=1200, fastThreshold=7)
         key_points, key_desc = orb.detectAndCompute(key["gray"], None)
         cur_points, cur_desc = orb.detectAndCompute(current["gray"], None)
@@ -2171,9 +2171,62 @@ class FurgenSceneAwareColorStabilize:
             key_xy, cur_xy, method=cv2.RANSAC, ransacReprojThreshold=2.5,
             maxIters=1500, confidence=0.995,
         )
-        if affine is None or inliers is None or int(inliers.sum()) < 8:
+        if affine is None or inliers is None:
             return None
-        return affine.astype(np.float32)
+        inlier_mask = inliers.reshape(-1).astype(bool)
+        inlier_count = int(inlier_mask.sum())
+        if inlier_count < 8:
+            return None
+        key_inliers = key_xy.reshape(-1, 2)[inlier_mask]
+        cur_inliers = cur_xy.reshape(-1, 2)[inlier_mask]
+        predicted = (
+            np.concatenate(
+                (key_inliers, np.ones((inlier_count, 1), dtype=np.float32)), axis=1,
+            )
+            @ affine.T
+        )
+        residual = float(np.median(np.linalg.norm(predicted - cur_inliers, axis=1)))
+
+        def hull_coverage(points, analysis):
+            if len(points) < 3:
+                return 0.0
+            hull = cv2.convexHull(points.astype(np.float32).reshape(-1, 1, 2))
+            return float(cv2.contourArea(hull)) / max(
+                1.0, float(analysis["width"] * analysis["height"]),
+            )
+
+        return {
+            "affine": affine.astype(np.float32),
+            "inlier_count": inlier_count,
+            "inlier_ratio": inlier_count / max(1, len(matches)),
+            "coverage": min(
+                hull_coverage(key_inliers, key), hull_coverage(cur_inliers, current),
+            ),
+            "median_residual": residual,
+        }
+
+    @classmethod
+    def _coarse_affine(cls, cv2, key, current):
+        details = cls._coarse_affine_details(cv2, key, current)
+        return details["affine"] if details is not None else None
+
+    @staticmethod
+    def _strong_affine_cut_veto(details):
+        if details is None or details["median_residual"] > 1.5:
+            return False
+        distributed = (
+            details["inlier_count"] >= 18
+            and details["inlier_ratio"] >= 0.35
+            and details["coverage"] >= 0.18
+        )
+        # Near the end of a large pan, overlap coverage naturally shrinks. A
+        # much larger consensus can still prove shared geometry safely.
+        overwhelming = (
+            details["inlier_count"] >= 64
+            and details["inlier_ratio"] >= 0.45
+            and details["coverage"] >= 0.075
+        )
+        return bool(distributed or overwhelming)
 
     @staticmethod
     def _lk(cv2, key, current, points, initial=None):
@@ -2285,9 +2338,9 @@ class FurgenSceneAwareColorStabilize:
         # still measured directly against the keyframe and crosses the band.
         if abs(math.log(max(gain, 1e-6))) < math.log(1.0075):
             gain = 1.0
-        if abs(cb) < 0.0005:
+        if abs(cb) <= 0.003:
             cb = 0.0
-        if abs(cr) < 0.0005:
+        if abs(cr) <= 0.003:
             cr = 0.0
         return {
             "gain": gain,
@@ -2316,10 +2369,13 @@ class FurgenSceneAwareColorStabilize:
         threshold = 0.46 - 0.18 * max(0.0, min(1.0, float(sensitivity)))
         # Large pans can exhaust the fixed grid while ORB still proves that the
         # two frames share one geometry.  Do not mistake that for a shot cut.
-        if ratio < cls.COAST_RATIO and cls._coarse_affine(cv2, key, current) is not None:
+        affine_details = cls._coarse_affine_details(cv2, key, current) if ratio < cls.COAST_RATIO else None
+        if ratio < cls.COAST_RATIO and cls._strong_affine_cut_veto(affine_details):
             return False
+        structurally_strong_break = ratio < cls.COAST_RATIO and distance > threshold + 0.16
         return bool(
             (ratio < cls.COAST_RATIO and distance > threshold and correlation < 0.35)
+            or structurally_strong_break
             or (distance > threshold + 0.16 and correlation < 0.05)
         )
 
