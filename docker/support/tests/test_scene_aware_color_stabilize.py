@@ -124,6 +124,84 @@ def _run(node, images, reference, **overrides):
     return node.stabilize(images, reference, **options)[0]
 
 
+def test_motion_adaptation_is_optional_and_defaults_to_disabled(module):
+    inputs = module.FurgenSceneAwareColorStabilize.INPUT_TYPES()
+
+    assert inputs["optional"]["motion_adaptation"][1]["default"] == 0.0
+    assert inputs["optional"]["motion_adaptation"][1]["max"] == 0.50
+
+
+def test_motion_risk_uses_coarse_affine_geometry(module):
+    node = module.FurgenSceneAwareColorStabilize()
+    analysis = node._analyze(cv2, torch.from_numpy(_texture(seed=13)), 160)
+    details = {"affine": np.float32([[1.0, 0.0, 12.0], [0.0, 1.0, 3.0]])}
+
+    risk = node._motion_risk(details, analysis)
+
+    expected = np.hypot(12.0, 3.0) / np.hypot(analysis["width"], analysis["height"])
+    assert risk == pytest.approx(expected, abs=1e-5)
+
+
+def test_motion_risk_controller_has_bounded_attack_decay_and_confidence_hold(module):
+    node = module.FurgenSceneAwareColorStabilize()
+    state = 0.0
+    states = []
+    for _ in range(4):
+        state = node._update_motion_risk(state, 0.050, 1.0, 0.80)
+        states.append(state)
+
+    assert states == pytest.approx((0.25, 0.50, 0.75, 1.0))
+    assert node._update_motion_risk(state, 0.0, 0.40, 0.25) == state
+    assert node._update_motion_risk(state, 0.0, 1.0, 0.80) == pytest.approx(0.99)
+
+
+def test_motion_adaptation_caches_key_orb_and_samples_reliable_locks(module, monkeypatch):
+    reference = torch.from_numpy(_texture(seed=14))[None]
+    images = reference.expand(7, -1, -1, -1).clone()
+    node = module.FurgenSceneAwareColorStabilize()
+    calls = []
+    original = node._coarse_affine_details
+
+    def record(cv2_module, key, current, **kwargs):
+        calls.append(kwargs.get("key_features"))
+        return original(cv2_module, key, current, **kwargs)
+
+    monkeypatch.setattr(node, "_coarse_affine_details", record)
+    _run(node, images, reference, motion_adaptation=0.30)
+
+    # The first reliable LOCK is sampled immediately, then every two LOCKs.
+    assert len(calls) == 4
+    assert all(features is not None for features in calls)
+
+
+def test_disabled_motion_adaptation_does_not_compute_orb_features(module, monkeypatch):
+    reference = torch.from_numpy(_texture(seed=15))[None]
+    images = reference.expand(5, -1, -1, -1).clone()
+    node = module.FurgenSceneAwareColorStabilize()
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("default-off motion adaptation must not add ORB work")
+
+    monkeypatch.setattr(node, "_orb_features", unexpected)
+    output = _run(node, images, reference)
+
+    assert torch.allclose(output, images, atol=2e-6)
+
+
+def test_motion_adaptation_is_split_and_strong_evidence_restores_full_grade(module):
+    node = module.FurgenSceneAwareColorStabilize()
+
+    weak = node._adaptive_grade(1.05, 0.006, -0.004, 1.0, 0.30)
+    assert weak[0] == pytest.approx(1.05 ** 0.70, rel=1e-6)
+    assert weak[1] == pytest.approx(0.006 * 0.70, rel=1e-6)
+    assert weak[2] == pytest.approx(-0.004 * 0.70, rel=1e-6)
+
+    strong_luma = node._adaptive_grade(1.12, 0.006, -0.004, 1.0, 0.30)
+    strong_chroma = node._adaptive_grade(1.05, 0.016, -0.016, 1.0, 0.30)
+    assert strong_luma[0] == pytest.approx(1.12, rel=1e-6)
+    assert strong_chroma[1:] == pytest.approx((0.016, -0.016), rel=1e-6)
+
+
 def test_node_is_registered_with_approved_interface(module):
     assert module.NODE_CLASS_MAPPINGS["FurgenSceneAwareColorStabilize"] is module.FurgenSceneAwareColorStabilize
     inputs = module.FurgenSceneAwareColorStabilize.INPUT_TYPES()["required"]
@@ -206,6 +284,89 @@ def test_persistent_pan_chroma_drift_beats_legacy_gate_without_pumping(module):
     applied_grade = (output_color[..., 1:3] - source_color[..., 1:3]).mean(axis=(1, 2))
     second_difference = np.linalg.norm(np.diff(applied_grade, n=2, axis=0), axis=1)
     assert float(second_difference.max(initial=0.0)) < 0.003
+
+
+def test_motion_adaptive_pan_drift_keeps_quality_gates_without_pumping(module):
+    reference = _texture(seed=103)
+    sources, targets = _pan_drift_frames(reference)
+    images = torch.from_numpy(np.stack(sources))
+    reference_tensor = torch.from_numpy(reference)[None]
+
+    candidate = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50, motion_adaptation=0.30,
+    )
+    legacy = module.FurgenAdaptiveExposureMatch().match(
+        images, reference_tensor, 0.75, 0.82, 1.22, 0.02, 0.98, 0.75,
+    )[0]
+    legacy = module.FurgenColorTransferMatch().match(
+        legacy, reference_tensor, "ycbcr_mean_std", 0.60, 0.10, 0.35,
+        0.50, 0.60, 1.40, 0.80,
+    )[0]
+
+    candidate_error = _chroma_bias_error(candidate, targets)
+    legacy_error = _chroma_bias_error(legacy, targets)
+    assert 1.0 - candidate_error / legacy_error >= 0.20
+
+    source_color = _linear_to_ycbcr(_srgb_to_linear(images.numpy()))
+    output_color = _linear_to_ycbcr(_srgb_to_linear(candidate.numpy()))
+    applied_grade = (output_color[..., 1:3] - source_color[..., 1:3]).mean(axis=(1, 2))
+    second_difference = np.linalg.norm(np.diff(applied_grade, n=2, axis=0), axis=1)
+    assert float(second_difference.max(initial=0.0)) < 0.003
+
+
+def test_motion_adaptation_preserves_full_fixed_camera_correction(module):
+    reference = _texture(seed=105)
+    sources = [
+        _apply_known_inverse_grade(reference, 1.0 + index * 0.004, 0.00035 * index, -0.00030 * index)
+        for index in range(20)
+    ]
+    images = torch.from_numpy(np.stack(sources))
+    reference_tensor = torch.from_numpy(reference)[None]
+
+    baseline = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50,
+    )
+    adaptive = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50, motion_adaptation=0.30,
+    )
+
+    assert torch.allclose(adaptive, baseline, atol=2e-5)
+
+
+def test_mild_zoom_remains_close_to_full_luma_correction(module):
+    reference = _texture(seed=107)
+    targets = []
+    sources = []
+    for index in range(20):
+        scale = 1.0 + index * 0.002
+        transform = np.float32([
+            [scale, 0.0, index * 0.35 - (scale - 1.0) * 80.0],
+            [0.0, scale, index * 0.10 - (scale - 1.0) * 64.0],
+        ])
+        target = cv2.warpAffine(
+            reference, transform, (160, 128), borderMode=cv2.BORDER_REFLECT,
+        )
+        targets.append(target)
+        sources.append(_apply_known_inverse_grade(target, 1.0 + index * 0.004, 0.0, 0.0))
+    images = torch.from_numpy(np.stack(sources))
+    reference_tensor = torch.from_numpy(reference)[None]
+    target_tensor = torch.from_numpy(np.stack(targets))
+
+    full = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50,
+    )
+    adaptive = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50, motion_adaptation=0.30,
+    )
+
+    full_error = torch.mean(torch.abs(full - target_tensor)).item()
+    adaptive_error = torch.mean(torch.abs(adaptive - target_tensor)).item()
+    assert adaptive_error <= full_error * 1.15
 
 
 def test_clean_homographic_pan_keeps_neutral_grade(module):
@@ -301,6 +462,38 @@ def test_large_pan_keeps_shared_shot_grade_through_coast_and_rebase(module):
     assert torch.mean(torch.abs(output - target_batch)).item() < 0.003
 
 
+def test_motion_adaptation_bounds_weak_grade_during_composition_change(module):
+    reference = _texture(seed=42)
+    sources = []
+    for index in range(18):
+        frame = cv2.warpAffine(
+            reference,
+            np.float32([[1.0, 0.0, index * 3.0], [0.0, 1.0, index * 0.5]]),
+            (160, 128),
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        if 5 <= index <= 14:
+            frame = frame.copy()
+            cv2.rectangle(frame, (45 + index, 18), (125, 110), (0.14, 0.20, 0.68), -1)
+        sources.append(_apply_known_inverse_grade(frame, 1.05, 0.005, -0.004))
+    images = torch.from_numpy(np.stack(sources))
+    reference_tensor = torch.from_numpy(reference)[None]
+
+    full = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50,
+    )
+    adaptive = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50, motion_adaptation=0.30,
+    )
+
+    full_change = torch.mean(torch.abs(full - images)).item()
+    adaptive_change = torch.mean(torch.abs(adaptive - images)).item()
+    assert adaptive_change < full_change
+    assert torch.isfinite(adaptive).all()
+
+
 def test_hard_cut_does_not_carry_the_previous_palette(module):
     first = _texture(seed=43)
     second = np.zeros_like(first)
@@ -317,7 +510,7 @@ def test_hard_cut_does_not_carry_the_previous_palette(module):
     assert torch.allclose(output[4], images[4], atol=2e-5)
 
 
-def test_hard_cut_resets_active_chroma_trend(module):
+def test_hard_cut_resets_active_chroma_and_motion_state(module, monkeypatch):
     reference = _texture(seed=45)
     drifted, _ = _pan_drift_frames(reference, count=8)
     second = np.zeros_like(reference)
@@ -330,12 +523,23 @@ def test_hard_cut_resets_active_chroma_trend(module):
         )
     images = torch.from_numpy(np.stack((*drifted, second, second, second)))
 
+    node = module.FurgenSceneAwareColorStabilize()
+    risks = []
+    original = node._adaptive_grade
+
+    def record(gain, cb, cr, motion_risk, adaptation):
+        risks.append(motion_risk)
+        return original(gain, cb, cr, motion_risk, adaptation)
+
+    monkeypatch.setattr(node, "_adaptive_grade", record)
     output = _run(
-        module.FurgenSceneAwareColorStabilize(), images,
-        torch.from_numpy(reference)[None], temporal_smoothing=0.50,
+        node, images, torch.from_numpy(reference)[None],
+        temporal_smoothing=0.50, motion_adaptation=0.30,
     )
 
     assert torch.allclose(output[8:], images[8:], atol=2e-5)
+    assert max(risks[:8]) > 0.0
+    assert risks[8] == 0.0
 
 
 def test_localized_orb_matches_cannot_veto_a_similarly_textured_hard_cut(module):
@@ -402,6 +606,31 @@ def test_persistent_lighting_rebase_clears_chroma_trend_history(module, monkeypa
     assert max(history_lengths) >= node.CHROMA_TREND_MIN_SAMPLES
     peak = history_lengths.index(max(history_lengths))
     assert 1 in history_lengths[peak + 1:]
+
+
+def test_persistent_lighting_rebase_clears_motion_state(module, monkeypatch):
+    reference = _texture(seed=51)
+    drifted, _ = _pan_drift_frames(reference, count=7)
+    brighter = np.clip(
+        _linear_to_srgb(_srgb_to_linear(drifted[-1]) * 1.30), 0.0, 1.0,
+    ).astype(np.float32)
+    images = torch.from_numpy(np.stack((*drifted, *([brighter] * 8))))
+    node = module.FurgenSceneAwareColorStabilize()
+    risks = []
+    original = node._adaptive_grade
+
+    def record(gain, cb, cr, motion_risk, adaptation):
+        risks.append(motion_risk)
+        return original(gain, cb, cr, motion_risk, adaptation)
+
+    monkeypatch.setattr(node, "_adaptive_grade", record)
+    _run(
+        node, images, torch.from_numpy(reference)[None],
+        temporal_smoothing=0.50, motion_adaptation=0.30,
+    )
+
+    assert max(risks[:7]) > 0.0
+    assert 0.0 in risks[7:]
 
 
 def test_feature_poor_track_loss_is_finite_and_neutral(module):

@@ -2077,23 +2077,40 @@ class FurgenSceneAwareColorStabilize:
     CHROMA_TREND_MIN_CONSISTENCY = 0.75
     CHROMA_TREND_MIN_STEP = 0.00005
     CHROMA_TREND_MAX_STEP = 0.002
+    MOTION_RISK_LOW = 0.020
+    MOTION_RISK_HIGH = 0.050
+    MOTION_RISK_ATTACK = 0.25
+    MOTION_RISK_DECAY = 0.01
+    MOTION_SAMPLE_INTERVAL = 2
+    MOTION_LUMA_EVIDENCE_LOW = math.log(1.08)
+    MOTION_LUMA_EVIDENCE_HIGH = math.log(1.12)
+    MOTION_CHROMA_EVIDENCE_LOW = 0.008
+    MOTION_CHROMA_EVIDENCE_HIGH = 0.016
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
-            "images": ("IMAGE",),
-            "reference": ("IMAGE",),
-            "reference_mode": (list(cls.REFERENCE_MODES), {"default": "external_anchor"}),
-            "wet_dry": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-            "gain_min": ("FLOAT", {"default": 0.90, "min": 0.10, "max": 4.0, "step": 0.01}),
-            "gain_max": ("FLOAT", {"default": 1.12, "min": 0.10, "max": 4.0, "step": 0.01}),
-            "correct_chroma": ("BOOLEAN", {"default": True}),
-            "max_chroma_offset": ("FLOAT", {"default": 0.020, "min": 0.0, "max": 0.25, "step": 0.001}),
-            "temporal_smoothing": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 0.99, "step": 0.01}),
-            "cut_sensitivity": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
-            "analysis_width": ("INT", {"default": 320, "min": 96, "max": 1024, "step": 8}),
-            "preserve_highlights": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01}),
-        }}
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "reference_mode": (list(cls.REFERENCE_MODES), {"default": "external_anchor"}),
+                "wet_dry": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "gain_min": ("FLOAT", {"default": 0.90, "min": 0.10, "max": 4.0, "step": 0.01}),
+                "gain_max": ("FLOAT", {"default": 1.12, "min": 0.10, "max": 4.0, "step": 0.01}),
+                "correct_chroma": ("BOOLEAN", {"default": True}),
+                "max_chroma_offset": ("FLOAT", {"default": 0.020, "min": 0.0, "max": 0.25, "step": 0.001}),
+                "temporal_smoothing": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 0.99, "step": 0.01}),
+                "cut_sensitivity": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "analysis_width": ("INT", {"default": 320, "min": 96, "max": 1024, "step": 8}),
+                "preserve_highlights": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+            "optional": {
+                "motion_adaptation": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 0.50, "step": 0.01},
+                ),
+            },
+        }
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images",)
@@ -2163,10 +2180,21 @@ class FurgenSceneAwareColorStabilize:
         return np.array([(x, y) for y in ys for x in xs], dtype=np.float32).reshape(-1, 1, 2), radius
 
     @staticmethod
-    def _coarse_affine_details(cv2, key, current):
+    def _orb_features(cv2, analysis):
         orb = cv2.ORB_create(nfeatures=1200, fastThreshold=7)
-        key_points, key_desc = orb.detectAndCompute(key["gray"], None)
-        cur_points, cur_desc = orb.detectAndCompute(current["gray"], None)
+        return orb.detectAndCompute(analysis["gray"], None)
+
+    @classmethod
+    def _coarse_affine_details(
+        cls, cv2, key, current, key_features=None, current_features=None,
+    ):
+        key_points, key_desc = (
+            key_features if key_features is not None else cls._orb_features(cv2, key)
+        )
+        cur_points, cur_desc = (
+            current_features if current_features is not None
+            else cls._orb_features(cv2, current)
+        )
         if key_desc is None or cur_desc is None or len(key_points) < 8 or len(cur_points) < 8:
             return None
         matches = sorted(cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True).match(key_desc, cur_desc), key=lambda match: match.distance)
@@ -2292,6 +2320,62 @@ class FurgenSceneAwareColorStabilize:
         median = float(np.median(values))
         mad = float(np.median(np.abs(values - median)))
         return np.abs(values - median) <= max(float(floor), 3.0 * 1.4826 * mad)
+
+    @staticmethod
+    def _smoothstep(low, high, value):
+        position = max(0.0, min(1.0, (float(value) - low) / max(high - low, 1e-9)))
+        return position * position * (3.0 - 2.0 * position)
+
+    @classmethod
+    def _motion_risk(cls, details, analysis):
+        if details is None:
+            return 0.0
+        grid, _ = cls._grid(analysis)
+        sample = grid.reshape(-1, 2)
+        if not len(sample):
+            return 0.0
+        predicted = np.concatenate(
+            (sample, np.ones((len(sample), 1), dtype=np.float32)), axis=1,
+        ) @ details["affine"].T
+        displacement = np.linalg.norm(predicted - sample, axis=1)
+        diagonal = math.hypot(float(analysis["width"]), float(analysis["height"]))
+        return float(np.median(displacement)) / max(1.0, diagonal)
+
+    @classmethod
+    def _update_motion_risk(cls, previous, motion, ratio, coverage):
+        observed = cls._smoothstep(cls.MOTION_RISK_LOW, cls.MOTION_RISK_HIGH, motion)
+        confidence = min(
+            cls._smoothstep(cls.LOCK_RATIO, 0.60, ratio),
+            cls._smoothstep(cls.MIN_COVERAGE, 0.50, coverage),
+        )
+        # Weak geometry may increase risk but cannot prove the shot stable again.
+        target = observed if confidence >= 0.50 else max(float(previous), observed)
+        change = max(-cls.MOTION_RISK_DECAY, min(cls.MOTION_RISK_ATTACK, target - previous))
+        return max(0.0, min(1.0, float(previous) + change))
+
+    @classmethod
+    def _adaptive_grade(cls, gain, cb, cr, motion_risk, adaptation):
+        strength = max(0.0, min(0.50, float(adaptation)))
+        if strength <= 0.0:
+            return float(gain), float(cb), float(cr)
+        risk = max(0.0, min(1.0, float(motion_risk)))
+        luma_evidence = cls._smoothstep(
+            cls.MOTION_LUMA_EVIDENCE_LOW,
+            cls.MOTION_LUMA_EVIDENCE_HIGH,
+            abs(math.log(max(float(gain), 1e-6))),
+        )
+        chroma_evidence = cls._smoothstep(
+            cls.MOTION_CHROMA_EVIDENCE_LOW,
+            cls.MOTION_CHROMA_EVIDENCE_HIGH,
+            max(abs(float(cb)), abs(float(cr))),
+        )
+        luma_factor = 1.0 - strength * risk * (1.0 - luma_evidence)
+        chroma_factor = 1.0 - strength * risk * (1.0 - chroma_evidence)
+        return (
+            math.exp(math.log(max(float(gain), 1e-6)) * luma_factor),
+            float(cb) * chroma_factor,
+            float(cr) * chroma_factor,
+        )
 
     @classmethod
     def _persistent_chroma_trend(cls, history):
@@ -2470,7 +2554,7 @@ class FurgenSceneAwareColorStabilize:
     def stabilize(
         self, images, reference, reference_mode, wet_dry, gain_min, gain_max,
         correct_chroma, max_chroma_offset, temporal_smoothing, cut_sensitivity,
-        analysis_width, preserve_highlights,
+        analysis_width, preserve_highlights, motion_adaptation=0.0,
     ):
         if _is_neutral(wet_dry, 0.0) or int(images.shape[0]) < 1:
             return (images,)
@@ -2489,6 +2573,7 @@ class FurgenSceneAwareColorStabilize:
                 lo, hi = sorted((float(gain_min), float(gain_max)))
                 max_chroma = max(0.0, float(max_chroma_offset))
                 smoothing = max(0.0, min(0.99, float(temporal_smoothing)))
+                adaptation = max(0.0, min(0.50, float(motion_adaptation)))
                 initial_count = min(5, int(images.shape[0]))
                 analyses = [self._analyze(cv2, images[index], analysis_width) for index in range(initial_count)]
                 target_size = (analyses[0]["width"], analyses[0]["height"])
@@ -2510,6 +2595,12 @@ class FurgenSceneAwareColorStabilize:
                 last_lock_analysis = key
                 last_lock_required_grade = (smooth_gain, smooth_cb, smooth_cr)
                 locked_since_key = False
+                motion_risk = 0.0
+                motion_observation = 0.0
+                motion_sample_age = self.MOTION_SAMPLE_INTERVAL
+                motion_key_features = (
+                    self._orb_features(cv2, key) if adaptation > 0.0 else None
+                )
                 output = torch.empty_like(images)
                 for index in range(int(images.shape[0])):
                     if reference_mode == "first_stable_frame" and index < stable_index:
@@ -2543,8 +2634,27 @@ class FurgenSceneAwareColorStabilize:
                         last_lock_analysis = current
                         last_lock_required_grade = (smooth_gain, smooth_cb, smooth_cr)
                         locked_since_key = False
+                        motion_risk = 0.0
+                        motion_observation = 0.0
+                        motion_sample_age = self.MOTION_SAMPLE_INTERVAL
+                        motion_key_features = (
+                            self._orb_features(cv2, key) if adaptation > 0.0 else None
+                        )
                         locked_once = True
                     elif ratio >= self.LOCK_RATIO and estimate["count"] >= self.MIN_PATCHES:
+                        if adaptation > 0.0:
+                            motion_sample_age += 1
+                            if motion_sample_age >= self.MOTION_SAMPLE_INTERVAL:
+                                details = self._coarse_affine_details(
+                                    cv2, key, current,
+                                    key_features=motion_key_features,
+                                )
+                                if details is not None:
+                                    motion_observation = self._motion_risk(details, key)
+                                motion_sample_age = 0
+                            motion_risk = self._update_motion_risk(
+                                motion_risk, motion_observation, ratio, estimate["coverage"],
+                            )
                         raw_measured_cb = max(
                             -max_chroma,
                             min(max_chroma, base_cb + base_gain * float(estimate["raw_cb"])),
@@ -2583,8 +2693,11 @@ class FurgenSceneAwareColorStabilize:
                                 else (smooth_gain, smooth_cb, smooth_cr)
                             )
                             locked_since_key = True
+                            apply_gain, apply_cb, apply_cr = self._adaptive_grade(
+                                smooth_gain, smooth_cb, smooth_cr, motion_risk, adaptation,
+                            )
                             output[index:index + 1] = self._apply(
-                                images[index:index + 1], smooth_gain, smooth_cb, smooth_cr,
+                                images[index:index + 1], apply_gain, apply_cb, apply_cr,
                                 correct_chroma, wet_dry, preserve_highlights,
                             )
                             continue
@@ -2607,6 +2720,13 @@ class FurgenSceneAwareColorStabilize:
                                 last_lock_analysis = current
                                 last_lock_required_grade = (smooth_gain, smooth_cb, smooth_cr)
                                 locked_since_key = False
+                                motion_risk = 0.0
+                                motion_observation = 0.0
+                                motion_sample_age = self.MOTION_SAMPLE_INTERVAL
+                                motion_key_features = (
+                                    self._orb_features(cv2, key)
+                                    if adaptation > 0.0 else None
+                                )
                         else:
                             lighting_frames = 0
                             pending = None
@@ -2645,9 +2765,15 @@ class FurgenSceneAwareColorStabilize:
                             last_lock_required_grade = (base_gain, base_cb, base_cr)
                             locked_since_key = False
                             coast_frames = 0
+                            if adaptation > 0.0:
+                                motion_key_features = self._orb_features(cv2, key)
+                                motion_sample_age = self.MOTION_SAMPLE_INTERVAL
                     phase = f"frame_{index}_apply"
+                    apply_gain, apply_cb, apply_cr = self._adaptive_grade(
+                        smooth_gain, smooth_cb, smooth_cr, motion_risk, adaptation,
+                    )
                     output[index:index + 1] = self._apply(
-                        images[index:index + 1], smooth_gain, smooth_cb, smooth_cr,
+                        images[index:index + 1], apply_gain, apply_cb, apply_cr,
                         correct_chroma, wet_dry, preserve_highlights,
                     )
                 return (output,)
