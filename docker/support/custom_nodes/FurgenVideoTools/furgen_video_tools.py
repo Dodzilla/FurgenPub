@@ -2671,6 +2671,7 @@ class FurgenSceneAwareColorStabilize:
                                     motion_observation = self._motion_risk(details, key)
                                     motion_sample = motion_observation
                                 else:
+                                    motion_observation = 0.0
                                     motion_sample = 0.0
                                 motion_sample_age = 0
                         raw_measured_cb = max(

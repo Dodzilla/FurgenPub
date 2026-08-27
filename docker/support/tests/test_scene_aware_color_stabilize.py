@@ -179,6 +179,9 @@ def test_motion_epoch_requires_two_of_three_complete_samples(module):
     assert node._motion_epoch_confirmed([0.022123, 0.0, 0.020105])
     assert not node._motion_epoch_confirmed([0.022123, 0.0, 0.0, 0.020105])
     assert node._motion_epoch_confirmed([0.024, 0.031, 0.026])
+    # Two adjacent above-deadband observations remain intentional evidence;
+    # the measured fixed-source peaks are isolated and do not take this path.
+    assert node._motion_epoch_confirmed([0.020105, 0.020672, 0.0])
 
 
 def test_single_valid_strong_motion_sample_confirms_short_epoch(module, monkeypatch):
@@ -231,6 +234,43 @@ def test_failed_coarse_affine_samples_cannot_confirm_motion(module, monkeypatch)
     )
 
     assert torch.equal(adaptive, baseline)
+
+
+def test_failed_affine_after_confirmation_releases_motion_risk(module, monkeypatch):
+    reference = _texture(seed=110)
+    images = torch.from_numpy(np.stack([
+        _apply_known_inverse_grade(reference, 1.05, 0.004, -0.003)
+        for _ in range(7)
+    ]))
+    node = module.FurgenSceneAwareColorStabilize()
+    node._orb_features = lambda *_args, **_kwargs: ([], None)
+    samples = iter((0.050, 0.050, None, None))
+
+    def lose_track(_cv2, key, current, **_kwargs):
+        motion = next(samples, None)
+        if motion is None:
+            return None
+        translation = np.hypot(key["width"], key["height"]) * motion
+        return {"affine": np.float32([[1.0, 0.0, translation], [0.0, 1.0, 0.0]])}
+
+    risks = []
+    original = node._adaptive_grade
+
+    def record(gain, cb, cr, motion_risk, adaptation):
+        risks.append(motion_risk)
+        return original(gain, cb, cr, motion_risk, adaptation)
+
+    monkeypatch.setattr(node, "_coarse_affine_details", lose_track)
+    monkeypatch.setattr(node, "_adaptive_grade", record)
+    _run(
+        node, images, torch.from_numpy(reference)[None],
+        temporal_smoothing=0.50, motion_adaptation=0.30,
+    )
+
+    assert risks[3] == pytest.approx(1.0)
+    assert risks[4] < risks[3]
+    assert risks[5] < risks[4]
+    assert risks[6] < risks[5]
 
 
 def test_motion_adaptation_caches_key_orb_and_samples_reliable_locks(module, monkeypatch):
