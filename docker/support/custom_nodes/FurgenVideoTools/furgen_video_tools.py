@@ -2765,6 +2765,11 @@ class FurgenSceneAwareColorStabilize:
                             last_lock_required_grade = (base_gain, base_cb, base_cr)
                             locked_since_key = False
                             coast_frames = 0
+                            # Motion is keyframe-relative. Carrying its old
+                            # state into a promoted key would attenuate an
+                            # unrelated span until the slow decay catches up.
+                            motion_risk = 0.0
+                            motion_observation = 0.0
                             if adaptation > 0.0:
                                 motion_key_features = self._orb_features(cv2, key)
                                 motion_sample_age = self.MOTION_SAMPLE_INTERVAL

@@ -828,6 +828,65 @@ def test_coast_promotes_last_locked_frame_not_low_confidence_current(module, mon
     assert (6, 2) in seen_keys
 
 
+def test_coast_key_promotion_resets_motion_attenuation(module, monkeypatch):
+    node = module.FurgenSceneAwareColorStabilize()
+    grades = []
+
+    def analyze(_cv2, frame, _analysis_width, target_size=None):
+        return {
+            "index": int(round(float(frame[0, 0, 0]) * 10.0)),
+            "luma": np.zeros((128, 160), dtype=np.float32),
+            "width": 160,
+            "height": 128,
+        }
+
+    def estimate(_cv2, key, current):
+        locked = current["index"] <= 2 or current["index"] == 6
+        return {
+            "gain": 1.05, "cb": 0.0, "cr": 0.0,
+            "raw_cb": 0.0, "raw_cr": 0.0,
+            "ratio": 1.0 if locked else 0.25,
+            "coverage": 0.8 if locked else 0.1,
+            "count": node.MIN_PATCHES if locked else 4,
+        }
+
+    def affine(_cv2, key, current, **_kwargs):
+        translation = 16.0 if key["index"] == 9 else 0.0
+        return {
+            "affine": np.float32([[1.0, 0.0, translation], [0.0, 1.0, 0.0]])
+        }
+
+    original_adaptive_grade = node._adaptive_grade
+
+    def record(gain, cb, cr, motion_risk, adaptation):
+        result = original_adaptive_grade(gain, cb, cr, motion_risk, adaptation)
+        grades.append((motion_risk, gain, result[0]))
+        return result
+
+    monkeypatch.setattr(node, "_analyze", analyze)
+    monkeypatch.setattr(node, "_estimate", estimate)
+    monkeypatch.setattr(node, "_is_cut", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(node, "_orb_features", lambda *_args, **_kwargs: ([], None))
+    monkeypatch.setattr(node, "_coarse_affine_details", affine)
+    monkeypatch.setattr(node, "_adaptive_grade", record)
+    monkeypatch.setattr(node, "_apply", lambda frame, *_args, **_kwargs: frame.clone())
+    images = torch.stack(
+        [torch.full((4, 4, 3), index / 10.0, dtype=torch.float32) for index in range(7)]
+    )
+    reference = torch.full((1, 4, 4, 3), 0.9, dtype=torch.float32)
+
+    _run(
+        node, images, reference, analysis_width=96,
+        temporal_smoothing=0.0, motion_adaptation=0.30,
+    )
+
+    assert max(risk for risk, _input, _output in grades[:5]) >= 0.75
+    assert grades[5][0] == 0.0
+    assert grades[5][2] == pytest.approx(grades[5][1])
+    assert grades[6][0] == 0.0
+    assert grades[6][2] == pytest.approx(grades[6][1])
+
+
 def test_zero_wet_dry_is_a_true_passthrough(module):
     images = torch.rand((3, 64, 64, 3), generator=torch.Generator().manual_seed(91))
     output = _run(module.FurgenSceneAwareColorStabilize(), images, images[:1], wet_dry=0.0)
