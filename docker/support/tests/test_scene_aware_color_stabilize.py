@@ -169,13 +169,68 @@ def test_motion_risk_deadband_rejects_subthreshold_jitter_and_admits_camera_moti
     assert pan == pytest.approx(node.MOTION_RISK_ATTACK)
 
 
-def test_motion_risk_requires_two_of_three_samples_and_uses_strongest(module):
+def test_motion_epoch_requires_two_of_three_complete_samples(module):
     node = module.FurgenSceneAwareColorStabilize()
 
-    assert node._confirmed_motion_observation([0.022123]) == 0.0
-    assert node._confirmed_motion_observation([0.022123, 0.0, 0.020105]) == pytest.approx(0.022123)
-    assert node._confirmed_motion_observation([0.0, 0.020105, 0.0]) == 0.0
-    assert node._confirmed_motion_observation([0.024, 0.031, 0.026]) == pytest.approx(0.031)
+    assert not node._motion_epoch_confirmed([0.022123])
+    assert not node._motion_epoch_confirmed([0.039999])
+    assert node._motion_epoch_confirmed([0.040])
+    assert not node._motion_epoch_confirmed([0.022123, 0.020105])
+    assert node._motion_epoch_confirmed([0.022123, 0.0, 0.020105])
+    assert not node._motion_epoch_confirmed([0.022123, 0.0, 0.0, 0.020105])
+    assert node._motion_epoch_confirmed([0.024, 0.031, 0.026])
+
+
+def test_single_valid_strong_motion_sample_confirms_short_epoch(module, monkeypatch):
+    reference = _texture(seed=108)
+    images = torch.from_numpy(np.stack([
+        _apply_known_inverse_grade(reference, 1.05, 0.004, -0.003)
+        for _ in range(5)
+    ]))
+    reference_tensor = torch.from_numpy(reference)[None]
+    node = module.FurgenSceneAwareColorStabilize()
+    node._orb_features = lambda *_args, **_kwargs: ([], None)
+    samples = iter((0.041, 0.0, 0.0))
+
+    def strong_once(_cv2, key, current, **_kwargs):
+        translation = np.hypot(key["width"], key["height"]) * next(samples, 0.0)
+        return {"affine": np.float32([[1.0, 0.0, translation], [0.0, 1.0, 0.0]])}
+
+    monkeypatch.setattr(node, "_coarse_affine_details", strong_once)
+    baseline = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50,
+    )
+    adaptive = _run(
+        node, images, reference_tensor,
+        temporal_smoothing=0.50, motion_adaptation=0.30,
+    )
+
+    assert not torch.equal(adaptive, baseline)
+    assert torch.mean(torch.abs(adaptive - images)) < torch.mean(torch.abs(baseline - images))
+
+
+def test_failed_coarse_affine_samples_cannot_confirm_motion(module, monkeypatch):
+    reference = _texture(seed=109)
+    images = torch.from_numpy(np.stack([
+        _apply_known_inverse_grade(reference, 1.05, 0.004, -0.003)
+        for _ in range(5)
+    ]))
+    reference_tensor = torch.from_numpy(reference)[None]
+    baseline = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50,
+    )
+    node = module.FurgenSceneAwareColorStabilize()
+    monkeypatch.setattr(node, "_orb_features", lambda *_args, **_kwargs: ([], None))
+    monkeypatch.setattr(node, "_coarse_affine_details", lambda *_args, **_kwargs: None)
+
+    adaptive = _run(
+        node, images, reference_tensor,
+        temporal_smoothing=0.50, motion_adaptation=0.30,
+    )
+
+    assert torch.equal(adaptive, baseline)
 
 
 def test_motion_adaptation_caches_key_orb_and_samples_reliable_locks(module, monkeypatch):
@@ -904,7 +959,7 @@ def test_coast_key_promotion_resets_motion_attenuation(module, monkeypatch):
         }
 
     def estimate(_cv2, key, current):
-        locked = current["index"] <= 2 or current["index"] == 6
+        locked = current["index"] <= 4 or current["index"] == 8
         return {
             "gain": 1.05, "cb": 0.0, "cr": 0.0,
             "raw_cb": 0.0, "raw_cr": 0.0,
@@ -934,7 +989,7 @@ def test_coast_key_promotion_resets_motion_attenuation(module, monkeypatch):
     monkeypatch.setattr(node, "_adaptive_grade", record)
     monkeypatch.setattr(node, "_apply", lambda frame, *_args, **_kwargs: frame.clone())
     images = torch.stack(
-        [torch.full((4, 4, 3), index / 10.0, dtype=torch.float32) for index in range(7)]
+        [torch.full((4, 4, 3), index / 10.0, dtype=torch.float32) for index in range(9)]
     )
     reference = torch.full((1, 4, 4, 3), 0.9, dtype=torch.float32)
 
@@ -943,11 +998,11 @@ def test_coast_key_promotion_resets_motion_attenuation(module, monkeypatch):
         temporal_smoothing=0.0, motion_adaptation=0.30,
     )
 
-    assert max(risk for risk, _input, _output in grades[:5]) > 0.0
-    assert grades[5][0] == 0.0
-    assert grades[5][2] == pytest.approx(grades[5][1])
-    assert grades[6][0] == 0.0
-    assert grades[6][2] == pytest.approx(grades[6][1])
+    assert max(risk for risk, _input, _output in grades[:7]) > 0.0
+    assert grades[7][0] == 0.0
+    assert grades[7][2] == pytest.approx(grades[7][1])
+    assert grades[8][0] == 0.0
+    assert grades[8][2] == pytest.approx(grades[8][1])
 
 
 def test_zero_wet_dry_is_a_true_passthrough(module):

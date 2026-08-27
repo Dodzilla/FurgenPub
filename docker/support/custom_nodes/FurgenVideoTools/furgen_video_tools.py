@@ -2084,6 +2084,7 @@ class FurgenSceneAwareColorStabilize:
     MOTION_SAMPLE_INTERVAL = 2
     MOTION_CONFIRM_WINDOW = 3
     MOTION_CONFIRM_COUNT = 2
+    MOTION_STRONG_EVIDENCE = 0.040
     MOTION_LUMA_EVIDENCE_LOW = math.log(1.08)
     MOTION_LUMA_EVIDENCE_HIGH = math.log(1.12)
     MOTION_CHROMA_EVIDENCE_LOW = 0.008
@@ -2356,12 +2357,15 @@ class FurgenSceneAwareColorStabilize:
         return max(0.0, min(1.0, float(previous) + change))
 
     @classmethod
-    def _confirmed_motion_observation(cls, history):
-        recent = [float(value) for value in history[-cls.MOTION_CONFIRM_WINDOW:]]
-        above_threshold = [value for value in recent if value > cls.MOTION_RISK_LOW]
-        if len(above_threshold) < cls.MOTION_CONFIRM_COUNT:
-            return 0.0
-        return max(above_threshold)
+    def _motion_epoch_confirmed(cls, samples):
+        values = [float(value) for value in samples]
+        if any(value >= cls.MOTION_STRONG_EVIDENCE for value in values):
+            return True
+        for start in range(len(values) - cls.MOTION_CONFIRM_WINDOW + 1):
+            window = values[start:start + cls.MOTION_CONFIRM_WINDOW]
+            if sum(value > cls.MOTION_RISK_LOW for value in window) >= cls.MOTION_CONFIRM_COUNT:
+                return True
+        return False
 
     @classmethod
     def _adaptive_grade(cls, gain, cb, cr, motion_risk, adaptation):
@@ -2607,13 +2611,16 @@ class FurgenSceneAwareColorStabilize:
                 last_lock_analysis = key
                 last_lock_required_grade = (smooth_gain, smooth_cb, smooth_cr)
                 locked_since_key = False
-                motion_risk = 0.0
                 motion_observation = 0.0
-                motion_history = []
                 motion_sample_age = self.MOTION_SAMPLE_INTERVAL
+                motion_epoch = 0
                 motion_key_features = (
                     self._orb_features(cv2, key) if adaptation > 0.0 else None
                 )
+                frame_grades = [None] * int(images.shape[0])
+                # Scalar-only metadata: epoch, held observation, ratio,
+                # coverage, controller-update flag, actual sampled value.
+                frame_motion = [None] * int(images.shape[0])
                 output = torch.empty_like(images)
                 for index in range(int(images.shape[0])):
                     if reference_mode == "first_stable_frame" and index < stable_index:
@@ -2625,14 +2632,11 @@ class FurgenSceneAwareColorStabilize:
                             preroll_gain = max(lo, min(hi, float(preroll["gain"])))
                             preroll_cb = max(-max_chroma, min(max_chroma, float(preroll["cb"])))
                             preroll_cr = max(-max_chroma, min(max_chroma, float(preroll["cr"])))
-                            output[index:index + 1] = self._apply(
-                                images[index:index + 1], preroll_gain, preroll_cb, preroll_cr,
-                                correct_chroma, wet_dry, preserve_highlights,
-                            )
-                        else:
-                            output[index:index + 1] = images[index:index + 1]
+                            frame_grades[index] = (preroll_gain, preroll_cb, preroll_cr)
                         continue
                     phase = f"frame_{index}_analysis"
+                    motion_sample = None
+                    motion_update = False
                     current = analyses[index] if index < initial_count else self._analyze(cv2, images[index], analysis_width)
                     estimate = self._estimate(cv2, key, current)
                     ratio = float(estimate["ratio"])
@@ -2647,9 +2651,8 @@ class FurgenSceneAwareColorStabilize:
                         last_lock_analysis = current
                         last_lock_required_grade = (smooth_gain, smooth_cb, smooth_cr)
                         locked_since_key = False
-                        motion_risk = 0.0
                         motion_observation = 0.0
-                        motion_history = []
+                        motion_epoch += 1
                         motion_sample_age = self.MOTION_SAMPLE_INTERVAL
                         motion_key_features = (
                             self._orb_features(cv2, key) if adaptation > 0.0 else None
@@ -2657,25 +2660,19 @@ class FurgenSceneAwareColorStabilize:
                         locked_once = True
                     elif ratio >= self.LOCK_RATIO and estimate["count"] >= self.MIN_PATCHES:
                         if adaptation > 0.0:
+                            motion_update = True
                             motion_sample_age += 1
                             if motion_sample_age >= self.MOTION_SAMPLE_INTERVAL:
-                                sampled_motion = 0.0
                                 details = self._coarse_affine_details(
                                     cv2, key, current,
                                     key_features=motion_key_features,
                                 )
                                 if details is not None:
-                                    sampled_motion = self._motion_risk(details, key)
-                                motion_history.append(sampled_motion)
-                                if len(motion_history) > self.MOTION_CONFIRM_WINDOW:
-                                    del motion_history[:-self.MOTION_CONFIRM_WINDOW]
-                                motion_observation = self._confirmed_motion_observation(
-                                    motion_history,
-                                )
+                                    motion_observation = self._motion_risk(details, key)
+                                    motion_sample = motion_observation
+                                else:
+                                    motion_sample = 0.0
                                 motion_sample_age = 0
-                            motion_risk = self._update_motion_risk(
-                                motion_risk, motion_observation, ratio, estimate["coverage"],
-                            )
                         raw_measured_cb = max(
                             -max_chroma,
                             min(max_chroma, base_cb + base_gain * float(estimate["raw_cb"])),
@@ -2714,12 +2711,10 @@ class FurgenSceneAwareColorStabilize:
                                 else (smooth_gain, smooth_cb, smooth_cr)
                             )
                             locked_since_key = True
-                            apply_gain, apply_cb, apply_cr = self._adaptive_grade(
-                                smooth_gain, smooth_cb, smooth_cr, motion_risk, adaptation,
-                            )
-                            output[index:index + 1] = self._apply(
-                                images[index:index + 1], apply_gain, apply_cb, apply_cr,
-                                correct_chroma, wet_dry, preserve_highlights,
+                            frame_grades[index] = (smooth_gain, smooth_cb, smooth_cr)
+                            frame_motion[index] = (
+                                motion_epoch, motion_observation, ratio,
+                                float(estimate["coverage"]), motion_update, motion_sample,
                             )
                             continue
                         abrupt = (
@@ -2741,9 +2736,10 @@ class FurgenSceneAwareColorStabilize:
                                 last_lock_analysis = current
                                 last_lock_required_grade = (smooth_gain, smooth_cb, smooth_cr)
                                 locked_since_key = False
-                                motion_risk = 0.0
                                 motion_observation = 0.0
-                                motion_history = []
+                                motion_epoch += 1
+                                motion_update = False
+                                motion_sample = None
                                 motion_sample_age = self.MOTION_SAMPLE_INTERVAL
                                 motion_key_features = (
                                     self._orb_features(cv2, key)
@@ -2790,16 +2786,48 @@ class FurgenSceneAwareColorStabilize:
                             # Motion is keyframe-relative. Carrying its old
                             # state into a promoted key would attenuate an
                             # unrelated span until the slow decay catches up.
-                            motion_risk = 0.0
                             motion_observation = 0.0
-                            motion_history = []
+                            motion_epoch += 1
+                            motion_update = False
+                            motion_sample = None
                             if adaptation > 0.0:
                                 motion_key_features = self._orb_features(cv2, key)
                                 motion_sample_age = self.MOTION_SAMPLE_INTERVAL
-                    phase = f"frame_{index}_apply"
-                    apply_gain, apply_cb, apply_cr = self._adaptive_grade(
-                        smooth_gain, smooth_cb, smooth_cr, motion_risk, adaptation,
+                    frame_grades[index] = (smooth_gain, smooth_cb, smooth_cr)
+                    frame_motion[index] = (
+                        motion_epoch, motion_observation, ratio,
+                        float(estimate["coverage"]), motion_update, motion_sample,
                     )
+
+                epoch_samples = {}
+                for record in frame_motion:
+                    if record is not None and record[5] is not None:
+                        epoch_samples.setdefault(record[0], []).append(record[5])
+                confirmed_epochs = {
+                    epoch for epoch, samples in epoch_samples.items()
+                    if self._motion_epoch_confirmed(samples)
+                }
+                epoch_risks = {}
+                for index, grade in enumerate(frame_grades):
+                    phase = f"frame_{index}_apply"
+                    if grade is None:
+                        output[index:index + 1] = images[index:index + 1]
+                        continue
+                    apply_gain, apply_cb, apply_cr = grade
+                    record = frame_motion[index]
+                    if adaptation > 0.0 and record is not None:
+                        epoch, observation, ratio, coverage, update, _sample = record
+                        risk = 0.0
+                        if epoch in confirmed_epochs:
+                            risk = epoch_risks.get(epoch, 0.0)
+                            if update:
+                                risk = self._update_motion_risk(
+                                    risk, observation, ratio, coverage,
+                                )
+                            epoch_risks[epoch] = risk
+                        apply_gain, apply_cb, apply_cr = self._adaptive_grade(
+                            apply_gain, apply_cb, apply_cr, risk, adaptation,
+                        )
                     output[index:index + 1] = self._apply(
                         images[index:index + 1], apply_gain, apply_cb, apply_cr,
                         correct_chroma, wet_dry, preserve_highlights,
