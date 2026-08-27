@@ -155,6 +155,18 @@ def test_motion_risk_controller_has_bounded_attack_decay_and_confidence_hold(mod
     assert node._update_motion_risk(state, 0.0, 1.0, 0.80) == pytest.approx(0.99)
 
 
+def test_motion_risk_deadband_rejects_fixed_jitter_and_admits_camera_motion(module):
+    node = module.FurgenSceneAwareColorStabilize()
+
+    fixed = node._update_motion_risk(0.0, 0.022, 1.0, 0.80)
+    zoom = node._update_motion_risk(0.0, 0.030, 1.0, 0.80)
+    pan = node._update_motion_risk(0.0, 0.040, 1.0, 0.80)
+
+    assert fixed == 0.0
+    assert 0.0 < zoom < node.MOTION_RISK_ATTACK
+    assert pan == pytest.approx(node.MOTION_RISK_ATTACK)
+
+
 def test_motion_adaptation_caches_key_orb_and_samples_reliable_locks(module, monkeypatch):
     reference = torch.from_numpy(_texture(seed=14))[None]
     images = reference.expand(7, -1, -1, -1).clone()
@@ -334,6 +346,43 @@ def test_motion_adaptation_preserves_full_fixed_camera_correction(module):
     )
 
     assert torch.allclose(adaptive, baseline, atol=2e-5)
+
+
+def test_fixed_camera_measured_orb_jitter_preserves_exact_grade(module, monkeypatch):
+    reference = _texture(seed=106)
+    sources = [
+        _apply_known_inverse_grade(
+            reference, 1.0 + index * 0.004,
+            0.00035 * index, -0.00030 * index,
+        )
+        for index in range(20)
+    ]
+    images = torch.from_numpy(np.stack(sources))
+    reference_tensor = torch.from_numpy(reference)[None]
+    baseline = _run(
+        module.FurgenSceneAwareColorStabilize(), images, reference_tensor,
+        temporal_smoothing=0.50,
+    )
+    node = module.FurgenSceneAwareColorStabilize()
+    node._orb_features = lambda *_args, **_kwargs: ([], None)
+
+    def fixed_jitter(_cv2, key, current, **_kwargs):
+        diagonal = np.hypot(key["width"], key["height"])
+        # Upper edge observed on the held-out fixed-camera dev source.
+        translation = diagonal * 0.022
+        return {
+            "affine": np.float32(
+                [[1.0, 0.0, translation], [0.0, 1.0, 0.0]]
+            )
+        }
+
+    monkeypatch.setattr(node, "_coarse_affine_details", fixed_jitter)
+    adaptive = _run(
+        node, images, reference_tensor,
+        temporal_smoothing=0.50, motion_adaptation=0.30,
+    )
+
+    assert torch.equal(adaptive, baseline)
 
 
 def test_mild_zoom_remains_close_to_full_luma_correction(module):

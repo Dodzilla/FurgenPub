@@ -2077,7 +2077,7 @@ class FurgenSceneAwareColorStabilize:
     CHROMA_TREND_MIN_CONSISTENCY = 0.75
     CHROMA_TREND_MIN_STEP = 0.00005
     CHROMA_TREND_MAX_STEP = 0.002
-    MOTION_RISK_LOW = 0.020
+    MOTION_RISK_LOW = 0.023
     MOTION_RISK_HIGH = 0.050
     MOTION_RISK_ATTACK = 0.25
     MOTION_RISK_DECAY = 0.01
@@ -2359,6 +2359,8 @@ class FurgenSceneAwareColorStabilize:
         if strength <= 0.0:
             return float(gain), float(cb), float(cr)
         risk = max(0.0, min(1.0, float(motion_risk)))
+        if risk <= 0.0:
+            return float(gain), float(cb), float(cr)
         luma_evidence = cls._smoothstep(
             cls.MOTION_LUMA_EVIDENCE_LOW,
             cls.MOTION_LUMA_EVIDENCE_HIGH,
