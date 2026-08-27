@@ -2082,6 +2082,8 @@ class FurgenSceneAwareColorStabilize:
     MOTION_RISK_ATTACK = 0.25
     MOTION_RISK_DECAY = 0.01
     MOTION_SAMPLE_INTERVAL = 2
+    MOTION_CONFIRM_WINDOW = 3
+    MOTION_CONFIRM_COUNT = 2
     MOTION_LUMA_EVIDENCE_LOW = math.log(1.08)
     MOTION_LUMA_EVIDENCE_HIGH = math.log(1.12)
     MOTION_CHROMA_EVIDENCE_LOW = 0.008
@@ -2354,6 +2356,14 @@ class FurgenSceneAwareColorStabilize:
         return max(0.0, min(1.0, float(previous) + change))
 
     @classmethod
+    def _confirmed_motion_observation(cls, history):
+        recent = [float(value) for value in history[-cls.MOTION_CONFIRM_WINDOW:]]
+        above_threshold = [value for value in recent if value > cls.MOTION_RISK_LOW]
+        if len(above_threshold) < cls.MOTION_CONFIRM_COUNT:
+            return 0.0
+        return max(above_threshold)
+
+    @classmethod
     def _adaptive_grade(cls, gain, cb, cr, motion_risk, adaptation):
         strength = max(0.0, min(0.50, float(adaptation)))
         if strength <= 0.0:
@@ -2599,6 +2609,7 @@ class FurgenSceneAwareColorStabilize:
                 locked_since_key = False
                 motion_risk = 0.0
                 motion_observation = 0.0
+                motion_history = []
                 motion_sample_age = self.MOTION_SAMPLE_INTERVAL
                 motion_key_features = (
                     self._orb_features(cv2, key) if adaptation > 0.0 else None
@@ -2638,6 +2649,7 @@ class FurgenSceneAwareColorStabilize:
                         locked_since_key = False
                         motion_risk = 0.0
                         motion_observation = 0.0
+                        motion_history = []
                         motion_sample_age = self.MOTION_SAMPLE_INTERVAL
                         motion_key_features = (
                             self._orb_features(cv2, key) if adaptation > 0.0 else None
@@ -2647,12 +2659,19 @@ class FurgenSceneAwareColorStabilize:
                         if adaptation > 0.0:
                             motion_sample_age += 1
                             if motion_sample_age >= self.MOTION_SAMPLE_INTERVAL:
+                                sampled_motion = 0.0
                                 details = self._coarse_affine_details(
                                     cv2, key, current,
                                     key_features=motion_key_features,
                                 )
                                 if details is not None:
-                                    motion_observation = self._motion_risk(details, key)
+                                    sampled_motion = self._motion_risk(details, key)
+                                motion_history.append(sampled_motion)
+                                if len(motion_history) > self.MOTION_CONFIRM_WINDOW:
+                                    del motion_history[:-self.MOTION_CONFIRM_WINDOW]
+                                motion_observation = self._confirmed_motion_observation(
+                                    motion_history,
+                                )
                                 motion_sample_age = 0
                             motion_risk = self._update_motion_risk(
                                 motion_risk, motion_observation, ratio, estimate["coverage"],
@@ -2724,6 +2743,7 @@ class FurgenSceneAwareColorStabilize:
                                 locked_since_key = False
                                 motion_risk = 0.0
                                 motion_observation = 0.0
+                                motion_history = []
                                 motion_sample_age = self.MOTION_SAMPLE_INTERVAL
                                 motion_key_features = (
                                     self._orb_features(cv2, key)
@@ -2772,6 +2792,7 @@ class FurgenSceneAwareColorStabilize:
                             # unrelated span until the slow decay catches up.
                             motion_risk = 0.0
                             motion_observation = 0.0
+                            motion_history = []
                             if adaptation > 0.0:
                                 motion_key_features = self._orb_features(cv2, key)
                                 motion_sample_age = self.MOTION_SAMPLE_INTERVAL
