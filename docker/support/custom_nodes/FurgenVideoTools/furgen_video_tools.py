@@ -3554,6 +3554,52 @@ class FurgenDisableDynamicVRAM:
         return (model.clone(disable_dynamic=True),)
 
 
+class FurgenAIMDOVRAMHeadroom:
+    """Temporarily raise AIMDO's eviction headroom for one serialized job."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "extra_headroom_gib": (
+                    "FLOAT",
+                    {"default": 4.0, "min": 0.0, "max": 16.0, "step": 0.25},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "FurgenAI/model_patches/memory"
+    DESCRIPTION = (
+        "Adds job-scoped AIMDO eviction headroom for large mixed-quantized models, "
+        "then restores the worker baseline during model cleanup."
+    )
+
+    def patch(self, model, extra_headroom_gib):
+        import comfy.patcher_extension
+        import comfy_aimdo.control
+
+        control = comfy_aimdo.control
+        if control.lib is None:
+            raise RuntimeError("FurgenAIMDOVRAMHeadroom requires active Comfy AIMDO.")
+        headroom_bytes = max(0, int(float(extra_headroom_gib) * (1024**3)))
+        control.lib.set_simple_vram_headroom(headroom_bytes)
+        patched = model.clone()
+
+        def restore_headroom(_model_patcher):
+            if control.lib is not None:
+                control.lib.set_simple_vram_headroom(0)
+
+        patched.add_callback_with_key(
+            comfy.patcher_extension.CallbacksMP.ON_CLEANUP,
+            "furgen_aimdo_vram_headroom",
+            restore_headroom,
+        )
+        return (patched,)
+
+
 def _atempo_chain(speed: float) -> list[str]:
     """atempo filters realising `speed`.
 
@@ -4625,6 +4671,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenAssertFiniteLatent": FurgenAssertFiniteLatent,
     "FurgenModelMemoryReserve": FurgenModelMemoryReserve,
     "FurgenDisableDynamicVRAM": FurgenDisableDynamicVRAM,
+    "FurgenAIMDOVRAMHeadroom": FurgenAIMDOVRAMHeadroom,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -4653,4 +4700,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenAssertFiniteLatent": "Furgen Assert Finite Latent",
     "FurgenModelMemoryReserve": "Furgen Model Memory Reserve",
     "FurgenDisableDynamicVRAM": "Furgen Disable Dynamic VRAM",
+    "FurgenAIMDOVRAMHeadroom": "Furgen AIMDO VRAM Headroom",
 }

@@ -179,6 +179,7 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FurgenAssertFiniteLatent" in module.NODE_CLASS_MAPPINGS
     assert "FurgenModelMemoryReserve" in module.NODE_CLASS_MAPPINGS
     assert "FurgenDisableDynamicVRAM" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenAIMDOVRAMHeadroom" in module.NODE_CLASS_MAPPINGS
     assert "FCSConcatVideosV4" in module.NODE_CLASS_MAPPINGS
     assert "FCSAnalyzeVideo" in module.NODE_CLASS_MAPPINGS
 
@@ -238,6 +239,45 @@ def test_disable_dynamic_vram_uses_non_dynamic_clone():
     patched, = module.FurgenDisableDynamicVRAM().patch(original)
     assert patched is not original
     assert patched.disable_dynamic is True
+
+
+def test_aimdo_vram_headroom_is_job_scoped(monkeypatch):
+    module = _load_furgen_video_tools()
+    cleanup_type = "cleanup"
+    patcher_extension = types.SimpleNamespace(
+        CallbacksMP=types.SimpleNamespace(ON_CLEANUP=cleanup_type)
+    )
+    calls = []
+    control = types.SimpleNamespace(
+        lib=types.SimpleNamespace(
+            set_simple_vram_headroom=lambda value: calls.append(value)
+        )
+    )
+    comfy = types.ModuleType("comfy")
+    comfy.patcher_extension = patcher_extension
+    comfy_aimdo = types.ModuleType("comfy_aimdo")
+    comfy_aimdo.control = control
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.patcher_extension", patcher_extension)
+    monkeypatch.setitem(sys.modules, "comfy_aimdo", comfy_aimdo)
+    monkeypatch.setitem(sys.modules, "comfy_aimdo.control", control)
+
+    class Model:
+        def __init__(self):
+            self.callbacks = []
+
+        def clone(self):
+            return Model()
+
+        def add_callback_with_key(self, kind, key, callback):
+            self.callbacks.append((kind, key, callback))
+
+    patched, = module.FurgenAIMDOVRAMHeadroom().patch(Model(), 5.5)
+    assert calls == [int(5.5 * (1024**3))]
+    kind, key, callback = patched.callbacks[0]
+    assert (kind, key) == (cleanup_type, "furgen_aimdo_vram_headroom")
+    callback(patched)
+    assert calls[-1] == 0
 
 
 def test_remote_media_is_staged_once_with_bounded_retries(tmp_path, monkeypatch):
