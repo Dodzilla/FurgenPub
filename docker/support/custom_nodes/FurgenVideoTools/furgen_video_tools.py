@@ -3533,6 +3533,27 @@ class FurgenModelMemoryReserve:
         return (patched,)
 
 
+class FurgenDisableDynamicVRAM:
+    """Use Comfy's conventional patcher for models AIMDO cannot stage efficiently."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model": ("MODEL",)}}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "FurgenAI/model_patches/memory"
+    DESCRIPTION = (
+        "Converts one model to ComfyUI's non-dynamic patcher. Use only for "
+        "mixed/quantized checkpoints whose AIMDO residency exceeds native weights."
+    )
+
+    def patch(self, model):
+        if not hasattr(model, "clone"):
+            raise TypeError("FurgenDisableDynamicVRAM requires a Comfy MODEL patcher.")
+        return (model.clone(disable_dynamic=True),)
+
+
 def _atempo_chain(speed: float) -> list[str]:
     """atempo filters realising `speed`.
 
@@ -4603,6 +4624,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenAssertFiniteImages": FurgenAssertFiniteImages,
     "FurgenAssertFiniteLatent": FurgenAssertFiniteLatent,
     "FurgenModelMemoryReserve": FurgenModelMemoryReserve,
+    "FurgenDisableDynamicVRAM": FurgenDisableDynamicVRAM,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -4630,4 +4652,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenAssertFiniteImages": "Furgen Assert Finite Images",
     "FurgenAssertFiniteLatent": "Furgen Assert Finite Latent",
     "FurgenModelMemoryReserve": "Furgen Model Memory Reserve",
+    "FurgenDisableDynamicVRAM": "Furgen Disable Dynamic VRAM",
 }

@@ -178,6 +178,7 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FurgenAssertFiniteImages" in module.NODE_CLASS_MAPPINGS
     assert "FurgenAssertFiniteLatent" in module.NODE_CLASS_MAPPINGS
     assert "FurgenModelMemoryReserve" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenDisableDynamicVRAM" in module.NODE_CLASS_MAPPINGS
     assert "FCSConcatVideosV4" in module.NODE_CLASS_MAPPINGS
     assert "FCSAnalyzeVideo" in module.NODE_CLASS_MAPPINGS
 
@@ -219,6 +220,24 @@ def test_model_memory_reserve_restores_estimate_on_cleanup(monkeypatch):
     assert patched.model.memory_required([1]) == 100 + int(1.5 * (1024**3))
     callback(patched)
     assert original.model.memory_required([1]) == 100
+
+
+def test_disable_dynamic_vram_uses_non_dynamic_clone():
+    module = _load_furgen_video_tools()
+
+    class Model:
+        def __init__(self):
+            self.disable_dynamic = None
+
+        def clone(self, *, disable_dynamic=False):
+            cloned = Model()
+            cloned.disable_dynamic = disable_dynamic
+            return cloned
+
+    original = Model()
+    patched, = module.FurgenDisableDynamicVRAM().patch(original)
+    assert patched is not original
+    assert patched.disable_dynamic is True
 
 
 def test_remote_media_is_staged_once_with_bounded_retries(tmp_path, monkeypatch):
