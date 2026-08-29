@@ -3500,43 +3500,35 @@ class FurgenModelMemoryReserve:
             return (model,)
 
         patched = model.clone()
+        base_model = patched.model
+        original_memory_required = getattr(
+            base_model,
+            "_furgen_original_memory_required",
+            base_model.memory_required,
+        )
 
-        def prepare_sampling_with_reserve(
-            executor,
-            sampling_model,
-            noise_shape,
-            conds,
-            *args,
-            **kwargs,
-        ):
-            base_model = sampling_model.model
-            original_memory_required = base_model.memory_required
-
-            def reserved_memory_required(input_shape, cond_shapes={}):
-                return (
-                    original_memory_required(
-                        input_shape=input_shape,
-                        cond_shapes=cond_shapes,
-                    )
-                    + reserve_bytes
+        def reserved_memory_required(input_shape, cond_shapes={}):
+            return (
+                original_memory_required(
+                    input_shape=input_shape,
+                    cond_shapes=cond_shapes,
                 )
+                + reserve_bytes
+            )
 
-            base_model.memory_required = reserved_memory_required
-            try:
-                return executor(
-                    sampling_model,
-                    noise_shape,
-                    conds,
-                    *args,
-                    **kwargs,
-                )
-            finally:
+        base_model.memory_required = reserved_memory_required
+        base_model._furgen_original_memory_required = original_memory_required
+
+        def restore_memory_estimate(_model_patcher):
+            if base_model.memory_required is reserved_memory_required:
                 base_model.memory_required = original_memory_required
+            if getattr(base_model, "_furgen_original_memory_required", None) is original_memory_required:
+                delattr(base_model, "_furgen_original_memory_required")
 
-        patched.add_wrapper_with_key(
-            comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
+        patched.add_callback_with_key(
+            comfy.patcher_extension.CallbacksMP.ON_CLEANUP,
             "furgen_model_memory_reserve",
-            prepare_sampling_with_reserve,
+            restore_memory_estimate,
         )
         return (patched,)
 

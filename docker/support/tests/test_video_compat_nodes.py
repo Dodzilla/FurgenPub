@@ -182,11 +182,11 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FCSAnalyzeVideo" in module.NODE_CLASS_MAPPINGS
 
 
-def test_model_memory_reserve_wraps_only_prepare_sampling(monkeypatch):
+def test_model_memory_reserve_restores_estimate_on_cleanup(monkeypatch):
     module = _load_furgen_video_tools()
-    wrapper_type = "prepare_sampling"
+    cleanup_type = "cleanup"
     patcher_extension = types.SimpleNamespace(
-        WrappersMP=types.SimpleNamespace(PREPARE_SAMPLING=wrapper_type)
+        CallbacksMP=types.SimpleNamespace(ON_CLEANUP=cleanup_type)
     )
     comfy = types.ModuleType("comfy")
     comfy.patcher_extension = patcher_extension
@@ -200,31 +200,24 @@ def test_model_memory_reserve_wraps_only_prepare_sampling(monkeypatch):
     class Model:
         def __init__(self):
             self.model = BaseModel()
-            self.wrappers = []
+            self.callbacks = []
 
         def clone(self):
             clone = Model()
             clone.model = self.model
             return clone
 
-        def add_wrapper_with_key(self, kind, key, wrapper):
-            self.wrappers.append((kind, key, wrapper))
+        def add_callback_with_key(self, kind, key, callback):
+            self.callbacks.append((kind, key, callback))
 
     original = Model()
     patched, = module.FurgenModelMemoryReserve().patch(original, 1.5)
     assert patched is not original
-    assert len(patched.wrappers) == 1
-    kind, key, wrapper = patched.wrappers[0]
-    assert (kind, key) == (wrapper_type, "furgen_model_memory_reserve")
-
-    observed = {}
-
-    def executor(sampling_model, noise_shape, conds, *args, **kwargs):
-        observed["during"] = sampling_model.model.memory_required([1])
-        return "prepared"
-
-    assert wrapper(executor, patched, [1], {}) == "prepared"
-    assert observed["during"] == 100 + int(1.5 * (1024**3))
+    assert len(patched.callbacks) == 1
+    kind, key, callback = patched.callbacks[0]
+    assert (kind, key) == (cleanup_type, "furgen_model_memory_reserve")
+    assert patched.model.memory_required([1]) == 100 + int(1.5 * (1024**3))
+    callback(patched)
     assert original.model.memory_required([1]) == 100
 
 
