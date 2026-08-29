@@ -143,6 +143,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 AGENT_VERSION = "dm-agent-py/0.10.154"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
+CIVITAI_DELIVERY_DOMAINS = frozenset((
+    "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
+))
 VIDEO_GEN_V2_FURGENPUB_COMMIT = "f46d81937e578aaf6f2674cd5deb7982ea09b4bb"
 VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
@@ -1597,6 +1600,20 @@ def _safe_url_for_logs(url: str) -> str:
         return f"{scheme}://{host}{path}"
     except Exception:
         return "<invalid-url>"
+
+
+def _civitai_authenticated_url(url: str, token: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"civitai.com", "www.civitai.com"}:
+        raise ValueError(f"Civitai token cannot be sent to download domain: {host or '<missing>'}")
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() != "token"
+    ]
+    query.append(("token", token))
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query)))
 
 
 def _command_exists(cmd: str) -> bool:
@@ -5301,7 +5318,10 @@ class DependencyAgent:
             if normalized_dest.startswith("input/"):
                 return self.input_allowed_domains or None
 
-        return self.allowed_domains
+        allowed_domains = set(self.allowed_domains)
+        if str(resolved.get("auth") or "").lower() == "civitai_token":
+            allowed_domains.update(CIVITAI_DELIVERY_DOMAINS)
+        return allowed_domains or None
 
     def _resolve_remote_expected_size_bytes(
         self,
@@ -13681,7 +13701,14 @@ class DependencyAgent:
         partial = dest_abs.with_suffix(dest_abs.suffix + ".partial")
 
         auth = resolved.get("auth")
-        auth_header = self._resolve_auth_header(auth if isinstance(auth, str) else None)
+        auth_name = auth if isinstance(auth, str) else None
+        auth_header = self._resolve_auth_header(auth_name)
+        if str(auth_name or "").lower() == "civitai_token":
+            url = _civitai_authenticated_url(url, self.civitai_token)
+            # GNU wget forwards custom headers across redirects. Civitai's signed
+            # R2 delivery URL rejects the Civitai bearer header, so authenticate
+            # only the initial API request via its supported token query parameter.
+            auth_header = None
         allowed_domains = self._download_allowed_domains_for_item(item, resolved)
         if expected_size_bytes <= 0:
             inferred_remote_size = self._resolve_remote_expected_size_bytes(url, auth_header)
