@@ -3464,6 +3464,83 @@ class FurgenAssertFiniteLatent:
         return (latent,)
 
 
+class FurgenModelMemoryReserve:
+    """Reserve sampler VRAM by asking Comfy's dynamic loader to offload weights."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "reserve_gib": (
+                    "FLOAT",
+                    {
+                        "default": 2.0,
+                        "min": 0.0,
+                        "max": 16.0,
+                        "step": 0.25,
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "FurgenAI/model_patches/memory"
+    DESCRIPTION = (
+        "Adds a workload-specific reserve to ComfyUI's sampler memory estimate so "
+        "dynamic VRAM offloads only the model weights needed to preserve headroom."
+    )
+
+    def patch(self, model, reserve_gib):
+        import comfy.patcher_extension
+
+        reserve_bytes = max(0, int(float(reserve_gib) * (1024**3)))
+        if reserve_bytes == 0:
+            return (model,)
+
+        patched = model.clone()
+
+        def prepare_sampling_with_reserve(
+            executor,
+            sampling_model,
+            noise_shape,
+            conds,
+            *args,
+            **kwargs,
+        ):
+            base_model = sampling_model.model
+            original_memory_required = base_model.memory_required
+
+            def reserved_memory_required(input_shape, cond_shapes={}):
+                return (
+                    original_memory_required(
+                        input_shape=input_shape,
+                        cond_shapes=cond_shapes,
+                    )
+                    + reserve_bytes
+                )
+
+            base_model.memory_required = reserved_memory_required
+            try:
+                return executor(
+                    sampling_model,
+                    noise_shape,
+                    conds,
+                    *args,
+                    **kwargs,
+                )
+            finally:
+                base_model.memory_required = original_memory_required
+
+        patched.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
+            "furgen_model_memory_reserve",
+            prepare_sampling_with_reserve,
+        )
+        return (patched,)
+
+
 def _atempo_chain(speed: float) -> list[str]:
     """atempo filters realising `speed`.
 
@@ -4533,6 +4610,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenLTXGuideAttentionAdjust": FurgenLTXGuideAttentionAdjust,
     "FurgenAssertFiniteImages": FurgenAssertFiniteImages,
     "FurgenAssertFiniteLatent": FurgenAssertFiniteLatent,
+    "FurgenModelMemoryReserve": FurgenModelMemoryReserve,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -4559,4 +4637,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenLTXGuideAttentionAdjust": "Furgen LTX Guide Attention Adjust",
     "FurgenAssertFiniteImages": "Furgen Assert Finite Images",
     "FurgenAssertFiniteLatent": "Furgen Assert Finite Latent",
+    "FurgenModelMemoryReserve": "Furgen Model Memory Reserve",
 }

@@ -177,8 +177,55 @@ def test_furgen_video_tools_registers_tail_context_utility_nodes():
     assert "FurgenLTXGuideAttentionAdjust" in module.NODE_CLASS_MAPPINGS
     assert "FurgenAssertFiniteImages" in module.NODE_CLASS_MAPPINGS
     assert "FurgenAssertFiniteLatent" in module.NODE_CLASS_MAPPINGS
+    assert "FurgenModelMemoryReserve" in module.NODE_CLASS_MAPPINGS
     assert "FCSConcatVideosV4" in module.NODE_CLASS_MAPPINGS
     assert "FCSAnalyzeVideo" in module.NODE_CLASS_MAPPINGS
+
+
+def test_model_memory_reserve_wraps_only_prepare_sampling(monkeypatch):
+    module = _load_furgen_video_tools()
+    wrapper_type = "prepare_sampling"
+    patcher_extension = types.SimpleNamespace(
+        WrappersMP=types.SimpleNamespace(PREPARE_SAMPLING=wrapper_type)
+    )
+    comfy = types.ModuleType("comfy")
+    comfy.patcher_extension = patcher_extension
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.patcher_extension", patcher_extension)
+
+    class BaseModel:
+        def memory_required(self, input_shape, cond_shapes=None):
+            return 100
+
+    class Model:
+        def __init__(self):
+            self.model = BaseModel()
+            self.wrappers = []
+
+        def clone(self):
+            clone = Model()
+            clone.model = self.model
+            return clone
+
+        def add_wrapper_with_key(self, kind, key, wrapper):
+            self.wrappers.append((kind, key, wrapper))
+
+    original = Model()
+    patched, = module.FurgenModelMemoryReserve().patch(original, 1.5)
+    assert patched is not original
+    assert len(patched.wrappers) == 1
+    kind, key, wrapper = patched.wrappers[0]
+    assert (kind, key) == (wrapper_type, "furgen_model_memory_reserve")
+
+    observed = {}
+
+    def executor(sampling_model, noise_shape, conds, *args, **kwargs):
+        observed["during"] = sampling_model.model.memory_required([1])
+        return "prepared"
+
+    assert wrapper(executor, patched, [1], {}) == "prepared"
+    assert observed["during"] == 100 + int(1.5 * (1024**3))
+    assert original.model.memory_required([1]) == 100
 
 
 def test_remote_media_is_staged_once_with_bounded_retries(tmp_path, monkeypatch):
