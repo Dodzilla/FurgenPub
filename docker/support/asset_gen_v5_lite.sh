@@ -1107,7 +1107,7 @@ function provisioning_install_omnivoice_requirements() {
     if [[ "${SERVER_TYPE:-}" == "asset_gen_v7_lite" ]]; then
         # Keep the reviewed shared framework. Upstream install.py and the
         # generic --upgrade resolver are not safe for the v7 mixed workload.
-        /venv/main/bin/python - "${OMNIVOICE_TRANSFORMERS_VERSION}" <<'PY'
+        /venv/main/bin/python - "${OMNIVOICE_TRANSFORMERS_VERSION}" <<'PY' || return 1
 import importlib.metadata as m
 import sys
 if m.version("transformers") != sys.argv[1]:
