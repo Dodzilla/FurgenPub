@@ -229,6 +229,8 @@ def get_coordinator():
             comfy_release_vram_headroom_bytes=int(
                 os.environ.get("GPU_COMFY_RELEASE_VRAM_HEADROOM_BYTES", str(512 * 1024**2))
             ),
+            tts_config_path=(os.environ.get("TTS_RESIDENCY_CONFIG") or
+                             ("/workspace/.fcs/tts/config.json" if os.path.isfile("/workspace/.fcs/tts/config.json") else None)),
         )
     return COORDINATOR
 
@@ -587,6 +589,7 @@ class CoordinatorHandler(JsonHandler):
                 not GPU_LOCK.locked()
                 and not diagnostics_busy
                 and (not isinstance(local_lease, dict) or lease_state == "WARM")
+                and coordinator_status.get("ttsResidency", {}).get("state") not in {"warming", "evicting"}
             )
             self.send_json(200, {
                 "safeToClearAdmission": safe_to_clear,
@@ -611,6 +614,17 @@ class CoordinatorHandler(JsonHandler):
         try:
             payload = self.read_json()
             coordinator = get_coordinator()
+            if self.path == "/v1/gpu/tts/validate":
+                self.send_json(200, {"valid": bool(coordinator.tts and coordinator.tts.validate(payload))})
+                return
+            if self.path == "/v1/gpu/tts/heartbeat":
+                result = coordinator.tts.idle_heartbeat(payload.get("foregroundDemand") is not False) if coordinator.tts else {"enabled": False}
+                self.send_json(200, result)
+                return
+            if self.path == "/v1/gpu/tts/idle":
+                result = coordinator.tts.idle_tick(payload.get("foregroundDemand") is not False) if coordinator.tts else {"canMine": True, "enabled": False}
+                self.send_json(200, result)
+                return
             if self.path == "/v1/gpu/drain":
                 self.send_json(200, coordinator.begin_drain())
                 return

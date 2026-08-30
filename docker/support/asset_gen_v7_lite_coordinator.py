@@ -374,6 +374,7 @@ class GPUCoordinator:
         comfy_release_vram_max_bytes=3 * 1024**3,
         comfy_idle_baseline_bytes=None,
         comfy_release_vram_headroom_bytes=512 * 1024**2,
+        tts_config_path=None,
     ):
         self.llama_base_url = llama_base_url.rstrip("/")
         self.comfy_base_url = comfy_base_url.rstrip("/")
@@ -445,6 +446,11 @@ class GPUCoordinator:
         if self.llama_running():
             self.state = "WARM"
             self.phase = "WARM"
+        self.tts = None
+        if tts_config_path or (previous_journal or {}).get("ttsResidency", {}).get("identity"):
+            from asset_gen_v7_lite_tts import TTSResidency
+            self.tts = TTSResidency(self, tts_config_path or "/workspace/.fcs/tts/config.json",
+                                    (previous_journal or {}).get("ttsResidency"))
         self._reconcile_previous_journal(previous_journal)
         self._persist_journal()
 
@@ -520,6 +526,7 @@ class GPUCoordinator:
             },
             "miningNotBeforeMs": self.mining_not_before_ms,
             "completionReceipts": self.completion_receipts,
+            "ttsResidency": self.tts.journal() if getattr(self, "tts", None) else {},
         }
         temporary = self.state_file.with_name(f".{self.state_file.name}.{uuid.uuid4().hex}.tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -620,6 +627,8 @@ class GPUCoordinator:
             if holder == "inference":
                 self._stop_llama()
             elif holder == "comfy":
+                if self.tts:
+                    self.tts.evict("unattached_comfy_recovery")
                 self._terminate_comfy_gpu_processes()
             self.lease = None
             self.state = "IDLE"
@@ -983,6 +992,7 @@ class GPUCoordinator:
             item["usedBytes"]
             for item in processes
             if self._is_comfy_gpu_process(item)
+            and item["pid"] != ((self.tts.identity or {}).get("pid") if getattr(self, "tts", None) else None)
         )
 
     def inference_readiness(self):
@@ -998,6 +1008,9 @@ class GPUCoordinator:
         if llama_running:
             ready = True
             reason = "llama_running"
+        elif self.tts and self.tts.state == "evicting":
+            ready = False
+            reason = "tts_vram_not_released"
         elif not configured:
             ready = False
             reason = "llama_command_unavailable"
@@ -1041,6 +1054,7 @@ class GPUCoordinator:
             "comfyReleaseEffectiveMaxBytes": allowed_bytes,
             "lastComfyBaselineAdjustment": self.last_comfy_baseline_adjustment,
             "lastTransitionError": self.last_transition_error,
+            "ttsResidency": self.tts.status() if self.tts else {"enabled": False},
         }
 
     def _is_comfy_gpu_process(self, item):
@@ -1296,6 +1310,8 @@ class GPUCoordinator:
             self.state = "GRANTING"
             self.phase = "GRANTING"
             try:
+                if self.tts:
+                    self.tts.before_acquire(holder, metadata)
                 if holder == "inference" and self.enforce_transitions:
                     if not comfy_verified_free:
                         self._free_comfy(preserve_cache=True)
@@ -1335,6 +1351,8 @@ class GPUCoordinator:
             }
             self.state = lease_state
             self.phase = lease_state
+            if self.tts:
+                self.tts.bind(self.lease)
             self._persist_journal()
             return {"epoch": self.epoch, "fencingToken": token, "deadlineMs": deadline}
 
@@ -1404,6 +1422,9 @@ class GPUCoordinator:
         with self.lock:
             lease = self._validate(token, epoch)
             holder = lease["holder"]
+            if self.tts:
+                self.tts.before_release(lease)
+                lease = self._validate(token, epoch)
             if self.recovery_timer:
                 self.recovery_timer.cancel()
                 self.recovery_timer = None
@@ -1474,6 +1495,8 @@ class GPUCoordinator:
     def begin_drain(self):
         with self.lock:
             self.draining = True
+            if self.tts and not self.tts.generating:
+                self.tts.evict("coordinator_drain")
             if self.lease and self.lease.get("state") == "WARM":
                 if self.enforce_transitions:
                     self._evict_warm(self.lease["holder"])
@@ -1826,6 +1849,7 @@ class GPUCoordinator:
                 "metrics": dict(self.metrics),
                 "diagnosticsBusy": not acquired,
                 "draining": self.draining,
+                "ttsResidency": self.tts.status() if self.tts else {"enabled": False},
             }
         finally:
             if acquired:

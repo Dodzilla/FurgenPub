@@ -97,6 +97,10 @@ fi
 download_support_file asset_gen_v7_lite_inference.sh "${INFERENCE_SCRIPT}"
 download_support_file asset_gen_v7_lite_gateway.py "${GATEWAY_SCRIPT}"
 download_support_file asset_gen_v7_lite_coordinator.py "${COORDINATOR_SCRIPT}"
+download_support_file asset_gen_v7_lite_tts.py "${WORKSPACE}/asset_gen_v7_lite_tts.py"
+download_support_file asset_gen_v7_lite_tts_runtime.py "${WORKSPACE}/asset_gen_v7_lite_tts_runtime.py"
+download_support_file asset_gen_v7_lite_tts_install.py "${WORKSPACE}/asset_gen_v7_lite_tts_install.py"
+download_support_file tts_profiles.py "${WORKSPACE}/tts_profiles.py"
 bash "${INFERENCE_SCRIPT}"
 
 curl -fsS "${DM_LOCAL_COMFY_BASE_URL}/system_stats" >/dev/null
