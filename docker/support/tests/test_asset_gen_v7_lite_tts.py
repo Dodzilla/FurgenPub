@@ -304,6 +304,25 @@ class ResidencyTest(unittest.TestCase):
         self.assertFalse(self.tts.idle_tick(False)["canMine"])
         self.owner._stop_mining.assert_not_called()
 
+    def test_idle_grace_cannot_start_miner_ahead_of_pending_warmup(self):
+        self.tts.not_before = time.monotonic() + .5
+        self.owner.mining_not_before_ms = 0
+        self.assertFalse(self.tts.idle_tick(False)["canMine"])
+        self.owner._free_comfy.assert_not_called()
+        self.tts.not_before = 0
+        with mock.patch.object(threading.Thread, "start"):
+            self.assertFalse(self.tts.idle_tick(False)["canMine"])
+        self.assertEqual(self.tts.state, "warming")
+
+    def test_explicit_mining_admission_cannot_bypass_pending_warmup(self):
+        with self.assertRaises(TTSError) as error:
+            self.tts.before_acquire("mining", {})
+        self.assertEqual(error.exception.code, "tts_warmup_pending")
+        self.assertEqual(self.tts.state, "absent")
+        self.tts.retry_at = time.monotonic() + 60
+        self.tts.before_acquire("mining", {})
+        self.assertTrue(self.tts.idle_tick(False)["canMine"])
+
     def test_cooldown_keeps_existing_miner_running(self):
         self.owner.lease = {"holder": "mining", "state": "ACTIVE"}
         self.tts.retry_at = time.monotonic() + 100

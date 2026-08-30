@@ -322,6 +322,10 @@ class TTSResidency:
             return
         if self.generating:
             raise TTSError("tts_busy", "TTS execution has not stopped")
+        if (holder == "mining" and self.enabled and not self.disabled and self.state == "absent"
+                and (self.config.get("coexistenceApproved") or self.config.get("diagnosticsEnabled"))
+                and time.monotonic() >= self.retry_at):
+            raise TTSError("tts_warmup_pending", "Restore TTS after idle grace before starting mining")
         eligible = bool((metadata or {}).get("tts", {}).get("runtimePolicy") == "auto_fast_all")
         eligible = eligible and bool(self.config.get("routingApproved") or self.config.get("diagnosticsEnabled"))
         if self.state == "warming":
@@ -390,8 +394,12 @@ class TTSResidency:
             lease = self.owner.lease or {}
             if self.owner.draining or self.owner.phase == "SNAPSHOTTING":
                 return {"canMine": False, **self.status()}
-            if time.monotonic() < max(self.retry_at, self.not_before) or time.time() * 1000 < self.owner.mining_not_before_ms:
+            if time.monotonic() < self.retry_at:
                 return {"canMine": True, **self.status()}
+            # Starting the miner during the last milliseconds of idle grace can
+            # postpone TTS until that startup finishes. Only backoff permits it.
+            if time.monotonic() < self.not_before or time.time() * 1000 < self.owner.mining_not_before_ms:
+                return {"canMine": False, **self.status()}
             if not self.config.get("coexistenceApproved") and not self.config.get("diagnosticsEnabled"):
                 return {"canMine": True, **self.status()}
             if (self.config.get("coexistenceApproved") or self.config.get("routingApproved")) and (
