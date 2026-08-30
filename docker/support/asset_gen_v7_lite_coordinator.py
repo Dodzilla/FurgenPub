@@ -402,6 +402,12 @@ class GPUCoordinator:
         self.mining_stop_durations_ms = []
         self.lock = threading.RLock()
         self.lease_condition = threading.Condition(self.lock)
+        # Suppress journal writes until TTS eviction and prior-owner
+        # reconciliation finish. A mid-init persist would replace the recovery
+        # journal with lease=None and drop the previous mining identity if this
+        # restart then crashes. The gateway is not serving yet, so the in-memory
+        # epoch cannot admit work.
+        self._journal_persist_suppressed = True
         previous_journal = self._read_journal()
         previous_epoch = max(int((previous_journal or {}).get("epoch", 0)), self._read_persisted_epoch())
         self.epoch = max(int(time.time_ns()), previous_epoch + 1)
@@ -452,6 +458,7 @@ class GPUCoordinator:
             self.tts = TTSResidency(self, tts_config_path or "/workspace/.fcs/tts/config.json",
                                     (previous_journal or {}).get("ttsResidency"))
         self._reconcile_previous_journal(previous_journal)
+        self._journal_persist_suppressed = False
         self._persist_journal()
 
     def _read_journal(self):
@@ -500,6 +507,8 @@ class GPUCoordinator:
             temporary.unlink(missing_ok=True)
 
     def _persist_journal(self):
+        if getattr(self, "_journal_persist_suppressed", False):
+            return
         if not self.state_file:
             return
         self.state_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

@@ -1167,6 +1167,136 @@ class CoordinatorLeaseTest(unittest.TestCase):
             self.assertIsNone(coordinator.llama_pid)
             self.assertIsNone(coordinator.current_cache_handle)
 
+    def _previous_mining_journal(self, epoch=4):
+        return {
+            "epoch": epoch,
+            "state": "ACTIVE",
+            "phase": "ACTIVE",
+            "lease": {
+                "holder": "mining",
+                "workId": "miner-prior",
+                "state": "ACTIVE",
+                "metadata": {"pid": 4242, "processStartTime": "miner-start", "processGroupId": 4242},
+                "deadlineMs": int(time.time() * 1000) + 60_000,
+            },
+            "llama": {},
+            "ttsResidency": {
+                "identity": {"pid": 111, "processStartTime": "tts-start", "processGroupId": 111},
+            },
+        }
+
+    def _assert_previous_owner_preserved(self, state, epoch_file, previous):
+        on_disk = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["epoch"], previous["epoch"])
+        self.assertEqual(on_disk["lease"]["holder"], "mining")
+        self.assertEqual(on_disk["lease"]["workId"], "miner-prior")
+        self.assertEqual(on_disk["lease"]["metadata"]["pid"], 4242)
+        self.assertEqual(on_disk["ttsResidency"]["identity"]["pid"], 111)
+        self.assertEqual(epoch_file.read_text(encoding="utf-8").strip(), str(previous["epoch"]))
+
+    def test_tts_init_journal_write_preserves_previous_owner_on_throw(self):
+        persist_attempts = []
+
+        class PersistThenRaiseTTS:
+            def __init__(self, coordinator, config_path, previous=None):
+                coordinator.tts = self
+                persist_attempts.append(True)
+                coordinator._persist_journal()
+                raise RuntimeError("tts eviction failed")
+
+            def journal(self):
+                return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            previous = self._previous_mining_journal()
+            state.write_text(json.dumps(previous))
+            epoch_file = state.with_suffix(".epoch")
+            epoch_file.write_text("4\n")
+            with mock.patch("asset_gen_v7_lite_tts.TTSResidency", PersistThenRaiseTTS), \
+                    mock.patch.object(GPUCoordinator, "_stop_mining") as stop_mining:
+                with self.assertRaisesRegex(RuntimeError, "tts eviction failed"):
+                    GPUCoordinator(
+                        "http://127.0.0.1:8081", "http://127.0.0.1:8188", FakeHttp(root),
+                        SnapshotStore(root / "cache", "fp", min_free_bytes=0),
+                        state_file=state, enabled=True, enforce_transitions=True,
+                    )
+            stop_mining.assert_not_called()
+            self.assertEqual(persist_attempts, [True])
+            self._assert_previous_owner_preserved(state, epoch_file, previous)
+
+    def test_mining_stop_failure_after_tts_init_write_preserves_previous_owner(self):
+        persist_attempts = []
+
+        class PersistTTS:
+            def __init__(self, coordinator, config_path, previous=None):
+                coordinator.tts = self
+                self.identity = dict((previous or {}).get("identity") or {})
+                persist_attempts.append(True)
+                coordinator._persist_journal()
+                self.identity = {}
+
+            def journal(self):
+                return {"identity": self.identity}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            previous = self._previous_mining_journal()
+            state.write_text(json.dumps(previous))
+            epoch_file = state.with_suffix(".epoch")
+            epoch_file.write_text("4\n")
+            with mock.patch("asset_gen_v7_lite_tts.TTSResidency", PersistTTS), \
+                    mock.patch.object(GPUCoordinator, "_stop_mining", side_effect=RuntimeError("mining stop failed")):
+                with self.assertRaisesRegex(RuntimeError, "mining stop failed"):
+                    GPUCoordinator(
+                        "http://127.0.0.1:8081", "http://127.0.0.1:8188", FakeHttp(root),
+                        SnapshotStore(root / "cache", "fp", min_free_bytes=0),
+                        state_file=state, enabled=True, enforce_transitions=True,
+                    )
+            self.assertEqual(persist_attempts, [True])
+            self._assert_previous_owner_preserved(state, epoch_file, previous)
+
+    def test_successful_restart_cleanup_persists_final_new_epoch(self):
+        persist_attempts = []
+
+        class PersistTTS:
+            def __init__(self, coordinator, config_path, previous=None):
+                coordinator.tts = self
+                persist_attempts.append(True)
+                coordinator._persist_journal()
+                self.identity = {}
+
+            def journal(self):
+                return {"identity": self.identity}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            previous = self._previous_mining_journal()
+            state.write_text(json.dumps(previous))
+            epoch_file = state.with_suffix(".epoch")
+            epoch_file.write_text("4\n")
+            with mock.patch("asset_gen_v7_lite_tts.TTSResidency", PersistTTS), \
+                    mock.patch.object(GPUCoordinator, "_stop_mining") as stop_mining:
+                coordinator = GPUCoordinator(
+                    "http://127.0.0.1:8081", "http://127.0.0.1:8188", FakeHttp(root),
+                    SnapshotStore(root / "cache", "fp", min_free_bytes=0),
+                    state_file=state, enabled=True, enforce_transitions=True,
+                )
+            stop_mining.assert_called_once()
+            self.assertEqual(persist_attempts, [True])
+            self.assertFalse(coordinator._journal_persist_suppressed)
+            self.assertIsNone(coordinator.lease)
+            self.assertEqual(coordinator.metrics["recoveryCount"], 1)
+            on_disk = json.loads(state.read_text(encoding="utf-8"))
+            self.assertGreater(on_disk["epoch"], previous["epoch"])
+            self.assertEqual(on_disk["epoch"], coordinator.epoch)
+            self.assertIsNone(on_disk["lease"])
+            self.assertEqual(on_disk["ttsResidency"].get("identity"), {})
+            self.assertEqual(epoch_file.read_text(encoding="utf-8").strip(), str(coordinator.epoch))
+
 
 if __name__ == "__main__":
     unittest.main()
