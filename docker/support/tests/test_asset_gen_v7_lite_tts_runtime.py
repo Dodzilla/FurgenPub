@@ -846,3 +846,21 @@ class OutputBudgetTest(unittest.TestCase):
         guard_output_budget(2047 - 512, 512)
         with self.assertRaises(UnsupportedProfile):
             guard_output_budget(2047 - 500, 512)
+
+
+class InferenceThreadTest(unittest.TestCase):
+    def test_rpc_thread_can_update_buffers_created_by_warmup(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("requires Torch; also run with the canary runtime Python")
+        from asset_gen_v7_lite_tts_runtime import OfficialGpuBackend
+        from concurrent.futures import ThreadPoolExecutor
+        with torch.inference_mode():
+            sampling_buffer = torch.zeros(1)
+        backend = object.__new__(OfficialGpuBackend)
+        backend._torch = torch
+        backend._generate = lambda params, cancel: sampling_buffer.fill_(params["temperature"]).item()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            value = executor.submit(backend.generate, {"temperature": 0.9}).result()
+        self.assertAlmostEqual(value, 0.9, places=6)

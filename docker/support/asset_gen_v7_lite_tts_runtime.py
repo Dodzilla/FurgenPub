@@ -542,6 +542,12 @@ class OfficialGpuBackend:
         }
 
     def generate(self, params, cancel_event=None):
+        # Warmup creates inference tensors, including mutable sampling buffers.
+        # RPC handlers run on different threads; inference mode is thread-local.
+        with self._torch.inference_mode():
+            return self._generate(params, cancel_event)
+
+    def _generate(self, params, cancel_event=None):
         if self.runtime is None:
             raise TtsError("not_ready", "runtime is not warmed")
         torch = self._torch
