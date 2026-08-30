@@ -1007,6 +1007,22 @@ class GPUCoordinator:
         elif used_bytes is None:
             ready = False
             reason = "gpu_process_probe_failed"
+        elif (
+            self.enabled and self.enforce_transitions and not self.draining
+            and holder == "comfy" and lease_state == "WARM"
+            and self.state == "WARM" and self.phase == "WARM"
+            and int(lease.get("deadlineMs") or 0) > int(time.time() * 1000)
+            and lease.get("epoch") == self.epoch
+            and bool(str(lease.get("workId") or "").strip())
+            and re.fullmatch(r"[a-f0-9]{32}", str(lease.get("fencingToken") or ""))
+        ):
+            # Readiness admits a transition; it is not proof that GPU memory
+            # has already been released. A known idle Comfy owner is evictable
+            # by acquire(), which still calls _free_comfy and verifies the
+            # unchanged hard ceiling BEFORE starting llama. Requiring that
+            # eviction here deadlocks routing before acquire can perform it.
+            ready = True
+            reason = "warm_comfy_eviction_required"
         elif used_bytes > allowed_bytes:
             ready = False
             reason = "comfy_vram_not_released"

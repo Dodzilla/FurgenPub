@@ -720,6 +720,93 @@ class CoordinatorLeaseTest(unittest.TestCase):
             used["bytes"] = 2598 * 1024**2
             self.assertTrue(coordinator.inference_readiness()["ready"])
 
+    def make_warm_comfy_readiness_fixture(self, directory):
+        coordinator, http = self.make_coordinator(directory, enforcing=True)
+        coordinator.llama_argv = ["/workspace/bin/llama-server", "--model", "/workspace/model.gguf"]
+        coordinator.llama_running = lambda: False
+        coordinator._comfy_gpu_bytes = mock.Mock(return_value=9 * 1024**3)
+        coordinator._memory_status = lambda: {"availableBytes": 64 * 1024**3}
+        # Create a real fenced lease and release it normally, rather than
+        # constructing a permissive WARM state that acquire() never issued.
+        lease = coordinator.acquire("comfy", "completed-workflow", 60_000)
+        coordinator.release(lease["fencingToken"], lease["epoch"], keep_warm=True)
+        return coordinator, http
+
+    def test_warm_comfy_is_transition_ready_but_llama_starts_only_after_verified_eviction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, http = self.make_warm_comfy_readiness_fixture(directory)
+            events = []
+            coordinator._wait_for_comfy_vram_release = lambda timeout: events.append("verified_free") or (True, True)
+            coordinator._ensure_llama = lambda: events.append("llama_start")
+
+            readiness = coordinator.inference_readiness()
+            self.assertTrue(readiness["ready"])
+            self.assertEqual(readiness["reason"], "warm_comfy_eviction_required")
+            self.assertEqual(http.free_payloads, [])  # readiness remains read-only
+            self.assertEqual(events, [])
+            coordinator.acquire("inference", "qwen-after-comfy", 60_000)
+
+            self.assertEqual(events, ["verified_free", "llama_start"])
+            self.assertEqual(http.free_payloads, [{"unload_models": True, "free_memory": False}])
+            self.assertEqual(coordinator.lease["holder"], "inference")
+
+    def test_warm_comfy_failed_eviction_never_starts_llama_or_removes_its_fence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, http = self.make_warm_comfy_readiness_fixture(directory)
+            original_lease = dict(coordinator.lease)
+            coordinator._wait_for_comfy_vram_release = mock.Mock(return_value=(False, True))
+            coordinator._ensure_llama = mock.Mock()
+
+            self.assertTrue(coordinator.inference_readiness()["ready"])
+            with self.assertRaisesRegex(Exception, "ComfyUI retained GPU memory"):
+                coordinator.acquire("inference", "qwen-failed-eviction", 60_000)
+
+            self.assertEqual(len(http.free_payloads), 2)
+            coordinator._ensure_llama.assert_not_called()
+            self.assertEqual(coordinator.lease, original_lease)
+            self.assertEqual(coordinator.last_transition_error["code"], "comfy_vram_not_released")
+            self.assertEqual(coordinator.comfy_release_vram_max_bytes, 3 * 1024**3)
+
+    def test_warm_comfy_admission_requires_exact_fresh_idle_fence(self):
+        mutations = {
+            "active": lambda c: c.lease.update(state="ACTIVE"),
+            "recovering": lambda c: c.lease.update(state="RECOVERING"),
+            "starting": lambda c: c.lease.update(state="STARTING"),
+            "expired": lambda c: c.lease.update(deadlineMs=int(time.time() * 1000) - 1),
+            "old_epoch": lambda c: c.lease.update(epoch=c.epoch - 1),
+            "no_token": lambda c: c.lease.pop("fencingToken"),
+            "no_work_id": lambda c: c.lease.pop("workId"),
+            "unowned_memory": lambda c: setattr(c, "lease", None),
+            "other_holder": lambda c: c.lease.update(holder="mining"),
+            "draining": lambda c: setattr(c, "draining", True),
+            "transition_busy": lambda c: setattr(c, "phase", "EVICTING"),
+            "state_busy": lambda c: setattr(c, "state", "GRANTING"),
+            "disabled": lambda c: setattr(c, "enabled", False),
+            "shadow": lambda c: setattr(c, "enforce_transitions", False),
+            "no_command": lambda c: setattr(c, "llama_argv", []),
+            "probe_failed": lambda c: setattr(c, "_comfy_gpu_bytes", lambda: None),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                coordinator, http = self.make_warm_comfy_readiness_fixture(directory)
+                mutate(coordinator)
+                self.assertFalse(coordinator.inference_readiness()["ready"])
+                self.assertEqual(http.free_payloads, [])
+
+    def test_active_comfy_stays_fenced_after_warm_readiness_was_observed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, http = self.make_warm_comfy_readiness_fixture(directory)
+            coordinator._ensure_llama = mock.Mock()
+            self.assertTrue(coordinator.inference_readiness()["ready"])
+            coordinator.acquire("comfy", "next-comfy-workflow", 60_000)
+
+            with self.assertRaises(LeaseConflict):
+                coordinator.acquire("inference", "raced-qwen", 60_000)
+            coordinator._ensure_llama.assert_not_called()
+            self.assertEqual(coordinator.lease["holder"], "comfy")
+            self.assertEqual(coordinator.lease["workId"], "next-comfy-workflow")
+            self.assertEqual(http.free_payloads, [])
+
     def test_comfy_vram_probe_excludes_only_verified_llama_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator, _ = self.make_coordinator(directory)

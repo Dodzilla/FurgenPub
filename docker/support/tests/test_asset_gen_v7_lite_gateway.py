@@ -11,6 +11,8 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 SUPPORT_DIR = Path(__file__).resolve().parents[1]
@@ -253,6 +255,28 @@ class GatewayTest(unittest.TestCase):
             self.gateway.COORDINATOR_MODE = original_mode
             self.gateway.http_request = original_http
             self.gateway.get_coordinator = original_get_coordinator
+
+    def test_health_admits_stopped_llama_when_coordinator_can_evict_fenced_warm_comfy(self):
+        coordinator = SimpleNamespace(
+            quick_status=lambda: {"state": "WARM", "lease": {"holder": "comfy", "state": "WARM"}},
+            inference_readiness=lambda: {
+                "ready": True, "reason": "warm_comfy_eviction_required",
+                "llamaConfigured": True, "llamaRunning": False,
+                "comfyUsedBytes": 9 * 1024**3, "comfyReleaseEffectiveMaxBytes": 3 * 1024**3,
+            },
+        )
+
+        def health_http(url, **_kwargs):
+            if url.endswith("/system_stats"):
+                return 200, "application/json", b"{}"
+            raise OSError("llama stopped")
+
+        with mock.patch.multiple(self.gateway, COORDINATOR_MODE="enforcing",
+                                 get_coordinator=lambda: coordinator, http_request=health_http):
+            payload = self.gateway.health_payload()
+        self.assertTrue(payload["ready"])
+        self.assertFalse(payload["llama"])
+        self.assertEqual(payload["coordinator"]["inferenceReadiness"]["reason"], "warm_comfy_eviction_required")
 
     def test_request_complete_is_not_safe_while_gpu_remains_warm(self):
         self.gateway.set_release(
