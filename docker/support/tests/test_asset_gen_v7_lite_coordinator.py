@@ -103,6 +103,23 @@ class SnapshotStoreTest(unittest.TestCase):
 
 
 class CoordinatorLeaseTest(unittest.TestCase):
+    def test_unreadable_gpu_process_is_unknown_not_released(self):
+        result = mock.Mock(returncode=0, stdout="123, 1024\n")
+        with mock.patch("asset_gen_v7_lite_coordinator.subprocess.run", return_value=result), \
+             mock.patch.object(Path, "read_bytes", side_effect=PermissionError("hidden")):
+            self.assertIsNone(GPUCoordinator._gpu_processes())
+
+    def test_mining_reclaims_comfy_before_measuring_tts_coexistence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory, enforcing=True)
+            order = []
+            coordinator._free_comfy = mock.Mock(side_effect=lambda **_: order.append("free"))
+            coordinator.tts = mock.Mock(state="ready", config={"coexistenceApproved": True})
+            coordinator.tts.before_acquire.side_effect = lambda *_: order.append("measure")
+            coordinator.tts.journal.return_value = {}
+            coordinator.acquire("mining", "measured-miner", 60_000)
+            self.assertEqual(order, ["free", "measure"])
+
     def test_exited_miner_does_not_wait_for_parent_reaping_but_verifies_gpu(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator, _ = self.make_coordinator(directory, enforcing=True)

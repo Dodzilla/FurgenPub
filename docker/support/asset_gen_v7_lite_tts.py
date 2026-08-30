@@ -524,7 +524,7 @@ class TTSResidency:
             processes = self.owner._gpu_processes()
             if processes is None:
                 raise TTSError("gpu_probe_failed", "Cannot verify resident GPU memory")
-            resident = sum(p["usedBytes"] for p in processes if p["pid"] == self.identity.get("pid"))
+            resident = self._group_gpu_bytes(processes, self.identity)
             mining = (self.owner.lease or {}).get("holder") == "mining"
             key = "warmupBytes" if self.state == "warming" else "executionBytes" if self.generating else "idleBytes"
             budget = self._budget(key)
@@ -534,8 +534,7 @@ class TTSResidency:
             exceeded = free < 2 * GIB or (budget and resident > budget)
             if mining:
                 miner_budget = self._budget("miningBytes")
-                miner_pid = (self.owner.lease.get("metadata") or {}).get("pid")
-                miner = sum(p["usedBytes"] for p in processes if p["pid"] == miner_pid)
+                miner = self._group_gpu_bytes(processes, self.owner.lease.get("metadata") or {})
                 exceeded = exceeded or not miner_budget or miner > miner_budget
             if not exceeded:
                 return
@@ -549,6 +548,21 @@ class TTSResidency:
             self.owner.state = self.owner.phase = "IDLE"
         self.evict(reason)
         self._failure(reason)
+
+    @staticmethod
+    def _group_gpu_bytes(processes, identity):
+        total = 0
+        for process in processes:
+            if process["pid"] == identity.get("pid"):
+                total += process["usedBytes"]
+            elif identity.get("processGroupId"):
+                try:
+                    if os.getpgid(process["pid"]) == identity["processGroupId"]:
+                        total += process["usedBytes"]
+                except ProcessLookupError:
+                    # It exited between NVML and procfs; the next probe reconciles it.
+                    continue
+        return total
 
     def _watchdog(self):
         while not self.stopped.wait(1):

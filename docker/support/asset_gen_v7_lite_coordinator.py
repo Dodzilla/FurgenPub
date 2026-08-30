@@ -981,7 +981,9 @@ class GPUCoordinator:
                     cwd = ""
                 processes.append({"pid": pid, "usedBytes": used_bytes, "cmdline": cmdline[:512], "cwd": cwd})
             except OSError:
-                continue
+                # A listed GPU PID is not proof of released VRAM merely because
+                # procfs hides its metadata. Retry the whole probe fail-closed.
+                return None
         return processes
 
     def _comfy_gpu_bytes(self):
@@ -1332,6 +1334,13 @@ class GPUCoordinator:
             self.state = "GRANTING"
             self.phase = "GRANTING"
             try:
+                if (holder == "mining" and self.enforce_transitions and self.tts
+                        and self.tts.state == "ready" and self.tts.config.get("coexistenceApproved")):
+                    if self.llama_running():
+                        self._stop_llama()
+                    if not comfy_verified_free:
+                        self._free_comfy(preserve_cache=True)
+                        comfy_verified_free = True
                 if self.tts:
                     self.tts.before_acquire(holder, metadata)
                 if holder == "inference" and self.enforce_transitions:

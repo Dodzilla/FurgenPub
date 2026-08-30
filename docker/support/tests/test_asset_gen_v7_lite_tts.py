@@ -137,6 +137,14 @@ class ResidencyTest(unittest.TestCase):
         self.owner._stop_mining.assert_called_once()
         self.tts.evict.assert_called_once_with("memory_budget_exceeded")
 
+    def test_memory_envelope_counts_cuda_children(self):
+        processes = [{"pid": 100, "usedBytes": 10}, {"pid": 101, "usedBytes": 20}, {"pid": 200, "usedBytes": 40}]
+        with mock.patch("asset_gen_v7_lite_tts.os.getpgid", side_effect=lambda pid: 100 if pid == 101 else 200):
+            self.assertEqual(self.tts._group_gpu_bytes(processes, {"pid": 100, "processGroupId": 100}), 30)
+        with mock.patch("asset_gen_v7_lite_tts.os.getpgid", side_effect=PermissionError("unknown")):
+            with self.assertRaises(PermissionError):
+                self.tts._group_gpu_bytes(processes, {"pid": 100, "processGroupId": 100})
+
     def test_cooperative_cancel_retains_healthy_graphs(self):
         self.ready()
         self.tts.binding = {"requestId": "r", "fencingToken": "token"}
