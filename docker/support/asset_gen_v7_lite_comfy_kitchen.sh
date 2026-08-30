@@ -25,6 +25,33 @@ before = {name: metadata.version(name) for name in protected}
 root.mkdir(parents=True, exist_ok=True)
 def git(*args):
     return subprocess.check_output(["git", "-c", f"safe.directory={root}", "-C", str(root), *args], text=True).strip()
+def restore_attention_patch(stash):
+    try:
+        git("stash", "apply", stash)
+    except subprocess.CalledProcessError:
+        # Native CK's core also added xformers' optional scale keyword. The
+        # preserved FCS fallback replaces that same line. Forward-port only
+        # this exact, recognized conflict; leave every other merge untouched.
+        rel = "comfy/ldm/modules/attention.py"
+        if git("diff", "--name-only", "--diff-filter=U").splitlines() != [rel]:
+            raise
+        path = root / rel
+        source = path.read_text()
+        start, middle, end = "<<<<<<< Updated upstream\n", "=======\n", ">>>>>>> Stashed changes\n"
+        upstream = '    out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask, scale=kwargs.get("scale", None))\n'
+        old_call = "out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask)"
+        if any(source.count(marker) != 1 for marker in (start, middle, end)):
+            raise
+        left, conflict = source.split(start)
+        current, conflict = conflict.split(middle)
+        preserved, right = conflict.split(end)
+        if current != upstream or preserved.count(old_call) != 1 or "FCS xformers fallback patch" not in preserved:
+            raise
+        preserved = preserved.replace(old_call, upstream.strip())
+        path.write_text(left + preserved + right)
+        git("add", "--", rel)
+        git("restore", "--staged", "--", rel)
+        print("Preserved FCS xformers fallback and native optional scale keyword", flush=True)
 if not (root / ".git").exists():
     if (root / "main.py").exists():
         raise SystemExit("Refusing to replace a non-git ComfyUI installation")
@@ -50,7 +77,7 @@ if current != pin:
         git("fetch", "--depth", "1", "https://github.com/Comfy-Org/ComfyUI.git", pin)
         git("checkout", "--detach", pin)
         if stash:
-            git("stash", "apply", stash)
+            restore_attention_patch(stash)
     except Exception:
         print(f"Core update failed; previous core={current}, recoverable stash={stash}", file=sys.stderr)
         raise
@@ -69,6 +96,13 @@ with tempfile.TemporaryDirectory(prefix="v7-ck-requirements-") as tmp:
     path = pathlib.Path(tmp) / "requirements.txt"
     path.write_text("\n".join(requirements) + "\n")
     subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--no-cache-dir", "-r", str(path)], check=True)
+# The template distribution splits its bundled JSON/media into exact-version
+# packages. Resolve only that closed, non-runtime namespace, still --no-deps.
+template_assets = sorted({req.split(";", 1)[0].strip() for req in metadata.requires("comfyui-workflow-templates") or []})
+if any(not re.fullmatch(r"comfyui[-_]workflow[-_]templates[-_][a-zA-Z0-9_-]+==[0-9.]+", req) for req in template_assets):
+    raise SystemExit("Unexpected template dependency; review before installing")
+if template_assets:
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--no-cache-dir", *template_assets], check=True)
 after = {name: metadata.version(name) for name in protected}
 if before != after:
     raise SystemExit("Protected framework versions changed")
@@ -86,6 +120,10 @@ import re
 import sys
 path = pathlib.Path(sys.argv[1])
 source = path.read_text()
+runtime_install = "    uv pip --no-cache-dir install -r requirements.txt\n"
+runtime_guard = '    if [[ "${SERVER_TYPE:-}" != "asset_gen_v7_lite" ]]; then\n' + runtime_install + "    fi\n"
+if runtime_guard not in source:
+    source = source.replace(runtime_install, runtime_guard)
 start = "# FURGEN v7 native Comfy Kitchen attention (managed)"
 end = "# /FURGEN v7 native Comfy Kitchen attention"
 source = re.sub(re.escape(start) + r"\n.*?" + re.escape(end) + r"\n", "", source, flags=re.S)
