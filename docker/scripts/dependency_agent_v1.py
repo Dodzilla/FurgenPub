@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.157"
+AGENT_VERSION = "dm-agent-py/0.10.158"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -1377,6 +1377,52 @@ def _is_permanent_http_error(err: Exception) -> bool:
     return any(400 <= code < 500 for code in codes)
 
 
+_CONTROL_HTTP = threading.local()
+
+
+def _control_urlopen(req, timeout):
+    """Reuse TLS for the v7 RTDB control plane; preserve CAS and HTTP errors.
+
+    Each thread owns its socket. Never retry a write with an unknown outcome.
+    Downloads, SSE streams, other server types and redirects keep urllib's path.
+    """
+    parsed = urllib.parse.urlsplit(req.full_url)
+    enabled = os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite" and _env_bool("DM_RTDB_HTTP_KEEPALIVE", True)
+    if not enabled or parsed.scheme != "https" or not (parsed.hostname or "").endswith((".firebaseio.com", ".firebasedatabase.app")):
+        return urllib.request.urlopen(req, timeout=timeout)
+    now = time.monotonic()
+    cached = getattr(_CONTROL_HTTP, "connection", None)
+    host = (parsed.hostname, parsed.port or 443)
+    if cached and (cached[0] != host or now - cached[2] > 15):
+        cached[1].close()
+        cached = None
+    connection = cached[1] if cached else http.client.HTTPSConnection(*host, timeout=timeout)
+    connection.timeout = timeout
+    if connection.sock is not None:
+        connection.sock.settimeout(timeout)
+    path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    try:
+        connection.request(req.get_method(), path, body=req.data, headers=dict(req.header_items()))
+        response = connection.getresponse()
+        _CONTROL_HTTP.connection = (host, connection, time.monotonic())
+        if response.status >= 300:
+            # Preserve urllib HTTPError semantics, particularly ETag conflicts.
+            import io
+            raw = response.read()
+            raise urllib.error.HTTPError(req.full_url, response.status, response.reason, response.headers, io.BytesIO(raw))
+        return response
+    except urllib.error.HTTPError:
+        raise
+    except (OSError, http.client.HTTPException):
+        connection.close()
+        _CONTROL_HTTP.connection = None
+        raise
+
+
+def _agent_stage(lease, stage):
+    logging.info("Agent stage jobId=%s stage=%s atMs=%d", getattr(lease, "job_id", "unknown"), stage, _now_ms())
+
+
 def api_json(
     method: str,
     url: str,
@@ -1394,7 +1440,7 @@ def api_json(
 
     req = urllib.request.Request(url, data=payload, method=method.upper(), headers=req_headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        with _control_urlopen(req, timeout=timeout_seconds) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             if not raw:
                 return resp.status, None
@@ -6759,7 +6805,7 @@ class DependencyAgent:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            with _control_urlopen(req, timeout=timeout_seconds) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 parsed = _json_loads_or_none(raw) if raw else None
                 return parsed, str(resp.headers.get("ETag") or "")
@@ -6796,7 +6842,7 @@ class DependencyAgent:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            with _control_urlopen(req, timeout=timeout_seconds) as resp:
                 return int(resp.status) in (200, 204)
         except urllib.error.HTTPError as e:
             if int(getattr(e, "code", 500) or 500) == 412:
@@ -15091,6 +15137,7 @@ class DependencyAgent:
         self._request_agent_queue_poll()
 
     def _prefetch_agent_execute_lease(self, lease: AgentExecuteLease) -> None:
+        _agent_stage(lease, "prefetch_started")
         retain_lease = False
         terminal_sent = False
         try:
@@ -15186,6 +15233,7 @@ class DependencyAgent:
                 active.prefetched_inputs = prefetched_inputs
                 active.stage = "ready"
                 active.ready_at_ms = _now_ms()
+                _agent_stage(lease, "inputs_ready")
                 self._enqueue_ready_locked(active)
             retain_lease = True
             self._stop_idle_prl_mining_for_work("execute_job")
@@ -15222,6 +15270,7 @@ class DependencyAgent:
                 self._cleanup_agent_lease(lease)
 
     def _execute_agent_ready_lease(self, lease: AgentExecuteLease) -> None:
+        _agent_stage(lease, "prepare_started")
         retain_lease = False
         terminal_sent = False
         node_timing_collector: Optional[ComfyNodeTimingCollector] = None
@@ -15269,12 +15318,14 @@ class DependencyAgent:
 
             workflow = self._parse_workflow_from_payload(lease.payload)
             self._ensure_runtime_assets_for_workflow(workflow)
+            _agent_stage(lease, "prepare_finished")
 
             try:
                 admission_claim_token = self._wait_for_comfy_gpu_admission(
                     lease,
                     estimated_duration_ms=max(1, execution_timeout_sec) * 1000,
                 )
+                _agent_stage(lease, "admission_claimed")
                 self._stop_idle_prl_mining_for_work("execute_job")
                 lease.gpu_coordinator_lease = self._acquire_gpu_lease(
                     "comfy",
@@ -15297,6 +15348,7 @@ class DependencyAgent:
                 self._defer_ready_lease_for_gpu_coordinator(lease, 5.0, str(exc))
                 retain_lease = True
                 return
+            _agent_stage(lease, "gpu_acquired")
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 execute_started_at_ms = _now_ms()
@@ -15336,6 +15388,7 @@ class DependencyAgent:
                 node_timing_collector.stop()
                 node_timing_collector = None
             lease.prompt_submitted_at_ms = _now_ms()
+            _agent_stage(lease, "prompt_submitted")
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
                 if active:
@@ -15428,16 +15481,19 @@ class DependencyAgent:
                     active.stage = "uploading"
                     active.history_entry = history_entry
                     active.prompt_id = prompt_id
+            _agent_stage(lease, "history_complete")
             lease.history_entry = history_entry
             lease.prompt_id = prompt_id
             self._arm_post_job_comfy_recycle(lease)
             self._mark_agent_gpu_work_finished(lease, "comfy_execution_complete", final_stage="uploading")
+            _agent_stage(lease, "gpu_released")
             output_commit_payload: Dict[str, Any] = {"promptId": prompt_id}
             if self._coalesce_agent_lifecycle_events(lease):
                 output_commit_payload["coalescedLifecycle"] = self._coalesced_agent_lifecycle_payload(lease)
             attach_node_timings(output_commit_payload, "success")
             self._emit_agent_event_durable(lease, "output_commit_started", output_commit_payload)
 
+            _agent_stage(lease, "commit_acknowledged")
             self._submit_agent_upload(lease)
             retain_lease = True
         except Exception as e:
@@ -15503,6 +15559,7 @@ class DependencyAgent:
                 self._cleanup_agent_lease(lease)
 
     def _upload_agent_outputs(self, lease: AgentExecuteLease) -> None:
+        _agent_stage(lease, "upload_started")
         terminal_sent = False
         output_commit_started_ms = _now_ms()
         lease.upload_started_at_ms = output_commit_started_ms
@@ -15563,6 +15620,7 @@ class DependencyAgent:
                     timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
                     chunk_size=int(self.download_chunk_size),
                 )
+                _agent_stage(lease, "output_downloaded")
                 download_ms = max(0, _now_ms() - download_started_ms)
                 bytes_written = int(local_output.stat().st_size)
                 hash_started_ms = _now_ms()
@@ -15576,6 +15634,7 @@ class DependencyAgent:
                     bytes_written,
                     sha256_sum,
                 )
+                _agent_stage(lease, "output_upload_returned")
                 timing = out_meta.get("uploadTiming") if isinstance(out_meta.get("uploadTiming"), dict) else {}
                 out_meta["uploadTiming"] = {
                     **timing,
@@ -15586,6 +15645,7 @@ class DependencyAgent:
                 uploaded_outputs.append(out_meta)
                 try:
                     self._emit_agent_event_best_effort(lease, "output_uploaded", out_meta)
+                    _agent_stage(lease, "output_event_acknowledged")
                 except Exception as e:
                     logging.debug(
                         "output_uploaded emit failed for %s/%s: %s",
