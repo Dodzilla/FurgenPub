@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.163"
+AGENT_VERSION = "dm-agent-py/0.10.164"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5979,7 +5979,7 @@ class DependencyAgent:
                 e,
             )
 
-    def _tts_has_foreground_demand(self, timeout_seconds: float = 1.0) -> bool:
+    def _tts_has_foreground_demand(self, timeout_seconds: float = 1.0) -> Optional[bool]:
         # TTS setup must yield before queue claiming/input preparation, not just
         # when a job reaches a GPU-blocking stage. This is a worker-scoped,
         # bounded control-plane read; completion still uses signed callbacks.
@@ -5992,7 +5992,7 @@ class DependencyAgent:
             if not isinstance(queue_path, str) or not queue_path:
                 return True
             queue_limit = 32
-            queued = self._coordination_get_json(queue_path, timeout_seconds=timeout_seconds, query={
+            queued = self._coordination_get_json(queue_path, timeout_seconds=timeout_seconds, allow_token_refresh=False, query={
                 "orderBy": json.dumps("state"), "equalTo": json.dumps("queued"), "limitToFirst": str(queue_limit),
             })
             if queued is not None and not isinstance(queued, dict):
@@ -6006,10 +6006,11 @@ class DependencyAgent:
             )):
                 logging.info("TTS queued foreground demand observed atMs=%d", _now_ms())
                 return True
-            return self._gpu_admission_has_foreground_work(timeout_seconds=timeout_seconds)
+            return self._gpu_admission_has_foreground_work(
+                timeout_seconds=timeout_seconds, unknown_is_demand=False, allow_token_refresh=False)
         except Exception:
             logging.warning("TTS pending-demand probe unavailable; withholding idle permission")
-            return True
+            return None
 
     def _start_tts_idle_heartbeat(self) -> None:
         # This clock must not share the serialized miner executor: mining
@@ -6020,15 +6021,20 @@ class DependencyAgent:
                 return
             def heartbeat():
                 while not self._stop.is_set() and getattr(self, "_tts_residency_seen_enabled", False):
+                    started = time.monotonic()
                     try:
-                        self._gpu_coordinator._request(
-                            "POST", "/v1/gpu/tts/heartbeat",
-                            body={"foregroundDemand": self._tts_has_foreground_demand()},
-                            timeout_seconds=1.5,
-                        )
+                        demand = self._tts_has_foreground_demand()
+                        # Unknown cannot renew an idle permit. Its existing
+                        # deadline and supervisor watchdog remain authoritative.
+                        if demand is not None:
+                            self._gpu_coordinator._request(
+                                "POST", "/v1/gpu/tts/heartbeat",
+                                body={"foregroundDemand": demand},
+                                timeout_seconds=1.5,
+                            )
                     except Exception:
                         logging.warning("TTS idle heartbeat unavailable; permit expiration remains fail-closed")
-                    if self._stop.wait(1):
+                    if self._stop.wait(max(.05, 1 - (time.monotonic() - started))):
                         break
             self._tts_idle_heartbeat_thread = threading.Thread(target=heartbeat, daemon=True, name="tts-idle-heartbeat")
             self._tts_idle_heartbeat_thread.start()
@@ -6048,17 +6054,22 @@ class DependencyAgent:
                 self._tts_residency_seen_enabled = bool(residency.get("enabled"))
                 if self._tts_residency_seen_enabled:
                     self._start_tts_idle_heartbeat()
+                    demand = local_demand or self._tts_has_foreground_demand()
+                    if demand is None:
+                        return
                     status, reply, _headers = self._gpu_coordinator._request(
                         "POST", "/v1/gpu/tts/idle",
-                        body={"foregroundDemand": local_demand or self._tts_has_foreground_demand()},
+                        body={"foregroundDemand": demand},
                         timeout_seconds=15.0,
                     )
                     if status == 200 and reply.get("state") == "warming":
                         # Re-read demand after the permit grant, not just before it.
-                        self._gpu_coordinator._request(
-                            "POST", "/v1/gpu/tts/idle",
-                            body={"foregroundDemand": self._tts_has_foreground_demand()}, timeout_seconds=15.0,
-                        )
+                        demand = self._tts_has_foreground_demand()
+                        if demand is not None:
+                            self._gpu_coordinator._request(
+                                "POST", "/v1/gpu/tts/idle",
+                                body={"foregroundDemand": demand}, timeout_seconds=15.0,
+                            )
                     if status != 200 or not reply.get("canMine"):
                         return
             if local_demand:
@@ -6876,8 +6887,16 @@ class DependencyAgent:
         node_path: str,
         timeout_seconds: float = 10.0,
         query: Optional[Dict[str, str]] = None,
+        allow_token_refresh: bool = True,
     ) -> Optional[Any]:
-        id_token = self._ensure_coordination_id_token()
+        if allow_token_refresh:
+            id_token = self._ensure_coordination_id_token()
+        else:
+            # Idle-permit probes must not enter a 30-second auth refresh.
+            # Ordinary coordination traffic continues refreshing the token.
+            id_token = self._coordination_id_token
+            if not id_token or self._coordination_id_token_expires_at_ms <= _now_ms() + 5000:
+                raise RuntimeError("Cached coordination token is unavailable")
         status, resp = api_json(
             "GET",
             self._coordination_rtdb_url(node_path, id_token=id_token, query=query),
@@ -7210,13 +7229,19 @@ class DependencyAgent:
         except Exception as exc:
             logging.error("Failed releasing FIFO GPU admission ticket=%s jobId=%s: %s", ticket_id, lease.job_id, exc)
 
-    def _gpu_admission_has_foreground_work(self, timeout_seconds: float = 5.0) -> bool:
+    def _gpu_admission_has_foreground_work(
+        self, timeout_seconds: float = 5.0, *, unknown_is_demand: bool = True,
+        allow_token_refresh: bool = True,
+    ) -> Optional[bool]:
         if self.gpu_admission_mode != "enforcing":
             return False
         if not self._coordination:
-            return True
+            return True if unknown_is_demand else None
         try:
-            raw = self._coordination_get_json(self._gpu_admission_root_path(), timeout_seconds=timeout_seconds)
+            raw = self._coordination_get_json(self._gpu_admission_root_path(), timeout_seconds=timeout_seconds,
+                                              allow_token_refresh=allow_token_refresh)
+            if raw is not None and not isinstance(raw, dict):
+                raise RuntimeError("GPU admission state is malformed")
             root = self._gpu_admission_prune(raw, _now_ms())
             if root.get("durableDemandActive") is True:
                 return True
@@ -7228,7 +7253,7 @@ class DependencyAgent:
             )
         except Exception as exc:
             logging.warning("Failing closed on mining because GPU admission state is unavailable: %s", exc)
-            return True
+            return True if unknown_is_demand else None
 
     def _coordination_queue_item_path(self, root_path: str, encoded_key: str) -> str:
         root = self._normalize_coordination_path(root_path) or ""
