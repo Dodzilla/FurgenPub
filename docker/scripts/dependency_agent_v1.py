@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.158"
+AGENT_VERSION = "dm-agent-py/0.10.159"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -6050,6 +6050,25 @@ class DependencyAgent:
         except Exception as e:
             logging.warning("Failed resuming idle PRL miner after %s: %s", reason, e)
 
+    def _schedule_idle_prl_resume(self, reason: str) -> None:
+        # Mining preparation/admission may perform slow network/process work.
+        # Keep it off foreground dispatch and output delivery, with at most one
+        # pending attempt on the existing serialized miner executor.
+        if os.environ.get("SERVER_TYPE") != "asset_gen_v7_lite":
+            self._resume_idle_prl_mining_if_idle(reason)
+            return
+        executor = self._agent_prl_miner_executor
+        if executor is None or self._stop.is_set() or self._pending_self_update is not None:
+            return
+        with self._lock:
+            if any(not future.done() for future in self._agent_prl_miner_inflight):
+                return
+            pending = getattr(self, "_idle_prl_resume_future", None)
+            if pending is not None and not pending.done():
+                return
+            self._idle_prl_resume_future = executor.submit(self._resume_idle_prl_mining_if_idle, reason)
+            self._agent_prl_miner_inflight.add(self._idle_prl_resume_future)
+
     def _mark_agent_gpu_work_finished(
         self,
         lease: AgentExecuteLease,
@@ -6061,7 +6080,7 @@ class DependencyAgent:
             if active:
                 active.stage = final_stage
         self._release_comfy_gpu_lease(lease, reason, keep_warm=True)
-        self._resume_idle_prl_mining_if_idle(reason)
+        self._schedule_idle_prl_resume(reason)
         self._request_agent_queue_poll()
 
     # Include shared secret by default to avoid token races causing 401 loops
@@ -15992,7 +16011,7 @@ class DependencyAgent:
                         except Exception as e:
                             logging.error("Unhandled agent %s worker error: %s", label, e)
 
-                self._resume_idle_prl_mining_if_idle("agent_loop_idle")
+                self._schedule_idle_prl_resume("agent_loop_idle")
 
                 # Heartbeats.
                 if not self.mining_only and now - self._last_heartbeat_ms >= int(self.heartbeat_seconds * 1000):
