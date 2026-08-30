@@ -7,13 +7,14 @@ export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
 export DM_LOCAL_COMFY_BASE_URL="${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}"
 export DM_LOCAL_READINESS_FILE="${DM_LOCAL_READINESS_FILE:-provisioned_asset_gen_v7_lite.txt}"
-export COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-v0.25.1}"
+export COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT:-e01fb4c56b7a88149d469b99cbbfe3223d715054}"
 export ASSET_GEN_V5_IGNORED_BUNDLE_IDS="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS:-asset_gen_v6_lite_comfy_core_v0251,asset_gen_v6_lite_runtime_helpers}"
 export FURGENPUB_RAW_BASE_URL="${FURGENPUB_RAW_BASE_URL:-https://raw.githubusercontent.com/Dodzilla/FurgenPub/refs/heads/main/docker/support}"
 BASE_SCRIPT="${WORKSPACE}/asset_gen_v5_lite.sh"
 INFERENCE_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_inference.sh"
 GATEWAY_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_gateway.py"
 COORDINATOR_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_coordinator.py"
+KITCHEN_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_comfy_kitchen.sh"
 READINESS_PATH="${DM_COMFYUI_DIR}/input/${DM_LOCAL_READINESS_FILE}"
 MODEL_PATH="${DM_COMFYUI_DIR}/models/llm/Qwen3.8-27B-Uncensored-Q5_K_M.gguf"
 VISION_PATH="${DM_COMFYUI_DIR}/models/llm/Qwen3.8-27B-Uncensored-vision-f16.gguf"
@@ -25,24 +26,13 @@ download_support_file() {
 }
 
 ensure_comfy_core() {
-    if [[ -f "${DM_COMFYUI_DIR}/main.py" && -f "${DM_COMFYUI_DIR}/comfy/cli_args.py" ]]; then
-        return 0
-    fi
-    echo "Initializing pinned ComfyUI v0.25.1 core in ${DM_COMFYUI_DIR}..."
-    mkdir -p "${DM_COMFYUI_DIR}"
     if ! command -v git >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
         apt-get install -y --no-install-recommends git ca-certificates
     fi
-    if [[ ! -d "${DM_COMFYUI_DIR}/.git" ]]; then
-        git -C "${DM_COMFYUI_DIR}" init
-        git -C "${DM_COMFYUI_DIR}" remote add origin https://github.com/comfyanonymous/ComfyUI.git
-    fi
-    git config --global --add safe.directory "${DM_COMFYUI_DIR}"
-    git -C "${DM_COMFYUI_DIR}" fetch --depth 1 origin refs/tags/v0.25.1
-    git -C "${DM_COMFYUI_DIR}" checkout --force FETCH_HEAD
-    /venv/main/bin/python -m pip install --no-cache-dir -r "${DM_COMFYUI_DIR}/requirements.txt"
+    download_support_file asset_gen_v7_lite_comfy_kitchen.sh "${KITCHEN_SCRIPT}"
+    bash "${KITCHEN_SCRIPT}" install-core
 }
 
 download_support_file asset_gen_v5_lite.sh "${BASE_SCRIPT}"
@@ -65,15 +55,25 @@ rm -f "${READINESS_PATH}"
 # Preserve Comfy's CPU node/object cache while allowing model VRAM to be
 # revoked by the local coordinator.  Normalize old service config safely.
 export COMFYUI_ARGS="${COMFYUI_ARGS:---disable-auto-launch --listen 0.0.0.0 --port 8188 --enable-cors-header}"
+COMFYUI_ARGS="$(printf '%s' "${COMFYUI_ARGS}" | tr '\t\r\n' '   ')"
 COMFYUI_ARGS="${COMFYUI_ARGS// --cache-none/}"
 COMFYUI_ARGS="${COMFYUI_ARGS//--cache-none/}"
 COMFYUI_ARGS="$(printf '%s\n' "${COMFYUI_ARGS}" | sed -E 's/(^|[[:space:]])--cache-ram([[:space:]]+[0-9.]+){0,2}//g')"
 COMFYUI_ARGS="${COMFYUI_ARGS} --cache-ram 16 40"
+for attention_flag in --use-sage-attention --use-pytorch-cross-attention --use-flash-attention --use-split-cross-attention --use-quad-cross-attention --use-ck-attention; do
+    COMFYUI_ARGS=" ${COMFYUI_ARGS} "
+    while [[ "${COMFYUI_ARGS}" == *" ${attention_flag} "* ]]; do
+        COMFYUI_ARGS="${COMFYUI_ARGS// ${attention_flag} / }"
+    done
+done
+COMFYUI_ARGS="${COMFYUI_ARGS} --use-ck-attention"
+unset attention_flag
 export COMFYUI_ARGS
 env SERVER_TYPE="${SERVER_TYPE}" DM_LOCAL_READINESS_FILE="${DM_LOCAL_READINESS_FILE}" \
     COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT}" \
     ASSET_GEN_V5_IGNORED_BUNDLE_IDS="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS}" \
     DM_ASSET_GEN_V5_LITE_SCRIPT="${BASE_SCRIPT}" bash "${BASE_SCRIPT}" start
+bash "${KITCHEN_SCRIPT}" configure-launcher
 
 echo "Waiting for the pinned Qwen model and vision projector dependencies..."
 model_ready=0

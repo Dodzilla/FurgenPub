@@ -509,6 +509,12 @@ PY
 }
 
 function provisioning_update_comfyui() {
+    if [[ "${SERVER_TYPE:-}" == "asset_gen_v7_lite" ]]; then
+        # v7 installs its reviewed native CK runtime before delegating here.
+        # Never let the generic updater reinstall shared framework packages.
+        [[ "$(git -c "safe.directory=${COMFYUI_DIR}" -C "${COMFYUI_DIR}" rev-parse HEAD)" == "${COMFYUI_PIN_COMMIT}" ]] || return 1
+        return 0
+    fi
     if [[ -z "${COMFYUI_PIN_COMMIT}" ]]; then
         printf "Using ComfyUI from the base image; no ComfyUI pin requested for asset_gen_v5_lite.\n"
         return 0
