@@ -26,6 +26,7 @@ import traceback
 import urllib.error
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tts_profiles import (
@@ -578,8 +579,6 @@ class OfficialGpuBackend:
                 request["ref_audio_path"] = str(ref_path)
                 request["ref_text"] = params["ref_text"]
                 template_name = "ref_edit_tata"
-            if params["seed"] > 0:
-                self.set_all_seeds(params["seed"])
             inputs = self.prepare_inputs(
                 self.tokenizer,
                 self.codec,
@@ -590,6 +589,9 @@ class OfficialGpuBackend:
                 guidance_scale_ref=None,
                 guidance_scale_ins=None,
             )
+            # Match Comfy: encode reference audio before resetting synthesis RNG.
+            if params["seed"] > 0:
+                self.set_all_seeds(params["seed"])
             inspection = inspect_prepared_inputs(inputs)
             prepared_profile = guard_prepared_profile(self.spec, inspection)
             max_frames = cap_max_new_tokens(params["max_new_tokens"], inspection["prefill_len"])
@@ -688,6 +690,8 @@ def _apply_sampling(runtime, replace, params, max_frames):
             max_k = int(getattr(graph, "_max_k", 1024))
             if top_k > max_k:
                 raise TtsError("unsupported_profile", "depth top_k exceeds the warmed graph")
+            if top_k <= 0 and max_k < int(getattr(graph, "codec_codebook_size", max_k + 1)):
+                raise TtsError("unsupported_profile", "unfiltered depth sampling exceeds the warmed workspace")
             graph.set_top_k(top_k)
     except TtsError:
         raise
@@ -824,6 +828,9 @@ class TtsRuntimeApp:
         self.backend = None if backend is None or callable(backend) else backend
         self.lock = threading.Lock()
         self.gpu_lock = threading.Lock()
+        # Reuse CUDA library handles/workspaces across requests. Socket handlers
+        # must remain separate so health, cancellation and permits stay responsive.
+        self.gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-gpu")
         self.cancel_events = {}
         self.in_flight = None
         self.started_ids = set()
@@ -987,7 +994,7 @@ class TtsRuntimeApp:
 
             watch = PermitWatch(self.permits, permit, on_invalid, self.poll_interval).start()
             backend = self._backend()
-            result = backend.warmup(cancel_event=cancel)
+            result = self.gpu_executor.submit(backend.warmup, cancel_event=cancel).result()
             self.synchronize(getattr(backend, "_torch", None))
             if not self.permits.validate(permit):
                 raise TtsError("invalid_permit", "permit was revoked")
@@ -1049,7 +1056,7 @@ class TtsRuntimeApp:
 
             watch = PermitWatch(self.permits, permit, on_invalid, self.poll_interval).start()
             backend = self._backend()
-            result = backend.generate(params, cancel_event=cancel)
+            result = self.gpu_executor.submit(backend.generate, params, cancel_event=cancel).result()
             self.synchronize(getattr(backend, "_torch", None))
             if permit_lost.is_set() or not self.permits.validate(permit):
                 raise TtsError("invalid_permit", "permit was revoked")
@@ -1140,6 +1147,7 @@ def main(argv=None):
         server.serve_forever()
     finally:
         server.server_close()
+        app.gpu_executor.shutdown(wait=False, cancel_futures=True)
         if os.path.exists(args.socket):
             os.unlink(args.socket)
 
