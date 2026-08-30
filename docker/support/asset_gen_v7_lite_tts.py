@@ -405,6 +405,7 @@ class TTSResidency:
         except Exception as error:
             with self.owner.lock:
                 if self.permit and self.permit["fencingToken"] == permit["fencingToken"]:
+                    self._event("warmup_error", code=getattr(error, "code", "warmup_failed"), message=str(error)[:240])
                     self.evict("warmup_failed")
                     self._failure(getattr(error, "code", "warmup_failed"))
 
