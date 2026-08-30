@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.156"
+AGENT_VERSION = "dm-agent-py/0.10.157"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -12839,7 +12839,12 @@ class DependencyAgent:
 
     def _input_cache_path(self, cache_key: str, desired_name: str) -> Path:
         safe_name = os.path.basename(desired_name) or "input.bin"
-        return self.input_cache_dir / cache_key[:2] / f"{cache_key}_{safe_name}"
+        cache_name = f"{cache_key}_{safe_name}"
+        # NAME_MAX is bytes, not characters. The key already includes source/name
+        # identity; only omit the diagnostic basename when it cannot fit.
+        if len(os.fsencode(cache_name)) > 255:
+            cache_name = cache_key
+        return self.input_cache_dir / cache_key[:2] / cache_name
 
     def _touch_input_cache_path(self, path: Path) -> None:
         now = time.time()
@@ -12992,7 +12997,7 @@ class DependencyAgent:
         safe_name = os.path.basename(desired_name) or f"input_{uuid.uuid4().hex}"
         dest = self.comfyui_dir / "input" / safe_name
         dest.parent.mkdir(parents=True, exist_ok=True)
-        temp_dest = dest.parent / f".{safe_name}.{uuid.uuid4().hex}.tmp"
+        temp_dest = dest.parent / f".dm_input_{uuid.uuid4().hex}.tmp"
         try:
             if temp_dest.exists():
                 temp_dest.unlink()
