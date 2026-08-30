@@ -191,6 +191,21 @@ class TTSResidency:
     def _identity_alive(self):
         return bool(self.identity and self.owner._process_matches(self.identity.get("pid"), self.identity.get("processStartTime")))
 
+    @staticmethod
+    def _group_alive(pgid):
+        # Include CPU compilation children: no runnable member may survive an
+        # eviction merely because it has not allocated CUDA memory yet.
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                if int(fields[2]) == pgid and fields[0] != "Z":
+                    return True
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return False
+
     def evict(self, reason, preempt=False):
         started = time.monotonic()
         self.permit = None
@@ -230,7 +245,7 @@ class TTSResidency:
                     except ProcessLookupError:
                         return False
                 remaining = None if processes is None else [p for p in processes if owned(p)]
-                if remaining == [] and not self.owner._process_matches(pid, identity.get("processStartTime")):
+                if remaining == [] and not self.owner._process_matches(pid, identity.get("processStartTime")) and not self._group_alive(pgid):
                     break
                 if time.monotonic() >= deadline:
                     self.last_error = "tts_vram_not_released"
