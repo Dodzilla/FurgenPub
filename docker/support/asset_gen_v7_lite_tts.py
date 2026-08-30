@@ -281,6 +281,8 @@ class TTSResidency:
                 self._failure("runtime_crash")
                 return
             if holder == "mining":
+                if self.config.get("diagnosticsEnabled") and not self.config.get("coexistenceApproved"):
+                    raise TTSError("tts_diagnostics_hold", "Mining waits for the diagnostic memory gate")
                 budget = self._budget("idleBytes") + self._budget("miningBytes")
                 keep = self.config.get("coexistenceApproved") and self._budget("idleBytes") and self._budget("miningBytes") and self._fits(budget)
             else:

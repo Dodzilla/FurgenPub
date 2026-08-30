@@ -143,6 +143,14 @@ class ResidencyTest(unittest.TestCase):
         self.assertEqual(self.tts.state, "absent")
         self.assertEqual(self.tts.failures, 1)
 
+    def test_explicit_mining_command_cannot_displace_diagnostic_runtime(self):
+        self.ready()
+        self.tts.config.update(diagnosticsEnabled=True, coexistenceApproved=False)
+        self.tts.evict = mock.Mock()
+        with self.assertRaisesRegex(TTSError, "diagnostic memory gate"):
+            self.tts.before_acquire("mining", {})
+        self.tts.evict.assert_not_called()
+
     def test_canary_allowlist_is_required(self):
         with mock.patch.dict(os.environ, {"DM_INSTANCE_ID": "other"}):
             self.assertFalse(self.tts.enabled)
