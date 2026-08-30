@@ -741,7 +741,7 @@ import sys
 path = pathlib.Path(sys.argv[1])
 source = path.read_text(encoding="utf-8")
 
-if "FCS xformers fallback patch" in source:
+if "FCS xformers fallback patch: unsupported xformers attention kernel" in source:
     print("Comfy xformers fallback patch already applied.")
     raise SystemExit(0)
 
@@ -754,6 +754,16 @@ new_snapshot_block = (
 )
 
 old_attention_call = "    out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask)\n"
+scaled_attention_call = '    out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask, scale=kwargs.get("scale", None))\n'
+matching_calls = [line for line in source.splitlines(keepends=True) if line in (old_attention_call, scaled_attention_call)]
+if len(matching_calls) != 1:
+    raise SystemExit("Expected exactly one recognized xformers attention call; leaving file unchanged.")
+attention_call = matching_calls[0]
+snapshot_present = new_snapshot_block in source
+if not snapshot_present and source.count(old_snapshot_anchor) != 1:
+    raise SystemExit("Expected exactly one xformers tensor snapshot anchor; leaving file unchanged.")
+if "FCS xformers fallback patch" in source and not snapshot_present:
+    raise SystemExit("Unrecognized partial FCS xformers fallback patch; leaving file unchanged.")
 new_attention_block = (
     "    force_pytorch = False\n"
     "    device_capability = None\n"
@@ -787,7 +797,7 @@ new_attention_block = (
     "        )\n"
     "\n"
     "    try:\n"
-    "        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask)\n"
+    "    " + attention_call +
     "    except NotImplementedError as e:\n"
     "        if not getattr(attention_xformers, \"_fcs_xformers_warning_emitted\", False):\n"
     "            logging.warning(\n"
@@ -807,21 +817,9 @@ new_attention_block = (
     "        )\n"
 )
 
-changed = False
-if old_snapshot_anchor in source:
+if not snapshot_present:
     source = source.replace(old_snapshot_anchor, new_snapshot_block, 1)
-    changed = True
-else:
-    print("WARN: Could not locate skip_reshape anchor; xformers fallback patch not applied.", file=sys.stderr)
-
-if old_attention_call in source:
-    source = source.replace(old_attention_call, new_attention_block, 1)
-    changed = True
-else:
-    print("WARN: Could not locate xformers attention call; xformers fallback patch not applied.", file=sys.stderr)
-
-if not changed:
-    raise SystemExit(0)
+source = source.replace(attention_call, new_attention_block, 1)
 
 path.write_text(source, encoding="utf-8")
 print("Applied Comfy xformers fallback patch.")
@@ -1013,6 +1011,10 @@ PY
         return 0
     fi
 
+    if [[ "${SERVER_TYPE:-}" == "asset_gen_v7_lite" ]]; then
+        printf "ERROR: v7 Torch import failed; refusing to replace its shared CUDA framework.\n"
+        return 1
+    fi
     printf "WARN: Torch import failed; reinstalling pinned CUDA 12.8 torch stack for asset_gen_v5_lite.\n"
     pip install --no-cache-dir --force-reinstall \
         --index-url https://download.pytorch.org/whl/cu128 \
@@ -1100,6 +1102,22 @@ function provisioning_install_omnivoice_requirements() {
     if [[ ! -d "${node_path}" ]]; then
         printf "ERROR: OmniVoice custom node directory missing: %s\n" "${node_path}"
         return 1
+    fi
+
+    if [[ "${SERVER_TYPE:-}" == "asset_gen_v7_lite" ]]; then
+        # Keep the reviewed shared framework. Upstream install.py and the
+        # generic --upgrade resolver are not safe for the v7 mixed workload.
+        /venv/main/bin/python - "${OMNIVOICE_TRANSFORMERS_VERSION}" <<'PY'
+import importlib.metadata as m
+import sys
+if m.version("transformers") != sys.argv[1]:
+    raise SystemExit("v7 requires its existing compatible Transformers pin; refusing automatic replacement")
+PY
+        pip install --no-cache-dir --no-deps \
+            "accelerate>=1.12.0" "pydub==${OMNIVOICE_PYDUB_VERSION}" \
+            "soxr==${OMNIVOICE_SOXR_VERSION}" soundfile scipy lazy_loader librosa sentencepiece jieba \
+            "omnivoice==${OMNIVOICE_PACKAGE_VERSION}" || return 1
+        return 0
     fi
 
     if [[ -f "${install_script_path}" ]]; then

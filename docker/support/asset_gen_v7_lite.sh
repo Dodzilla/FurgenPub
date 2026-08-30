@@ -51,6 +51,7 @@ if [[ "${command}" != "start" && -n "${command}" ]]; then
 fi
 
 ensure_comfy_core
+bash "${KITCHEN_SCRIPT}" configure-launcher
 rm -f "${READINESS_PATH}"
 # Preserve Comfy's CPU node/object cache while allowing model VRAM to be
 # revoked by the local coordinator.  Normalize old service config safely.

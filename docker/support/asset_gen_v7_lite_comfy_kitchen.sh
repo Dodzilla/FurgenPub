@@ -122,6 +122,8 @@ path = pathlib.Path(sys.argv[1])
 source = path.read_text()
 runtime_install = "    uv pip --no-cache-dir install -r requirements.txt\n"
 runtime_guard = '    if [[ "${SERVER_TYPE:-}" != "asset_gen_v7_lite" ]]; then\n' + runtime_install + "    fi\n"
+if source.count(runtime_install) != 1 or source.count(runtime_guard) > 1:
+    raise SystemExit("Unrecognized automatic requirements installer; review before launching v7")
 if runtime_guard not in source:
     source = source.replace(runtime_install, runtime_guard)
 start = "# FURGEN v7 native Comfy Kitchen attention (managed)"
@@ -138,7 +140,7 @@ fi
 ''' + end + "\n"
 marker = "# Launch ComfyUI\n"
 env_marker = "# /FURGEN dependency agent watchdog bootstrap\n"
-if source.count(marker) != 1 or source.count(env_marker) != 1 or source.index(env_marker) > source.index(marker):
+if source.count(marker) != 1 or source.count(env_marker) > 1 or (env_marker in source and source.index(env_marker) > source.index(marker)):
     raise SystemExit("Expected exactly one post-env launcher anchor")
 source = source.replace(marker, marker + block)
 path.write_text(source)
