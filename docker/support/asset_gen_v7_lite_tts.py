@@ -29,6 +29,8 @@ if not LOG.handlers:
 GIB = 1024**3
 MAX_RPC_BYTES = 32 * 1024**2
 MODES = {"BreezeTTS2VoiceClone", "BreezeTTS2VoiceDesign", "BreezeTTS2VoiceDirection"}
+SAMPLING_KEYS = {"temperature", "top_k", "top_p", "repetition_penalty",
+                 "depth_temperature", "depth_top_k", "depth_top_p"}
 
 
 class TTSError(RuntimeError):
@@ -606,6 +608,12 @@ class TTSResidency:
                 raise TTSError("unsupported_profile", "Official runtime is not ready for this request")
             if self.generating:
                 raise TTSError("busy", "Official generation already active")
+            controls = self.config.get("validatedSamplingControls")
+            if controls is not None or self.config.get("routingApproved"):
+                params = request.get("params") or {}
+                if (not isinstance(controls, dict) or set(controls) != SAMPLING_KEYS
+                        or any(type(params.get(k)) not in (int, float) or params[k] != controls[k] for k in SAMPLING_KEYS)):
+                    raise TTSError("unsupported_profile", "Sampling controls are outside the validated serving profile; use Comfy unchanged")
             self.generating = True
             self.generation_request_id = binding["requestId"]
         try:

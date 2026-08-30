@@ -331,6 +331,44 @@ class ResidencyTest(unittest.TestCase):
             kill.assert_not_called()
         self.assertEqual(self.tts.state, "evicting")
 
+    def test_unqualified_controls_fall_back_before_official_execution_without_mutation(self):
+        self.ready()
+        controls = dict(temperature=.9, top_k=50, top_p=1., repetition_penalty=1.1,
+                        depth_temperature=.9, depth_top_k=50, depth_top_p=1.)
+        self.tts.config['validatedSamplingControls'] = controls
+        lease = {'holder': 'comfy', 'state': 'ACTIVE', 'epoch': 11, 'fencingToken': 'token',
+                 'workId': 'job', 'deadlineMs': time.time()*1000+10000,
+                 'metadata': {'tts': {'requestId': 'request'}}}
+        self.owner.lease = lease
+        self.tts.bind(lease)
+        params = {**controls, 'temperature': .7, 'text': 'Synthetic test.'}
+        original = copy.deepcopy(params)
+        with mock.patch('asset_gen_v7_lite_tts.rpc') as runtime:
+            with self.assertRaises(TTSError) as error:
+                self.tts.bridge({'method': 'generate', 'requestId': 'request', 'params': params})
+            self.assertEqual(error.exception.code, 'unsupported_profile')
+            runtime.assert_not_called()
+        self.assertFalse(self.tts.generating)
+        self.assertEqual(params, original)
+        with mock.patch.object(self.tts, 'evict') as evict:
+            self.assertEqual(self.tts.bridge({'method': 'fallback', 'requestId': 'request'})['backend'], 'comfy')
+            evict.assert_called_once_with('comfy_fallback')
+
+    def test_approved_sampling_controls_reach_runtime_unchanged(self):
+        self.ready()
+        controls = dict(temperature=.9, top_k=50, top_p=1., repetition_penalty=1.1,
+                        depth_temperature=.9, depth_top_k=50, depth_top_p=1.)
+        self.tts.config['validatedSamplingControls'] = controls
+        lease = {'holder': 'comfy', 'state': 'ACTIVE', 'epoch': 11, 'fencingToken': 'token',
+                 'workId': 'job', 'deadlineMs': time.time()*1000+10000,
+                 'metadata': {'tts': {'requestId': 'request'}}}
+        self.owner.lease = lease
+        self.tts.bind(lease)
+        params = {**controls, 'text': 'Synthetic test.', 'seed': 420}
+        with mock.patch('asset_gen_v7_lite_tts.rpc', return_value={'timing': {'generationMs': 700}}) as runtime:
+            self.tts.bridge({'method': 'generate', 'requestId': 'request', 'params': params})
+            self.assertEqual(runtime.call_args.args[1]['params'], params)
+
 
 class ClassificationTest(unittest.TestCase):
     def workflow(self):
