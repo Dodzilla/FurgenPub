@@ -835,3 +835,14 @@ class HashAndFingerprintTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OutputBudgetTest(unittest.TestCase):
+    def test_sparse_padding_cannot_silently_shorten_output(self):
+        from tts_profiles import guard_output_budget, UnsupportedProfile
+        guard_output_budget(1500, 544)  # expanded, actual prefill 513
+        with self.assertRaises(UnsupportedProfile):
+            guard_output_budget(1500, 768)  # compact must fall back
+        guard_output_budget(2047 - 512, 512)
+        with self.assertRaises(UnsupportedProfile):
+            guard_output_budget(2047 - 500, 512)

@@ -45,6 +45,7 @@ from tts_profiles import (
     encode_f32le,
     fingerprint_hex,
     guard_prepared_profile,
+    guard_output_budget,
     inspect_prepared_inputs,
     load_profile_spec,
     profile_payload,
@@ -166,6 +167,7 @@ def load_runtime_config(path):
         "checkpointHashes": {str(key): str(value) for key, value in hashes.items()},
         "sourceRevision": str(payload["sourceRevision"]),
         "version": str(payload["version"]),
+        "packagePins": dict(payload.get("packagePins") or {}),
     }
 
 
@@ -445,6 +447,9 @@ class OfficialGpuBackend:
             "numpy": str(getattr(np, "__version__", "")),
         }
         assert_package_pins(self.package_versions)
+        dependency_versions = {name: _package_version(name, "") for name in self.config.get("packagePins", {})}
+        if self.config.get("packagePins"):
+            assert_package_pins(dependency_versions, self.config["packagePins"])
 
         from breeze_infer.runtime import load_runtime, set_all_seeds, update_generation_config_for_breeze
         from breeze_infer.templates import get_template, prepare_inputs
@@ -466,6 +471,7 @@ class OfficialGpuBackend:
             transformers_version=self.package_versions["transformers"],
             qwen_tts_version=self.package_versions["qwen_tts"],
             numpy_version=self.package_versions["numpy"],
+            extra_versions=dependency_versions,
         )
         self.fingerprint = fingerprint_hex(self.fingerprint_payload)
         inductor = cache_dir / self.fingerprint / "inductor"
@@ -579,8 +585,9 @@ class OfficialGpuBackend:
                 guidance_scale_ins=None,
             )
             inspection = inspect_prepared_inputs(inputs)
-            guard_prepared_profile(self.spec, inspection)
+            prepared_profile = guard_prepared_profile(self.spec, inspection)
             max_frames = cap_max_new_tokens(params["max_new_tokens"], inspection["prefill_len"])
+            guard_output_budget(max_frames, prepared_profile["prefill_bucket"])
             _apply_sampling(self.runtime, self.replace, params, max_frames)
             prepare_ms = (time.monotonic() - prepare_started) * 1000.0
             chunks = []

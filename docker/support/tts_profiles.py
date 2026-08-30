@@ -258,6 +258,11 @@ def guard_prepared_profile(spec, inspection):
     }
 
 
+def guard_output_budget(max_frames, prefill_bucket, max_seq_len=MAX_SEQ_LEN):
+    if int(max_frames) > int(max_seq_len) - 1 - int(prefill_bucket):
+        raise UnsupportedProfile("padded prefill would shorten the permitted output")
+
+
 def cap_max_new_tokens(requested, prefill_len, max_seq_len=MAX_SEQ_LEN):
     requested = int(requested)
     prefill_len = int(prefill_len)

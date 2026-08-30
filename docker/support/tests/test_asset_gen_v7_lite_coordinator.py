@@ -103,6 +103,18 @@ class SnapshotStoreTest(unittest.TestCase):
 
 
 class CoordinatorLeaseTest(unittest.TestCase):
+    def test_exited_miner_does_not_wait_for_parent_reaping_but_verifies_gpu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory, enforcing=True)
+            with mock.patch.object(coordinator, "_process_matches", return_value=True), \
+                 mock.patch.object(coordinator, "_process_is_zombie", return_value=True), \
+                 mock.patch.object(coordinator, "_gpu_processes", return_value=[]) as probe, \
+                 mock.patch("asset_gen_v7_lite_coordinator.os.kill"), \
+                 mock.patch("asset_gen_v7_lite_coordinator.time.sleep") as sleep:
+                coordinator._stop_mining({"pid": 9999, "processStartTime": "test"})
+                probe.assert_called_once()
+                sleep.assert_not_called()
+
     def make_coordinator(self, directory, enforcing=False):
         http = FakeHttp(directory)
         store = SnapshotStore(directory, "fp", min_free_bytes=0)

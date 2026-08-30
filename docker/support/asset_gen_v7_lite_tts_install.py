@@ -9,7 +9,8 @@ import subprocess
 
 SOURCE = "https://github.com/breezeblue-ai/breeze-tts.git"
 REVISION = "ca632ce6c4d05f7985da4eab29b1a5d445b43f7b"
-PINS = ["transformers==4.57.3", "qwen-tts==0.1.1", "tokenizers==0.22.2", "huggingface-hub==0.36.2"]
+PINS = ["transformers==4.57.3", "qwen-tts==0.1.1", "tokenizers==0.22.2", "huggingface-hub==0.36.2", "sox==1.5.0", "onnxruntime==1.29.0",
+        "accelerate==1.12.0", "librosa==1.0.0", "soundfile==0.14.0", "einops==0.8.2"]
 
 
 def run(argv):
@@ -52,6 +53,7 @@ def install(args):
     config = {"enabled": False, "canaryInstanceIds": [args.instance], "version": args.version,
               "sourceDir": str(source), "sourceRevision": REVISION,
               "checkpointDir": str(checkpoint), "checkpointHashes": hashes,
+              "packagePins": dict(item.split("==", 1) for item in PINS),
               "stateDir": str(root), "cacheDir": str(root / "cache"), "python": python,
               "runtimeScript": str(Path(__file__).with_name("asset_gen_v7_lite_tts_runtime.py")),
               "coordinatorUrl": "http://127.0.0.1:8189", "profile": "stock",

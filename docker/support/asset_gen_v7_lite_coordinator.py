@@ -1139,6 +1139,28 @@ class GPUCoordinator:
             return False
         return expected_start_time is None or str(actual) == str(expected_start_time)
 
+    @staticmethod
+    def _process_is_zombie(pid):
+        try:
+            return Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+        except (OSError, IndexError, ValueError):
+            return False
+
+    def _mining_gpu_released(self, pid, process_group_id):
+        processes = self._gpu_processes(timeout_seconds=1)
+        if processes is None:
+            raise CoordinatorError("GPU process probe failed during mining release")
+        for item in processes:
+            if int(item["pid"]) == pid:
+                return False
+            if process_group_id:
+                try:
+                    if os.getpgid(int(item["pid"])) == process_group_id:
+                        return False
+                except ProcessLookupError:
+                    pass
+        return True
+
     def _stop_mining(self, metadata):
         pid = int((metadata or {}).get("pid") or 0)
         start_time = (metadata or {}).get("processStartTime")
@@ -1156,7 +1178,7 @@ class GPUCoordinator:
                 return
             deadline = time.monotonic() + wait_seconds
             while time.monotonic() < deadline:
-                if not self._process_matches(pid, start_time):
+                if (not self._process_matches(pid, start_time) or self._process_is_zombie(pid)) and self._mining_gpu_released(pid, process_group_id):
                     self.metrics["miningRevocations"] += 1
                     self.mining_stop_durations_ms.append(round((time.monotonic() - started) * 1000))
                     self.mining_stop_durations_ms = self.mining_stop_durations_ms[-100:]
