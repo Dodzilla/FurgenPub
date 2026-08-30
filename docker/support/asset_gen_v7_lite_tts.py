@@ -20,6 +20,12 @@ import uuid
 from pathlib import Path
 
 LOG = logging.getLogger("tts-residency")
+LOG.setLevel(logging.INFO)
+if not LOG.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(name)s %(message)s"))
+    LOG.addHandler(handler)
+    LOG.propagate = False
 GIB = 1024**3
 MAX_RPC_BYTES = 32 * 1024**2
 MODES = {"BreezeTTS2VoiceClone", "BreezeTTS2VoiceDesign", "BreezeTTS2VoiceDirection"}
@@ -106,7 +112,10 @@ class TTSResidency:
         self.generating = False
         self.generation_request_id = None
         self.failures = int((previous or {}).get("failures", 0)) if (previous or {}).get("version") == self.config.get("version") else 0
-        self.disabled = self.failures >= 3
+        self.policy_fingerprint = hashlib.sha256(json.dumps({k: self.config.get(k) for k in
+            ("version", "profile", "measuredRuntimeFingerprint", "miningFingerprint", "measuredPeaks")}, sort_keys=True).encode()).hexdigest()
+        self.policy_failure = (previous or {}).get("policyFailure") if (previous or {}).get("policyFingerprint") == self.policy_fingerprint else None
+        self.disabled = self.failures >= 3 or bool(self.policy_failure)
         self.backoff = 0
         self.retry_at = 0.0
         self.last_error = None
@@ -142,7 +151,8 @@ class TTSResidency:
                     and time.time() * 1000 < self.config.get("validUntilMs", float("inf")))
 
     def journal(self):
-        return {"identity": self.identity, "failures": self.failures, "version": self.config.get("version")}
+        return {"identity": self.identity, "failures": self.failures, "version": self.config.get("version"),
+                "policyFailure": self.policy_failure, "policyFingerprint": self.policy_fingerprint}
 
     def status(self):
         return {"enabled": self.enabled, "state": "disabled" if self.disabled else self.state,
@@ -179,6 +189,46 @@ class TTSResidency:
     def _budget(self, key):
         peak = self.config.get("measuredPeaks", {}).get(key)
         return math.ceil(float(peak) * 1.15) if isinstance(peak, (int, float)) and peak > 0 else 0
+
+    def _policy_mismatch(self, reason):
+        self.evict(reason)
+        self.policy_failure = self.last_error = reason
+        self.disabled = True
+        self._event("policy_disabled", reason=reason)
+        self._save()
+
+    def _runtime_measurement_matches(self):
+        expected = self.config.get("measuredRuntimeFingerprint")
+        return bool(expected and expected == self.health.get("fingerprint"))
+
+    def _mining_measurement_matches(self, metadata):
+        """Verify the gated launch before its coordinator registration permits CUDA."""
+        expected = self.config.get("miningFingerprint") or {}
+        try:
+            pid = int(metadata["pid"])
+            if not self.owner._process_matches(pid, metadata.get("processStartTime")):
+                return False
+            parts = (Path("/proc") / str(pid) / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+            if len(parts) > 4 and parts[1] == b"-c":
+                gate = Path(os.fsdecode(parts[3]))
+                if (hashlib.sha256(parts[2]).hexdigest() != expected.get("gateWrapperSha256")
+                        or gate.parent != Path("/workspace/.fcs/prl/launch_gates") or gate.suffix != ".gate"):
+                    return False
+                parts = parts[4:]
+            binary = Path("/workspace/.fcs/prl/prl_gpu_miner")
+            return bool(parts and os.fsdecode(parts[0]) == str(binary)
+                        and hashlib.sha256(b"\0".join(parts) + b"\0").hexdigest() == expected.get("commandSha256")
+                        and hashlib.sha256(binary.read_bytes()).hexdigest() == expected.get("binarySha256"))
+        except (OSError, KeyError, ValueError):
+            return False
+
+    def before_mining_registration(self, metadata):
+        if self.state != "ready" or not self.config.get("coexistenceApproved"):
+            return
+        if not self._runtime_measurement_matches() or not self._mining_measurement_matches(metadata):
+            self.owner._stop_mining(metadata)
+            self._policy_mismatch("unmeasured_mining_configuration")
+            raise TTSError("unmeasured_mining_configuration", "Miner/runtime configuration no longer matches its memory measurement")
 
     def _failure(self, code):
         self.failures += 1
@@ -284,7 +334,7 @@ class TTSResidency:
                 if self.config.get("diagnosticsEnabled") and not self.config.get("coexistenceApproved"):
                     raise TTSError("tts_diagnostics_hold", "Mining waits for the diagnostic memory gate")
                 budget = self._budget("idleBytes") + self._budget("miningBytes")
-                keep = self.config.get("coexistenceApproved") and self._budget("idleBytes") and self._budget("miningBytes") and self._fits(budget)
+                keep = self.config.get("coexistenceApproved") and self._runtime_measurement_matches() and self._budget("idleBytes") and self._budget("miningBytes") and self._fits(budget)
             else:
                 execution_budget = self._budget("executionBytes")
                 if not execution_budget and self.config.get("diagnosticsEnabled") and not self.config.get("coexistenceApproved"):
@@ -338,6 +388,12 @@ class TTSResidency:
             if time.monotonic() < max(self.retry_at, self.not_before) or time.time() * 1000 < self.owner.mining_not_before_ms:
                 return {"canMine": True, **self.status()}
             if not self.config.get("coexistenceApproved") and not self.config.get("diagnosticsEnabled"):
+                return {"canMine": True, **self.status()}
+            if (self.config.get("coexistenceApproved") or self.config.get("routingApproved")) and (
+                self.config.get("measuredRuntimeVersion") != self.config.get("version")
+                or self.config.get("measuredProfile") != self.config.get("profile")
+            ):
+                self._policy_mismatch("warmup_measurement_mismatch")
                 return {"canMine": True, **self.status()}
             if lease.get("state") in {"ACTIVE", "STARTING", "RECOVERING"}:
                 if lease.get("holder") != "mining" or lease.get("state") != "ACTIVE":
@@ -399,6 +455,9 @@ class TTSResidency:
                         self.evict("warmup_permit_lost", preempt=True)
                     return
                 self.health = result
+                if (self.config.get("coexistenceApproved") or self.config.get("routingApproved")) and not self._runtime_measurement_matches():
+                    self._policy_mismatch("runtime_measurement_mismatch")
+                    return
                 self.state = "ready"
                 self.permit = None
                 self.backoff = 0

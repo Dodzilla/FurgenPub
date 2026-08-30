@@ -27,6 +27,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, ExitStack
 from pathlib import Path
 
 from tts_profiles import (
@@ -404,6 +405,20 @@ def encode_audio_result(samples, sample_rate=OUTPUT_SAMPLE_RATE):
     }
 
 
+@contextmanager
+def trace_warmup_method(target, name, backend, phase):
+    original = getattr(target, name)
+    def tracked(*args, **kwargs):
+        backend.warmup_phase = phase
+        backend.warmup_phase_started_ms = time.time_ns() // 1_000_000
+        return original(*args, **kwargs)
+    setattr(target, name, tracked)
+    try:
+        yield
+    finally:
+        setattr(target, name, original)
+
+
 class OfficialGpuBackend:
     """Loads official fast-all only after the caller has admitted a warmup permit."""
 
@@ -429,6 +444,8 @@ class OfficialGpuBackend:
         cache_dir = Path(self.config["cacheDir"]).resolve()
         cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(cache_dir, 0o700)
+        self.warmup_phase = "integrity"
+        self.warmup_phase_started_ms = time.time_ns() // 1_000_000
         validate_checkpoint_hashes(checkpoint_dir, self.config["checkpointHashes"])
         verify_source_revision(source_dir, self.config["sourceRevision"])
         isolated = str(source_dir)
@@ -489,6 +506,8 @@ class OfficialGpuBackend:
 
         view = materialize_attention_view(checkpoint_dir, cache_dir / self.fingerprint)
         torch.cuda.reset_peak_memory_stats()
+        self.warmup_phase = "loading"
+        self.warmup_phase_started_ms = time.time_ns() // 1_000_000
         tokenizer, model, codec = load_runtime(
             view,
             device="cuda:0",
@@ -514,11 +533,22 @@ class OfficialGpuBackend:
         profile = replace(profile, codec_chunk_frames=runtime.codec_chunk_frames)
         if cancel_event is not None and cancel_event.is_set():
             raise TtsError("cancelled", "warmup cancelled")
-        manifest = runtime.warmup_from_profile(profile)
+        from models.text_encoder_graph import TextEncoderGraphCache
+        from models.cudagraph.backbone_prefill_graph import BackbonePrefillGraphCache
+        with ExitStack() as traces:
+            for target, method, phase in (
+                (runtime, "_ensure_graphs", "decode_compile_and_capture"),
+                (TextEncoderGraphCache, "warmup_graph", "text_graph_capture"),
+                (BackbonePrefillGraphCache, "warmup_graph", "prefill_graph_capture"),
+                (runtime, "_codec", "codec_setup"),
+            ):
+                traces.enter_context(trace_warmup_method(target, method, self, phase))
+            manifest = runtime.warmup_from_profile(profile)
         apply_sparse_buckets(runtime, spec)
         disable_joint_text_encoder_merge(runtime)
         _synchronize(torch)
         self.runtime = runtime
+        self.warmup_phase = "ready"
         self.tokenizer = tokenizer
         self.model = model
         self.codec = codec
@@ -877,6 +907,8 @@ class TtsRuntimeApp:
                 },
             }
             if backend is not None:
+                result["warmupPhase"] = getattr(backend, "warmup_phase", None)
+                result["warmupPhaseStartedAtMs"] = getattr(backend, "warmup_phase_started_ms", None)
                 if getattr(backend, "manifest", None) is not None:
                     result["manifest"] = backend.manifest
                 if getattr(backend, "peaks", None) is not None:

@@ -40,6 +40,8 @@ class ResidencyTest(unittest.TestCase):
         self.owner = Owner()
         self.config = {"enabled": True, "canaryInstanceIds": ["canary"], "version": "test", "stateDir": self.tmp.name,
                        "coexistenceApproved": True, "routingApproved": True,
+                       "measuredRuntimeFingerprint": "measured-runtime",
+                       "measuredRuntimeVersion": "test",
                        "measuredPeaks": {"warmupBytes": 20 * GIB, "idleBytes": 15 * GIB,
                                          "executionBytes": 19 * GIB, "miningBytes": 6 * GIB}}
         path = Path(self.tmp.name) / "config.json"
@@ -54,9 +56,48 @@ class ResidencyTest(unittest.TestCase):
 
     def ready(self):
         self.tts.state = "ready"
+        self.tts.health["fingerprint"] = "measured-runtime"
         self.tts.identity = {"pid": 100, "processStartTime": 200, "processGroupId": 100}
         self.owner._process_matches.return_value = True
         self.owner._process_start_time.return_value = 200
+
+    def test_changed_miner_stops_before_registration_and_disables_residency(self):
+        self.ready()
+        calls = []
+        self.owner._stop_mining.side_effect = lambda _: calls.append("miner-stopped")
+        self.tts.evict = mock.Mock(side_effect=lambda _: calls.append("tts-evicted"))
+        self.tts._mining_measurement_matches = mock.Mock(return_value=False)
+        with self.assertRaises(TTSError):
+            self.tts.before_mining_registration({"pid": 200})
+        self.assertEqual(calls, ["miner-stopped", "tts-evicted"])
+        self.assertTrue(self.tts.disabled)
+        self.assertEqual(self.tts.failures, 0)
+        self.assertEqual(self.tts.journal()["policyFailure"], "unmeasured_mining_configuration")
+
+    def test_gate_and_running_miner_fingerprints_match_same_measurement(self):
+        import hashlib
+        self.ready()
+        argv = b"/workspace/.fcs/prl/prl_gpu_miner\0--algorithm\0pearlhash\0"
+        wrapper = b"approved gated wrapper"
+        self.tts.config["miningFingerprint"] = {
+            "commandSha256": hashlib.sha256(argv).hexdigest(),
+            "binarySha256": hashlib.sha256(b"binary").hexdigest(),
+            "gateWrapperSha256": hashlib.sha256(wrapper).hexdigest(),
+        }
+        for command in (argv, b"python\0-c\0" + wrapper + b"\0/workspace/.fcs/prl/launch_gates/one.gate\0" + argv):
+            def read(path):
+                return b"binary" if str(path).endswith("prl_gpu_miner") else command
+            with mock.patch.object(Path, "read_bytes", read):
+                self.assertTrue(self.tts._mining_measurement_matches({"pid": 200, "processStartTime": 1}))
+        with mock.patch.object(Path, "read_bytes", return_value=argv.replace(b"pearlhash", b"other")):
+            self.assertFalse(self.tts._mining_measurement_matches({"pid": 200, "processStartTime": 1}))
+
+    def test_unmeasured_runtime_cannot_coexist_with_mining(self):
+        self.ready()
+        self.tts.health["fingerprint"] = "changed-runtime"
+        self.tts.evict = mock.Mock()
+        self.tts.before_acquire("mining", {})
+        self.tts.evict.assert_called_once_with("memory_handoff")
 
     def test_memory_probe_failure_stops_miner_then_evicts(self):
         self.ready()

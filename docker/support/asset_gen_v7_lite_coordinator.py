@@ -1409,6 +1409,8 @@ class GPUCoordinator:
                 ):
                     raise StaleLease("miner PID/start time/process group registration is missing or invalid")
             if lease["holder"] == "mining" and lease.get("state") == "STARTING":
+                if getattr(self, "tts", None):
+                    self.tts.before_mining_registration(lease["metadata"])
                 lease["state"] = "ACTIVE"
                 lease["registrationDeadlineMs"] = None
                 self.state = "ACTIVE"
