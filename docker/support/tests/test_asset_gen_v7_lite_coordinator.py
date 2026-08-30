@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -14,6 +15,7 @@ sys.path.insert(0, str(SUPPORT_DIR))
 
 from asset_gen_v7_lite_coordinator import (  # noqa: E402
     GPUCoordinator,
+    CoordinatorError,
     LeaseConflict,
     SnapshotStore,
     StaleLease,
@@ -131,6 +133,51 @@ class CoordinatorLeaseTest(unittest.TestCase):
                 coordinator._stop_mining({"pid": 9999, "processStartTime": "test"})
                 probe.assert_called_once()
                 sleep.assert_not_called()
+
+    def test_missing_or_reused_miner_leader_still_requires_gpu_release(self):
+        for processes in ([], [{"pid": 10000, "usedBytes": 1024}], None):
+            with self.subTest(processes=processes), tempfile.TemporaryDirectory() as directory:
+                coordinator, _ = self.make_coordinator(directory, enforcing=True)
+                with mock.patch.object(coordinator, "_process_matches", return_value=False), \
+                     mock.patch.object(coordinator, "_gpu_processes", return_value=processes), \
+                     mock.patch("asset_gen_v7_lite_coordinator.os.getpgid", return_value=9999), \
+                     mock.patch("asset_gen_v7_lite_coordinator.os.kill") as kill, \
+                     mock.patch("asset_gen_v7_lite_coordinator.os.killpg") as killpg:
+                    metadata = {"pid": 9999, "processStartTime": "old", "processGroupId": 9999}
+                    if processes == []:
+                        coordinator._stop_mining(metadata)
+                    else:
+                        with self.assertRaises(CoordinatorError):
+                            coordinator._stop_mining(metadata)
+                    kill.assert_not_called()
+                    killpg.assert_not_called()
+
+    def test_miner_disappearing_during_signal_still_requires_gpu_release(self):
+        for processes in ([], [{"pid": 10000, "usedBytes": 1024}]):
+            with self.subTest(processes=processes), tempfile.TemporaryDirectory() as directory:
+                coordinator, _ = self.make_coordinator(directory, enforcing=True)
+                with mock.patch.object(coordinator, "_process_matches", return_value=True), \
+                     mock.patch.object(coordinator, "_gpu_processes", return_value=processes), \
+                     mock.patch("asset_gen_v7_lite_coordinator.os.getpgid", return_value=9999), \
+                     mock.patch("asset_gen_v7_lite_coordinator.os.killpg", side_effect=ProcessLookupError):
+                    metadata = {"pid": 9999, "processStartTime": "old", "processGroupId": 9999}
+                    if processes == []:
+                        coordinator._stop_mining(metadata)
+                    else:
+                        with self.assertRaises(CoordinatorError):
+                            coordinator._stop_mining(metadata)
+
+    def test_miner_escalation_does_not_signal_reused_leader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory, enforcing=True)
+            with mock.patch.object(coordinator, "_process_matches", side_effect=[True, False]), \
+                 mock.patch.object(coordinator, "_gpu_processes", return_value=[{"pid": 10000, "usedBytes": 1024}]), \
+                 mock.patch("asset_gen_v7_lite_coordinator.os.getpgid", return_value=9999), \
+                 mock.patch("asset_gen_v7_lite_coordinator.os.killpg") as killpg, \
+                 mock.patch("asset_gen_v7_lite_coordinator.time.monotonic", side_effect=[0, 0, 11]):
+                with self.assertRaisesRegex(CoordinatorError, "mining process did not release GPU"):
+                    coordinator._stop_mining({"pid": 9999, "processStartTime": "old", "processGroupId": 9999})
+                killpg.assert_called_once_with(9999, signal.SIGTERM)
 
     def make_coordinator(self, directory, enforcing=False):
         http = FakeHttp(directory)

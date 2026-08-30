@@ -1176,16 +1176,24 @@ class GPUCoordinator:
         pid = int((metadata or {}).get("pid") or 0)
         start_time = (metadata or {}).get("processStartTime")
         process_group_id = int((metadata or {}).get("processGroupId") or 0)
-        if not pid or not self._process_matches(pid, start_time):
+        if not pid:
             return
         started = time.monotonic()
         for sig, wait_seconds in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+            # A missing/reused leader does not prove its GPU-owning children
+            # exited. Recheck identity before escalation; never signal a new PID.
+            if not self._process_matches(pid, start_time):
+                if not self._mining_gpu_released(pid, process_group_id):
+                    raise CoordinatorError("mining process did not release GPU")
+                return
             try:
                 if process_group_id > 0 and os.getpgid(pid) == process_group_id:
                     os.killpg(process_group_id, sig)
                 else:
                     os.kill(pid, sig)
             except ProcessLookupError:
+                if not self._mining_gpu_released(pid, process_group_id):
+                    raise CoordinatorError("mining process did not release GPU")
                 return
             deadline = time.monotonic() + wait_seconds
             while time.monotonic() < deadline:
