@@ -23,13 +23,17 @@ from pathlib import Path
 SUPPORT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SUPPORT_DIR))
 
+from dataclasses import dataclass, replace
+
 from asset_gen_v7_lite_tts_runtime import (  # noqa: E402
     PACKAGES,
     STARTED_ID_LIMIT,
+    OfficialGpuBackend,
     PermitClient,
     PermitWatch,
     TtsError,
     TtsRuntimeApp,
+    _apply_sampling,
     assert_package_pins,
     create_server,
     encode_audio_result,
@@ -831,6 +835,168 @@ class HashAndFingerprintTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.05)
         time.sleep(0.2)
         self.assertEqual(fired, [])
+
+
+@dataclass
+class _FastConfig:
+    max_new_tokens: int = 1500
+    repetition_penalty: float = 1.1
+    temperature: object = None
+    top_k: object = None
+    top_p: object = None
+    do_sample: object = None
+
+
+class _DepthGraph:
+    def __init__(self, max_k, codebook_size):
+        self._max_k = max_k
+        self.codec_codebook_size = codebook_size
+        self.top_k = None
+
+    def set_temperature(self, value):
+        return None
+
+    def set_top_p(self, value):
+        return None
+
+    def set_top_k(self, value):
+        self.top_k = int(value)
+
+
+def _sampling_params(**overrides):
+    params = {
+        "temperature": 0.9,
+        "top_k": 50,
+        "top_p": 1.0,
+        "repetition_penalty": 1.1,
+        "depth_temperature": 0.9,
+        "depth_top_k": 50,
+        "depth_top_p": 1.0,
+    }
+    params.update(overrides)
+    return params
+
+
+def _fake_np():
+    class _Arr(list):
+        def tolist(self):
+            return list(self)
+
+    class _NP:
+        float32 = "float32"
+
+        @staticmethod
+        def asarray(audio, dtype=None):
+            return list(audio)
+
+        @staticmethod
+        def concatenate(chunks):
+            return _Arr(item for chunk in chunks for item in chunk)
+
+    return _NP()
+
+
+class SeedAndDepthSamplingTests(unittest.TestCase):
+    def _runtime(self, graph):
+        return type(
+            "Runtime",
+            (),
+            {
+                "config": _FastConfig(),
+                "model": type(
+                    "Model",
+                    (),
+                    {
+                        "generation_config": type("G", (), {})(),
+                        "depth_decoder": type("D", (), {"generation_config": type("G", (), {})()})(),
+                    },
+                )(),
+                "_depth_decoder_graph": graph,
+            },
+        )()
+
+    def test_seed_is_applied_after_prepare_inputs(self):
+        order = []
+        backend = OfficialGpuBackend({})
+        backend.runtime = self._runtime(_DepthGraph(1024, 2048))
+        backend.replace = replace
+        backend.spec = load_profile_spec("stock")
+        backend.tokenizer = object()
+        backend.codec = object()
+        backend.model = backend.runtime.model
+        backend.get_template = lambda name: name
+        backend._torch = type("Torch", (), {"cuda": type("Cuda", (), {"is_available": staticmethod(lambda: False)})()})()
+        backend.np = _fake_np()
+
+        def prepare_inputs(*_args, **_kwargs):
+            order.append("prepare")
+            return {
+                "text_ids_len": [32],
+                "input_ids": type("T", (), {"shape": (1, 80)})(),
+            }
+
+        def set_all_seeds(seed):
+            order.append(("seed", int(seed)))
+
+        class Chunk:
+            audio = [0.0, 0.25]
+
+        backend.prepare_inputs = prepare_inputs
+        backend.set_all_seeds = set_all_seeds
+        backend.runtime.iter_audio_chunks = lambda *_args, **_kwargs: iter([Chunk()])
+        params = parse_generate_params({"params": _params(seed=301)})
+        backend._generate(params)
+        self.assertEqual(order, ["prepare", ("seed", 301)])
+
+    def test_nonpositive_seed_does_not_reset_rng(self):
+        seeded = []
+        backend = OfficialGpuBackend({})
+        backend.runtime = self._runtime(_DepthGraph(1024, 2048))
+        backend.replace = replace
+        backend.spec = load_profile_spec("stock")
+        backend.tokenizer = object()
+        backend.codec = object()
+        backend.model = backend.runtime.model
+        backend.get_template = lambda name: name
+        backend._torch = type("Torch", (), {"cuda": type("Cuda", (), {"is_available": staticmethod(lambda: False)})()})()
+        backend.np = _fake_np()
+        backend.prepare_inputs = lambda *_args, **_kwargs: {
+            "text_ids_len": [32],
+            "input_ids": type("T", (), {"shape": (1, 80)})(),
+        }
+        backend.set_all_seeds = seeded.append
+        backend.runtime.iter_audio_chunks = lambda *_args, **_kwargs: iter(
+            [type("Chunk", (), {"audio": [0.0]})()]
+        )
+        backend._generate(parse_generate_params({"params": _params(seed=0)}))
+        self.assertEqual(seeded, [])
+
+    def test_depth_top_k_zero_rejected_when_workspace_smaller_than_codebook(self):
+        graph = _DepthGraph(max_k=1024, codebook_size=2048)
+        runtime = self._runtime(graph)
+        with self.assertRaises(TtsError) as raised:
+            _apply_sampling(runtime, replace, _sampling_params(depth_top_k=0), 1500)
+        self.assertEqual(raised.exception.code, "unsupported_profile")
+        self.assertIsNone(graph.top_k)
+
+    def test_depth_top_k_zero_accepted_when_workspace_covers_codebook(self):
+        graph = _DepthGraph(max_k=2048, codebook_size=2048)
+        runtime = self._runtime(graph)
+        _apply_sampling(runtime, replace, _sampling_params(depth_top_k=0), 1500)
+        self.assertEqual(graph.top_k, 0)
+        graph = _DepthGraph(max_k=1024, codebook_size=1024)
+        runtime = self._runtime(graph)
+        _apply_sampling(runtime, replace, _sampling_params(depth_top_k=0), 1500)
+        self.assertEqual(graph.top_k, 0)
+
+    def test_positive_depth_top_k_still_capped_by_workspace(self):
+        graph = _DepthGraph(max_k=1024, codebook_size=2048)
+        runtime = self._runtime(graph)
+        _apply_sampling(runtime, replace, _sampling_params(depth_top_k=50), 1500)
+        self.assertEqual(graph.top_k, 50)
+        with self.assertRaises(TtsError) as raised:
+            _apply_sampling(runtime, replace, _sampling_params(depth_top_k=1025), 1500)
+        self.assertEqual(raised.exception.code, "unsupported_profile")
 
 
 if __name__ == "__main__":
