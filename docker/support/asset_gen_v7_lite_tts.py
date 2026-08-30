@@ -540,8 +540,9 @@ class TTSResidency:
                 self.health["lastGeneration"] = timing
                 self._event("generation", requestId=binding["requestId"], timing=timing)
             return result
-        except BaseException:
+        except BaseException as error:
             with self.owner.lock:
+                self._event("generation_error", requestId=binding["requestId"], code=getattr(error, "code", type(error).__name__), message=str(error)[:240])
                 # A socket timeout is not a CUDA completion acknowledgement.
                 if self.identity and self.generation_request_id == binding["requestId"]:
                     self._stop_request("unconfirmed_generation_stop")
