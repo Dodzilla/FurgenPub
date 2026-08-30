@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.160"
+AGENT_VERSION = "dm-agent-py/0.10.161"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5786,9 +5786,9 @@ class DependencyAgent:
 
     def _release_comfy_gpu_lease(self, lease: AgentExecuteLease, reason: str, keep_warm: bool = True) -> None:
         coordinator_lease = lease.gpu_coordinator_lease
-        lease.gpu_coordinator_lease = None
         local_release_confirmed = self._release_gpu_lease(coordinator_lease, reason, keep_warm=keep_warm)
         if local_release_confirmed:
+            lease.gpu_coordinator_lease = None
             self._release_comfy_gpu_admission(lease, reason)
         elif lease.gpu_admission_claim_token:
             logging.error(
@@ -6128,12 +6128,13 @@ class DependencyAgent:
         lease: AgentExecuteLease,
         reason: str,
         final_stage: str = "finalizing",
+        keep_warm: bool = True,
     ) -> None:
         with self._lock:
             active = self._active_exec_by_item.get(lease.item_id)
             if active:
                 active.stage = final_stage
-        self._release_comfy_gpu_lease(lease, reason, keep_warm=True)
+        self._release_comfy_gpu_lease(lease, reason, keep_warm=keep_warm)
         self._schedule_idle_prl_resume(reason)
         self._request_agent_queue_poll()
 
@@ -12102,6 +12103,20 @@ class DependencyAgent:
         policy = lease.payload.get("eventPolicy") if isinstance(lease.payload, dict) else None
         return bool(isinstance(policy, dict) and policy.get("coalesceLifecycle") is True)
 
+    def _require_comfy_start_ack(self) -> bool:
+        if os.environ.get("SERVER_TYPE") != "asset_gen_v7_lite":
+            return False
+        instance = os.environ.get("DM_AGENT_EXECUTION_START_ACK_INSTANCE_ID", "")
+        policy = self.workspace / ".fcs" / "tts" / "execution-start-ack.json"
+        if not instance and policy.exists():
+            # Trusted worker-local configuration, never workflow input. Read
+            # before GPU admission so malformed policy cannot strand a prompt.
+            config = json.loads(policy.read_text("utf-8"))
+            if not isinstance(config, dict) or type(config.get("enabled")) is not bool:
+                raise RuntimeError("Invalid worker execution-start acknowledgement policy")
+            instance = config.get("instanceId") if config["enabled"] else None
+        return bool(instance and instance == self._resolved_instance_id)
+
     def _coalesced_agent_lifecycle_payload(self, lease: AgentExecuteLease) -> Dict[str, Any]:
         now_ms = _now_ms()
         inputs_ready_at_ms = int(lease.ready_at_ms or lease.execute_started_at_ms or now_ms)
@@ -15350,6 +15365,7 @@ class DependencyAgent:
         _agent_stage(lease, "prepare_started")
         retain_lease = False
         terminal_sent = False
+        execution_start_ack_failed = False
         node_timing_collector: Optional[ComfyNodeTimingCollector] = None
 
         def attach_node_timings(payload: Dict[str, Any], terminal_status: str) -> None:
@@ -15394,6 +15410,7 @@ class DependencyAgent:
                 self._copy_input_to_comfy(Path(cache_path), input_name)
 
             workflow = self._parse_workflow_from_payload(lease.payload)
+            require_start_ack = self._require_comfy_start_ack()
             self._ensure_runtime_assets_for_workflow(workflow)
             _agent_stage(lease, "prepare_finished")
 
@@ -15483,8 +15500,17 @@ class DependencyAgent:
                 if active:
                     active.prompt_id = prompt_id
 
-            if not self._coalesce_agent_lifecycle_events(lease):
-                self._emit_agent_event_durable(lease, "execution_started", {"promptId": prompt_id})
+            # Instance-local containment for cached idle evidence requeuing a
+            # coalesced job that is already executing. The ack overlaps GPU work.
+            if require_start_ack or not self._coalesce_agent_lifecycle_events(lease):
+                try:
+                    self._emit_agent_event_durable(lease, "execution_started", {"promptId": prompt_id})
+                except Exception:
+                    if require_start_ack:
+                        execution_start_ack_failed = True
+                        self._post_job_comfy_recycle_active.set()
+                        self._comfy_interrupt()
+                    raise
 
             start_exec_ms = _now_ms()
             last_progress_emit_ms = start_exec_ms
@@ -15614,7 +15640,21 @@ class DependencyAgent:
                     payload["promptId"] = prompt_id
                 attach_node_timings(payload, event_type)
                 try:
-                    self._mark_agent_gpu_work_finished(lease, "comfy_execution_error")
+                    if execution_start_ack_failed:
+                        # Prompt acceptance was not recorded. Do not release a
+                        # lease while an interrupted/queued prompt can still run.
+                        retain_lease = True
+                        recovered = self._complete_post_job_comfy_recycle(lease)
+                        if not recovered or not getattr(self, "_last_comfy_restart_process_turnover_proven", False):
+                            self._post_job_comfy_recycle_active.set()
+                            self._remove_local_readiness_file()
+                            retain_lease = True
+                            logging.error("Unacknowledged Comfy execution cleanup unproven; retaining fenced ownership jobId=%s", lease.job_id)
+                            return
+                        retain_lease = False
+                        self._mark_agent_gpu_work_finished(lease, "comfy_execution_start_ack_failed", keep_warm=False)
+                    else:
+                        self._mark_agent_gpu_work_finished(lease, "comfy_execution_error")
                     self._emit_agent_event_durable(lease, event_type, payload)
                     terminal_sent = True
                 except Exception as event_err:
