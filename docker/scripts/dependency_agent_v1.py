@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.161"
+AGENT_VERSION = "dm-agent-py/0.10.162"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5979,6 +5979,31 @@ class DependencyAgent:
                 e,
             )
 
+    def _tts_has_foreground_demand(self, timeout_seconds: float = 1.0) -> bool:
+        # TTS setup must yield before queue claiming/input preparation, not just
+        # when a job reaches a GPU-blocking stage. This is a worker-scoped,
+        # bounded control-plane read; completion still uses signed callbacks.
+        with self._lock:
+            if self._active_exec_by_item or self._agent_maintenance_inflight or self._pending_self_update is not None:
+                return True
+        try:
+            paths = (self._coordination or {}).get("paths") or {}
+            queue_path = paths.get("agentQueueItems")
+            if not isinstance(queue_path, str) or not queue_path:
+                return True
+            queued = self._coordination_get_json(queue_path, timeout_seconds=timeout_seconds, query={
+                "orderBy": json.dumps("state"), "equalTo": json.dumps("queued"), "limitToFirst": "1",
+            })
+            if queued is not None and not isinstance(queued, dict):
+                return True
+            if queued:
+                logging.info("TTS queued foreground demand observed atMs=%d", _now_ms())
+                return True
+            return self._gpu_admission_has_foreground_work(timeout_seconds=timeout_seconds)
+        except Exception:
+            logging.warning("TTS pending-demand probe unavailable; withholding idle permission")
+            return True
+
     def _start_tts_idle_heartbeat(self) -> None:
         # This clock must not share the serialized miner executor: mining
         # startup/eviction can block it longer than an idle permit's lifetime.
@@ -5989,13 +6014,9 @@ class DependencyAgent:
             def heartbeat():
                 while not self._stop.is_set() and getattr(self, "_tts_residency_seen_enabled", False):
                     try:
-                        with self._lock:
-                            demand = bool(self._agent_maintenance_inflight or self._pending_self_update is not None or any(
-                                str(getattr(lease, "stage", "") or "") in AGENT_GPU_BLOCKING_STAGES
-                                for lease in self._active_exec_by_item.values()))
                         self._gpu_coordinator._request(
                             "POST", "/v1/gpu/tts/heartbeat",
-                            body={"foregroundDemand": demand or self._gpu_admission_has_foreground_work(timeout_seconds=1.5)},
+                            body={"foregroundDemand": self._tts_has_foreground_demand()},
                             timeout_seconds=1.5,
                         )
                     except Exception:
@@ -6022,14 +6043,14 @@ class DependencyAgent:
                     self._start_tts_idle_heartbeat()
                     status, reply, _headers = self._gpu_coordinator._request(
                         "POST", "/v1/gpu/tts/idle",
-                        body={"foregroundDemand": local_demand or self._gpu_admission_has_foreground_work()},
+                        body={"foregroundDemand": local_demand or self._tts_has_foreground_demand()},
                         timeout_seconds=15.0,
                     )
                     if status == 200 and reply.get("state") == "warming":
                         # Re-read demand after the permit grant, not just before it.
                         self._gpu_coordinator._request(
                             "POST", "/v1/gpu/tts/idle",
-                            body={"foregroundDemand": self._gpu_admission_has_foreground_work()}, timeout_seconds=15.0,
+                            body={"foregroundDemand": self._tts_has_foreground_demand()}, timeout_seconds=15.0,
                         )
                     if status != 200 or not reply.get("canMine"):
                         return
