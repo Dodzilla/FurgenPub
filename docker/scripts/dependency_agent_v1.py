@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.162"
+AGENT_VERSION = "dm-agent-py/0.10.163"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5991,12 +5991,19 @@ class DependencyAgent:
             queue_path = paths.get("agentQueueItems")
             if not isinstance(queue_path, str) or not queue_path:
                 return True
+            queue_limit = 32
             queued = self._coordination_get_json(queue_path, timeout_seconds=timeout_seconds, query={
-                "orderBy": json.dumps("state"), "equalTo": json.dumps("queued"), "limitToFirst": "1",
+                "orderBy": json.dumps("state"), "equalTo": json.dumps("queued"), "limitToFirst": str(queue_limit),
             })
             if queued is not None and not isinstance(queued, dict):
                 return True
-            if queued:
+            # PRL commands already use the exclusive mining lease and cannot
+            # interrupt TTS setup. A single-item query would let an earlier
+            # mining command hide foreground work. Saturation is conservative.
+            if queued and (len(queued) >= queue_limit or any(
+                not isinstance(item, dict) or item.get("type") != "prl_miner"
+                for item in queued.values()
+            )):
                 logging.info("TTS queued foreground demand observed atMs=%d", _now_ms())
                 return True
             return self._gpu_admission_has_foreground_work(timeout_seconds=timeout_seconds)
