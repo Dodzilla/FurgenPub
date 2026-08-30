@@ -111,9 +111,11 @@ class TTSResidency:
         self.binding = None
         self.generating = False
         self.generation_request_id = None
-        self.failures = int((previous or {}).get("failures", 0)) if (previous or {}).get("version") == self.config.get("version") else 0
+        same_failure_scope = ((previous or {}).get("version") == self.config.get("version")
+                              and (previous or {}).get("failureResetToken") == self.config.get("failureResetToken"))
+        self.failures = int((previous or {}).get("failures", 0)) if same_failure_scope else 0
         self.policy_fingerprint = hashlib.sha256(json.dumps({k: self.config.get(k) for k in
-            ("version", "profile", "measuredRuntimeVersion", "measuredProfile", "measuredRuntimeFingerprint", "miningFingerprint", "measuredPeaks")}, sort_keys=True).encode()).hexdigest()
+            ("version", "profile", "failureResetToken", "measuredRuntimeVersion", "measuredProfile", "measuredRuntimeFingerprint", "miningFingerprint", "measuredPeaks")}, sort_keys=True).encode()).hexdigest()
         self.policy_failure = (previous or {}).get("policyFailure") if (previous or {}).get("policyFingerprint") == self.policy_fingerprint else None
         self.disabled = self.failures >= 3 or bool(self.policy_failure)
         self.backoff = 0
@@ -152,6 +154,7 @@ class TTSResidency:
 
     def journal(self):
         return {"identity": self.identity, "failures": self.failures, "version": self.config.get("version"),
+                "failureResetToken": self.config.get("failureResetToken"),
                 "policyFailure": self.policy_failure, "policyFingerprint": self.policy_fingerprint}
 
     def status(self):

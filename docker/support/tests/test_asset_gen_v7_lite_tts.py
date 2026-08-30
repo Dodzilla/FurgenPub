@@ -61,6 +61,24 @@ class ResidencyTest(unittest.TestCase):
         self.owner._process_matches.return_value = True
         self.owner._process_start_time.return_value = 200
 
+    def test_failure_hold_survives_restart_until_explicit_reset(self):
+        for _ in range(3):
+            self.tts._failure("warmup_timeout")
+        journal = self.tts.journal()
+        path = Path(self.tmp.name) / "config.json"
+        with mock.patch.object(TTSResidency, "_serve"), mock.patch.object(threading.Thread, "start"):
+            resumed = TTSResidency(self.owner, path, journal)
+            self.assertTrue(resumed.disabled)
+            self.assertEqual(resumed.failures, 3)
+            self.config["failureResetToken"] = "operator-reset-after-diagnosis"
+            path.write_text(json.dumps(self.config))
+            reset = TTSResidency(self.owner, path, journal)
+            self.assertFalse(reset.disabled)
+            self.assertEqual(reset.failures, 0)
+            reset._failure("new_failure")
+            restarted = TTSResidency(self.owner, path, reset.journal())
+            self.assertEqual(restarted.failures, 1)
+
     def test_changed_miner_stops_before_registration_and_disables_residency(self):
         self.ready()
         calls = []
