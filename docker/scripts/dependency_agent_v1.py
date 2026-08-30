@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.159"
+AGENT_VERSION = "dm-agent-py/0.10.160"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -3001,6 +3001,7 @@ class GPUCoordinatorClient:
         ttl_ms: int,
         admission_claim_id: Optional[str] = None,
         admission_ticket_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[GPUCoordinatorLease]:
         if not self._ensure_supported():
             return None
@@ -3013,6 +3014,7 @@ class GPUCoordinatorClient:
                 "ttlMs": int(ttl_ms),
                 **({"admissionClaimId": admission_claim_id} if admission_claim_id else {}),
                 **({"admissionTicketId": admission_ticket_id} if admission_ticket_id else {}),
+                **({"metadata": metadata} if metadata else {}),
             },
             timeout_seconds=10.0,
         )
@@ -5707,6 +5709,7 @@ class DependencyAgent:
         metadata_provider: Optional[Callable[[], Dict[str, Any]]] = None,
         admission_ticket_id: Optional[str] = None,
         admission_claim_token: Optional[str] = None,
+        workload_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[GPUCoordinatorLease]:
         handoff_deadline = time.monotonic() + (10.0 if admission_claim_token else 0.0)
         while True:
@@ -5717,6 +5720,7 @@ class DependencyAgent:
                     self.gpu_coordinator_lease_ttl_ms,
                     admission_claim_id=admission_claim_token,
                     admission_ticket_id=admission_ticket_id,
+                    **({"metadata": workload_metadata} if workload_metadata else {}),
                 )
                 break
             except GPUCoordinatorBusy:
@@ -5895,6 +5899,13 @@ class DependencyAgent:
 
     def _stop_idle_prl_mining_for_work(self, reason: str) -> None:
         try:
+            if getattr(self, "_tts_residency_seen_enabled", False):
+                try:
+                    self._gpu_coordinator._request(
+                        "POST", "/v1/gpu/tts/idle", body={"foregroundDemand": True}, timeout_seconds=15.0,
+                    )
+                except Exception:
+                    logging.warning("Could not revoke background TTS permit; execution admission remains fenced")
             if reason == "execute_job":
                 # Coordinator-managed mining must release VRAM, so suspend/resume
                 # and keep-running modes are deliberately overridden here.
@@ -5968,6 +5979,32 @@ class DependencyAgent:
                 e,
             )
 
+    def _start_tts_idle_heartbeat(self) -> None:
+        # This clock must not share the serialized miner executor: mining
+        # startup/eviction can block it longer than an idle permit's lifetime.
+        with self._lock:
+            thread = getattr(self, "_tts_idle_heartbeat_thread", None)
+            if thread is not None and thread.is_alive():
+                return
+            def heartbeat():
+                while not self._stop.is_set() and getattr(self, "_tts_residency_seen_enabled", False):
+                    try:
+                        with self._lock:
+                            demand = bool(self._agent_maintenance_inflight or self._pending_self_update is not None or any(
+                                str(getattr(lease, "stage", "") or "") in AGENT_GPU_BLOCKING_STAGES
+                                for lease in self._active_exec_by_item.values()))
+                        self._gpu_coordinator._request(
+                            "POST", "/v1/gpu/tts/heartbeat",
+                            body={"foregroundDemand": demand or self._gpu_admission_has_foreground_work(timeout_seconds=1.5)},
+                            timeout_seconds=1.5,
+                        )
+                    except Exception:
+                        logging.warning("TTS idle heartbeat unavailable; permit expiration remains fail-closed")
+                    if self._stop.wait(1):
+                        break
+            self._tts_idle_heartbeat_thread = threading.Thread(target=heartbeat, daemon=True, name="tts-idle-heartbeat")
+            self._tts_idle_heartbeat_thread.start()
+
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
             with self._lock:
@@ -5977,9 +6014,26 @@ class DependencyAgent:
                     if str(getattr(lease, "stage", "") or "") in AGENT_GPU_BLOCKING_STAGES
                 )
                 maintenance_count = len(self._agent_maintenance_inflight)
-            if gpu_blocking_work_count > 0 or maintenance_count > 0:
-                return
-            if self._pending_self_update is not None:
+            local_demand = gpu_blocking_work_count > 0 or maintenance_count > 0 or self._pending_self_update is not None
+            if os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite" and self._gpu_coordinator.configured:
+                residency = self._gpu_coordinator.status().get("ttsResidency") or {}
+                self._tts_residency_seen_enabled = bool(residency.get("enabled"))
+                if self._tts_residency_seen_enabled:
+                    self._start_tts_idle_heartbeat()
+                    status, reply, _headers = self._gpu_coordinator._request(
+                        "POST", "/v1/gpu/tts/idle",
+                        body={"foregroundDemand": local_demand or self._gpu_admission_has_foreground_work()},
+                        timeout_seconds=15.0,
+                    )
+                    if status == 200 and reply.get("state") == "warming":
+                        # Re-read demand after the permit grant, not just before it.
+                        self._gpu_coordinator._request(
+                            "POST", "/v1/gpu/tts/idle",
+                            body={"foregroundDemand": self._gpu_admission_has_foreground_work()}, timeout_seconds=15.0,
+                        )
+                    if status != 200 or not reply.get("canMine"):
+                        return
+            if local_demand:
                 return
             miner_snapshot = self._idle_prl_miner.snapshot()
             miner_running = str(miner_snapshot.get("state") or "") in ("running", "starting", "paused")
@@ -7127,13 +7181,13 @@ class DependencyAgent:
         except Exception as exc:
             logging.error("Failed releasing FIFO GPU admission ticket=%s jobId=%s: %s", ticket_id, lease.job_id, exc)
 
-    def _gpu_admission_has_foreground_work(self) -> bool:
+    def _gpu_admission_has_foreground_work(self, timeout_seconds: float = 5.0) -> bool:
         if self.gpu_admission_mode != "enforcing":
             return False
         if not self._coordination:
             return True
         try:
-            raw = self._coordination_get_json(self._gpu_admission_root_path(), timeout_seconds=5.0)
+            raw = self._coordination_get_json(self._gpu_admission_root_path(), timeout_seconds=timeout_seconds)
             root = self._gpu_admission_prune(raw, _now_ms())
             if root.get("durableDemandActive") is True:
                 return True
@@ -12660,8 +12714,12 @@ class DependencyAgent:
         workflow: Dict[str, Any],
         client_id: str,
         prompt_id: Optional[str] = None,
+        tts_request_id: Optional[str] = None,
     ) -> str:
         body: Dict[str, Any] = {"prompt": workflow, "client_id": client_id}
+        if tts_request_id:
+            # Correlation only: lease tokens never enter Comfy output metadata.
+            body["extra_data"] = {"extra_pnginfo": {"fcs_tts_request_id": tts_request_id}}
         if isinstance(prompt_id, str) and prompt_id:
             body["prompt_id"] = prompt_id
         status, resp = self._comfy_api_json(
@@ -15339,6 +15397,16 @@ class DependencyAgent:
             self._ensure_runtime_assets_for_workflow(workflow)
             _agent_stage(lease, "prepare_finished")
 
+            tts_metadata = None
+            if os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite" and any(
+                isinstance(node, dict) and (node.get("inputs") or {}).get("runtime_policy") == "auto_fast_all"
+                for node in workflow.values()
+            ) and (self._gpu_coordinator.status().get("ttsResidency") or {}).get("enabled"):
+                from asset_gen_v7_lite_tts import classify_workflow
+                tts_profile = classify_workflow(workflow)
+                if tts_profile:
+                    tts_metadata = {"tts": {**tts_profile, "requestId": uuid.uuid4().hex}}
+
             try:
                 admission_claim_token = self._wait_for_comfy_gpu_admission(
                     lease,
@@ -15352,6 +15420,7 @@ class DependencyAgent:
                     metadata_provider=self._comfy_gpu_process_metadata,
                     admission_ticket_id=lease.gpu_admission_ticket_id,
                     admission_claim_token=admission_claim_token,
+                    **({"workload_metadata": tts_metadata} if tts_metadata else {}),
                 )
             except GPUCoordinatorBusy as exc:
                 self._release_comfy_gpu_admission(lease, "gpu_handoff_busy")
@@ -15402,6 +15471,7 @@ class DependencyAgent:
                 workflow,
                 client_id=client_id,
                 prompt_id=requested_prompt_id,
+                **({"tts_request_id": tts_metadata["tts"]["requestId"]} if tts_metadata else {}),
             )
             if node_timing_collector is not None and prompt_id != requested_prompt_id:
                 node_timing_collector.stop()
