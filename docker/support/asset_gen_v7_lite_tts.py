@@ -113,7 +113,7 @@ class TTSResidency:
         self.generation_request_id = None
         self.failures = int((previous or {}).get("failures", 0)) if (previous or {}).get("version") == self.config.get("version") else 0
         self.policy_fingerprint = hashlib.sha256(json.dumps({k: self.config.get(k) for k in
-            ("version", "profile", "measuredRuntimeFingerprint", "miningFingerprint", "measuredPeaks")}, sort_keys=True).encode()).hexdigest()
+            ("version", "profile", "measuredRuntimeVersion", "measuredProfile", "measuredRuntimeFingerprint", "miningFingerprint", "measuredPeaks")}, sort_keys=True).encode()).hexdigest()
         self.policy_failure = (previous or {}).get("policyFailure") if (previous or {}).get("policyFingerprint") == self.policy_fingerprint else None
         self.disabled = self.failures >= 3 or bool(self.policy_failure)
         self.backoff = 0
