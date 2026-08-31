@@ -648,6 +648,41 @@ class PermitAndServerTests(unittest.TestCase):
         self.assertFalse(result["response"]["ok"])
         self.assertEqual(result["response"]["error"]["code"], "cancelled")
 
+    def test_generation_lease_loss_discards_audio_after_synchronizing(self):
+        self._warmup()
+        self.backend.block = threading.Event()
+        blocked = self.backend.block
+        self.backend.return_audio_on_cancel = True
+        synced = []
+        self.app.synchronize = lambda _torch: synced.append(self.app.health()["inFlight"])
+        result = {}
+        worker = threading.Thread(target=lambda: result.update(response=_rpc(self.socket_path, {
+            "method": "generate", "requestId": "lease-lost", "permit": _permit("generate", work="lease-lost"),
+            "params": _params(),
+        }, timeout=8)))
+        worker.start()
+        try:
+            self.assertTrue(self.backend.started.wait(2))
+            self.permits.valid = False
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(result["response"]["ok"])
+            self.assertEqual(result["response"]["error"]["code"], "invalid_permit")
+            self.assertNotIn("result", result["response"])
+            self.assertTrue(synced)
+            self.assertIsNotNone(synced[0])
+            self.assertIsNone(self.app.health()["inFlight"])
+            self.permits.valid = True
+            self.backend.block = None
+            followup = _rpc(self.socket_path, {
+                "method": "generate", "requestId": "after-loss", "permit": _permit("generate", work="after-loss"),
+                "params": _params(),
+            })
+            self.assertTrue(followup["ok"])
+        finally:
+            blocked.set()
+            worker.join(3)
+
     def test_cuda_failure_is_not_generic_success(self):
         self._warmup()
         seen = []
