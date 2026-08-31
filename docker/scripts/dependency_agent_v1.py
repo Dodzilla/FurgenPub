@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.167"
+AGENT_VERSION = "dm-agent-py/0.10.168"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -7349,6 +7349,7 @@ class DependencyAgent:
         target_state: str,
         limit: int,
         skip_execute_jobs: bool = False,
+        on_claim: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         if not self._coordination or not self._coordination_stream_healthy:
             return None
@@ -7484,12 +7485,18 @@ class DependencyAgent:
                             )
                             continue
                 claimed.append(claimed_item)
+                if on_claim is not None:
+                    on_claim(claimed_item)
             except Exception as e:
                 logging.warning("RTDB queue claim failed for %s/%s: %s", queue_path_key, item.get("itemId"), e)
+                if on_claim is not None and claimed:
+                    return claimed
                 return None
         return claimed
 
     def _coordination_fetch_agent_queue(self, limit: int) -> Optional[List[Dict[str, Any]]]:
+        incremental = (os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite"
+                       and _env_bool("DM_AGENT_INCREMENTAL_QUEUE_DISPATCH", False))
         skip_execute_jobs = bool(self.mining_only)
         if not skip_execute_jobs:
             try:
@@ -7506,12 +7513,13 @@ class DependencyAgent:
             "leased",
             limit,
             skip_execute_jobs=skip_execute_jobs,
+            **({"on_claim": self._dispatch_claimed_agent_queue_item} if incremental else {}),
         )
         if items == [] and skip_execute_jobs:
             return []
         if items == [] and self._coordination_direct_empty_probe_due("agent"):
             return None
-        return items
+        return [] if incremental and items else items
 
     def _coordination_fetch_dependency_queue(self, limit: int) -> Optional[List[Dict[str, Any]]]:
         items = self._coordination_claim_queue_items(
@@ -12553,6 +12561,11 @@ class DependencyAgent:
 
     def _pop_next_ready_lease(self) -> Optional[AgentExecuteLease]:
         with self._lock:
+            # Reserve prompt preparation atomically too: concurrent prefetch
+            # completions must not race each other into FIFO admission.
+            counts = self._agent_stage_counts_map_locked()
+            if counts["preparing_prompt"] + counts["executing"] >= self._agent_effective_execute_capacity():
+                return None
             candidates = len(self._ready_agent_item_ids)
             now_ms = _now_ms()
             while self._ready_agent_item_ids and candidates > 0:
@@ -15909,6 +15922,21 @@ class DependencyAgent:
         finally:
             self._complete_post_job_comfy_recycle(lease)
             self._cleanup_agent_lease(lease)
+
+    def _dispatch_claimed_agent_queue_item(self, item: Dict[str, Any]) -> None:
+        if self._stop.is_set():
+            return
+        try:
+            self._process_agent_queue_item(item)
+        except Exception as exc:
+            item_id, lease_id = item.get("itemId"), item.get("leaseId")
+            logging.warning("Failed processing claimed agent queue item %s: %s", item_id, exc)
+            if isinstance(item_id, str) and isinstance(lease_id, str):
+                try:
+                    self._agent_ack(item_id, lease_id, "command_failed",
+                                    error_code="agent_processing_error", error_message=str(exc))
+                except Exception:
+                    pass
 
     def _process_agent_queue_item(self, item: Dict[str, Any]) -> None:
         item_type = item.get("type") if isinstance(item.get("type"), str) else ""
