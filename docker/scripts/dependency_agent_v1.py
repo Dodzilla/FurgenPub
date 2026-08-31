@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.166"
+AGENT_VERSION = "dm-agent-py/0.10.167"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -4439,15 +4439,6 @@ class ComfyNodeTimingCollector:
         self._terminal.set()
 
     def stop(self) -> None:
-        # Revoke background compilation before its heartbeat stops. Letting
-        # the permit expire misclassifies normal shutdown as a warmup failure.
-        if getattr(self, "_tts_residency_seen_enabled", False):
-            try:
-                self._gpu_coordinator._request(
-                    "POST", "/v1/gpu/tts/idle", body={"foregroundDemand": True}, timeout_seconds=15.0,
-                )
-            except Exception:
-                logging.warning("Could not revoke TTS warmup during agent shutdown; permit expiry remains fenced")
         self._stop.set()
         sock = self._sock
         self._sock = None
@@ -5526,6 +5517,15 @@ class DependencyAgent:
         return installed_static, installed_dynamic, failed, downloading, active_downloads
 
     def stop(self) -> None:
+        # Revoke background compilation before its heartbeat stops. Letting
+        # the permit expire misclassifies normal shutdown as a warmup failure.
+        if getattr(self, "_tts_residency_seen_enabled", False):
+            try:
+                self._gpu_coordinator._request(
+                    "POST", "/v1/gpu/tts/idle", body={"foregroundDemand": True}, timeout_seconds=15.0,
+                )
+            except Exception:
+                logging.warning("Could not revoke TTS warmup during agent shutdown; permit expiry remains fenced")
         self._stop.set()
         self._coordination_stream_stop.set()
         self._dependency_poll_wakeup.set()
