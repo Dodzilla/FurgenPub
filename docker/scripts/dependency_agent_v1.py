@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.164"
+AGENT_VERSION = "dm-agent-py/0.10.165"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -1381,17 +1381,24 @@ _CONTROL_HTTP = threading.local()
 
 
 def _control_urlopen(req, timeout):
-    """Reuse TLS for the v7 RTDB control plane; preserve CAS and HTTP errors.
+    """Reuse TLS for opted-in v7 control requests; preserve CAS and HTTP errors.
 
     Each thread owns its socket. Never retry a write with an unknown outcome.
     Downloads, SSE streams, other server types and redirects keep urllib's path.
     """
     parsed = urllib.parse.urlsplit(req.full_url)
-    enabled = os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite" and _env_bool("DM_RTDB_HTTP_KEEPALIVE", True)
-    if not enabled or parsed.scheme != "https" or not (parsed.hostname or "").endswith((".firebaseio.com", ".firebasedatabase.app")):
+    is_v7 = os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite"
+    rtdb = is_v7 and _env_bool("DM_RTDB_HTTP_KEEPALIVE", True) and (parsed.hostname or "").endswith((".firebaseio.com", ".firebasedatabase.app"))
+    agent_api = (is_v7 and _env_bool("DM_AGENT_HTTP_KEEPALIVE", False)
+                 and parsed.hostname == "us-central1-furgencontentserver.cloudfunctions.net"
+                 and parsed.path.startswith("/api/agent/"))
+    if parsed.scheme != "https" or not (rtdb or agent_api):
         return urllib.request.urlopen(req, timeout=timeout)
+    # Agent API calls and RTDB CAS often alternate on the same thread.
+    # Keep their sockets separate instead of evicting one for the other.
+    cache_slot = "agent_connection" if agent_api else "connection"
     now = time.monotonic()
-    cached = getattr(_CONTROL_HTTP, "connection", None)
+    cached = getattr(_CONTROL_HTTP, cache_slot, None)
     host = (parsed.hostname, parsed.port or 443)
     if cached and (cached[0] != host or now - cached[2] > 15):
         cached[1].close()
@@ -1404,7 +1411,7 @@ def _control_urlopen(req, timeout):
     try:
         connection.request(req.get_method(), path, body=req.data, headers=dict(req.header_items()))
         response = connection.getresponse()
-        _CONTROL_HTTP.connection = (host, connection, time.monotonic())
+        setattr(_CONTROL_HTTP, cache_slot, (host, connection, time.monotonic()))
         if response.status >= 300:
             # Preserve urllib HTTPError semantics, particularly ETag conflicts.
             import io
@@ -1415,7 +1422,7 @@ def _control_urlopen(req, timeout):
         raise
     except (OSError, http.client.HTTPException):
         connection.close()
-        _CONTROL_HTTP.connection = None
+        setattr(_CONTROL_HTTP, cache_slot, None)
         raise
 
 
