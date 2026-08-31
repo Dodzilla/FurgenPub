@@ -1380,6 +1380,12 @@ def _is_permanent_http_error(err: Exception) -> bool:
 _CONTROL_HTTP = threading.local()
 
 
+def _control_http_keepalive_server_enabled():
+    configured = os.environ.get("DM_AGENT_HTTP_KEEPALIVE_SERVER_TYPES", "asset_gen_v7_lite")
+    allowed = {value.strip() for value in configured.split(",") if value.strip()}
+    return os.environ.get("SERVER_TYPE") in allowed
+
+
 def _control_urlopen(req, timeout):
     """Reuse TLS for opted-in v7 control requests; preserve CAS and HTTP errors.
 
@@ -1389,7 +1395,7 @@ def _control_urlopen(req, timeout):
     parsed = urllib.parse.urlsplit(req.full_url)
     is_v7 = os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite"
     rtdb = is_v7 and _env_bool("DM_RTDB_HTTP_KEEPALIVE", True) and (parsed.hostname or "").endswith((".firebaseio.com", ".firebasedatabase.app"))
-    agent_api = (is_v7 and _env_bool("DM_AGENT_HTTP_KEEPALIVE", False)
+    agent_api = (_control_http_keepalive_server_enabled() and _env_bool("DM_AGENT_HTTP_KEEPALIVE", False)
                  and parsed.hostname == "us-central1-furgencontentserver.cloudfunctions.net"
                  and parsed.path.startswith("/api/agent/"))
     if parsed.scheme != "https" or not (rtdb or agent_api):
