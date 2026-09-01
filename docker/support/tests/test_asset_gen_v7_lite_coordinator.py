@@ -372,6 +372,21 @@ class CoordinatorLeaseTest(unittest.TestCase):
             self.assertIsNone(coordinator.lease)
             coordinator._stop_llama.assert_called_once_with()
 
+    def test_inference_release_prioritizes_configured_tts_even_after_runtime_eviction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator, _ = self.make_coordinator(directory, enforcing=True)
+            coordinator._ensure_llama = mock.Mock()
+            coordinator._stop_llama = mock.Mock()
+            lease = coordinator.acquire("inference", "request", 60_000)
+            coordinator.tts = mock.Mock()
+            coordinator.tts.enabled = False
+            coordinator.tts.config = {"prioritizeAfterInference": True}
+            released = coordinator.release(lease["fencingToken"], lease["epoch"], keep_warm=True)
+            self.assertTrue(released["gpuReleased"])
+            self.assertLessEqual(coordinator.mining_not_before_ms, int(time.time() * 1000))
+            coordinator.tts.prioritize_idle_restore.assert_called_once_with()
+            coordinator._stop_llama.assert_called_once_with()
+
     def test_drain_holds_starting_mining_fence_until_late_pid_is_revoked(self):
         with tempfile.TemporaryDirectory() as directory:
             coordinator, _ = self.make_coordinator(directory, enforcing=True)

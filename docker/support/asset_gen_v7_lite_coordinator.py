@@ -1481,7 +1481,6 @@ class GPUCoordinator:
             prioritize_tts = bool(
                 holder == "inference"
                 and self.tts
-                and self.tts.enabled
                 and self.tts.config.get("prioritizeAfterInference")
             )
             if holder in FOREGROUND:
