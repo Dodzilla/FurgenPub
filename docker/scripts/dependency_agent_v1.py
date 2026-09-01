@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.172"
+AGENT_VERSION = "dm-agent-py/0.10.173"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -1395,7 +1395,7 @@ def _control_urlopen(req, timeout):
     parsed = urllib.parse.urlsplit(req.full_url)
     is_v7 = os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite"
     rtdb = is_v7 and _env_bool("DM_RTDB_HTTP_KEEPALIVE", True) and (parsed.hostname or "").endswith((".firebaseio.com", ".firebasedatabase.app"))
-    agent_api = (_control_http_keepalive_server_enabled() and _env_bool("DM_AGENT_HTTP_KEEPALIVE", False)
+    agent_api = (_control_http_keepalive_server_enabled() and _env_bool("DM_AGENT_HTTP_KEEPALIVE", True)
                  and parsed.hostname == "us-central1-furgencontentserver.cloudfunctions.net"
                  and parsed.path.startswith("/api/agent/"))
     if parsed.scheme != "https" or not (rtdb or agent_api):
