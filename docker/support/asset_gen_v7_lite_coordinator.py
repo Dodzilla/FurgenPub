@@ -1478,9 +1478,25 @@ class GPUCoordinator:
             if self.recovery_timer:
                 self.recovery_timer.cancel()
                 self.recovery_timer = None
+            prioritize_tts = bool(
+                holder == "inference"
+                and self.tts
+                and self.tts.enabled
+                and self.tts.config.get("prioritizeAfterInference")
+            )
             if holder in FOREGROUND:
-                self.mining_not_before_ms = int(time.time() * 1000) + self._effective_mining_grace_seconds() * 1000
-            keep_warm = bool(keep_warm and not self.draining and self.warm_residency and holder in FOREGROUND)
+                self.mining_not_before_ms = (
+                    int(time.time() * 1000)
+                    if prioritize_tts
+                    else int(time.time() * 1000) + self._effective_mining_grace_seconds() * 1000
+                )
+            keep_warm = bool(
+                keep_warm
+                and not prioritize_tts
+                and not self.draining
+                and self.warm_residency
+                and holder in FOREGROUND
+            )
             if keep_warm:
                 lease["state"] = "WARM"
                 lease["deadlineMs"] = int(time.time() * 1000) + 24 * 3600 * 1000
@@ -1501,6 +1517,8 @@ class GPUCoordinator:
                 self.state = "IDLE"
                 self.phase = "IDLE"
                 self.lease_condition.notify_all()
+            if prioritize_tts:
+                self.tts.prioritize_idle_restore()
             self._persist_journal()
             return {"safe": not keep_warm, "requestComplete": True, "gpuReleased": not keep_warm, "state": self.state}
 

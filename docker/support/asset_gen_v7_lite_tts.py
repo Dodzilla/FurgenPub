@@ -655,6 +655,10 @@ class TTSResidency:
         self.binding = None
         self.not_before = time.monotonic() + 30
 
+    def prioritize_idle_restore(self):
+        """Allow the idle watchdog to restore TTS immediately after Qwen exits."""
+        self.not_before = time.monotonic()
+
     def _serve(self):
         self.socket.unlink(missing_ok=True)
         manager = self

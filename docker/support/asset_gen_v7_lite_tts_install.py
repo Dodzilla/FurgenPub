@@ -58,6 +58,7 @@ def install(args):
               "runtimeScript": str(Path(__file__).with_name("asset_gen_v7_lite_tts_runtime.py")),
               "coordinatorUrl": "http://127.0.0.1:8189", "profile": "stock",
               "diagnosticsEnabled": False, "routingApproved": False, "coexistenceApproved": False,
+              "prioritizeAfterInference": False,
               "measuredPeaks": {}, "validUntilMs": 0,
               "environmentLockSha256": hashlib.sha256(versions.encode()).hexdigest()}
     destination = root / "config.installed.json"
