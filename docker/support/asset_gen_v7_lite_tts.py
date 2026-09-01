@@ -127,6 +127,7 @@ class TTSResidency:
         self.transitions = []
         self.last_demand_check = 0.0
         self.not_before = time.monotonic() + 30
+        self.priority_restore_pending = False
         self.server = None
         self.stopped = threading.Event()
         coordinator.tts = self
@@ -378,7 +379,8 @@ class TTSResidency:
         with self.owner.lock:
             self.last_demand_check = time.monotonic()
             if demand:
-                self.not_before = time.monotonic() + 30
+                if not self.priority_restore_pending:
+                    self.not_before = time.monotonic() + 30
                 if self.state == "warming":
                     self.evict("queued_foreground", preempt=True)
                 return {"canMine": False, **self.status()}
@@ -430,6 +432,7 @@ class TTSResidency:
             self.permit = {"kind": "warmup", "epoch": self.owner.epoch, "fencingToken": uuid.uuid4().hex,
                            "workId": "tts-warmup-" + uuid.uuid4().hex, "deadline": time.monotonic() + 10,
                            "started": time.monotonic()}
+            self.priority_restore_pending = False
             self.state = "warming"
             self.owner.state = self.owner.phase = "IDLE"
             permit = dict(self.permit)
@@ -657,6 +660,7 @@ class TTSResidency:
 
     def prioritize_idle_restore(self):
         """Allow the idle watchdog to restore TTS immediately after Qwen exits."""
+        self.priority_restore_pending = True
         self.not_before = time.monotonic()
 
     def _serve(self):

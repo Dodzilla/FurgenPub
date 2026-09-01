@@ -278,6 +278,16 @@ class ResidencyTest(unittest.TestCase):
         self.assertEqual(self.tts.backoff, 60)
         self.assertTrue(self.tts.idle_tick(False)["canMine"])
 
+    def test_inference_priority_survives_trailing_demand_until_restore_starts(self):
+        self.tts.prioritize_idle_restore()
+        priority_not_before = self.tts.not_before
+        self.assertFalse(self.tts.idle_tick(True)["canMine"])
+        self.assertEqual(self.tts.not_before, priority_not_before)
+        with mock.patch.object(threading.Thread, "start"):
+            self.assertFalse(self.tts.idle_tick(False)["canMine"])
+        self.assertEqual(self.tts.state, "warming")
+        self.assertFalse(self.tts.priority_restore_pending)
+
     def test_preemption_backoff_caps_without_disabling(self):
         for expected in (60, 120, 240, 300, 300):
             self.tts.evict("preempt", preempt=True)
