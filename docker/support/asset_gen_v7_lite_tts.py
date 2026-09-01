@@ -379,7 +379,7 @@ class TTSResidency:
         with self.owner.lock:
             self.last_demand_check = time.monotonic()
             if demand:
-                if not self.priority_restore_pending:
+                if not self.priority_restore_pending and not self.config.get("prioritizeAfterInference"):
                     self.not_before = time.monotonic() + 30
                 if self.state == "warming":
                     self.evict("queued_foreground", preempt=True)
