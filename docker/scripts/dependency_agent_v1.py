@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.168"
+AGENT_VERSION = "dm-agent-py/0.10.169"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -14708,6 +14708,21 @@ class DependencyAgent:
                 chunk_size=8 * 1024 * 1024,
             )
             upload_ms = max(0, _now_ms() - upload_started_ms)
+            staged_public_url = None
+            staged_verify_ms = 0
+            if target.get("publishStagedReadUrl") is True:
+                verify_url = target.get("verifyHeadUrl")
+                if not isinstance(verify_url, str) or not verify_url:
+                    raise RuntimeError("Missing verified read URL for staged first publication.")
+                verify_started_ms = _now_ms()
+                head_status, head_headers = http_head(verify_url, timeout_seconds=30.0)
+                staged_verify_ms = max(0, _now_ms() - verify_started_ms)
+                remote_len = head_headers.get("content-length")
+                if head_status not in (200, 204) or not isinstance(remote_len, str) or not remote_len.isdigit() or int(remote_len) != bytes_written:
+                    raise RuntimeError(
+                        f"Staged output verification failed (status={head_status}, bytes={remote_len or 'missing'})."
+                    )
+                staged_public_url = verify_url
             out_meta: Dict[str, Any] = {
                 "logicalOutputKey": logical_key,
                 "attemptObjectPath": attempt_object_path,
@@ -14720,7 +14735,9 @@ class DependencyAgent:
                     "agentUploadMs": upload_ms,
                     "agentUploadAttempts": 1,
                     "deliveryPath": "gcs_staged",
+                    **({"agentStagedVerifyMs": staged_verify_ms} if staged_public_url else {}),
                 },
+                **({"publicUrl": staged_public_url} if staged_public_url else {}),
             }
             bucket = target.get("bucket") if isinstance(target.get("bucket"), str) and target.get("bucket") else None
             if bucket:
