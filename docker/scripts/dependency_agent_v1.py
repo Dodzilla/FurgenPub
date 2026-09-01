@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.169"
+AGENT_VERSION = "dm-agent-py/0.10.170"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -7046,9 +7046,13 @@ class DependencyAgent:
         identity = f"{self.instance_id or 'instance'}:{lease.item_id}"
         return "comfy_" + base64.urlsafe_b64encode(identity.encode("utf-8")).decode("ascii").rstrip("=")
 
-    def _enqueue_comfy_gpu_admission(self, lease: AgentExecuteLease, estimated_duration_ms: int) -> Optional[str]:
+    def _enqueue_comfy_gpu_admission(
+        self,
+        lease: AgentExecuteLease,
+        estimated_duration_ms: int,
+    ) -> Tuple[Optional[str], Optional[str]]:
         if self.gpu_admission_mode != "enforcing":
-            return None
+            return None, None
         ticket_id = self._gpu_admission_ticket_key(lease)
         now_ms = _now_ms()
 
@@ -7060,32 +7064,57 @@ class DependencyAgent:
                 existing["heartbeatAtMs"] = now_ms
                 existing["expiresAtMs"] = max(int(existing.get("expiresAtMs") or 0), now_ms + 3_600_000)
                 existing["attached"] = True
-                root["updatedAtMs"] = now_ms
-                root["revision"] = int(root.get("revision") or 0) + 1
-                return root, ticket_id
-            if len(tickets) >= self.gpu_admission_max_depth:
-                raise GPUCoordinatorBusy("GPU admission queue is full", 5.0)
-            sequence = int(root.get("nextSequence") or 0) + 1
-            root["nextSequence"] = sequence
-            tickets[ticket_id] = {
-                "ticketId": ticket_id,
-                "requestId": str(lease.job_id)[:128],
-                "holder": "comfy",
-                "sequence": sequence,
-                "enqueuedAtMs": now_ms,
-                "heartbeatAtMs": now_ms,
-                "expiresAtMs": now_ms + 3_600_000,
-                "estimatedDurationMs": max(1_000, min(3_600_000, int(estimated_duration_ms))),
-                "stream": False,
-                "attached": True,
-                "state": "waiting",
-            }
+            else:
+                if len(tickets) >= self.gpu_admission_max_depth:
+                    raise GPUCoordinatorBusy("GPU admission queue is full", 5.0)
+                sequence = int(root.get("nextSequence") or 0) + 1
+                root["nextSequence"] = sequence
+                tickets[ticket_id] = {
+                    "ticketId": ticket_id,
+                    "requestId": str(lease.job_id)[:128],
+                    "holder": "comfy",
+                    "sequence": sequence,
+                    "enqueuedAtMs": now_ms,
+                    "heartbeatAtMs": now_ms,
+                    "expiresAtMs": now_ms + 3_600_000,
+                    "estimatedDurationMs": max(1_000, min(3_600_000, int(estimated_duration_ms))),
+                    "stream": False,
+                    "attached": True,
+                    "state": "waiting",
+                }
+
+            claim_token = None
+            active = root.get("active")
+            if not isinstance(active, dict):
+                eligible = sorted(
+                    (
+                        row for row in tickets.values()
+                        if isinstance(row, dict) and row.get("attached") is True and row.get("state") == "waiting"
+                    ),
+                    key=lambda row: (int(row.get("sequence") or 0), str(row.get("ticketId") or "")),
+                )
+                if eligible and eligible[0].get("ticketId") == ticket_id:
+                    claim_token = uuid.uuid4().hex
+                    tickets[ticket_id]["state"] = "active"
+                    root["active"] = {
+                        "ticketId": ticket_id,
+                        "requestId": str(tickets[ticket_id].get("requestId") or ""),
+                        "holder": "comfy",
+                        "sequence": int(tickets[ticket_id].get("sequence") or 0),
+                        "claimToken": claim_token,
+                        "claimedAtMs": now_ms,
+                        "heartbeatAtMs": now_ms,
+                        "state": "active",
+                    }
             root["updatedAtMs"] = now_ms
             root["revision"] = int(root.get("revision") or 0) + 1
-            return root, ticket_id
+            return root, (ticket_id, claim_token)
 
-        lease.gpu_admission_ticket_id = self._gpu_admission_transaction(mutate)
-        return lease.gpu_admission_ticket_id
+        lease.gpu_admission_ticket_id, claim_token = self._gpu_admission_transaction(mutate)
+        if claim_token:
+            lease.gpu_admission_claim_token = str(claim_token)
+            logging.info("Claimed FIFO GPU admission ticket=%s jobId=%s during enqueue", ticket_id, lease.job_id)
+        return lease.gpu_admission_ticket_id, lease.gpu_admission_claim_token
 
     def _recover_gpu_admission_if_locally_idle(self) -> bool:
         try:
@@ -7117,9 +7146,11 @@ class DependencyAgent:
         return recovered
 
     def _wait_for_comfy_gpu_admission(self, lease: AgentExecuteLease, estimated_duration_ms: int) -> Optional[str]:
-        ticket_id = self._enqueue_comfy_gpu_admission(lease, estimated_duration_ms)
+        ticket_id, enqueue_claim_token = self._enqueue_comfy_gpu_admission(lease, estimated_duration_ms)
         if ticket_id is None:
             return None
+        if enqueue_claim_token:
+            return enqueue_claim_token
         last_heartbeat_ms = 0
         while not self._stop.is_set():
             if self._is_cancel_requested(lease):
@@ -14684,7 +14715,7 @@ class DependencyAgent:
             fast_path_threshold is not None and
             int(bytes_written) > int(fast_path_threshold) and
             staged_upload_url is not None and
-            staged_upload_method == "gcs_resumable_session_put"
+            staged_upload_method in ("gcs_resumable_session_put", "gcs_signed_url_put")
         )
 
         attempt_object_path = (
@@ -14700,13 +14731,25 @@ class DependencyAgent:
 
         if should_stage:
             upload_started_ms = _now_ms()
-            gcs_resumable_upload_file(
-                staged_upload_url,
-                local_output,
-                content_type,
-                timeout_seconds=max(300.0, float(self.download_timeout_seconds)),
-                chunk_size=8 * 1024 * 1024,
-            )
+            if staged_upload_method == "gcs_signed_url_put":
+                upload_status, upload_body, _upload_headers = http_put_file_stream(
+                    staged_upload_url,
+                    local_output,
+                    headers={"Content-Type": content_type},
+                    timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                )
+                if upload_status < 200 or upload_status >= 300:
+                    raise RuntimeError(
+                        f"GCS signed output upload failed (status={upload_status}): {upload_body[:200]}"
+                    )
+            else:
+                gcs_resumable_upload_file(
+                    staged_upload_url,
+                    local_output,
+                    content_type,
+                    timeout_seconds=max(300.0, float(self.download_timeout_seconds)),
+                    chunk_size=8 * 1024 * 1024,
+                )
             upload_ms = max(0, _now_ms() - upload_started_ms)
             staged_public_url = None
             staged_verify_ms = 0
