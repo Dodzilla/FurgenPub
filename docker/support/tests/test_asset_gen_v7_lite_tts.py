@@ -291,6 +291,8 @@ class ResidencyTest(unittest.TestCase):
     def test_priority_policy_skips_idle_grace_after_foreground_demand_drains(self):
         self.tts.config["prioritizeAfterInference"] = True
         self.tts.not_before = 0
+        self.tts.idle_heartbeat(True)
+        self.assertEqual(self.tts.not_before, 0)
         self.assertFalse(self.tts.idle_tick(True)["canMine"])
         self.assertEqual(self.tts.not_before, 0)
         with mock.patch.object(threading.Thread, "start"):
