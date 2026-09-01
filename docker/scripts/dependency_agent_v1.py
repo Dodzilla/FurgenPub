@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.171"
+AGENT_VERSION = "dm-agent-py/0.10.172"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -2641,6 +2641,116 @@ def http_put_file_stream(
         raw = resp.read().decode("utf-8", errors="replace")
         out_headers = {k.lower(): v for k, v in dict(resp.headers).items()}
         return int(resp.status), raw, out_headers
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def http_put_file_stream_then_head(
+    upload_url: str,
+    verify_url: str,
+    file_path: Path,
+    headers: Optional[Dict[str, str]] = None,
+    upload_timeout_seconds: float = 300.0,
+    verify_timeout_seconds: float = 30.0,
+    chunk_size: int = 8 * 1024 * 1024,
+) -> Tuple[int, str, Dict[str, str], int, Dict[str, str], int, int, bool]:
+    """Upload and verify over one connection when both signed URLs share an origin.
+
+    A completed PUT is never retried. If the server closes its keep-alive socket,
+    only the idempotent HEAD verification falls back to the existing transport.
+    """
+    upload_parsed = urllib.parse.urlparse(upload_url)
+    verify_parsed = urllib.parse.urlparse(verify_url)
+
+    def origin(parsed: urllib.parse.ParseResult) -> Tuple[str, str, int]:
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
+        host = parsed.hostname or ""
+        if not host:
+            raise ValueError("URL missing hostname")
+        return scheme, host, int(parsed.port or (443 if scheme == "https" else 80))
+
+    upload_origin = origin(upload_parsed)
+    verify_origin = origin(verify_parsed)
+    if upload_origin != verify_origin:
+        upload_started_ms = _now_ms()
+        upload_status, upload_body, upload_headers = http_put_file_stream(
+            upload_url,
+            file_path,
+            headers=headers,
+            timeout_seconds=upload_timeout_seconds,
+            chunk_size=chunk_size,
+        )
+        upload_ms = max(0, _now_ms() - upload_started_ms)
+        verify_started_ms = _now_ms()
+        head_status, head_headers = http_head(verify_url, timeout_seconds=verify_timeout_seconds)
+        verify_ms = max(0, _now_ms() - verify_started_ms)
+        return upload_status, upload_body, upload_headers, head_status, head_headers, upload_ms, verify_ms, False
+
+    scheme, host, port = upload_origin
+    conn: Any = (
+        http.client.HTTPSConnection(host, port, timeout=upload_timeout_seconds)
+        if scheme == "https"
+        else http.client.HTTPConnection(host, port, timeout=upload_timeout_seconds)
+    )
+    upload_path = upload_parsed.path or "/"
+    if upload_parsed.query:
+        upload_path = f"{upload_path}?{upload_parsed.query}"
+    verify_path = verify_parsed.path or "/"
+    if verify_parsed.query:
+        verify_path = f"{verify_path}?{verify_parsed.query}"
+
+    total_size = int(file_path.stat().st_size)
+    request_headers = {"Content-Length": str(total_size)}
+    if headers:
+        request_headers.update(headers)
+
+    upload_started_ms = _now_ms()
+    try:
+        conn.putrequest("PUT", upload_path)
+        for key, value in request_headers.items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        with file_path.open("rb") as stream:
+            while True:
+                chunk = stream.read(int(chunk_size))
+                if not chunk:
+                    break
+                conn.send(chunk)
+
+        upload_response = conn.getresponse()
+        upload_body = upload_response.read().decode("utf-8", errors="replace")
+        upload_headers = {key.lower(): value for key, value in dict(upload_response.headers).items()}
+        upload_status = int(upload_response.status)
+        upload_ms = max(0, _now_ms() - upload_started_ms)
+        if upload_status < 200 or upload_status >= 300:
+            return upload_status, upload_body, upload_headers, 0, {}, upload_ms, 0, False
+
+        verify_started_ms = _now_ms()
+        try:
+            if getattr(upload_response, "will_close", False) or conn.sock is None:
+                raise http.client.RemoteDisconnected("upload response closed the reusable connection")
+            conn.sock.settimeout(verify_timeout_seconds)
+            conn.putrequest("HEAD", verify_path)
+            conn.endheaders()
+            verify_response = conn.getresponse()
+            verify_response.read()
+            head_status = int(verify_response.status)
+            head_headers = {key.lower(): value for key, value in dict(verify_response.headers).items()}
+            verify_ms = max(0, _now_ms() - verify_started_ms)
+            return upload_status, upload_body, upload_headers, head_status, head_headers, upload_ms, verify_ms, True
+        except (OSError, socket.timeout, TimeoutError, http.client.HTTPException):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            head_status, head_headers = http_head(verify_url, timeout_seconds=verify_timeout_seconds)
+            verify_ms = max(0, _now_ms() - verify_started_ms)
+            return upload_status, upload_body, upload_headers, head_status, head_headers, upload_ms, verify_ms, False
     finally:
         try:
             conn.close()
@@ -14733,13 +14843,38 @@ class DependencyAgent:
 
         if should_stage:
             upload_started_ms = _now_ms()
+            head_status = 0
+            head_headers: Dict[str, str] = {}
+            staged_verify_ms = 0
+            upload_verify_connection_reused = False
             if staged_upload_method == "gcs_signed_url_put":
-                upload_status, upload_body, _upload_headers = http_put_file_stream(
-                    staged_upload_url,
-                    local_output,
-                    headers={"Content-Type": content_type},
-                    timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
-                )
+                verify_url = target.get("verifyHeadUrl") if target.get("publishStagedReadUrl") is True else None
+                if isinstance(verify_url, str) and verify_url:
+                    (
+                        upload_status,
+                        upload_body,
+                        _upload_headers,
+                        head_status,
+                        head_headers,
+                        upload_ms,
+                        staged_verify_ms,
+                        upload_verify_connection_reused,
+                    ) = http_put_file_stream_then_head(
+                        staged_upload_url,
+                        verify_url,
+                        local_output,
+                        headers={"Content-Type": content_type},
+                        upload_timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                        verify_timeout_seconds=30.0,
+                    )
+                else:
+                    upload_status, upload_body, _upload_headers = http_put_file_stream(
+                        staged_upload_url,
+                        local_output,
+                        headers={"Content-Type": content_type},
+                        timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                    )
+                    upload_ms = max(0, _now_ms() - upload_started_ms)
                 if upload_status < 200 or upload_status >= 300:
                     raise RuntimeError(
                         f"GCS signed output upload failed (status={upload_status}): {upload_body[:200]}"
@@ -14752,16 +14887,16 @@ class DependencyAgent:
                     timeout_seconds=max(300.0, float(self.download_timeout_seconds)),
                     chunk_size=8 * 1024 * 1024,
                 )
-            upload_ms = max(0, _now_ms() - upload_started_ms)
+                upload_ms = max(0, _now_ms() - upload_started_ms)
             staged_public_url = None
-            staged_verify_ms = 0
             if target.get("publishStagedReadUrl") is True:
                 verify_url = target.get("verifyHeadUrl")
                 if not isinstance(verify_url, str) or not verify_url:
                     raise RuntimeError("Missing verified read URL for staged first publication.")
-                verify_started_ms = _now_ms()
-                head_status, head_headers = http_head(verify_url, timeout_seconds=30.0)
-                staged_verify_ms = max(0, _now_ms() - verify_started_ms)
+                if staged_upload_method != "gcs_signed_url_put":
+                    verify_started_ms = _now_ms()
+                    head_status, head_headers = http_head(verify_url, timeout_seconds=30.0)
+                    staged_verify_ms = max(0, _now_ms() - verify_started_ms)
                 remote_len = head_headers.get("content-length")
                 if head_status not in (200, 204) or not isinstance(remote_len, str) or not remote_len.isdigit() or int(remote_len) != bytes_written:
                     raise RuntimeError(
@@ -14781,6 +14916,7 @@ class DependencyAgent:
                     "agentUploadAttempts": 1,
                     "deliveryPath": "gcs_staged",
                     **({"agentStagedVerifyMs": staged_verify_ms} if staged_public_url else {}),
+                    **({"agentUploadVerifyConnectionReused": upload_verify_connection_reused} if staged_public_url else {}),
                 },
                 **({"publicUrl": staged_public_url} if staged_public_url else {}),
             }
