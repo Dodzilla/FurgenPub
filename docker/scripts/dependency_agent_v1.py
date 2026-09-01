@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.170"
+AGENT_VERSION = "dm-agent-py/0.10.171"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -3135,6 +3135,8 @@ class AgentExecuteLease:
     prompt_submitted_at_ms: int = 0
     upload_enqueued_at_ms: int = 0
     upload_started_at_ms: int = 0
+    output_commit_succeeded: bool = False
+    output_commit_acknowledged: threading.Event = field(default_factory=threading.Event, repr=False)
     gpu_retry_after_ms: int = 0
     gpu_coordinator_lease: Optional[GPUCoordinatorLease] = None
     gpu_admission_ticket_id: Optional[str] = None
@@ -15754,11 +15756,16 @@ class DependencyAgent:
             if self._coalesce_agent_lifecycle_events(lease):
                 output_commit_payload["coalescedLifecycle"] = self._coalesced_agent_lifecycle_payload(lease)
             attach_node_timings(output_commit_payload, "success")
-            self._emit_agent_event_durable(lease, "output_commit_started", output_commit_payload)
-
-            _agent_stage(lease, "commit_acknowledged")
             self._submit_agent_upload(lease)
             retain_lease = True
+            try:
+                self._emit_agent_event_durable(lease, "output_commit_started", output_commit_payload)
+                lease.output_commit_succeeded = True
+                _agent_stage(lease, "commit_acknowledged")
+            finally:
+                # The upload worker may stage bytes concurrently, but it cannot
+                # publish an output event until this fenced commit succeeds.
+                lease.output_commit_acknowledged.set()
         except Exception as e:
             if not terminal_sent:
                 event_type = "job_cancelled" if self._is_cancel_requested(lease) else "job_failed"
@@ -15920,6 +15927,16 @@ class DependencyAgent:
                     "agentUploadWorkerQueueMs": upload_worker_queue_ms,
                 }
                 uploaded_outputs.append(out_meta)
+
+            if not uploaded_outputs:
+                raise RuntimeError("No outputs were uploaded.")
+
+            if not lease.output_commit_acknowledged.wait(timeout=60.0):
+                raise RuntimeError("Timed out waiting for output commit acknowledgement")
+            if not lease.output_commit_succeeded:
+                raise RuntimeError("Output commit was not acknowledged; staged outputs remain unpublished")
+
+            for out_meta in uploaded_outputs:
                 try:
                     self._emit_agent_event_best_effort(lease, "output_uploaded", out_meta)
                     _agent_stage(lease, "output_event_acknowledged")
@@ -15930,9 +15947,6 @@ class DependencyAgent:
                         out_meta.get("logicalOutputKey"),
                         e,
                     )
-
-            if not uploaded_outputs:
-                raise RuntimeError("No outputs were uploaded.")
 
             completion_payload: Dict[str, Any] = {
                 "outputs": uploaded_outputs,
@@ -15964,6 +15978,8 @@ class DependencyAgent:
             terminal_sent = True
         except Exception as e:
             if not terminal_sent:
+                if not lease.output_commit_acknowledged.is_set():
+                    lease.output_commit_acknowledged.wait(timeout=60.0)
                 error_code = "upload_error"
                 error_text = str(e)
                 payload: Dict[str, Any] = {
@@ -15972,11 +15988,12 @@ class DependencyAgent:
                 }
                 if isinstance(lease.prompt_id, str) and lease.prompt_id:
                     payload["promptId"] = lease.prompt_id
-                try:
-                    self._emit_agent_event_durable(lease, "job_failed", payload)
-                    terminal_sent = True
-                except Exception as event_err:
-                    logging.warning("Failed emitting upload terminal event for %s: %s", lease.job_id, event_err)
+                if lease.output_commit_succeeded:
+                    try:
+                        self._emit_agent_event_durable(lease, "job_failed", payload)
+                        terminal_sent = True
+                    except Exception as event_err:
+                        logging.warning("Failed emitting upload terminal event for %s: %s", lease.job_id, event_err)
             logging.error(
                 "execute_job upload failed: itemId=%s jobId=%s attempt=%d epoch=%d err=%s",
                 lease.item_id,
