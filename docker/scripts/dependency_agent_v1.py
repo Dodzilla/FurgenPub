@@ -141,7 +141,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.173"
+AGENT_VERSION = "dm-agent-py/0.10.175"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -9253,6 +9253,18 @@ class DependencyAgent:
         git = shutil.which("git")
         if not git:
             raise RuntimeError("git not found; cannot install custom node repository")
+        # Some Vast hosts currently receive a spurious GitHub 401 during the
+        # git-upload-pack POST when Git/libcurl negotiates HTTP/2. GitHub's
+        # HTTP/1.1 path works from the same host, so pin the transport before
+        # clone/fetch operations instead of burning the provisioning retry
+        # budget on an otherwise healthy worker.
+        subprocess.run(
+            [git, "config", "--global", "http.version", "HTTP/1.1"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
         pip_cmd = [self._comfy_python_executable(), "-m", "pip"]
         node_dir = (verify_dir_name or os.path.basename(repo_url.rstrip("/"))).removesuffix(".git")
         if not re.match(r"^[A-Za-z0-9_.-]{1,128}$", node_dir):
