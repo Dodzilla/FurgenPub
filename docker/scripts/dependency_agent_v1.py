@@ -70,6 +70,7 @@ Optional knobs:
   - DM_AGENT_API_RETRY_BASE_SECONDS (initial agent API retry backoff; default: 1)
   - DM_AGENT_API_RETRY_MAX_SECONDS (max agent API retry backoff; default: 20)
   - DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS (extra retries for terminal job events; default: 8)
+  - DM_AGENT_MAX_PREFETCH_WORKERS  (local prefetch worker cap; default: 8, max: 32)
   - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
   - DM_COMFY_NODE_TIMING_ENABLED  (capture native Comfy node-boundary timings; default: true on video_gen_v3/video_gen_v4)
@@ -141,7 +142,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.175"
+AGENT_VERSION = "dm-agent-py/0.10.174"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5028,6 +5029,15 @@ class DependencyAgent:
         default_readiness_file = "provisioned_furry_all.txt" if (self.server_type or "").strip() == "video_gen_v2" else "provisioning_complete.txt"
         self.agent_local_readiness_file = self._agent_local_readiness_file_env or default_readiness_file
         self.agent_max_execute_workers = 0 if self.mining_only else max(1, min(8, _env_int("DM_AGENT_MAX_EXEC_WORKERS", 2)))
+        # Prefetch includes remote input download, dependency preparation, and prompt
+        # materialization. It must not be coupled to GPU execution concurrency: a
+        # single-GPU worker can safely prepare several future leases in parallel.
+        # ThreadPoolExecutor starts threads lazily, while the live maxPrefetchJobs
+        # policy still bounds how many leases may enter this pool.
+        self.agent_max_prefetch_workers = 0 if self.mining_only else max(
+            1,
+            min(32, _env_int("DM_AGENT_MAX_PREFETCH_WORKERS", 8)),
+        )
         default_upload_workers = max(4, int(self.agent_max_execute_workers) * 2)
         self.agent_max_upload_workers = 0 if self.mining_only else max(1, min(16, _env_int("DM_AGENT_MAX_UPLOAD_WORKERS", default_upload_workers)))
         self.asset_gen_v5_script = _env_str("DM_ASSET_GEN_V5_SCRIPT")
@@ -9253,18 +9263,6 @@ class DependencyAgent:
         git = shutil.which("git")
         if not git:
             raise RuntimeError("git not found; cannot install custom node repository")
-        # Some Vast hosts currently receive a spurious GitHub 401 during the
-        # git-upload-pack POST when Git/libcurl negotiates HTTP/2. GitHub's
-        # HTTP/1.1 path works from the same host, so pin the transport before
-        # clone/fetch operations instead of burning the provisioning retry
-        # budget on an otherwise healthy worker.
-        subprocess.run(
-            [git, "config", "--global", "http.version", "HTTP/1.1"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-        )
         pip_cmd = [self._comfy_python_executable(), "-m", "pip"]
         node_dir = (verify_dir_name or os.path.basename(repo_url.rstrip("/"))).removesuffix(".git")
         if not re.match(r"^[A-Za-z0-9_.-]{1,128}$", node_dir):
@@ -12693,6 +12691,15 @@ class DependencyAgent:
                 if lease.stage == "ready" and int(lease.ready_at_ms or 0) > 0
             ]
         counts["checkedAtMs"] = _now_ms()
+        prefetch_capacity = max(0, int(getattr(self, "agent_max_prefetch_workers", 0) or 0))
+        counts["prefetchWorkerCapacity"] = prefetch_capacity
+        counts["prefetchPolicyCapacity"] = max(0, int(self._agent_effective_prefetch_capacity()))
+        counts["prefetchQueued"] = max(0, int(counts.get("leased", 0)))
+        counts["prefetchActive"] = max(
+            0,
+            int(counts.get("prefetching", 0)) + int(counts.get("waiting_dependencies", 0)),
+        )
+        counts["prefetchCapacityCapped"] = counts["prefetchPolicyCapacity"] > prefetch_capacity
         upload_capacity = max(0, int(getattr(self, "agent_max_upload_workers", 0) or 0))
         counts["uploadWorkerCapacity"] = upload_capacity
         counts["uploadBacklog"] = max(0, int(counts.get("uploading", 0)) - upload_capacity)
@@ -16339,7 +16346,7 @@ class DependencyAgent:
         )
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
-            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxUploadWorkers=%d restartComfyAfterSuccessfulJob=%s restartComfyAfterFailedJob=%s miningOnly=%s",
+            "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxPrefetchWorkers=%d maxUploadWorkers=%d restartComfyAfterSuccessfulJob=%s restartComfyAfterFailedJob=%s miningOnly=%s",
             "yes" if self.agent_control_enabled else "no",
             self.agent_poll_seconds,
             self.agent_heartbeat_seconds,
@@ -16353,6 +16360,7 @@ class DependencyAgent:
             self.agent_local_comfy_base_url,
             self.agent_local_readiness_file,
             int(self.agent_max_execute_workers),
+            int(self.agent_max_prefetch_workers),
             int(self.agent_max_upload_workers),
             "yes" if self.restart_comfy_after_successful_job else "no",
             "yes" if self.restart_comfy_after_failed_job else "no",
@@ -16382,8 +16390,9 @@ class DependencyAgent:
 
         dep_executor = ThreadPoolExecutor(max_workers=self.max_parallel)
         dep_inflight: Set[Future[None]] = set()
-        agent_aux_workers = max(2, int(self.agent_max_execute_workers))
-        self._agent_prefetch_executor = ThreadPoolExecutor(max_workers=agent_aux_workers)
+        self._agent_prefetch_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(self.agent_max_prefetch_workers)),
+        )
         self._agent_execute_executor = ThreadPoolExecutor(max_workers=max(1, int(self.agent_max_execute_workers)))
         self._agent_upload_executor = ThreadPoolExecutor(max_workers=max(1, int(self.agent_max_upload_workers)))
         self._agent_maintenance_executor = ThreadPoolExecutor(max_workers=1)
