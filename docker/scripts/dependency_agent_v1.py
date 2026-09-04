@@ -142,7 +142,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.178"
+AGENT_VERSION = "dm-agent-py/0.10.179"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -13399,16 +13399,49 @@ class DependencyAgent:
         self, lease: AgentExecuteLease, prefetched_inputs: List[Dict[str, Any]],
     ) -> Tuple[Dict[str, Any], Set[str]]:
         workflow = self._parse_workflow_from_payload(lease.payload)
-        if self.server_type == "image_gen_v1" and lease.payload.get("imageReferenceInputs"):
+        if self.server_type == "image_gen_v1":
             workflow = json.loads(json.dumps(workflow))
         return workflow, self._prepare_image_reference_inputs(workflow, lease, prefetched_inputs)
+
+    def _infer_image_reference_inputs(self, workflow: Dict[str, Any], prefetched_inputs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        """Compatibility with dispatchers that forward inputs but not the new mapping."""
+        names = {}
+        for entry in prefetched_inputs:
+            name = entry.get("name")
+            match = re.fullmatch(r"imgref_[a-f0-9]{16}_([a-f0-9]{32})\.[a-z0-9]+", name or "")
+            if match:
+                names[match.group(1)] = name
+        rows = []
+        for node_id, node in workflow.items():
+            if not isinstance(node, dict) or node.get("class_type") != "EZLoadImgFromUrlNode":
+                continue
+            inputs = node.get("inputs")
+            url = inputs.get("url") if isinstance(inputs, dict) else None
+            if not isinstance(url, str) or len(url) > 8192:
+                continue
+            try:
+                parsed = urllib.parse.urlparse(url)
+                allowed = parsed.scheme == "https" and parsed.netloc == "furgenai.b-cdn.net" and not parsed.fragment
+            except ValueError:
+                continue
+            if not allowed:
+                continue
+            digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+            name = names.get(digest[:32])
+            if name:
+                rows.append({"nodeId": str(node_id), "fileName": name, "sourceUrlSha256": digest})
+                if len(rows) >= 16:
+                    break
+        return rows
 
     def _prepare_image_reference_inputs(
         self, workflow: Dict[str, Any], lease: AgentExecuteLease, prefetched_inputs: List[Dict[str, Any]],
     ) -> Set[str]:
         """Bind prefetched bytes without changing the installed image/mask decoder."""
-        rows = lease.payload.get("imageReferenceInputs")
-        if not rows or getattr(self, "server_type", "") != "image_gen_v1":
+        if getattr(self, "server_type", "") != "image_gen_v1":
+            return set()
+        rows = lease.payload.get("imageReferenceInputs") or self._infer_image_reference_inputs(workflow, prefetched_inputs)
+        if not rows:
             return set()
         if not isinstance(rows, list) or len(rows) > 16:
             raise RuntimeError("invalid_image_reference_inputs")
