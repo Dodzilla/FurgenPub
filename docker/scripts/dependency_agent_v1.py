@@ -142,7 +142,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.176"
+AGENT_VERSION = "dm-agent-py/0.10.178"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -4485,6 +4485,7 @@ class ComfyNodeTimingCollector:
         prompt_id: str,
         workflow: Dict[str, Any],
         max_rows: int = MAX_COMFY_NODE_TIMING_ROWS,
+        include_titles: bool = True,
     ) -> None:
         self.base_url = str(base_url or "").rstrip("/")
         self.client_id = str(client_id)
@@ -4497,7 +4498,7 @@ class ComfyNodeTimingCollector:
             node_id = str(raw_id)[:64]
             class_type = str(raw_node.get("class_type") or "")[:96]
             meta = raw_node.get("_meta") if isinstance(raw_node.get("_meta"), dict) else {}
-            title = str(meta.get("title") or "")[:96]
+            title = str(meta.get("title") or "")[:96] if include_titles else ""
             self._node_meta[node_id] = {
                 "classType": class_type,
                 "title": title,
@@ -5015,7 +5016,7 @@ class DependencyAgent:
         )
         self.comfy_node_timing_enabled = _env_bool(
             "DM_COMFY_NODE_TIMING_ENABLED",
-            self.server_type in ("video_gen_v3", "video_gen_v4"),
+            self.server_type in ("video_gen_v3", "video_gen_v4", "image_gen_v1"),
         )
         self.comfy_node_timing_max_rows = max(
             1,
@@ -12815,6 +12816,7 @@ class DependencyAgent:
     def _cleanup_agent_lease(self, lease: AgentExecuteLease) -> None:
         tmp_root = Path(lease.tmp_root) if isinstance(lease.tmp_root, str) and lease.tmp_root else None
         self._release_comfy_gpu_lease(lease, "execute_job_cleanup", keep_warm=False)
+        self._release_image_reference_inputs(lease)
         self._finish_active_lease(lease.item_id)
         self._resume_idle_prl_mining_if_idle("execute_job_complete")
         self._request_agent_queue_poll()
@@ -13034,8 +13036,9 @@ class DependencyAgent:
                 prompt_id=prompt_id,
                 workflow=workflow,
                 max_rows=int(getattr(self, "comfy_node_timing_max_rows", MAX_COMFY_NODE_TIMING_ROWS)),
+                include_titles=getattr(self, "server_type", "") != "image_gen_v1",
             )
-            if collector.start(timeout_seconds=3.0):
+            if collector.start(timeout_seconds=0.5 if getattr(self, "server_type", "") == "image_gen_v1" else 3.0):
                 return collector
         except Exception as exc:
             logging.debug("Comfy node timing setup failed open for prompt %s: %s", prompt_id, exc)
@@ -13391,6 +13394,73 @@ class DependencyAgent:
         finally:
             with self._lock:
                 self._input_cache_downloading.discard(cache_key)
+
+    def _workflow_with_image_references(
+        self, lease: AgentExecuteLease, prefetched_inputs: List[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Any], Set[str]]:
+        workflow = self._parse_workflow_from_payload(lease.payload)
+        if self.server_type == "image_gen_v1" and lease.payload.get("imageReferenceInputs"):
+            workflow = json.loads(json.dumps(workflow))
+        return workflow, self._prepare_image_reference_inputs(workflow, lease, prefetched_inputs)
+
+    def _prepare_image_reference_inputs(
+        self, workflow: Dict[str, Any], lease: AgentExecuteLease, prefetched_inputs: List[Dict[str, Any]],
+    ) -> Set[str]:
+        """Bind prefetched bytes without changing the installed image/mask decoder."""
+        rows = lease.payload.get("imageReferenceInputs")
+        if not rows or getattr(self, "server_type", "") != "image_gen_v1":
+            return set()
+        if not isinstance(rows, list) or len(rows) > 16:
+            raise RuntimeError("invalid_image_reference_inputs")
+        cached = {entry.get("name"): entry.get("cache_path") for entry in prefetched_inputs}
+        base_url = self._resolve_local_comfy_base_url(force_refresh=False, timeout_seconds=3.0).rstrip("/")
+        skipped: Set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RuntimeError("invalid_image_reference_input")
+            node_id, name, source_digest = row.get("nodeId"), row.get("fileName"), row.get("sourceUrlSha256")
+            node = workflow.get(node_id) if isinstance(node_id, str) else None
+            if (not isinstance(name, str) or not re.fullmatch(r"imgref_[a-f0-9]{16}_[a-f0-9]{32}\.[a-z0-9]+", name)
+                    or not isinstance(source_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", source_digest)
+                    or not isinstance(node, dict) or node.get("class_type") != "EZLoadImgFromUrlNode"):
+                raise RuntimeError("invalid_image_reference_binding")
+            inputs = node.get("inputs")
+            original_url = inputs.get("url") if isinstance(inputs, dict) else None
+            if not isinstance(original_url, str) or hashlib.sha256(original_url.encode("utf-8")).hexdigest() != source_digest:
+                raise RuntimeError("image_reference_source_mismatch")
+            source = cached.get(name)
+            if not isinstance(source, str) or not Path(source).is_file():
+                raise RuntimeError("image_reference_not_prefetched")
+            digest = hashlib.sha256()
+            with open(source, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            # Stable content identity preserves Comfy's warm decoded-image cache,
+            # while job-scoped download identity avoids stale mutable URL bytes.
+            content_name = f"imgref_content_{digest.hexdigest()}.img"
+            with self._lock:
+                users = getattr(self, "_image_reference_users", None)
+                if users is None:
+                    users = self._image_reference_users = {}
+                self._copy_input_to_comfy(Path(source), content_name)
+                users.setdefault(content_name, set()).add(lease.item_id)
+            inputs["url"] = f"{base_url}/view?{urllib.parse.urlencode({'filename': content_name, 'type': 'input'})}"
+            skipped.add(name)
+        return skipped
+
+    def _release_image_reference_inputs(self, lease: AgentExecuteLease) -> None:
+        with self._lock:
+            users = getattr(self, "_image_reference_users", {})
+            for name, owners in list(users.items()):
+                owners.discard(lease.item_id)
+                if not owners:
+                    # Only worker-owned bindings; source cache and user inputs remain.
+                    if re.fullmatch(r"imgref_content_[a-f0-9]{64}\.img", name):
+                        try:
+                            (self.comfyui_dir / "input" / name).unlink(missing_ok=True)
+                        except OSError:
+                            logging.warning("Unable to clean image reference input binding")
+                    users.pop(name, None)
 
     def _copy_input_to_comfy(self, source_path: Path, desired_name: str) -> Path:
         safe_name = os.path.basename(desired_name) or f"input_{uuid.uuid4().hex}"
@@ -15716,16 +15786,18 @@ class DependencyAgent:
                 active = self._active_exec_by_item.get(lease.item_id)
                 prefetched_inputs = list(active.prefetched_inputs) if active else list(lease.prefetched_inputs)
 
+            workflow, image_reference_names = self._workflow_with_image_references(lease, prefetched_inputs)
             for entry in prefetched_inputs:
                 cache_path = entry.get("cache_path")
                 input_name = entry.get("name")
+                if input_name in image_reference_names:
+                    continue
                 if not isinstance(cache_path, str) or not cache_path:
                     continue
                 if not isinstance(input_name, str) or not input_name:
                     input_name = f"input_{uuid.uuid4().hex}"
                 self._copy_input_to_comfy(Path(cache_path), input_name)
 
-            workflow = self._parse_workflow_from_payload(lease.payload)
             require_start_ack = self._require_comfy_start_ack()
             self._ensure_runtime_assets_for_workflow(workflow)
             _agent_stage(lease, "prepare_finished")
