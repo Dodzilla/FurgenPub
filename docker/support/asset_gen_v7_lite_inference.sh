@@ -110,21 +110,18 @@ import sys
 
 path = Path(sys.argv[1])
 source = path.read_text(encoding="utf-8")
+prefix = "/venv/main/lib/python3.12/site-packages/nvidia/cu13/lib:"
 old = (
-    "/venv/main/lib:/venv/main/lib/python3.12/site-packages/torch/lib:"
-    "/opt/miniforge3/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:"
-    "/venv/main/lib/python3.12/site-packages/nvidia/cu13/lib"
-)
-new = (
-    "/venv/main/lib/python3.12/site-packages/nvidia/cu13/lib:"
     "/venv/main/lib:/venv/main/lib/python3.12/site-packages/torch/lib:"
     "/opt/miniforge3/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
 )
-old_cuda12 = old.replace("nvidia/cu13/lib", "nvidia/cublas/lib")
-if old in source or old_cuda12 in source:
-    path.write_text(source.replace(old, new).replace(old_cuda12, new), encoding="utf-8")
+new = prefix + old
+if new in source:
+    pass
+elif old in source:
+    path.write_text(source.replace(old, new), encoding="utf-8")
     print("Pinned ComfyUI to PyTorch's bundled CUDA 13 CUBLAS runtime.")
-elif new not in source:
+else:
     raise SystemExit("ERROR: Unrecognized ComfyUI LD_LIBRARY_PATH bootstrap; refusing a mixed CUBLAS runtime.")
 PY
 
