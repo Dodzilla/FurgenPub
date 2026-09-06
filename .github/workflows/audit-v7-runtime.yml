@@ -1,0 +1,22 @@
+name: Audit V7 runtime footprint
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect public runtime without models or credentials
+        run: |
+          set -euo pipefail
+          image=ghcr.io/dodzilla/furgen-vast-v7@sha256:6be7200c7b53fe79f4d3b5b09dd5f86372a4e2d25c4891b08cc7806db7c7f5d2
+          docker pull "$image"
+          docker run --rm --entrypoint /bin/bash "$image" -c '
+            du -xhd1 / /opt /usr/local /venv/main/lib/python3.12/site-packages 2>/dev/null | sort -h
+            /venv/main/bin/python -m pip list
+            dpkg-query -W -f="\${Installed-Size}\t\${Package}\n" | sort -n | tail -n 50
+            ldd /opt/furgen/v7/llama-build/bin/llama-server
+            find /opt/furgen/v7/llama-build/bin -maxdepth 1 -type f -printf "%f %s\n"
+          '
