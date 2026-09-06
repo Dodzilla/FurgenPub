@@ -26,6 +26,11 @@ download_support_file() {
 }
 
 ensure_comfy_core() {
+    if [[ "${FURGEN_REQUIRE_PREBUILT_V7:-false}" == "true" ]]; then
+        /venv/main/bin/python /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py verify --comfy "${DM_COMFYUI_DIR}"
+        download_support_file asset_gen_v7_lite_comfy_kitchen.sh "${KITCHEN_SCRIPT}"
+        return 0
+    fi
     if ! command -v git >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update

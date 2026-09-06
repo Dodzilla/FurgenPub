@@ -71,6 +71,17 @@ build_llama_server() {
     if [[ -x "${LLAMA_SERVER}" && -f "${LLAMA_BUILD}/furgen-commit-${LLAMA_CPP_COMMIT}-cuda-${cuda_version}" ]]; then
         return 0
     fi
+    local baked="/opt/furgen/v7/llama-build"
+    if [[ "${cuda_version}" == "13.0" && -x "${baked}/bin/llama-server" && -f "${baked}/furgen-commit-${LLAMA_CPP_COMMIT}-cuda-${cuda_version}" ]]; then
+        LLAMA_BUILD="${baked}"
+        LLAMA_SERVER="${baked}/bin/llama-server"
+        echo "Using image-baked llama-server; no rental-time compilation."
+        return 0
+    fi
+    if [[ "${FURGEN_REQUIRE_PREBUILT_V7:-false}" == "true" ]]; then
+        echo "ERROR: Production v7 image is missing its pinned native binary; rebuild the image." >&2
+        return 1
+    fi
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     # Keep compiler and CUBLAS on the template-selected CUDA minor version.
