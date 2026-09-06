@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 
-BUNDLES = ['asset_gen_v5_runtime_helpers', 'asset_gen_v5_flux_image', 'asset_gen_v5_omnivoice', 'asset_gen_v7_lite_breeze_tts2']
+BUNDLES = ['asset_gen_v5_runtime_helpers', 'asset_gen_v5_flux_image', 'asset_gen_v7_lite_breeze_tts2']
 CORE = 'e01fb4c56b7a88149d469b99cbbfe3223d715054'
 PACKAGES = {'torch': '2.10.0+cu130', 'torchvision': '0.25.0+cu130', 'torchaudio': '2.10.0+cu130',
             'transformers': '5.3.0', 'comfy-kitchen': '0.2.31', 'comfy-aimdo': '0.4.13'}
@@ -32,7 +32,7 @@ def snapshot(root, runtime):
     for name, version in PACKAGES.items():
         assert installed.get(name) == version, f'Framework mismatch: {name}'
     nodes = {p.name: head(p) for p in (root / 'custom_nodes').iterdir() if (p / '.git').exists()}
-    required_nodes = {'easy-comfy-nodes-async', 'ComfyUI_essentials', 'ComfyUI-NAG', 'ComfyUI_Comfyroll_CustomNodes', 'was-node-suite-comfyui', 'ComfyUI-OmniVoice-TTS', 'ComfyUI-Breeze-TTS-2'}
+    required_nodes = {'easy-comfy-nodes-async', 'ComfyUI_essentials', 'ComfyUI-NAG', 'ComfyUI_Comfyroll_CustomNodes', 'was-node-suite-comfyui', 'ComfyUI-Breeze-TTS-2'}
     assert required_nodes <= nodes.keys(), 'Missing baked custom nodes'
     binaries = {str(p.relative_to(runtime)): sha(p) for p in (runtime / 'llama-build/bin').iterdir() if p.is_file()}
     assert 'llama-build/bin/llama-server' in binaries, 'Missing llama-server'
