@@ -351,6 +351,17 @@ PY
 }
 
 function provisioning_install_selected_node_bundles() {
+    if [[ "${SERVER_TYPE:-}" == "asset_gen_v7_lite" && "${FURGEN_REQUIRE_PREBUILT_V7:-false}" == "true" ]]; then
+        local bundle_id
+        local -a baked_bundle_ids=()
+        for bundle_id in "${SELECTED_NODE_BUNDLE_IDS[@]}"; do
+            bundle_ignored "${bundle_id}" || baked_bundle_ids+=("${bundle_id}")
+        done
+        /venv/main/bin/python /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py verify \
+            --comfy "${COMFYUI_DIR}" "${baked_bundle_ids[@]}" || return 1
+        printf "Using verified image-baked node bundles; no rental-time package installation.\n"
+        return 0
+    fi
     if [[ "${ASSET_GEN_V5_INSTALL_MODE}" == "legacy_all" ]]; then
         NODES=("${ALL_NODES[@]}")
     else
@@ -360,12 +371,6 @@ function provisioning_install_selected_node_bundles() {
     load_node_pins_from_env
     validate_required_repo_pins || return 1
 
-    if [[ "${SERVER_TYPE:-}" == "asset_gen_v7_lite" && "${FURGEN_REQUIRE_PREBUILT_V7:-false}" == "true" ]]; then
-        /venv/main/bin/python /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py verify \
-            --comfy "${COMFYUI_DIR}" "${SELECTED_NODE_BUNDLE_IDS[@]}" || return 1
-        printf "Using verified image-baked node bundles; no rental-time package installation.\n"
-        return 0
-    fi
     if [[ ${#NODES[@]} -gt 0 ]]; then
         provisioning_get_nodes || return 1
     else
