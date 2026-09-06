@@ -147,7 +147,9 @@ def validate_admission_claim(server_type, ticket_id, claim_token, request_id):
             "claim_token": claim_token,
             "request_id": request_id,
         },
-        timeout=5,
+        # A freshly scaled validation Function can take more than five seconds
+        # to start. Keep validation fail-closed while allowing that cold start.
+        timeout=30,
         authorize_backend=True,
     )
     try:
