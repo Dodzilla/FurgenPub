@@ -2,10 +2,10 @@
 FROM ghcr.io/dodzilla/furgen-vast-v7@sha256:6be7200c7b53fe79f4d3b5b09dd5f86372a4e2d25c4891b08cc7806db7c7f5d2 AS slim
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 COPY remove-obsolete-cuda.py /opt/furgen/v7/remove-obsolete-cuda.py
-RUN /venv/main/bin/python /opt/furgen/v7/remove-obsolete-cuda.py && \
+RUN /venv/main/bin/python /opt/furgen/v7/remove-obsolete-cuda.py --manifest /opt/furgen/v7/manifest.json && \
     /venv/main/bin/python -c 'import torch; assert torch.version.cuda == "13.0"; print(torch.ones(1))'
 RUN mapfile -t obsolete < <(dpkg-query -W -f='${Package}\n' | grep -E '(-12-9$|^libcublas-dev-13-0$|^cuda-nvcc-13-0$|^cuda-cccl-13-0$|^libnvvm-13-0$|^libnvptxcompiler-13-0$)') && \
-    apt-get purge -y "${obsolete[@]}" && apt-get clean && \
+    apt-mark manual cuda-cudart-13-0 libcublas-13-0 && apt-get purge -y "${obsolete[@]}" && apt-get clean && \
     /venv/main/bin/python -c 'import torch, torchvision, torchaudio, transformers; assert torch.version.cuda == "13.0"' && \
     ldd /opt/furgen/v7/llama-build/bin/llama-server > /tmp/llama-linkage.txt && \
     ! grep 'not found' /tmp/llama-linkage.txt | grep -v 'libcuda.so.1' && \
