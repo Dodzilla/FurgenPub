@@ -108,6 +108,7 @@ from __future__ import annotations
 import ast
 import base64
 from collections import deque
+from contextlib import contextmanager
 import hashlib
 import http.client
 import ipaddress
@@ -142,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.179"
+AGENT_VERSION = "dm-agent-py/0.10.180"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -1434,7 +1435,52 @@ def _control_urlopen(req, timeout):
 
 
 def _agent_stage(lease, stage):
-    logging.info("Agent stage jobId=%s stage=%s atMs=%d", getattr(lease, "job_id", "unknown"), stage, _now_ms())
+    elapsed_ms = _agent_timing_elapsed_ms(lease)
+    if hasattr(lease, "timing_lock"):
+        with lease.timing_lock:
+            lease.timing_stages.setdefault(stage, elapsed_ms)
+    logging.info(
+        "Agent stage jobId=%s stage=%s atMs=%d attempt=%d epoch=%d elapsedMs=%d",
+        getattr(lease, "job_id", "unknown"), stage, _now_ms(),
+        getattr(lease, "execution_attempt", 0), getattr(lease, "attempt_epoch", 0), elapsed_ms,
+    )
+
+
+def _agent_timing_elapsed_ms(lease):
+    started = getattr(lease, "timing_started_ns", None)
+    return max(0, (time.monotonic_ns() - started) // 1_000_000) if started is not None else 0
+
+
+@contextmanager
+def _agent_timing_span(lease, key):
+    started = time.monotonic_ns()
+    try:
+        yield
+    finally:
+        if hasattr(lease, "timing_lock"):
+            elapsed = max(0, time.monotonic_ns() - started)
+            with lease.timing_lock:
+                lease.timing_durations_ns[key] = lease.timing_durations_ns.get(key, 0) + elapsed
+
+
+def _agent_timing_count(lease, key, count=1):
+    if hasattr(lease, "timing_lock"):
+        with lease.timing_lock:
+            lease.timing_counters[key] = lease.timing_counters.get(key, 0) + max(0, int(count))
+
+
+def _agent_worker_timing(lease):
+    if not hasattr(lease, "timing_lock"):
+        return None
+    with lease.timing_lock:
+        return {
+            "version": 1, "clock": "monotonic",
+            "executionAttempt": lease.execution_attempt, "attemptEpoch": lease.attempt_epoch,
+            "elapsedMs": _agent_timing_elapsed_ms(lease),
+            "stages": dict(lease.timing_stages),
+            "durationsMs": {key: value // 1_000_000 for key, value in lease.timing_durations_ns.items()},
+            "counters": dict(lease.timing_counters),
+        }
 
 
 def api_json(
@@ -3252,6 +3298,12 @@ class AgentExecuteLease:
     gpu_coordinator_lease: Optional[GPUCoordinatorLease] = None
     gpu_admission_ticket_id: Optional[str] = None
     gpu_admission_claim_token: Optional[str] = None
+    timing_started_ns: int = field(default_factory=time.monotonic_ns, repr=False)
+    timing_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    timing_stages: Dict[str, int] = field(default_factory=lambda: {"lease_received": 0}, repr=False)
+    timing_durations_ns: Dict[str, int] = field(default_factory=dict, repr=False)
+    timing_counters: Dict[str, int] = field(default_factory=dict, repr=False)
+    timing_event_envelopes: Dict[Tuple[int, str], Dict[str, Any]] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -12292,6 +12344,29 @@ class DependencyAgent:
         if not self._resolved_instance_id:
             raise RuntimeError("Cannot emit event without resolved instanceId")
         event_payload = dict(payload) if isinstance(payload, dict) else {}
+        # Response loss retries an identical eventVersion/digest. Freeze clock
+        # diagnostics per event, while later event versions get fresh snapshots.
+        event_key = (int(event_version), event_type)
+        with lease.timing_lock:
+            diagnostics = lease.timing_event_envelopes.get(event_key)
+        if diagnostics is None:
+            diagnostics = {"workerTiming": _agent_worker_timing(lease)}
+            if self._coalesce_agent_lifecycle_events(lease) and int(lease.prompt_submitted_at_ms or 0) > 0:
+                diagnostics["coalescedLifecycle"] = self._coalesced_agent_lifecycle_payload(lease)
+            with lease.timing_lock:
+                diagnostics = lease.timing_event_envelopes.setdefault(event_key, diagnostics)
+                # Concurrent upload/commit events can overlap; retain a bounded
+                # retry window without retaining diagnostics for the entire job.
+                while len(lease.timing_event_envelopes) > 16:
+                    del lease.timing_event_envelopes[next(iter(lease.timing_event_envelopes))]
+        if event_type in {"inputs_ready", "execution_started", "output_commit_started",
+                          "job_completed", "job_failed", "job_cancelled"}:
+            timing = diagnostics["workerTiming"]
+            if timing is not None:
+                supplied = event_payload.get("agentTiming")
+                event_payload["agentTiming"] = {
+                    **(supplied if isinstance(supplied, dict) else {}), "workerTiming": timing,
+                }
         if (
             self._coalesce_agent_lifecycle_events(lease)
             and int(lease.prompt_submitted_at_ms or 0) > 0
@@ -12303,7 +12378,8 @@ class DependencyAgent:
                 "job_cancelled",
             }
         ):
-            event_payload.setdefault("coalescedLifecycle", self._coalesced_agent_lifecycle_payload(lease))
+            if "coalescedLifecycle" in diagnostics:
+                event_payload.setdefault("coalescedLifecycle", diagnostics["coalescedLifecycle"])
 
         body: Dict[str, Any] = {
             "schemaVersion": 1,
@@ -13337,7 +13413,10 @@ class DependencyAgent:
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         while True:
-            if self._is_cached_input_valid(cache_path, row):
+            with _agent_timing_span(lease, "cacheLookup"):
+                cached_valid = self._is_cached_input_valid(cache_path, row)
+            if cached_valid:
+                _agent_timing_count(lease, "inputCacheHit")
                 self._touch_input_cache_path(cache_path)
                 return {
                     "name": name,
@@ -13357,26 +13436,34 @@ class DependencyAgent:
                     self._input_cache_downloading.add(cache_key)
                     should_download = True
             if should_download:
+                _agent_timing_count(lease, "inputCacheMiss")
                 break
-            time.sleep(0.2)
+            with _agent_timing_span(lease, "cacheSharedWait"):
+                time.sleep(0.2)
 
         try:
-            self._agent_maybe_refresh_urls(lease, lease.command_state, force=False)
+            with _agent_timing_span(lease, "inputUrlRefresh"):
+                self._agent_maybe_refresh_urls(lease, lease.command_state, force=False)
             download_url = row.get("downloadUrl")
             if not isinstance(download_url, str) or not download_url:
                 raise RuntimeError(f"Input file #{idx} missing downloadUrl")
 
-            self._prune_input_cache(self._input_cache_expected_size_bytes(row))
+            with _agent_timing_span(lease, "inputCachePrune"):
+                self._prune_input_cache(self._input_cache_expected_size_bytes(row))
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             partial = tmp_dir / f"{cache_key}.{uuid.uuid4().hex}.partial"
             try:
-                http_download_to_file(
-                    download_url,
-                    partial,
-                    timeout_seconds=float(self.download_timeout_seconds),
-                    chunk_size=int(self.download_chunk_size),
-                )
-                if not self._is_cached_input_valid(partial, row):
+                with _agent_timing_span(lease, "inputDownload"):
+                    http_download_to_file(
+                        download_url,
+                        partial,
+                        timeout_seconds=float(self.download_timeout_seconds),
+                        chunk_size=int(self.download_chunk_size),
+                    )
+                _agent_timing_count(lease, "inputDownloadBytes", partial.stat().st_size)
+                with _agent_timing_span(lease, "inputValidation"):
+                    downloaded_valid = self._is_cached_input_valid(partial, row)
+                if not downloaded_valid:
                     raise RuntimeError(f"input_cache_validation_failed for {name}")
                 os.replace(str(partial), str(cache_path))
             finally:
@@ -15267,7 +15354,8 @@ class DependencyAgent:
                         terminal_sent = True
                         return
 
-                    verified = self._verified_installed_dep_ids_for_execution(required_dep_ids)
+                    with _agent_timing_span(lease, "dependencyVerification"):
+                        verified = self._verified_installed_dep_ids_for_execution(required_dep_ids)
                     missing = [dep for dep in required_dep_ids if dep not in verified]
                     if not missing:
                         break
@@ -15287,7 +15375,9 @@ class DependencyAgent:
                     if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= self.agent_waiting_deps_event_ms:
                         emit_best_effort("waiting_dependencies", {"missingDepIds": missing[:200]})
                         last_wait_emit_ms = now_ms
-                    time.sleep(self.agent_dependency_wait_poll_seconds)
+                    _agent_timing_count(lease, "dependencyWaitPolls")
+                    with _agent_timing_span(lease, "dependencyWait"):
+                        time.sleep(self.agent_dependency_wait_poll_seconds)
 
             if self._is_cancel_requested(lease):
                 self._comfy_interrupt()
@@ -15714,7 +15804,8 @@ class DependencyAgent:
                         terminal_sent = True
                         return
 
-                    verified = self._verified_installed_dep_ids_for_execution(required_dep_ids)
+                    with _agent_timing_span(lease, "dependencyVerification"):
+                        verified = self._verified_installed_dep_ids_for_execution(required_dep_ids)
                     missing = [dep for dep in required_dep_ids if dep not in verified]
                     if not missing:
                         break
@@ -15735,7 +15826,9 @@ class DependencyAgent:
                     if last_wait_emit_ms == 0 or now_ms - last_wait_emit_ms >= self.agent_waiting_deps_event_ms:
                         self._emit_agent_event_best_effort(lease, "waiting_dependencies", {"missingDepIds": missing[:200]})
                         last_wait_emit_ms = now_ms
-                    time.sleep(self.agent_dependency_wait_poll_seconds)
+                    _agent_timing_count(lease, "dependencyWaitPolls")
+                    with _agent_timing_span(lease, "dependencyWait"):
+                        time.sleep(self.agent_dependency_wait_poll_seconds)
 
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
@@ -15747,7 +15840,8 @@ class DependencyAgent:
                 _agent_stage(lease, "inputs_ready")
                 self._enqueue_ready_locked(active)
             retain_lease = True
-            self._stop_idle_prl_mining_for_work("execute_job")
+            with _agent_timing_span(lease, "miningStop"):
+                self._stop_idle_prl_mining_for_work("execute_job")
             if not self._coalesce_agent_lifecycle_events(lease):
                 try:
                     self._emit_agent_event_best_effort(lease, "inputs_ready", None)
@@ -15829,10 +15923,12 @@ class DependencyAgent:
                     continue
                 if not isinstance(input_name, str) or not input_name:
                     input_name = f"input_{uuid.uuid4().hex}"
-                self._copy_input_to_comfy(Path(cache_path), input_name)
+                with _agent_timing_span(lease, "inputPreparation"):
+                    self._copy_input_to_comfy(Path(cache_path), input_name)
 
             require_start_ack = self._require_comfy_start_ack()
-            self._ensure_runtime_assets_for_workflow(workflow)
+            with _agent_timing_span(lease, "inputPreparation"):
+                self._ensure_runtime_assets_for_workflow(workflow)
             _agent_stage(lease, "prepare_finished")
 
             tts_metadata = None
@@ -15846,21 +15942,25 @@ class DependencyAgent:
                     tts_metadata = {"tts": {**tts_profile, "requestId": uuid.uuid4().hex}}
 
             try:
-                admission_claim_token = self._wait_for_comfy_gpu_admission(
-                    lease,
-                    estimated_duration_ms=max(1, execution_timeout_sec) * 1000,
-                )
+                with _agent_timing_span(lease, "gpuAdmission"):
+                    admission_claim_token = self._wait_for_comfy_gpu_admission(
+                        lease,
+                        estimated_duration_ms=max(1, execution_timeout_sec) * 1000,
+                    )
                 _agent_stage(lease, "admission_claimed")
-                self._stop_idle_prl_mining_for_work("execute_job")
-                lease.gpu_coordinator_lease = self._acquire_gpu_lease(
-                    "comfy",
-                    lease.job_id,
-                    metadata_provider=self._comfy_gpu_process_metadata,
-                    admission_ticket_id=lease.gpu_admission_ticket_id,
-                    admission_claim_token=admission_claim_token,
-                    **({"workload_metadata": tts_metadata} if tts_metadata else {}),
-                )
+                with _agent_timing_span(lease, "miningStop"):
+                    self._stop_idle_prl_mining_for_work("execute_job")
+                with _agent_timing_span(lease, "gpuAcquire"):
+                    lease.gpu_coordinator_lease = self._acquire_gpu_lease(
+                        "comfy",
+                        lease.job_id,
+                        metadata_provider=self._comfy_gpu_process_metadata,
+                        admission_ticket_id=lease.gpu_admission_ticket_id,
+                        admission_claim_token=admission_claim_token,
+                        **({"workload_metadata": tts_metadata} if tts_metadata else {}),
+                    )
             except GPUCoordinatorBusy as exc:
+                _agent_timing_count(lease, "gpuAcquireRetries")
                 self._release_comfy_gpu_admission(lease, "gpu_handoff_busy")
                 self._defer_ready_lease_for_gpu_coordinator(
                     lease,
@@ -15870,6 +15970,7 @@ class DependencyAgent:
                 retain_lease = True
                 return
             except GPUCoordinatorUnavailable as exc:
+                _agent_timing_count(lease, "gpuAcquireRetries")
                 self._release_comfy_gpu_admission(lease, "gpu_handoff_unavailable")
                 self._defer_ready_lease_for_gpu_coordinator(lease, 5.0, str(exc))
                 retain_lease = True
