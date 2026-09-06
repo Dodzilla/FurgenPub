@@ -93,6 +93,7 @@ env SERVER_TYPE="${SERVER_TYPE}" DM_LOCAL_READINESS_FILE="${DM_LOCAL_READINESS_F
     COMFYUI_PIN_COMMIT="${COMFYUI_PIN_COMMIT}" \
     ASSET_GEN_V5_IGNORED_BUNDLE_IDS="${ASSET_GEN_V5_IGNORED_BUNDLE_IDS}" \
     DM_ASSET_GEN_V5_LITE_SCRIPT="${BASE_SCRIPT}" bash "${BASE_SCRIPT}" start
+rm -f "${READINESS_PATH}"
 bash "${KITCHEN_SCRIPT}" configure-launcher
 
 echo "Waiting for the pinned Qwen model and vision projector dependencies..."
@@ -124,6 +125,24 @@ bash "${INFERENCE_SCRIPT}"
 
 curl -fsS "${DM_LOCAL_COMFY_BASE_URL}/system_stats" >/dev/null
 curl -fsS "http://127.0.0.1:8080/health" >/dev/null
+if [[ "${FURGEN_REQUIRE_PREBUILT_V7:-false}" == "true" ]]; then
+    /venv/main/bin/python /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py verify --comfy "${DM_COMFYUI_DIR}"
+    /venv/main/bin/python - <<'PY'
+import hashlib, json, os, urllib.request
+from pathlib import Path
+with urllib.request.urlopen(os.environ['DM_LOCAL_COMFY_BASE_URL'] + '/object_info', timeout=30) as response:
+    classes = list(json.load(response))
+payload = {'instanceId': os.environ.get('DM_INSTANCE_ID') or os.environ['CONTAINER_ID'],
+           'manifestSha256': hashlib.sha256(Path('/opt/furgen/v7/manifest.json').read_bytes()).hexdigest(),
+           'verifiedClassTypes': classes}
+request = urllib.request.Request(os.environ['FCS_API_BASE_URL'].rstrip('/') + '/provisioning/prebuilt-node-proof',
+    data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json',
+    'X-DM-Secret': os.environ['DEPENDENCY_MANAGER_SHARED_SECRET']}, method='POST')
+with urllib.request.urlopen(request, timeout=60) as response:
+    assert json.load(response).get('ok') is True, 'Prebuilt node proof was rejected'
+print('Registered verified image-baked node signatures before accepting jobs.')
+PY
+fi
 mkdir -p "$(dirname "${READINESS_PATH}")"
 printf 'asset_gen_v7_lite ready at %s\nmodel=%s\nsha256=%s\nllama_cpp=%s\n' \
     "$(date -u +%FT%TZ)" \
