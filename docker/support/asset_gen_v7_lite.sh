@@ -32,6 +32,10 @@ ensure_comfy_core() {
         apt-get install -y --no-install-recommends git ca-certificates
     fi
     download_support_file asset_gen_v7_lite_comfy_kitchen.sh "${KITCHEN_SCRIPT}"
+    if [[ "${FURGEN_CUDA_VERSION:-13.2}" == "13.0" ]]; then
+        download_support_file asset_gen_v7_lite_cuda130.sh "${WORKSPACE}/asset_gen_v7_lite_cuda130.sh"
+        bash "${WORKSPACE}/asset_gen_v7_lite_cuda130.sh"
+    fi
     bash "${KITCHEN_SCRIPT}" bootstrap-framework
     bash "${KITCHEN_SCRIPT}" install-core
 }

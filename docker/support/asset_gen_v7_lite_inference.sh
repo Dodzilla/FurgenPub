@@ -66,21 +66,21 @@ verify_model() {
 }
 
 build_llama_server() {
-    if [[ -x "${LLAMA_SERVER}" && -f "${LLAMA_BUILD}/furgen-commit-${LLAMA_CPP_COMMIT}" ]]; then
+    local cuda_version="${FURGEN_CUDA_VERSION:-13.2}"
+    case "${cuda_version}" in 13.0|13.2) ;; *) echo "Unsupported v7 CUDA version" >&2; return 1 ;; esac
+    if [[ -x "${LLAMA_SERVER}" && -f "${LLAMA_BUILD}/furgen-commit-${LLAMA_CPP_COMMIT}-cuda-${cuda_version}" ]]; then
         return 0
     fi
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    # The v6 CUDA 13.2 image intentionally ships the runtime libraries without
-    # nvcc. Install only the pinned CUDA compiler package needed to build the
-    # Blackwell (sm_120) llama.cpp target; avoid the much larger toolkit meta
-    # package and keep all model transfer direct from Hugging Face to Vast.
+    # Keep compiler and CUBLAS on the template-selected CUDA minor version.
+    local cuda_package="${cuda_version/./-}"
     apt-get install -y --no-install-recommends \
         build-essential ca-certificates cmake curl git ninja-build pkg-config \
-        cuda-nvcc-13-2 libcublas-dev-13-2 vmtouch
-    export CUDACXX="${CUDACXX:-/usr/local/cuda-13.2/bin/nvcc}"
+        "cuda-nvcc-${cuda_package}" "libcublas-dev-${cuda_package}" vmtouch
+    export CUDACXX="${CUDACXX:-/usr/local/cuda-${cuda_version}/bin/nvcc}"
     if [[ ! -x "${CUDACXX}" ]]; then
-        echo "ERROR: CUDA 13.2 nvcc was not installed at ${CUDACXX}." >&2
+        echo "ERROR: CUDA ${cuda_version} nvcc was not installed at ${CUDACXX}." >&2
         return 1
     fi
     if [[ ! -d "${LLAMA_REPO}/.git" ]]; then
@@ -98,7 +98,7 @@ build_llama_server() {
     jobs="$(nproc)"
     (( jobs > 8 )) && jobs=8
     cmake --build "${LLAMA_BUILD}" --target llama-server -j "${jobs}"
-    touch "${LLAMA_BUILD}/furgen-commit-${LLAMA_CPP_COMMIT}"
+    touch "${LLAMA_BUILD}/furgen-commit-${LLAMA_CPP_COMMIT}-cuda-${cuda_version}"
 }
 
 protect_comfy_cublas_resolution() {
@@ -120,8 +120,9 @@ new = (
     "/venv/main/lib:/venv/main/lib/python3.12/site-packages/torch/lib:"
     "/opt/miniforge3/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
 )
-if old in source:
-    path.write_text(source.replace(old, new), encoding="utf-8")
+old_cuda12 = old.replace("nvidia/cu13/lib", "nvidia/cublas/lib")
+if old in source or old_cuda12 in source:
+    path.write_text(source.replace(old, new).replace(old_cuda12, new), encoding="utf-8")
     print("Pinned ComfyUI to PyTorch's bundled CUDA 13 CUBLAS runtime.")
 elif new not in source:
     raise SystemExit("ERROR: Unrecognized ComfyUI LD_LIBRARY_PATH bootstrap; refusing a mixed CUBLAS runtime.")
