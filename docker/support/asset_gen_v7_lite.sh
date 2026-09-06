@@ -3,6 +3,7 @@
 set -euo pipefail
 
 export SERVER_TYPE="asset_gen_v7_lite"
+export DM_ALLOWED_DOMAINS="${DM_ALLOWED_DOMAINS:-huggingface.co,hf.co,civitai.red,civitai.com},furgen-models.b-cdn.net"
 export WORKSPACE="${WORKSPACE:-/workspace}"
 export DM_COMFYUI_DIR="${DM_COMFYUI_DIR:-${WORKSPACE}/ComfyUI}"
 export DM_LOCAL_COMFY_BASE_URL="${DM_LOCAL_COMFY_BASE_URL:-http://127.0.0.1:8188}"
