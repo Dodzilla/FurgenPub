@@ -32,6 +32,7 @@ ensure_comfy_core() {
         apt-get install -y --no-install-recommends git ca-certificates
     fi
     download_support_file asset_gen_v7_lite_comfy_kitchen.sh "${KITCHEN_SCRIPT}"
+    bash "${KITCHEN_SCRIPT}" bootstrap-framework
     bash "${KITCHEN_SCRIPT}" install-core
 }
 

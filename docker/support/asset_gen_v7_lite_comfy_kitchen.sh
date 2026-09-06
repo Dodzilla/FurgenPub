@@ -9,6 +9,37 @@ if [[ -n "${COMFYUI_PIN_COMMIT:-}" && "${COMFYUI_PIN_COMMIT}" != "${PIN}" ]]; th
     exit 1
 fi
 case "${1:-}" in
+    bootstrap-framework)
+        "${PYTHON}" - "${COMFY_DIR}" <<'PYBOOT'
+import importlib.metadata as metadata
+import pathlib
+import socket
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+pin = "5.3.0"
+if metadata.version("transformers") != pin:
+    # A fresh base image can drift. Only provision an inactive worker; an
+    # existing service must go through an explicit maintenance procedure.
+    if (root / "input/provisioned_asset_gen_v7_lite.txt").exists():
+        raise SystemExit("Refusing framework replacement on a provisioned v7 worker")
+    for port in (8080, 8188, 8189):
+        with socket.socket() as probe:
+            probe.settimeout(1)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                raise SystemExit("Refusing framework replacement while a v7 service is listening")
+    protected = ("torch", "torchaudio", "torchvision", "tokenizers", "huggingface-hub")
+    before = {name: metadata.version(name) for name in protected}
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--no-cache-dir",
+                    "transformers==" + pin], check=True)
+    if before != {name: metadata.version(name) for name in protected}:
+        raise SystemExit("Protected framework packages changed during v7 bootstrap")
+if metadata.version("transformers") != pin:
+    raise SystemExit("v7 Transformers bootstrap did not establish the reviewed pin")
+print("v7 Transformers bootstrap verified: " + pin, flush=True)
+PYBOOT
+        ;;
     install-core)
         "${PYTHON}" - "${COMFY_DIR}" "${PIN}" <<'PY'
 import importlib.metadata as metadata
