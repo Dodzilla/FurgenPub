@@ -24,9 +24,9 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          image="ghcr.io/dodzilla/furgen-vast-v7:cu130-${GITHUB_SHA}"
+          image="ghcr.io/dodzilla/furgen-vast-v7:cu130-slim-${GITHUB_SHA}"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker build --progress=plain -t "$image" docker/vast-v7-cuda130
+          docker build --progress=plain -f docker/vast-v7-cuda130/Dockerfile.slim -t "$image" docker/vast-v7-cuda130
           docker push "$image"
           docker image inspect "$image" --format '{{join .RepoDigests "\n"}}' >> "$GITHUB_STEP_SUMMARY"
           docker run --rm --entrypoint /usr/bin/sha256sum "$image" /opt/furgen/v7/manifest.json >> "$GITHUB_STEP_SUMMARY"
