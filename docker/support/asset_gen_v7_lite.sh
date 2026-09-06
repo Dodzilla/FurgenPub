@@ -132,7 +132,10 @@ import hashlib, json, os, urllib.request
 from pathlib import Path
 with urllib.request.urlopen(os.environ['DM_LOCAL_COMFY_BASE_URL'] + '/object_info', timeout=30) as response:
     classes = list(json.load(response))
-payload = {'instanceId': os.environ.get('DM_INSTANCE_ID') or os.environ['CONTAINER_ID'],
+instance_id = (os.environ.get('DM_INSTANCE_ID') or os.environ.get('CONTAINER_ID')
+               or os.environ.get('VAST_CONTAINERLABEL', '').removeprefix('C.'))
+assert instance_id.isdigit(), 'Missing numeric Vast instance ID'
+payload = {'instanceId': instance_id,
            'manifestSha256': hashlib.sha256(Path('/opt/furgen/v7/manifest.json').read_bytes()).hexdigest(),
            'verifiedClassTypes': classes}
 request = urllib.request.Request(os.environ['FCS_API_BASE_URL'].rstrip('/') + '/provisioning/prebuilt-node-proof',
