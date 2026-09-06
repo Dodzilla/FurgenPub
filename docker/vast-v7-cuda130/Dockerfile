@@ -77,7 +77,7 @@ ENV UV_PYTHON_BIN_DIR="/.uv/python_bin"
 ENV UV_PYTHON_INSTALL_DIR="/.uv/python_install"
 ENV PYTHON_VERSION="3.12"
 ENV PYTORCH_VERSION="2.10.0"
-ENV PYTORCH_BACKEND="cu128"
+ENV PYTORCH_BACKEND="cu130"
 ENV COMFYUI_ARGS="--disable-auto-launch --enable-cors-header --port 18188"
 ENV FURGEN_CUDA_VERSION="13.0"
 ENV FURGEN_REQUIRE_PREBUILT_V7="true"
@@ -85,4 +85,4 @@ RUN /venv/main/bin/python /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py verify --
 ENTRYPOINT ["/opt/instance-tools/bin/entrypoint.sh"]
 
 LABEL org.opencontainers.image.source="https://github.com/Dodzilla/FurgenPub"
-RUN sha256sum /opt/furgen/v7/manifest.json
+RUN env-hash > /.env_hash && sha256sum /opt/furgen/v7/manifest.json
