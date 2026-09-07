@@ -10,7 +10,7 @@ import subprocess
 SOURCE = "https://github.com/breezeblue-ai/breeze-tts.git"
 REVISION = "ca632ce6c4d05f7985da4eab29b1a5d445b43f7b"
 PINS = ["transformers==4.57.3", "qwen-tts==0.1.1", "tokenizers==0.22.2", "huggingface-hub==0.36.2", "sox==1.5.0", "onnxruntime==1.29.0",
-        "accelerate==1.12.0", "librosa==1.0.0", "soundfile==0.14.0", "einops==0.8.2"]
+        "soxr==0.5.0.post1", "joblib==1.5.2", "msgpack==1.1.1", "scikit-learn==1.7.2", "flatbuffers==25.9.23", "protobuf==6.32.1", "threadpoolctl==3.6.0", "accelerate==1.12.0", "librosa==1.0.0", "soundfile==0.14.0", "einops==0.8.2"]
 
 
 def run(argv):
@@ -42,6 +42,8 @@ def install(args):
     expected_pins = dict(item.split("==", 1) for item in PINS)
     if probe.returncode or json.loads(probe.stdout) != expected_pins:
         run([python, "-m", "pip", "install", "--no-deps", *PINS])
+    # A slim replacement image must not accidentally supply required imports.
+    run([python, "-c", "import librosa, soxr, qwen_tts, transformers, onnxruntime"])
     versions = subprocess.check_output([python, "-m", "pip", "freeze", "--all"], text=True)
     (root / "environment.lock.txt").write_text(versions)
     hashes = json.loads(Path(args.checkpoint_manifest).read_text())
@@ -72,7 +74,47 @@ def install(args):
     destination = root / "config.installed.json"
     destination.write_text(json.dumps(config, indent=2) + "\n")
     os.chmod(destination, 0o600)
+    if getattr(args, "production_policy", None):
+        activate_production(config, Path(args.production_policy), root)
     print(json.dumps({"installed": True, "enabled": False, "config": str(destination), "sourceRevision": REVISION}))
+
+
+def activate_production(config, policy_path, root):
+    """Only activate a measured immutable runtime/hardware policy, never guess budgets."""
+    policy = json.loads(policy_path.read_text())
+    if (policy.get("sourceRevision") != config["sourceRevision"] or
+            policy.get("packagePins") != config["packagePins"] or
+            policy.get("checkpointHashes") != config["checkpointHashes"] or
+            policy.get("version") != config["version"] or
+            policy.get("profile") != "stock" or not policy.get("measuredRuntimeFingerprint")):
+        raise RuntimeError("Production TTS policy does not match installed runtime")
+    for name, expected in policy.get("supportHashes", {}).items():
+        path = Path(__file__).with_name(name)
+        if Path(name).name != name or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise RuntimeError("Production TTS support hash mismatch")
+    if set(policy.get("supportHashes", {})) != {"asset_gen_v7_lite_tts_runtime.py", "tts_profiles.py"}:
+        raise RuntimeError("Missing production runtime source hashes")
+    probe = r"""
+import importlib.metadata as m,json,sys,torch,numpy
+from pathlib import Path
+sys.path.insert(0,str(Path(sys.argv[1]).parent))
+from tts_profiles import canonical_fingerprint_payload,fingerprint_hex
+c=json.load(open(sys.argv[1]));p=canonical_fingerprint_payload(source_revision=c['sourceRevision'],checkpoint_hashes=c['checkpointHashes'],profile=c['profile'],version=c['version'],torch_version=torch.__version__,cuda_version=torch.version.cuda,device_name=torch.cuda.get_device_name(0),device_capability=torch.cuda.get_device_capability(0),transformers_version=m.version('transformers'),qwen_tts_version=m.version('qwen-tts'),numpy_version=numpy.__version__,extra_versions={k:m.version(k) for k in c['packagePins']})
+print(json.dumps({'fingerprint':fingerprint_hex(p),'deviceCount':torch.cuda.device_count(),'vram':torch.cuda.get_device_properties(0).total_memory}))
+"""
+    # Modules live with the pinned support, not in the policy state directory.
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).parent))
+    measured = json.loads(subprocess.check_output([config["python"], "-c", probe, str(root / "config.installed.json")], env=env, text=True))
+    if measured["deviceCount"] != 1 or measured["vram"] < 31 * 1024**3 or measured["fingerprint"] != policy["measuredRuntimeFingerprint"]:
+        raise RuntimeError("Unvalidated TTS runtime/hardware; replacement cannot silently use fallback")
+    active = {**config, **{k:v for k,v in policy.items() if k not in {"supportHashes", "canaryInstanceIds"}}}
+    active.update(enabled=True, diagnosticsEnabled=False, routingApproved=True, validUntilMs=253402300799000,
+                  canaryInstanceIds=config["canaryInstanceIds"])
+    destination = root / "config.json"
+    temporary = root / "config.activate.json"
+    temporary.write_text(json.dumps(active, indent=2) + "\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, destination)
 
 
 if __name__ == "__main__":
@@ -84,4 +126,5 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--checkpoint-manifest", required=True)
     parser.add_argument("--allow-missing-checkpoint", action="store_true")
+    parser.add_argument("--production-policy")
     install(parser.parse_args())
