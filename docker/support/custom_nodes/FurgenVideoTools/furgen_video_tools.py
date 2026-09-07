@@ -2058,6 +2058,124 @@ class FurgenColorTransferMatch:
             raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
 
 
+class FurgenLevelsMatch:
+    """Match luma percentiles to a reference still, per frame.
+
+    A mean/std transfer keeps a clip's average and contrast on its anchor but
+    not the shape of its histogram: an anchored H3 continuation piles shadow
+    mass between the 2nd and 25th percentile and dims highlights while its
+    mean and std still match, and a chain of such parts drifts a few points
+    of crushed black per hop. This node maps each frame's luma percentiles
+    (a monotone knot list, default 2/10/25/50/75/90/98) onto the reference's
+    with a continuous piecewise-linear curve, so the black floor, the toe and
+    the highlight ceiling land on the anchor's. Chroma follows luma. Source
+    percentiles are smoothed over frames so the curve does not flicker.
+    """
+
+    MAX_SAMPLE_PIXELS = 262144
+    DEFAULT_KNOTS = "2,10,25,50,75,90,98"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "knots": ("STRING", {"default": cls.DEFAULT_KNOTS}),
+                "min_gain": ("FLOAT", {"default": 0.50, "min": 0.10, "max": 1.0, "step": 0.01}),
+                "max_gain": ("FLOAT", {"default": 4.00, "min": 1.0, "max": 8.0, "step": 0.01}),
+                "temporal_smoothing": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 0.99, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "match"
+    CATEGORY = "Furgen/image"
+
+    @staticmethod
+    def _parse_knots(value) -> list[float]:
+        knots = [float(part) for part in str(value or "").replace(";", ",").split(",") if part.strip()]
+        if len(knots) < 2 or any(not (0.0 < k < 100.0) for k in knots) or any(b <= a for a, b in zip(knots, knots[1:])):
+            raise ValueError("knots must be 2+ strictly increasing percentiles inside (0, 100)")
+        return knots
+
+    @classmethod
+    def _luma_percentiles(cls, rgb: torch.Tensor, quantiles: torch.Tensor) -> torch.Tensor:
+        """[N, K] luma percentiles of an [N, H, W, C] batch (subsampled)."""
+        luma = _luma(rgb.float())[..., 0]
+        pixels = luma.shape[1] * luma.shape[2]
+        stride = max(1, int(math.ceil(math.sqrt(pixels / float(cls.MAX_SAMPLE_PIXELS)))))
+        sampled = luma[:, ::stride, ::stride].reshape(luma.shape[0], -1)
+        return torch.quantile(sampled, quantiles.to(sampled.device, sampled.dtype), dim=1).transpose(0, 1)
+
+    @staticmethod
+    def _curve(y: torch.Tensor, src: torch.Tensor, ref: torch.Tensor, lo: float, hi: float, eps: float) -> torch.Tensor:
+        """Continuous piecewise-linear luma map through (src_k -> ref_k); src/ref are [N, K]."""
+        n, k = src.shape
+        view = lambda t: t.view(n, 1, 1, 1)
+        # Segment gains between consecutive knots, clamped; the knots are then
+        # rebuilt cumulatively so clamping never breaks continuity.
+        gains = ((ref[:, 1:] - ref[:, :-1]) / (src[:, 1:] - src[:, :-1]).clamp_min(eps)).clamp(lo, hi)
+        toe = torch.where(src[:, :1] > eps, ref[:, :1] / src[:, :1].clamp_min(eps), gains[:, :1]).clamp(lo, hi)
+        out_knots = [src[:, 0] * toe[:, 0]]
+        for i in range(k - 1):
+            out_knots.append(out_knots[-1] + (src[:, i + 1] - src[:, i]) * gains[:, i])
+        head = ((1.0 - out_knots[-1]) / (1.0 - src[:, -1]).clamp_min(eps)).clamp(0.0, hi)
+        out = y * view(toe[:, 0])
+        for i in range(k - 1):
+            seg = view(out_knots[i]) + (y - view(src[:, i])) * view(gains[:, i])
+            out = torch.where(y >= view(src[:, i]), seg, out)
+        top = view(out_knots[-1]) + (y - view(src[:, -1])) * view(head)
+        out = torch.where(y >= view(src[:, -1]), top, out)
+        return out.clamp(0.0, 1.0)
+
+    def match(self, images, reference, strength, knots, min_gain, max_gain, temporal_smoothing):
+        if _is_neutral(strength, 0.0):
+            return (images,)
+        phase = "validate"
+        try:
+            with torch.no_grad():
+                rgb_channels = _image_rgb(images).shape[-1]
+                ref_rgb = _first_reference_rgb(reference, images)
+                if images.shape[0] < 1 or reference.shape[0] < 1:
+                    raise ValueError("images and reference must each contain at least one frame")
+                knot_list = self._parse_knots(knots)
+                lo, hi = sorted((float(min_gain), float(max_gain)))
+                quantiles = torch.tensor([k / 100.0 for k in knot_list], dtype=torch.float32)
+                eps = 1e-4
+                smoothing = max(0.0, min(0.99, float(temporal_smoothing)))
+
+                phase = "reference_percentiles"
+                ref_pct = self._luma_percentiles(ref_rgb, quantiles)  # [1, K]
+
+                phase = "frame_chunks"
+                output = torch.empty_like(images)
+                state = None
+                for start, end in _chunked_frame_ranges(images):
+                    chunk = images[start:end]
+                    rgb = _image_rgb(chunk)
+                    src_pct = self._luma_percentiles(rgb, quantiles)  # [n, K]
+                    if smoothing > 0.0:
+                        smoothed = torch.empty_like(src_pct)
+                        for index in range(src_pct.shape[0]):
+                            state = src_pct[index] if state is None else state.lerp(src_pct[index], 1.0 - smoothing)
+                            smoothed[index] = state
+                        src_pct = smoothed
+                    rgb_f = rgb.float()
+                    luma = _luma(rgb_f)
+                    mapped = self._curve(
+                        luma, src_pct.to(luma.device), ref_pct.to(luma.device).expand(src_pct.shape[0], -1), lo, hi, eps
+                    )
+                    ratio = mapped / luma.clamp_min(eps)
+                    corrected = (rgb_f * ratio).clamp(0.0, 1.0).to(dtype=images.dtype)
+                    output[start:end] = _blend_and_restore_channels(chunk, corrected[..., :rgb_channels], strength)
+                return (output,)
+        except Exception as exc:
+            raise _node_runtime_error(self.__class__.__name__, images, phase, exc) from exc
+
+
 class FurgenSceneAwareColorStabilize:
     """Keyframe-relative exposure/chroma stabilization for moving video."""
 
@@ -4661,6 +4779,7 @@ NODE_CLASS_MAPPINGS = {
     "FurgenBoundaryGradeMatch": FurgenBoundaryGradeMatch,
     "FurgenAdaptiveExposureMatch": FurgenAdaptiveExposureMatch,
     "FurgenColorTransferMatch": FurgenColorTransferMatch,
+    "FurgenLevelsMatch": FurgenLevelsMatch,
     "FurgenSceneAwareColorStabilize": FurgenSceneAwareColorStabilize,
     "FurgenTemporalToneSmooth": FurgenTemporalToneSmooth,
     "FurgenTemporalUnsharpMask": FurgenTemporalUnsharpMask,
@@ -4690,6 +4809,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FurgenBoundaryGradeMatch": "Furgen Boundary Grade Match",
     "FurgenAdaptiveExposureMatch": "Furgen Adaptive Exposure Match",
     "FurgenColorTransferMatch": "Furgen Color Transfer Match",
+    "FurgenLevelsMatch": "Furgen Levels Match (percentiles)",
     "FurgenSceneAwareColorStabilize": "Furgen Scene-Aware Color Stabilize",
     "FurgenTemporalToneSmooth": "Furgen Temporal Tone Smooth",
     "FurgenTemporalUnsharpMask": "Furgen Temporal Unsharp Mask",
