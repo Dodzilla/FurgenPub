@@ -121,7 +121,19 @@ download_support_file asset_gen_v7_lite_tts.py "${WORKSPACE}/asset_gen_v7_lite_t
 download_support_file asset_gen_v7_lite_tts_runtime.py "${WORKSPACE}/asset_gen_v7_lite_tts_runtime.py"
 download_support_file asset_gen_v7_lite_tts_install.py "${WORKSPACE}/asset_gen_v7_lite_tts_install.py"
 download_support_file tts_profiles.py "${WORKSPACE}/tts_profiles.py"
+download_support_file asset_gen_v7_lite_tts_provision.sh "${WORKSPACE}/asset_gen_v7_lite_tts_provision.sh"
+bash "${WORKSPACE}/asset_gen_v7_lite_tts_provision.sh"
+export TTS_RESIDENCY_CONFIG="${WORKSPACE}/.fcs/tts/config.json"
+export TTS_FAST_ALL_REQUIRED=true
 bash "${INFERENCE_SCRIPT}"
+/venv/main/bin/python - <<'TTS_CHECK'
+import json, urllib.request
+with urllib.request.urlopen('http://127.0.0.1:8189/v1/gpu/status', timeout=10) as response:
+    tts = json.load(response).get('ttsResidency', {})
+if not tts.get('enabled') or tts.get('state') == 'disabled' or not tts.get('version'):
+    raise RuntimeError('Required fast-all runtime policy is not active; refusing silent fallback provisioning')
+print('Fast-all installation and enabled coordinator policy verified (models warm on demand).')
+TTS_CHECK
 
 curl -fsS "${DM_LOCAL_COMFY_BASE_URL}/system_stats" >/dev/null
 curl -fsS "http://127.0.0.1:8080/health" >/dev/null

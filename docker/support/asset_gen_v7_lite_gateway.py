@@ -234,6 +234,10 @@ def get_coordinator():
             tts_config_path=(os.environ.get("TTS_RESIDENCY_CONFIG") or
                              ("/workspace/.fcs/tts/config.json" if os.path.isfile("/workspace/.fcs/tts/config.json") else None)),
         )
+    if os.environ.get("TTS_FAST_ALL_REQUIRED", "").lower() == "true":
+        tts = getattr(COORDINATOR, "tts", None)
+        if tts is None or not tts.enabled or not tts.config.get("version"):
+            raise RuntimeError("Required fast-all policy missing or disabled; run pinned TTS provisioning")
     return COORDINATOR
 
 

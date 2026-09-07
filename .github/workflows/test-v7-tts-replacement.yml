@@ -1,0 +1,22 @@
+name: Verify V7 fast-all replacement provisioning
+on:
+  push:
+    paths:
+      - 'docker/support/**'
+      - '.github/workflows/test-v7-tts-replacement.yml'
+  pull_request:
+    paths:
+      - 'docker/support/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: |
+          python3 -m unittest discover -s docker/support/tests -p 'test_v7_tts_replacement.py'
+          python3 -m unittest discover -s docker/support/tests -p 'test_asset_gen_v7_lite_tts*.py'
+          bash -n docker/support/asset_gen_v7_lite.sh docker/support/asset_gen_v7_lite_tts_provision.sh

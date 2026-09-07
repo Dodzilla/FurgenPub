@@ -1,0 +1,68 @@
+{
+  "version": "fast-all-replacement-v1",
+  "sourceRevision": "ca632ce6c4d05f7985da4eab29b1a5d445b43f7b",
+  "profile": "stock",
+  "packagePins": {
+    "transformers": "4.57.3",
+    "qwen-tts": "0.1.1",
+    "tokenizers": "0.22.2",
+    "huggingface-hub": "0.36.2",
+    "sox": "1.5.0",
+    "onnxruntime": "1.29.0",
+    "accelerate": "1.12.0",
+    "librosa": "1.0.0",
+    "soundfile": "0.14.0",
+    "einops": "0.8.2",
+    "soxr": "0.5.0.post1",
+    "joblib": "1.5.2",
+    "msgpack": "1.1.1",
+    "scikit-learn": "1.7.2",
+    "flatbuffers": "25.9.23",
+    "protobuf": "6.32.1",
+    "threadpoolctl": "3.6.0"
+  },
+  "checkpointHashes": {
+    "audio_tokenizer/config.json": "ee65bb901c876664ab8707c487157aa1a6ee57c65969b28fb5ec9dc211e68167",
+    "audio_tokenizer/configuration.json": "6bc26d64eb5024b4d1dab5a52371958b429256d6c9d59787f1f5294a54e0cebd",
+    "audio_tokenizer/model.safetensors": "836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258",
+    "audio_tokenizer/preprocessor_config.json": "fcb3805e597e786d4067706e602f6688524640f8d3396790e2e09b5942fcbdfb",
+    "config.json": "57849eb756ca1602efe89afcc5c70379dd127f8deeb9f655204d4340190ea929",
+    "generation_config.json": "2ef3f2c0ab8d9ad241059138a795433c5410fd9954efb9625674ecd2a9529434",
+    "model-00001-of-00002.safetensors": "abf813781256e10cbe81f2dbb415f897556225d4dfa0282d67aa8ea164e114a9",
+    "model-00002-of-00002.safetensors": "36aa73b1a11361e1774db90d9c63c63303b294c022de112aa51904d940edcef1",
+    "model.safetensors.index.json": "19977e3d96bb502ed3165b48adff094f6bd71ec3d349940d1a3ba6a0060bd5e3",
+    "special_tokens_map.json": "194f265bb588d142a16f27d9576104eb3dab3d7ba9961541d2d6e3d5e77e6470",
+    "tokenizer.json": "d3ec9ac3eb2392389b9f5112e85d8b43316494addb587ba7b7a9d61eac23af96",
+    "tokenizer_config.json": "2c084fd6725c2284e8aa6da095a8d036d48fe79665595bfcd50371821b620e44"
+  },
+  "enabled": true,
+  "routingApproved": true,
+  "coexistenceApproved": true,
+  "diagnosticsEnabled": false,
+  "prioritizeAfterInference": true,
+  "deferMissingCheckpoint": true,
+  "measuredRuntimeVersion": "fast-all-replacement-v1",
+  "measuredProfile": "stock",
+  "measuredRuntimeFingerprint": "9ccdeb9e3ae6e703f53277243325cd4f97e3b21df9f3c333d61e7e68727b4a4f",
+  "measuredPeaks": {
+    "warmupBytes": 25769803776,
+    "executionBytes": 25769803776,
+    "idleBytes": 19327352832,
+    "miningBytes": 6442450944
+  },
+  "miningFingerprint": {
+    "binarySha256": "5e07adc2a42e4d59d0c768b05eda67613c506686ea6a2e803237608693985c9d",
+    "commandPolicy": "srbminer_pearlhash_v1",
+    "gateWrapperSha256": "006c62a7dd6dd39884daac034f52eb17654567e63d53b9efce6c6e6aaa61a16b"
+  },
+  "supportHashes": {
+    "asset_gen_v7_lite_tts_runtime.py": "5480374719073911071fbff9e0547421501c8f2ef7758ed047dae5bac034dde1",
+    "tts_profiles.py": "870ebbe415a1ad2bbfdb8b2a56237c2d2a95c348c8eb37ce80e5cfcffca7e70f"
+  },
+  "validation": {
+    "instanceId": "50203390",
+    "date": "2026-09-07",
+    "hardware": "RTX 5090, 32 GB",
+    "memoryPolicy": "Conservative envelopes above observed stock warmup/execution and historical two-hour stock residency; additional 15% margin and 2 GiB free guard remain enforced."
+  }
+}

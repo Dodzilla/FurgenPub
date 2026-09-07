@@ -203,9 +203,27 @@ class TTSResidency:
         self._event("policy_disabled", reason=reason)
         self._save()
 
+    def _checkpoint_files_present(self):
+        # Model dependencies are intentionally downloaded on demand. Absence is
+        # not a runtime failure and must not exhaust the warmup retry budget.
+        if not self.config.get("deferMissingCheckpoint"):
+            return True
+        hashes = self.config.get("checkpointHashes", {})
+        root = Path(self.config.get("checkpointDir", "/nonexistent"))
+        return bool(hashes) and all((root / name).is_file() for name in hashes)
+
     def _runtime_measurement_matches(self):
         expected = self.config.get("measuredRuntimeFingerprint")
         return bool(expected and expected == self.health.get("fingerprint"))
+
+    @staticmethod
+    def _mining_command_matches(parts, expected):
+        # Only pool and account/worker identity vary between identical rentals.
+        # All memory-affecting options and the executable hash remain pinned.
+        if expected.get("commandPolicy") == "srbminer_pearlhash_v1":
+            return (len(parts) == 8 and parts[1:5] == [b"--disable-cpu", b"--algorithm", b"pearlhash", b"--pool"]
+                    and parts[6] == b"--wallet" and all(parts[i] and not parts[i].startswith(b"-") for i in (5, 7)))
+        return hashlib.sha256(b"\0".join(parts) + b"\0").hexdigest() == expected.get("commandSha256")
 
     def _mining_measurement_matches(self, metadata):
         """Verify the gated launch before its coordinator registration permits CUDA."""
@@ -223,7 +241,7 @@ class TTSResidency:
                 parts = parts[4:]
             binary = Path("/workspace/.fcs/prl/prl_gpu_miner")
             return bool(parts and os.fsdecode(parts[0]) == str(binary)
-                        and hashlib.sha256(b"\0".join(parts) + b"\0").hexdigest() == expected.get("commandSha256")
+                        and self._mining_command_matches(parts, expected)
                         and hashlib.sha256(binary.read_bytes()).hexdigest() == expected.get("binarySha256"))
         except (OSError, KeyError, ValueError):
             return False
@@ -325,7 +343,7 @@ class TTSResidency:
             raise TTSError("tts_busy", "TTS execution has not stopped")
         if (holder == "mining" and self.enabled and not self.disabled and self.state == "absent"
                 and (self.config.get("coexistenceApproved") or self.config.get("diagnosticsEnabled"))
-                and time.monotonic() >= self.retry_at):
+                and time.monotonic() >= self.retry_at and self._checkpoint_files_present()):
             raise TTSError("tts_warmup_pending", "Restore TTS after idle grace before starting mining")
         eligible = bool((metadata or {}).get("tts", {}).get("runtimePolicy") == "auto_fast_all")
         eligible = eligible and bool(self.config.get("routingApproved") or self.config.get("diagnosticsEnabled"))
@@ -385,6 +403,8 @@ class TTSResidency:
                     self.evict("queued_foreground", preempt=True)
                 return {"canMine": False, **self.status()}
             if not self.enabled or self.disabled:
+                return {"canMine": True, **self.status()}
+            if not self._checkpoint_files_present():
                 return {"canMine": True, **self.status()}
             if self.state == "warming":
                 self.idle_heartbeat(False)
