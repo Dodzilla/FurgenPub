@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canary-only CPU installation; never enables residency or starts GPU work."""
+"""Pinned CPU installation for v7 replacements; never starts GPU work."""
 import argparse
 import hashlib
 import json
@@ -18,8 +18,9 @@ def run(argv):
 
 
 def install(args):
-    if args.instance != "48542054":
-        raise ValueError("This installer is restricted to the approved canary")
+    actual = os.environ.get("DM_INSTANCE_ID") or os.environ.get("VAST_CONTAINERLABEL", "").removeprefix("C.")
+    if not args.instance.isdigit() or args.instance != actual or os.environ.get("SERVER_TYPE") != "asset_gen_v7_lite":
+        raise ValueError("Installation requires the current numeric v7 worker identity")
     root = Path(args.root).resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
@@ -37,14 +38,21 @@ def install(args):
     if not venv.exists():
         run([args.python, "-m", "venv", "--system-site-packages", str(venv)])
     python = str(venv / "bin/python")
-    run([python, "-m", "pip", "install", "--no-deps", *PINS])
+    probe = subprocess.run([python, "-c", "import importlib.metadata as m,json; print(json.dumps({k:m.version(k) for k in " + repr([p.split("==")[0] for p in PINS]) + "}))"], capture_output=True, text=True)
+    expected_pins = dict(item.split("==", 1) for item in PINS)
+    if probe.returncode or json.loads(probe.stdout) != expected_pins:
+        run([python, "-m", "pip", "install", "--no-deps", *PINS])
     versions = subprocess.check_output([python, "-m", "pip", "freeze", "--all"], text=True)
     (root / "environment.lock.txt").write_text(versions)
     hashes = json.loads(Path(args.checkpoint_manifest).read_text())
     checkpoint = Path(args.checkpoint).resolve()
     for name, expected in hashes.items():
         path = checkpoint / name
-        if not path.resolve().is_relative_to(checkpoint) or not path.is_file():
+        if not path.resolve().is_relative_to(checkpoint):
+            raise RuntimeError("Checkpoint escaped root: " + name)
+        if not path.is_file() and getattr(args, "allow_missing_checkpoint", False):
+            continue
+        if not path.is_file():
             raise RuntimeError("Checkpoint file missing or escaped root: " + name)
         with path.open("rb") as stream:
             actual = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -75,4 +83,5 @@ if __name__ == "__main__":
     parser.add_argument("--python", default="/venv/main/bin/python")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--checkpoint-manifest", required=True)
+    parser.add_argument("--allow-missing-checkpoint", action="store_true")
     install(parser.parse_args())
