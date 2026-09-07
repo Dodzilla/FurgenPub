@@ -64,5 +64,14 @@
     "date": "2026-09-07",
     "hardware": "RTX 5090, 32 GB",
     "memoryPolicy": "Conservative envelopes above observed stock warmup/execution and historical two-hour stock residency; additional 15% margin and 2 GiB free guard remain enforced."
+  },
+  "validatedSamplingControls": {
+    "temperature": 0.9,
+    "top_k": 50,
+    "top_p": 1.0,
+    "repetition_penalty": 1.1,
+    "depth_temperature": 0.9,
+    "depth_top_k": 50,
+    "depth_top_p": 1.0
   }
 }

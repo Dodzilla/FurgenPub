@@ -93,3 +93,10 @@ class ActivationTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'hash mismatch'):
             install.activate_production(self.config,changed,self.root)
         self.assertFalse((self.root/'config.json').exists())
+
+    def test_missing_sampling_controls_cannot_activate(self):
+        self.policy.pop('validatedSamplingControls')
+        changed=self.root/'policy.json';changed.write_text(json.dumps(self.policy))
+        with self.assertRaisesRegex(RuntimeError,'sampling controls'):
+            install.activate_production(self.config,changed,self.root)
+        self.assertFalse((self.root/'config.json').exists())

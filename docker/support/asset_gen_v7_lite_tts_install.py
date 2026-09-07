@@ -88,6 +88,9 @@ def activate_production(config, policy_path, root):
             policy.get("version") != config["version"] or
             policy.get("profile") != "stock" or not policy.get("measuredRuntimeFingerprint")):
         raise RuntimeError("Production TTS policy does not match installed runtime")
+    expected_sampling = {'temperature': 0.9, 'top_k': 50, 'top_p': 1.0, 'repetition_penalty': 1.1, 'depth_temperature': 0.9, 'depth_top_k': 50, 'depth_top_p': 1.0}
+    if policy.get("validatedSamplingControls") != expected_sampling:
+        raise RuntimeError("Missing or unvalidated production sampling controls")
     for name, expected in policy.get("supportHashes", {}).items():
         path = Path(__file__).with_name(name)
         if Path(name).name != name or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
