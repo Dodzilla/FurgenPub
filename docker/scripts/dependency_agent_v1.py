@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.180"
+AGENT_VERSION = "dm-agent-py/0.10.181"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -1383,20 +1383,24 @@ _CONTROL_HTTP = threading.local()
 
 
 def _control_http_keepalive_server_enabled():
-    configured = os.environ.get("DM_AGENT_HTTP_KEEPALIVE_SERVER_TYPES", "asset_gen_v7_lite")
+    configured = os.environ.get("DM_AGENT_HTTP_KEEPALIVE_SERVER_TYPES", "asset_gen_v7_lite,image_gen_v1")
     allowed = {value.strip() for value in configured.split(",") if value.strip()}
     return os.environ.get("SERVER_TYPE") in allowed
 
 
 def _control_urlopen(req, timeout):
-    """Reuse TLS for opted-in v7 control requests; preserve CAS and HTTP errors.
+    """Reuse TLS for opted-in control requests; preserve CAS and HTTP errors.
 
     Each thread owns its socket. Never retry a write with an unknown outcome.
     Downloads, SSE streams, other server types and redirects keep urllib's path.
     """
     parsed = urllib.parse.urlsplit(req.full_url)
-    is_v7 = os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite"
-    rtdb = is_v7 and _env_bool("DM_RTDB_HTTP_KEEPALIVE", True) and (parsed.hostname or "").endswith((".firebaseio.com", ".firebasedatabase.app"))
+    rtdb_enabled = os.environ.get("SERVER_TYPE") in {
+        value.strip() for value in os.environ.get(
+            "DM_RTDB_HTTP_KEEPALIVE_SERVER_TYPES", "asset_gen_v7_lite,image_gen_v1",
+        ).split(",")
+    }
+    rtdb = rtdb_enabled and _env_bool("DM_RTDB_HTTP_KEEPALIVE", True) and (parsed.hostname or "").endswith((".firebaseio.com", ".firebasedatabase.app"))
     agent_api = (_control_http_keepalive_server_enabled() and _env_bool("DM_AGENT_HTTP_KEEPALIVE", True)
                  and parsed.hostname == "us-central1-furgencontentserver.cloudfunctions.net"
                  and parsed.path.startswith("/api/agent/"))
@@ -3336,6 +3340,8 @@ class PrlMinerController:
         self.download_chunk_size = max(1024 * 1024, int(download_chunk_size))
         self._lock = threading.Lock()
         self._process_op_lock = threading.Lock()
+        self.launch_allowed: Optional[Callable[[], bool]] = None
+        self.before_launch: Optional[Callable[[], None]] = None
         self._proc: Optional[subprocess.Popen] = None
         self._state = "stopped"
         self._desired_state = "stopped"
@@ -3503,7 +3509,8 @@ class PrlMinerController:
         self._last_agent_update_resume_attempt_ms = now_ms
         try:
             logging.info("Resuming idle PRL miner from agent-update marker after %s.", reason or "agent_start")
-            self.start(dict(payload))
+            if self.start(dict(payload)).get("deferred"):
+                return False
             try:
                 self.agent_update_resume_path.unlink(missing_ok=True)
             except Exception:
@@ -3879,8 +3886,24 @@ class PrlMinerController:
             self._terminate_pid(pid, signal.SIGKILL)
         return len(pids)
 
+    def _allow_launch_serialized(self, prepare: bool = False) -> bool:
+        # Caller holds _process_op_lock, the same fence used by foreground pause.
+        # Demand can arrive after this check: foreground then waits for this
+        # transition and pauses the process before submitting any GPU work.
+        allowed = self.launch_allowed
+        if allowed is not None and not allowed():
+            return False
+        if prepare and self.before_launch is not None:
+            self.before_launch()
+            if allowed is not None and not allowed():
+                return False
+        return True
+
     def start(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self._process_op_lock:
+            if not self._allow_launch_serialized():
+                self.defer_start(payload, "foreground_or_idle_grace")
+                return {"deferred": True}
             return self._start_serialized(payload)
 
     def prepare_gated(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -4067,6 +4090,10 @@ class PrlMinerController:
                 "pauseMode": pause_mode,
             }
 
+        if not self._allow_launch_serialized(prepare=True):
+            self.defer_start(payload, "foreground_or_idle_grace")
+            return {"deferred": True}
+
         self.root.mkdir(parents=True, exist_ok=True)
         log_file = self.log_path.open("ab")
         try:
@@ -4216,6 +4243,8 @@ class PrlMinerController:
 
     def release_start_gate(self, gate_path_raw: str) -> Dict[str, Any]:
         with self._process_op_lock:
+            if not self._allow_launch_serialized(prepare=True):
+                raise RuntimeError("Foreground demand or idle grace revoked mining launch")
             gate_path = Path(str(gate_path_raw or ""))
             with self._lock:
                 self._reap_locked()
@@ -4390,6 +4419,12 @@ class PrlMinerController:
                 self._pause_stop_count += 1
 
     def resume_if_paused(self, reason: str) -> bool:
+        with self._process_op_lock:
+            if not self._allow_launch_serialized():
+                return False
+            return self._resume_if_paused_serialized(reason)
+
+    def _resume_if_paused_serialized(self, reason: str) -> bool:
         with self._lock:
             self._reap_locked()
             if self._suspended_for_work and self._proc is not None and self._proc.poll() is None:
@@ -4399,6 +4434,8 @@ class PrlMinerController:
                 proc = None
                 paused_reason = self._paused_reason
         if proc is not None:
+            if not self._allow_launch_serialized(prepare=True):
+                return False
             logging.info("Continuing suspended idle PRL miner after %s", reason or paused_reason or "work")
             self._signal_process(proc, signal.SIGCONT)
             with self._lock:
@@ -4418,7 +4455,8 @@ class PrlMinerController:
         if not payload:
             return False
         logging.info("Resuming idle PRL miner after %s", reason or self._paused_reason or "work")
-        self.start(payload)
+        if self._start_serialized(payload).get("deferred"):
+            return False
         with self._lock:
             self._resume_start_count += 1
         return True
@@ -4462,8 +4500,7 @@ class PrlMinerController:
             failures,
             backoff_ms,
         )
-        self.start(payload)
-        return True
+        return not self.start(payload).get("deferred", False)
 
     def defer_start(self, payload: Dict[str, Any], reason: str) -> None:
         """Remember a backend mining request without starting GPU work yet."""
@@ -4524,7 +4561,8 @@ class ComfyNodeTimingCollector:
     """Best-effort, dependency-free reader for ComfyUI's local WebSocket events.
 
     This intentionally measures wall time between native ``executing`` boundaries.
-    It never synchronizes CUDA, polls GPU state, or participates in job completion.
+    It never synchronizes CUDA or polls GPU state. A terminal event may wake
+    image history verification; authoritative history still decides completion.
     Any telemetry failure is recorded as partial coverage and must remain fail-open.
     """
 
@@ -4966,6 +5004,12 @@ class DependencyAgent:
             min(30.0, _env_float("DM_IDLE_PRL_FREE_COMFY_TIMEOUT_SECONDS", 10.0)),
         )
         self._last_idle_prl_comfy_free_ms = 0
+        self.image_idle_mining_grace_seconds = max(0.0, min(300.0, _env_float("DM_IMAGE_IDLE_MINING_GRACE_SECONDS", 30.0)))
+        self._image_mining_demand = threading.Event()
+        self._image_mining_idle_after = time.monotonic() + self.image_idle_mining_grace_seconds
+        if self.server_type == "image_gen_v1":
+            self._idle_prl_miner.launch_allowed = self._image_mining_launch_allowed
+            self._idle_prl_miner.before_launch = lambda: self._free_local_comfy_for_idle_prl_mining("image_idle_admitted")
         coordinator_url = (_env_str("DM_GPU_COORDINATOR_URL") or "").strip().rstrip("/")
         coordinator_required = _env_bool("DM_GPU_COORDINATOR_REQUIRED", False)
         if coordinator_required and not coordinator_url:
@@ -6121,6 +6165,19 @@ class DependencyAgent:
                 self._release_mining_gpu_lease(reason)
 
     def _host_memory_pressure_requires_full_comfy_trim(self) -> bool:
+        if getattr(self, "server_type", "") == "image_gen_v1":
+            for root, limit_name, used_name in (
+                (Path("/sys/fs/cgroup"), "memory.max", "memory.current"),
+                (Path("/sys/fs/cgroup/memory"), "memory.limit_in_bytes", "memory.usage_in_bytes"),
+            ):
+                try:
+                    limit = int((root / limit_name).read_text().strip())
+                    used = int((root / used_name).read_text().strip())
+                    reserve = max(int(self.comfy_full_trim_mem_available_bytes), limit // 10)
+                    if 0 < limit < 2 ** 60 and limit - used < reserve:
+                        return True
+                except (OSError, ValueError):
+                    pass
         try:
             meminfo = Path("/proc/meminfo").read_text("utf-8", errors="replace")
             match = re.search(r"^MemAvailable:\s+(\d+)\s+kB\s*$", meminfo, re.MULTILINE)
@@ -6137,6 +6194,28 @@ class DependencyAgent:
             pass
         return False
 
+    def _image_mining_launch_allowed(self) -> bool:
+        # No agent lock is acquired under the miner process lock. The event and
+        # deadline are maintained under the agent lock as leases enter/leave.
+        return (not self._image_mining_demand.is_set()
+                and not self._stop.is_set()
+                and self._pending_self_update is None
+                and time.monotonic() >= self._image_mining_idle_after)
+
+    def _refresh_image_mining_demand_locked(self) -> None:
+        if getattr(self, "server_type", "") != "image_gen_v1":
+            return
+        demand = bool(self._active_exec_by_item) or any(
+            row.get("stage") != "maintenance:prl_miner"
+            for row in self._active_maintenance_by_item.values()
+        )
+        if demand:
+            self._image_mining_demand.set()
+        elif self._image_mining_demand.is_set():
+            # Publish the deadline before clearing demand, never a false idle gap.
+            self._image_mining_idle_after = time.monotonic() + self.image_idle_mining_grace_seconds
+            self._image_mining_demand.clear()
+
     def _free_local_comfy_for_idle_prl_mining(self, reason: str) -> None:
         if self.mining_only or not self.idle_prl_free_comfy_before_start:
             return
@@ -6150,11 +6229,11 @@ class DependencyAgent:
         try:
             timeout = self.idle_prl_free_comfy_timeout_seconds
             base_url = self._resolve_local_comfy_base_url(force_refresh=True, timeout_seconds=min(5.0, timeout))
-            # Preserve the existing fleet-wide full trim. CPU cache retention
-            # is intentionally enabled only on coordinator-managed workers.
+            # Image workers retain CPU caches across idle mining when memory
+            # permits. GPU models still unload before mining starts.
             full_trim = (
                 self._host_memory_pressure_requires_full_comfy_trim()
-                if self._gpu_coordinator.configured else True
+                if self._gpu_coordinator.configured or self.server_type == "image_gen_v1" else True
             )
             status, _resp = api_json(
                 "POST",
@@ -6238,6 +6317,8 @@ class DependencyAgent:
 
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
+            if getattr(self, "server_type", "") == "image_gen_v1" and not self._image_mining_launch_allowed():
+                return
             with self._lock:
                 gpu_blocking_work_count = sum(
                     1
@@ -6315,7 +6396,7 @@ class DependencyAgent:
                     if should_stop_unmanaged:
                         self._idle_prl_miner.stop_if_running("gpu_coordinator_admission_denied")
                 return
-            if should_attempt_start:
+            if should_attempt_start and getattr(self, "server_type", "") != "image_gen_v1":
                 self._free_local_comfy_for_idle_prl_mining(reason)
             try:
                 resumed = self._idle_prl_miner.resume_if_paused(reason)
@@ -6344,7 +6425,7 @@ class DependencyAgent:
         # Mining preparation/admission may perform slow network/process work.
         # Keep it off foreground dispatch and output delivery, with at most one
         # pending attempt on the existing serialized miner executor.
-        if os.environ.get("SERVER_TYPE") != "asset_gen_v7_lite":
+        if os.environ.get("SERVER_TYPE") not in ("asset_gen_v7_lite", "image_gen_v1"):
             self._resume_idle_prl_mining_if_idle(reason)
             return
         executor = self._agent_prl_miner_executor
@@ -7161,6 +7242,8 @@ class DependencyAgent:
         )
         try:
             with _control_urlopen(req, timeout=timeout_seconds) as resp:
+                # Consume the successful JSON response before socket reuse.
+                resp.read()
                 return int(resp.status) in (200, 204)
         except urllib.error.HTTPError as e:
             if int(getattr(e, "code", 500) or 500) == 412:
@@ -7596,6 +7679,7 @@ class DependencyAgent:
             )
         )
 
+        query_started = time.monotonic()
         candidates: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         for query_name, query in query_attempts:
             try:
@@ -7620,6 +7704,7 @@ class DependencyAgent:
         if not candidates:
             return []
 
+        query_ms = round((time.monotonic() - query_started) * 1000)
         claimed: List[Dict[str, Any]] = []
         instance_id = str(self._resolved_instance_id or "")
         lease_duration_sec = float(self._coordination.get("leaseDurationSeconds") or 90.0)
@@ -7628,7 +7713,9 @@ class DependencyAgent:
                 break
             item_path = self._coordination_queue_item_path(root_path, encoded_key)
             try:
+                read_started = time.monotonic()
                 current, etag = self._coordination_get_json_with_etag(item_path, timeout_seconds=10.0)
+                read_ms = round((time.monotonic() - read_started) * 1000)
                 if not isinstance(current, dict) or str(current.get("state") or "") != "queued":
                     continue
                 lease_id = f"lease_{uuid.uuid4().hex}"
@@ -7666,8 +7753,13 @@ class DependencyAgent:
                 elif queue_path_key == "dependencyQueueItems":
                     write_value.pop("payload", None)
                     write_value.pop("resolved", None)
+                cas_started = time.monotonic()
                 if not self._coordination_put_json_if_match(item_path, write_value, etag, timeout_seconds=10.0):
                     continue
+                cas_ms = round((time.monotonic() - cas_started) * 1000)
+                if os.environ.get("SERVER_TYPE") == "image_gen_v1" and queue_path_key == "agentQueueItems":
+                    logging.info("Agent queue claim itemId=%s queryMs=%d readMs=%d casMs=%d",
+                                 claimed_item["itemId"], query_ms, read_ms, cas_ms)
                 if queue_path_key == "agentQueueItems" and not isinstance(claimed_item.get("payload"), dict):
                     fetched_item = self._agent_fetch_queue_item(claimed_item["itemId"], lease_id)
                     if isinstance(fetched_item, dict) and isinstance(fetched_item.get("payload"), dict):
@@ -7707,8 +7799,8 @@ class DependencyAgent:
         return claimed
 
     def _coordination_fetch_agent_queue(self, limit: int) -> Optional[List[Dict[str, Any]]]:
-        incremental = (os.environ.get("SERVER_TYPE") == "asset_gen_v7_lite"
-                       and _env_bool("DM_AGENT_INCREMENTAL_QUEUE_DISPATCH", False))
+        incremental = (os.environ.get("SERVER_TYPE") in ("asset_gen_v7_lite", "image_gen_v1")
+                       and _env_bool("DM_AGENT_INCREMENTAL_QUEUE_DISPATCH", os.environ.get("SERVER_TYPE") == "image_gen_v1"))
         skip_execute_jobs = bool(self.mining_only)
         if not skip_execute_jobs:
             try:
@@ -12696,6 +12788,7 @@ class DependencyAgent:
     def _register_active_lease(self, lease: AgentExecuteLease) -> None:
         with self._lock:
             self._active_exec_by_item[lease.item_id] = lease
+            self._refresh_image_mining_demand_locked()
 
     def _prepare_logical_execute_lease(
         self,
@@ -12733,6 +12826,7 @@ class DependencyAgent:
     def _finish_active_lease(self, item_id: str) -> None:
         with self._lock:
             self._active_exec_by_item.pop(item_id, None)
+            self._refresh_image_mining_demand_locked()
             try:
                 self._ready_agent_item_ids.remove(item_id)
             except ValueError:
@@ -12894,7 +12988,7 @@ class DependencyAgent:
         self._release_comfy_gpu_lease(lease, "execute_job_cleanup", keep_warm=False)
         self._release_image_reference_inputs(lease)
         self._finish_active_lease(lease.item_id)
-        self._resume_idle_prl_mining_if_idle("execute_job_complete")
+        self._schedule_idle_prl_resume("execute_job_complete")
         self._request_agent_queue_poll()
         if tmp_root is not None:
             try:
@@ -14034,7 +14128,7 @@ class DependencyAgent:
                         self._agent_ack(item_id, lease_id, "command_succeeded")
                     logging.info("Deferred gated PRL miner launch after fencing race: %s", exc)
                 return
-            if action == "start":
+            if action == "start" and getattr(self, "server_type", "") != "image_gen_v1":
                 self._free_local_comfy_for_idle_prl_mining("prl_miner_start_command")
             command_item = item
             if action == "stop" and self._gpu_coordinator.configured:
@@ -15713,6 +15807,7 @@ class DependencyAgent:
                     "leaseId": lease_id,
                     "stage": f"maintenance:{item_type}" if isinstance(item_type, str) and item_type else "maintenance",
                 }
+                self._refresh_image_mining_demand_locked()
 
         def _run() -> None:
             try:
@@ -15728,6 +15823,7 @@ class DependencyAgent:
                         active = self._active_maintenance_by_item.get(item_id)
                         if isinstance(active, dict) and active.get("leaseId") == lease_id:
                             self._active_maintenance_by_item.pop(item_id, None)
+                            self._refresh_image_mining_demand_locked()
 
         future = executor.submit(_run)
         with self._lock:
@@ -15874,6 +15970,56 @@ class DependencyAgent:
             if not retain_lease:
                 self._cleanup_agent_lease(lease)
 
+    def _without_unrequested_image_previews(
+        self, workflow: Dict[str, Any], lease: AgentExecuteLease,
+    ) -> Dict[str, Any]:
+        if (getattr(self, "server_type", "") != "image_gen_v1"
+                or not _env_bool("DM_IMAGE_PRUNE_DIAGNOSTIC_PREVIEWS", True)):
+            return workflow
+        targets = lease.command_state.get("outputTargets")
+        if not isinstance(targets, list) or not targets:
+            return workflow
+        # Prove every requested artifact is an exact WAS Image Save filename.
+        # Unknown naming conventions or requested preview artifacts fail open.
+        saved_names = set()
+        referenced = set()
+        for node in workflow.values():
+            if not isinstance(node, dict):
+                continue
+            inputs = node.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                return workflow
+            for value in inputs.values():
+                if isinstance(value, list) and len(value) == 2 and isinstance(value[0], (str, int)):
+                    referenced.add(str(value[0]))
+            if node.get("class_type") == "Image Save" and inputs.get("overwrite_mode") == "prefix_as_filename":
+                prefix, extension = inputs.get("filename_prefix"), inputs.get("extension")
+                if isinstance(prefix, str) and isinstance(extension, str):
+                    saved_names.add(f"{prefix}.{extension}")
+        if any(not isinstance(target, dict) or not isinstance(target.get("sourceFilename"), str)
+               or target["sourceFilename"] not in saved_names for target in targets):
+            return workflow
+        remove = {
+            key for key, node in workflow.items()
+            if isinstance(node, dict) and node.get("class_type") in ("PreviewImage", "MaskPreview+")
+            and str(key) not in referenced
+        }
+        if not remove:
+            return workflow
+        logging.info("Removed unrequested image diagnostic previews jobId=%s count=%d", lease.job_id, len(remove))
+        return {key: node for key, node in workflow.items() if key not in remove}
+
+    def _wait_for_comfy_history_poll(self, collector: Optional[ComfyNodeTimingCollector]) -> None:
+        # A WS terminal wakes authoritative /history verification immediately.
+        # If history lags a terminal event, keep polling bounded (no hot loop).
+        if getattr(self, "server_type", "") == "image_gen_v1" and collector is not None:
+            if collector.wait_terminal(timeout_seconds=0.0):
+                time.sleep(0.05)
+            else:
+                collector.wait_terminal(timeout_seconds=0.5)
+        else:
+            time.sleep(0.5)
+
     def _execute_agent_ready_lease(self, lease: AgentExecuteLease) -> None:
         _agent_stage(lease, "prepare_started")
         retain_lease = False
@@ -15914,6 +16060,7 @@ class DependencyAgent:
                 prefetched_inputs = list(active.prefetched_inputs) if active else list(lease.prefetched_inputs)
 
             workflow, image_reference_names = self._workflow_with_image_references(lease, prefetched_inputs)
+            workflow = self._without_unrequested_image_previews(workflow, lease)
             for entry in prefetched_inputs:
                 cache_path = entry.get("cache_path")
                 input_name = entry.get("name")
@@ -16110,7 +16257,7 @@ class DependencyAgent:
                 if _now_ms() - last_progress_emit_ms >= self.agent_progress_event_ms:
                     self._emit_agent_event_best_effort(lease, "execution_progress", {"promptId": prompt_id})
                     last_progress_emit_ms = _now_ms()
-                time.sleep(0.5)
+                self._wait_for_comfy_history_poll(node_timing_collector)
 
             with self._lock:
                 active = self._active_exec_by_item.get(lease.item_id)
@@ -16561,6 +16708,11 @@ class DependencyAgent:
             "yes" if self.verbose_progress else "no",
             "yes" if self.download_debug else "no",
         )
+        if self.server_type == "image_gen_v1":
+            logging.info("Image latency policy: miningGraceSeconds=%.1f guardedMining=yes asyncMining=yes incrementalDispatch=%s diagnosticPreviewPruning=%s websocketHistoryWake=yes",
+                         self.image_idle_mining_grace_seconds,
+                         _env_bool("DM_AGENT_INCREMENTAL_QUEUE_DISPATCH", True),
+                         _env_bool("DM_IMAGE_PRUNE_DIAGNOSTIC_PREVIEWS", True))
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
         logging.info(
             "Agent control: enabled=%s poll=%.1fs activeHeartbeat=%.1fs idleHeartbeat=%.1fs queueWait=%ds rtdbSignalWait=%s rtdbSignalSafetyMin=%.1fs fullCapacityPoll=%.1fs progressEvent=%.1fs waitingDepsEvent=%.1fs localComfy=%s readinessFile=%s maxExecWorkers=%d maxPrefetchWorkers=%d maxUploadWorkers=%d restartComfyAfterSuccessfulJob=%s restartComfyAfterFailedJob=%s miningOnly=%s",
