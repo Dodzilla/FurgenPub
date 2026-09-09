@@ -3582,6 +3582,45 @@ class FurgenAssertFiniteLatent:
         return (latent,)
 
 
+class FurgenReferenceLatentPolicy:
+    """Keep encoder evidence and keyframes while selecting reference latent roles.
+
+    Comfy H3's reference node encodes multimodal tokens separately from the
+    `minimax_refs` diffusion payload. This adapter changes only that payload;
+    it never substitutes for a conditioning, sampler, encoder or guide node.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"conditioning": ("CONDITIONING",),
+                             "policy": (["encoder_only", "images_only", "full"],)}}
+
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "apply"
+    CATEGORY = "FurgenAI/conditioning"
+
+    def apply(self, conditioning, policy):
+        if policy not in {"encoder_only", "images_only", "full"}:
+            raise ValueError("Unknown reference latent policy")
+        result = []
+        found = False
+        for tokens, metadata in conditioning:
+            copied = dict(metadata)
+            if "minimax_refs" in metadata:
+                found = True
+                refs = metadata["minimax_refs"]
+                if not isinstance(refs, list) or any(not isinstance(ref, dict) for ref in refs):
+                    raise ValueError("Unsupported H3 reference latent contract")
+                if policy == "encoder_only":
+                    copied.pop("minimax_refs")
+                elif policy == "images_only":
+                    copied["minimax_refs"] = [ref for ref in refs if ref.get("kind") == "image"]
+            result.append([tokens, copied])
+        if not found:
+            raise ValueError("Reference latent policy requires H3 reference conditioning")
+        return (result,)
+
+
 class FurgenModelMemoryReserve:
     """Reserve sampler VRAM by asking Comfy's dynamic loader to offload weights."""
 
@@ -4773,6 +4812,7 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
 
 
 NODE_CLASS_MAPPINGS = {
+    "FurgenReferenceLatentPolicy": FurgenReferenceLatentPolicy,
     "FCSConcatVideos": FCSConcatVideos,
     "FCSConcatVideosV2": FCSConcatVideosV2,
     "FCSConcatVideosV3": FCSConcatVideosV3,
@@ -4803,6 +4843,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "FurgenReferenceLatentPolicy": "Furgen Reference Latent Policy",
     "FCSConcatVideos": "Furgen Concat Videos",
     "FCSConcatVideosV2": "Furgen Concat Videos V2 (trims)",
     "FCSConcatVideosV3": "Furgen Concat Videos V3 (trims, speed, colour, crossfade)",
