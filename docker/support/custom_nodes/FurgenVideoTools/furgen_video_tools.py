@@ -4353,6 +4353,7 @@ class FCSAnalyzeVideo:
                         "integratedLoudnessLufs": float(measured["input_i"]),
                         "truePeakDbfs": float(measured["input_tp"]),
                     }
+                    loudness = {key: value for key, value in loudness.items() if math.isfinite(value)}
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     loudness = {}
 

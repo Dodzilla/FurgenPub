@@ -400,12 +400,13 @@ def _make_test_video(
     subprocess.run([*command, str(path)], check=True)
 
 
-def test_video_analysis_preserves_proxy_audio_density_and_stable_names(tmp_path, monkeypatch):
+@pytest.mark.parametrize("frequency", [0, 440])
+def test_video_analysis_preserves_proxy_audio_density_and_stable_names(tmp_path, monkeypatch, frequency):
     module = _load_furgen_video_tools()
     monkeypatch.setattr(module.folder_paths, "get_output_directory", lambda: str(tmp_path))
     monkeypatch.setattr(module.folder_paths, "get_save_image_path", lambda prefix, output: (output, prefix, 0, "", prefix))
     source = tmp_path / "source.mp4"
-    _make_test_video(source, duration=1.2)
+    _make_test_video(source, duration=1.2, frequency=frequency)
     node = module.FCSAnalyzeVideo()
     first = node.analyze_video(str(source), "content_abc123", "analysis_test", True)
     second = node.analyze_video(str(source), "content_abc123", "analysis_test", True)
@@ -424,6 +425,10 @@ def test_video_analysis_preserves_proxy_audio_density_and_stable_names(tmp_path,
     manifest = json.loads(manifest_path.read_text())
     assert len(manifest["storyboard"]["cues"]) == 3
     assert manifest["waveform"]["peaks"]
+    if frequency == 0:
+        assert max(manifest["waveform"]["peaks"]) == 0
+        assert "integratedLoudnessLufs" not in manifest["waveform"]
+        assert "truePeakDbfs" not in manifest["waveform"]
     assert manifest["cors"] == {"allowOrigin": "*"}
 
 
