@@ -4567,6 +4567,15 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             ))
             base_filters.append(f"fps={frame_rate}")
             framing = entry.get("framing") or {}
+            fade_in = float(framing.get("fadeInSeconds") or 0.0)
+            fade_out = float(framing.get("fadeOutSeconds") or 0.0)
+            if (not all(math.isfinite(value) and value >= 0 for value in (fade_in, fade_out))
+                    or fade_in + fade_out > duration + 1e-6):
+                raise ValueError("Picture fades must fit within the post-speed clip duration")
+            if fade_in:
+                base_filters.append(f"fade=t=in:st=0:d={fade_in:.6f}:color=black")
+            if fade_out:
+                base_filters.append(f"fade=t=out:st={duration - fade_out:.6f}:d={fade_out:.6f}:color=black")
             mode = framing.get("mode") or "fit"
             pan_x = max(0.0, min(1.0, float(framing.get("panX", 0.5))))
             pan_y = max(0.0, min(1.0, float(framing.get("panY", 0.5))))

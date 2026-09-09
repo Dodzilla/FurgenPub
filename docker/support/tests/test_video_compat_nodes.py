@@ -508,6 +508,33 @@ def test_precision_video_ducking_depth_is_a_bounded_db_attenuation():
     assert math.isclose(1.0 - wet_mix, 10 ** (-24 / 20), rel_tol=1e-9)
 
 
+@pytest.mark.parametrize("framing", [{"mode": "fit"}, {"mode": "fit", "fitBackground": "blur"}, {"mode": "custom", "zoom": 1.2}])
+def test_precision_picture_fade_preserves_audio_after_trim_and_speed(tmp_path, monkeypatch, framing):
+    import array
+    module = _load_furgen_video_tools()
+    monkeypatch.setattr(module.folder_paths, "get_output_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(module.folder_paths, "get_save_image_path", lambda prefix, output: (output, prefix, 0, "", prefix))
+    source = tmp_path / "source.mp4"
+    _make_test_video(source, duration=5)
+    manifest = {"clips": [{"sourceVideoUrl": str(source), "trimStartSeconds": 1, "trimEndSeconds": 5,
+                            "speed": 2, "framing": {**framing, "fadeOutSeconds": 2}}]}
+    module.FCSConcatVideosV4().concat_videos_v4(json.dumps(manifest), 96, 64, 30, "equalPower", "fade", "yuv420p", 18, True)
+    output = str(tmp_path / "fade_00001-audio.mp4")
+    def brightness(time):
+        pixels = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(time), "-i", output,
+                                 "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
+        return sum(pixels) / len(pixels)
+    assert brightness(0.1) > brightness(1) > brightness(1.9)
+    assert brightness(1.9) < brightness(0.1) * 0.1
+    def rms(time):
+        pcm = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(time), "-i", output,
+                              "-t", "0.2", "-vn", "-f", "f32le", "-ac", "1", "-"], capture_output=True, check=True).stdout
+        samples = array.array("f", pcm)
+        return math.sqrt(sum(value * value for value in samples) / len(samples))
+    assert rms(1.7) > 0.01
+    assert math.isclose(rms(0.1), rms(1.7), rel_tol=0.15)
+
+
 def test_precision_video_framing_animation_clamps_window_and_builds_easing_expression():
     module = _load_furgen_video_tools()
     framing = {
