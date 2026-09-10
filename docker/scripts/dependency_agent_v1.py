@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.186"
+AGENT_VERSION = "dm-agent-py/0.10.187"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -15861,6 +15861,12 @@ class DependencyAgent:
                                 active.prompt_id = prompt_id
                         # Same lease, event stream and original timeout. Only the
                         # final attempt may publish output/terminal events.
+                        try:
+                            emit_durable("execution_progress", {"promptId": prompt_id})
+                        except Exception:
+                            self._comfy_interrupt()
+                            raise
+                        last_progress_emit_ms = _now_ms()
                         continue
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_failed")
                     emit_durable(
@@ -16507,6 +16513,18 @@ class DependencyAgent:
                             active = self._active_exec_by_item.get(lease.item_id)
                             if active:
                                 active.prompt_id = prompt_id
+                        try:
+                            # Publish correlation immediately without resetting
+                            # executionStartedAt or repeating lifecycle start.
+                            self._emit_agent_event_durable(lease, "execution_progress", {"promptId": prompt_id})
+                        except Exception:
+                            # Same containment as an unacknowledged first prompt:
+                            # do not release ownership while it can still run.
+                            execution_start_ack_failed = True
+                            self._post_job_comfy_recycle_active.set()
+                            self._comfy_interrupt()
+                            raise
+                        last_progress_emit_ms = _now_ms()
                         continue
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_failed")
                     failed_payload: Dict[str, Any] = {
