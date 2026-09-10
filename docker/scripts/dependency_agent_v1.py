@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.184"
+AGENT_VERSION = "dm-agent-py/0.10.185"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -153,6 +153,23 @@ VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
+
+
+def _compact_comfy_failure(status_obj: Dict[str, Any]) -> str:
+    """Keep the actual exception ahead of history, without prompts or tensors."""
+    for event in reversed(status_obj.get("messages") or []):
+        if isinstance(event, (list, tuple)) and len(event) > 1 and event[0] == "execution_error" and isinstance(event[1], dict):
+            error = event[1]
+            summary = {key: str(error.get(key) or "")[:limit] for key, limit in (
+                ("exception_type", 160), ("exception_message", 1800),
+                ("node_type", 160), ("node_id", 80))}
+            encoded = json.dumps(summary, ensure_ascii=False)
+            while len(encoded) > MAX_AGENT_ERROR_MESSAGE_CHARS:
+                summary["exception_message"] = summary["exception_message"][:len(summary["exception_message"]) // 2]
+                encoded = json.dumps(summary, ensure_ascii=False)
+            return encoded
+    return "ComfyUI execution failed without a structured execution_error event."
+
 # Flags that control ComfyUI memory behaviour rather than transport/attention.
 # A restart that rebuilds COMFYUI_ARGS must carry these over from the
 # provisioning env; dropping them changes how the workload allocates VRAM.
@@ -15683,7 +15700,7 @@ class DependencyAgent:
                         {
                             "promptId": prompt_id,
                             "errorCode": "comfy_execution_failed",
-                            "errorMessage": (json.dumps(status_obj)[:MAX_AGENT_ERROR_MESSAGE_CHARS] if status_obj else "ComfyUI execution failed."),
+                            "errorMessage": _compact_comfy_failure(status_obj),
                         },
                     )
                     terminal_sent = True
@@ -16309,7 +16326,7 @@ class DependencyAgent:
                     failed_payload: Dict[str, Any] = {
                         "promptId": prompt_id,
                         "errorCode": "comfy_execution_failed",
-                        "errorMessage": (json.dumps(status_obj)[:MAX_AGENT_ERROR_MESSAGE_CHARS] if status_obj else "ComfyUI execution failed."),
+                        "errorMessage": _compact_comfy_failure(status_obj),
                     }
                     attach_node_timings(failed_payload, "failed")
                     self._emit_agent_event_durable(
