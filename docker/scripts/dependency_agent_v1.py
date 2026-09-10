@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.185"
+AGENT_VERSION = "dm-agent-py/0.10.186"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5029,6 +5029,11 @@ class DependencyAgent:
         if self.server_type == "image_gen_v1":
             self._idle_prl_miner.launch_allowed = self._image_mining_launch_allowed
             self._idle_prl_miner.before_launch = lambda: self._free_local_comfy_for_idle_prl_mining("image_idle_admitted")
+        elif self.server_type == "video_gen_v4":
+            # Use the same process-operation fence as foreground pause. A
+            # queued start/resume must recheck demand at the actual launch,
+            # not only when its maintenance command was received.
+            self._idle_prl_miner.launch_allowed = self._image_mining_launch_allowed
         coordinator_url = (_env_str("DM_GPU_COORDINATOR_URL") or "").strip().rstrip("/")
         coordinator_required = _env_bool("DM_GPU_COORDINATOR_REQUIRED", False)
         if coordinator_required and not coordinator_url:
@@ -6169,7 +6174,7 @@ class DependencyAgent:
             if reason == "execute_job":
                 # Coordinator-managed mining must release VRAM, so suspend/resume
                 # and keep-running modes are deliberately overridden here.
-                if self._gpu_coordinator.configured:
+                if self._gpu_coordinator.configured or self.server_type == "video_gen_v4":
                     self._idle_prl_miner.pause_for_work(reason, force_stop=True)
                 else:
                     self._idle_prl_miner.pause_for_work(reason)
@@ -6222,7 +6227,7 @@ class DependencyAgent:
                 and time.monotonic() >= self._image_mining_idle_after)
 
     def _refresh_image_mining_demand_locked(self) -> None:
-        if getattr(self, "server_type", "") != "image_gen_v1":
+        if getattr(self, "server_type", "") not in ("image_gen_v1", "video_gen_v4"):
             return
         demand = bool(self._active_exec_by_item) or any(
             row.get("stage") != "maintenance:prl_miner"
@@ -13245,6 +13250,154 @@ class DependencyAgent:
             return resp
         return entry if isinstance(entry, dict) else {}
 
+    def _log_video_gpu_processes(self, lease: AgentExecuteLease, phase: str) -> None:
+        """Local-only, bounded attribution; never collect process args or env."""
+        if getattr(self, "server_type", "") != "video_gen_v4":
+            return
+        rows = []
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid,process_name,used_gpu_memory",
+                 "--format=csv,noheader,nounits"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                timeout=2.5, check=False,
+            )
+            if result.returncode == 0:
+                for line in (result.stdout or "")[:8192].splitlines()[:16]:
+                    fields = line.split(",")
+                    if len(fields) != 3:
+                        continue
+                    try:
+                        pid, memory = int(fields[0].strip()), int(fields[2].strip())
+                    except ValueError:
+                        continue
+                    if pid > 0 and memory >= 0:
+                        rows.append({"pid": pid, "name": os.path.basename(fields[1].strip())[:80],
+                                     "vramMiB": memory})
+            logging.info("Video GPU processes jobId=%s phase=%s processes=%s",
+                         lease.job_id, phase, json.dumps(rows, ensure_ascii=True))
+        except Exception:
+            logging.debug("Video GPU process attribution unavailable jobId=%s phase=%s", lease.job_id, phase)
+
+    def _prepare_sampler_oom_retry(
+        self, lease: AgentExecuteLease, status_obj: Dict[str, Any], deadline_ms: int,
+        workflow: Dict[str, Any],
+    ) -> bool:
+        """Recover only a proven terminal sampler CUDA OOM, retaining GPU ownership.
+
+        Consume a persistent local token *before* cleanup/submission. A restart,
+        repeated history result, or cleanup failure cannot create a retry loop.
+        The token is deliberately retained for the worker's lifetime.
+        """
+        if getattr(self, "server_type", "") != "video_gen_v4":
+            return False
+        # Leave coordinated recovery to its fenced recovery protocol.
+        if self._gpu_coordinator.configured:
+            return False
+        status_str = str(status_obj.get("status_str") or status_obj.get("status") or "").lower()
+        if status_obj.get("failed") is not True and status_str not in ("failed", "error"):
+            return False
+        try:
+            detail = json.loads(_compact_comfy_failure(status_obj))
+        except (ValueError, TypeError):
+            return False
+        if (detail.get("exception_type") not in ("torch.OutOfMemoryError", "torch.cuda.OutOfMemoryError")
+                or detail.get("node_type") != "SamplerCustomAdvanced"
+                or "cuda out of memory" not in str(detail.get("exception_message", "")).lower()):
+            return False
+        # Only the failed sampler's guider/model ancestry counts. An unrelated
+        # disconnected headroom node does not satisfy the memory contract.
+        pending = [str(detail.get("node_id", ""))]
+        seen = set()
+        has_headroom = False
+        while pending and len(seen) < 128:
+            node_id = pending.pop()
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            node = workflow.get(node_id)
+            if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+                continue
+            inputs = node["inputs"]
+            reserve = inputs.get("extra_headroom_gib")
+            if (node.get("class_type") == "FurgenAIMDOVRAMHeadroom"
+                    and isinstance(reserve, (int, float)) and reserve >= 10):
+                has_headroom = True
+                break
+            for key in ("model", "guider"):
+                link = inputs.get(key)
+                if isinstance(link, (list, tuple)) and len(link) == 2:
+                    pending.append(str(link[0]))
+        if not has_headroom:
+            return False
+        runtime = self._comfy_runtime_snapshot(force_refresh=True)
+        args = str(runtime.get("comfyArgs", "")).split()
+        if (runtime.get("source") != "comfy_system_stats_v1" or "--cache-none" not in args
+                or any(flag.startswith("--cache-") and flag != "--cache-none" for flag in args)):
+            # /free is asynchronous, not a cache-reset barrier. Only a verified
+            # no-cache listener guarantees that the headroom node runs again.
+            return False
+
+        def owned() -> bool:
+            with self._lock:
+                active = self._active_exec_by_item.get(lease.item_id)
+                other_execution = any(
+                    row is not active and row.stage == "executing"
+                    for row in self._active_exec_by_item.values()
+                )
+                coordinator = lease.gpu_coordinator_lease
+                return (active is lease and not lease.cancel_requested and not other_execution
+                        and not self._stop.is_set() and _now_ms() < deadline_ms
+                        and (not self._gpu_coordinator.configured
+                             or (coordinator is not None and not coordinator.renew_stop.is_set()
+                                 and not coordinator.lost.is_set() and not coordinator.released
+                                 and coordinator.deadline_ms > _now_ms())))
+
+        if not owned():
+            return False
+        try:
+            # A history failure must not authorize clearing another queued/running
+            # prompt. Unknown queue shapes fail closed. No interrupt or restart.
+            code, queue = self._comfy_api_json("GET", "/queue", timeout_seconds=5.0)
+            if (code != 200 or not isinstance(queue, dict)
+                    or queue.get("queue_running") != [] or queue.get("queue_pending") != []):
+                return False
+            token_key = hashlib.sha256(
+                f"{lease.job_id}:{lease.execution_attempt}".encode("utf-8")
+            ).hexdigest()
+            token_dir = self.workspace / ".fcs" / "sampler_oom_retries"
+            token_dir.mkdir(parents=True, exist_ok=True)
+            # Bound disk usage without expiring tokens and reopening old retries.
+            # A pathological worker with 1024 OOMs simply stops auto-recovering.
+            with os.scandir(token_dir) as entries:
+                if any(index >= 1023 for index, _ in enumerate(entries)):
+                    return False
+            # O_EXCL makes this atomic across threads/agent processes; fsync
+            # precedes any action that could result in a second prompt.
+            with (token_dir / token_key).open("x") as marker:
+                marker.write("1\n")
+                marker.flush()
+                os.fsync(marker.fileno())
+            self._idle_prl_miner.pause_for_work("sampler_oom_recovery", force_stop=True)
+            self._release_mining_gpu_lease("sampler_oom_recovery")
+            if not owned():
+                return False
+            code, _ = self._comfy_api_json(
+                "POST", "/free", body={"unload_models": True, "free_memory": True}, timeout_seconds=10.0,
+            )
+            if code != 200 or not owned():
+                return False
+            _agent_timing_count(lease, "samplerOomRetries")
+            logging.info("Prepared one local sampler OOM retry jobId=%s attempt=%d epoch=%d",
+                         lease.job_id, lease.execution_attempt, lease.attempt_epoch)
+            return True
+        except FileExistsError:
+            return False
+        except Exception:
+            # Preserve the original structured OOM, not a cleanup exception.
+            logging.warning("Sampler OOM recovery unavailable jobId=%s", lease.job_id)
+            return False
+
     def _comfy_interrupt(self) -> None:
         try:
             self._comfy_api_json("POST", "/interrupt", body={}, timeout_seconds=10.0)
@@ -15634,6 +15787,7 @@ class DependencyAgent:
                     active.stage = "executing"
             self._stop_idle_prl_mining_for_work("execute_job")
             lease.execute_started_at_ms = _now_ms()
+            self._log_video_gpu_processes(lease, "start")
             prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{job_id}-{uuid.uuid4().hex[:12]}")
             lease.prompt_submitted_at_ms = _now_ms()
             with self._lock:
@@ -15694,6 +15848,20 @@ class DependencyAgent:
                 completed = status_obj.get("completed") is True or status_str in ("success", "succeeded", "completed")
 
                 if failed:
+                    self._log_video_gpu_processes(lease, "failure")
+                    if self._prepare_sampler_oom_retry(
+                        lease, status_obj, start_exec_ms + max(1, execution_timeout_sec) * 1000, workflow,
+                    ):
+                        if self._is_cancel_requested(lease) or self._stop.is_set():
+                            continue
+                        prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{job_id}-{uuid.uuid4().hex[:12]}")
+                        with self._lock:
+                            active = self._active_exec_by_item.get(lease.item_id)
+                            if active:
+                                active.prompt_id = prompt_id
+                        # Same lease, event stream and original timeout. Only the
+                        # final attempt may publish output/terminal events.
+                        continue
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_failed")
                     emit_durable(
                         "job_failed",
@@ -16231,6 +16399,7 @@ class DependencyAgent:
                 f"job start jobId={lease.job_id}",
                 self._comfy_runtime_snapshot(force_refresh=True),
             )
+            self._log_video_gpu_processes(lease, "start")
             client_id = f"{lease.job_id}-{uuid.uuid4().hex[:12]}"
             requested_prompt_id = str(uuid.uuid4()) if self.comfy_node_timing_enabled else None
             if requested_prompt_id is not None:
@@ -16322,6 +16491,23 @@ class DependencyAgent:
                 completed = status_obj.get("completed") is True or status_str in ("success", "succeeded", "completed")
 
                 if failed:
+                    self._log_video_gpu_processes(lease, "failure")
+                    if self._prepare_sampler_oom_retry(
+                        lease, status_obj, start_exec_ms + max(1, execution_timeout_sec) * 1000, workflow,
+                    ):
+                        if self._is_cancel_requested(lease) or self._stop.is_set():
+                            continue
+                        # Do not attribute the first failed prompt's timings to
+                        # the recovered prompt. Lifecycle start is not repeated.
+                        if node_timing_collector is not None:
+                            node_timing_collector.stop()
+                            node_timing_collector = None
+                        prompt_id = self._comfy_submit_prompt(workflow, client_id=f"{lease.job_id}-{uuid.uuid4().hex[:12]}")
+                        with self._lock:
+                            active = self._active_exec_by_item.get(lease.item_id)
+                            if active:
+                                active.prompt_id = prompt_id
+                        continue
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_failed")
                     failed_payload: Dict[str, Any] = {
                         "promptId": prompt_id,
