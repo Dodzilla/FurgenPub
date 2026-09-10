@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.183"
+AGENT_VERSION = "dm-agent-py/0.10.184"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -14129,6 +14129,27 @@ class DependencyAgent:
         item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
         lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
         try:
+            if action == "start" and not self._gpu_coordinator.configured:
+                # Legacy workers do not have a coordinator fence. A start command
+                # can be queued while a job is preparing, then arrive after the
+                # execution thread has stopped mining and submitted its prompt.
+                # Fail closed on every local execution lease so that stale starts
+                # cannot launch a miner over an active Comfy graph.
+                with self._lock:
+                    local_work_active = bool(
+                        self._active_exec_by_item or
+                        self._agent_maintenance_inflight or
+                        self._pending_self_update is not None
+                    )
+                if local_work_active:
+                    self._idle_prl_miner.stop_if_running("foreground_work_active")
+                    if item_id and lease_id:
+                        self._agent_ack(item_id, lease_id, "command_succeeded")
+                    logging.info(
+                        "Skipped uncoordinated PRL miner start while local foreground work is active itemId=%s",
+                        item_id,
+                    )
+                    return
             if action == "start" and self._gpu_coordinator.configured:
                 prepared_payload = {**payload, "forceRestart": True}
                 try:
