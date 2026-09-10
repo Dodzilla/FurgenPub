@@ -4438,6 +4438,39 @@ def _v4_clip_duration(entry, probe):
     return start, end, (end - start) / speed
 
 
+def _v4_global_grid(entries, frame_rate):
+    """Allocate hard-cut segments on one cumulative video/audio clock."""
+    def boundary(seconds, rate):
+        ticks = seconds * rate
+        nearest = round(ticks)
+        return nearest if abs(ticks - nearest) < 1e-7 else math.ceil(ticks)
+
+    durations, boundaries = [], []
+    for index, entry in enumerate(entries):
+        if index < len(entries) - 1 and (entry.get("transitionAfter") or {}).get("type", "cut") != "cut":
+            raise ValueError("global-grid timing supports hard cuts and picture fades only")
+        start = math.fsum(durations)
+        durations.append(entry["_output_duration"])
+        end = math.fsum(durations)
+        first, last = boundary(start, frame_rate), boundary(end, frame_rate)
+        first_sample, last_sample = boundary(start, 48000), boundary(end, 48000)
+        entry["_global_grid"] = {
+            "start": start, "first_frame": first, "frames": last - first,
+            "samples": last_sample - first_sample,
+        }
+        boundaries.append({
+            "clipIndex": index, "startSeconds": start, "endSeconds": end,
+            "startFrame": first, "endFrame": last,
+            "startSample": first_sample, "endSample": last_sample,
+        })
+    return {
+        "version": 1, "mode": "global-grid", "frameRate": frame_rate,
+        "audioSampleRate": 48000, "nominalDurationSeconds": math.fsum(durations),
+        "totalFrames": boundaries[-1]["endFrame"],
+        "totalAudioSamples": boundaries[-1]["endSample"], "boundaries": boundaries,
+    }
+
+
 def _ducking_compressor_options(depth_db):
     depth = max(0.0, min(24.0, float(depth_db or 0.0)))
     minimum_gain = math.pow(10.0, -depth / 20.0)
@@ -4573,9 +4606,17 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             budget = min(entry["_output_duration"], entries[index + 1]["_output_duration"])
             entry["_xfade"] = min(fade, max(0.0, budget - 1.0 / float(frame_rate)))
 
-        _, subfolder, stem, paths = _output_bundle(
-            filename_prefix, {"video": ".mp4", "audio": "-audio.mp4"}, save_output
-        )
+        timing_mode = manifest.get("timingMode", "legacy")
+        if timing_mode not in ("legacy", "global-grid"):
+            raise ValueError("Unsupported video timingMode")
+        composition_timing = None
+        if timing_mode == "global-grid":
+            composition_timing = _v4_global_grid(entries, float(frame_rate))
+
+        extensions = {"video": ".mp4", "audio": "-audio.mp4"}
+        if composition_timing:
+            extensions["timing"] = "-timing.json"
+        _, subfolder, stem, paths = _output_bundle(filename_prefix, extensions, save_output)
         self._render_precision_filtergraph(
             entries=entries, probes=probes, soundtrack=manifest.get("soundtrack"),
             output_width=int(output_width), output_height=int(output_height), frame_rate=float(frame_rate),
@@ -4587,7 +4628,11 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             "type": "output" if save_output else "temp", "format": "video/h264-mp4",
             "frame_rate": frame_rate, "fullpath": paths["audio"],
         }
-        return {"ui": {"gifs": [preview]}, "result": ((save_output, [paths["video"], paths["audio"]]),)}
+        ui = {"gifs": [preview]}
+        if composition_timing:
+            Path(paths["timing"]).write_text(json.dumps(composition_timing, sort_keys=True), encoding="utf-8")
+            ui["compositionTiming"] = [composition_timing]
+        return {"ui": ui, "result": ((save_output, list(paths.values())),)}
 
     def _render_precision_filtergraph(self, *, entries, probes, soundtrack, output_width,
                                       output_height, frame_rate, audio_curve, pix_fmt, crf,
@@ -4605,7 +4650,15 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
                 float(adjustments.get("contrast") or 1.0),
                 float(adjustments.get("saturation") or 1.0),
             ))
-            base_filters.append(f"fps={frame_rate}")
+            grid = entry.get("_global_grid")
+            if grid:
+                base_filters.extend([
+                    "settb=1/720000000", f"setpts=PTS+{grid['start']:.9f}/TB",
+                    f"fps={frame_rate}:round=up",
+                    "setpts=PTS-STARTPTS",
+                ])
+            else:
+                base_filters.append(f"fps={frame_rate}")
             framing = entry.get("framing") or {}
             fade_in = float(framing.get("fadeInSeconds") or 0.0)
             fade_out = float(framing.get("fadeOutSeconds") or 0.0)
@@ -4669,6 +4722,11 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
                     ])
                 filters.append(f"[{index}:v]{','.join(base_filters)}[v{index}]")
 
+            if grid:
+                filters.append(
+                    f"[v{index}]tpad=stop_mode=clone:stop_duration={duration:.9f},"
+                    f"trim=end_frame={grid['frames']},setpts=PTS-STARTPTS[vg{index}]"
+                )
             audio = entry.get("audio") or {}
             if probe["has_audio"]:
                 audio_filters = [f"atrim=start={start:.6f}:end={end:.6f}", "asetpts=PTS-STARTPTS"]
@@ -4686,6 +4744,11 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
                     "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
                     "asetpts=PTS-STARTPTS",
                 ])
+                if grid:
+                    audio_filters.extend([
+                        f"apad=whole_len={grid['samples']}",
+                        f"atrim=end_sample={grid['samples']}", "asetpts=PTS-STARTPTS",
+                    ])
                 filters.append(f"[{index}:a]{','.join(audio_filters)}[a{index}]")
             else:
                 filters.append(
@@ -4695,7 +4758,17 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
                     f"asetpts=PTS-STARTPTS[a{index}]"
                 )
 
-        cur_v, cur_a = "[v0]", "[a0]"
+            if grid and not probe["has_audio"]:
+                filters.append(
+                    f"[a{index}]apad=whole_len={grid['samples']},"
+                    f"atrim=end_sample={grid['samples']},asetpts=PTS-STARTPTS[ag{index}]"
+                )
+        global_grid = bool(entries[0].get("_global_grid"))
+        def video_label(index):
+            return f"[{'vg' if global_grid else 'v'}{index}]"
+        def audio_label(index):
+            return f"[{'ag' if global_grid and not probes[index]['has_audio'] else 'a'}{index}]"
+        cur_v, cur_a = video_label(0), audio_label(0)
         timeline_duration = float(entries[0]["_output_duration"])
         curve = "tri" if audio_curve == "linear" else "qsin"
         for index in range(1, len(entries)):
@@ -4704,9 +4777,9 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             left_v, right_v = f"[vleft{index}]", f"[vright{index}]"
             left_a, right_a = f"[aleft{index}]", f"[aright{index}]"
             filters.append(f"{cur_v}settb=AVTB,setpts=PTS-STARTPTS{left_v}")
-            filters.append(f"[v{index}]settb=AVTB,setpts=PTS-STARTPTS{right_v}")
+            filters.append(f"{video_label(index)}settb=AVTB,setpts=PTS-STARTPTS{right_v}")
             filters.append(f"{cur_a}asettb=1/48000,asetpts=PTS-STARTPTS{left_a}")
-            filters.append(f"[a{index}]asettb=1/48000,asetpts=PTS-STARTPTS{right_a}")
+            filters.append(f"{audio_label(index)}asettb=1/48000,asetpts=PTS-STARTPTS{right_a}")
             if fade:
                 filters.append(
                     f"{left_v}{right_v}xfade=transition=fade:duration={fade:.6f}:"
@@ -4812,12 +4885,26 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             raise RuntimeError(json.dumps(failure, sort_keys=True)) from None
 
 
+class FCSConcatVideosV4GlobalGrid(FCSConcatVideosV4):
+    """Separate capability name makes older workers reject exact-timeline jobs."""
+
+    def concat_videos_v4(self, edit_manifest, output_width, output_height, frame_rate,
+                         audio_crossfade_curve, filename_prefix, pix_fmt, crf, save_output):
+        manifest = json.loads(edit_manifest)
+        manifest["timingMode"] = "global-grid"
+        return super().concat_videos_v4(
+            json.dumps(manifest), output_width, output_height, frame_rate,
+            audio_crossfade_curve, filename_prefix, pix_fmt, crf, save_output,
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "FurgenReferenceLatentPolicy": FurgenReferenceLatentPolicy,
     "FCSConcatVideos": FCSConcatVideos,
     "FCSConcatVideosV2": FCSConcatVideosV2,
     "FCSConcatVideosV3": FCSConcatVideosV3,
     "FCSConcatVideosV4": FCSConcatVideosV4,
+    "FCSConcatVideosV4GlobalGrid": FCSConcatVideosV4GlobalGrid,
     "FCSAnalyzeVideo": FCSAnalyzeVideo,
     "FurgenExposureAdjust": FurgenExposureAdjust,
     "FurgenGetImageRangeFromBatch": FurgenGetImageRangeFromBatch,
