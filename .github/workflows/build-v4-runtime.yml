@@ -1,0 +1,29 @@
+name: Build free V4 worker runtime
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: v4-runtime-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Free unused SDK disk space on standard public runner
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+      - name: Build and publish software-only runtime
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/dodzilla/furgen-vast-v4:cu129-${GITHUB_SHA}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --progress=plain -t "$image" docker/vast-v4-cu129
+          docker push "$image"
+          docker image inspect "$image" --format '{{join .RepoDigests "\n"}}' >> "$GITHUB_STEP_SUMMARY"
+          docker run --rm --entrypoint /bin/cat "$image" /opt/furgen/v4/manifest.json >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
