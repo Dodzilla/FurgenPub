@@ -54,3 +54,18 @@ request the new timing mode, retain that choice in saved export/cache identity, 
 store `compositionTiming` separately from source continuation boundary metadata.
 Rollback routes new requests to the previous explicit legacy mode and restores the
 prior bundle on an idle worker; it must not reinterpret an exact-timeline request.
+
+## Optional artifact delivery bridge
+
+For workers pinned to the original renderer, install this repository as a separate
+`git_custom_node` directory at an immutable commit. Its root entrypoint exports only
+`FCSExposeCompositionTiming`; it does not replace any existing generation classes.
+Link the V4 node's `VHS_FILENAMES` output to the bridge's `filenames` input. The bridge
+exposes the existing executed ledger through Comfy history `files`, enabling upload
+without replacing the shared utility bundle. It requires exactly one supported
+timing file beneath Comfy's output/temp directory and does not manufacture evidence.
+
+Register it as an optional, uniquely identified bundle required only by workflows
+using the bridge. Preserve existing base/bootstrap/full-provisioning bundle lists
+and signatures. Verify installation on an idle fenced worker before enabling the
+new workflow route. Existing workers retain their current serving contracts.
