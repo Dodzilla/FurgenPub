@@ -4632,6 +4632,10 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
         if composition_timing:
             Path(paths["timing"]).write_text(json.dumps(composition_timing, sort_keys=True), encoding="utf-8")
             ui["compositionTiming"] = [composition_timing]
+            ui["files"] = [{
+                "filename": os.path.basename(paths["timing"]), "subfolder": subfolder,
+                "type": "output" if save_output else "temp",
+            }]
         return {"ui": ui, "result": ((save_output, list(paths.values())),)}
 
     def _render_precision_filtergraph(self, *, entries, probes, soundtrack, output_width,

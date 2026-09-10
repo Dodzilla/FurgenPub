@@ -65,6 +65,9 @@ def test_global_grid_preserves_cumulative_frame_and_audio_clock(tmp_path, monkey
     actual, expected, timeline, marker_times = pixels(out), [], 0, []
     receipt = result['ui']['compositionTiming'][0]
     assert json.loads(Path(result['result'][0][1][2]).read_text()) == receipt
+    history_file = result['ui']['files'][0]
+    assert history_file['type'] == 'output'
+    assert json.loads((tmp_path / history_file['subfolder'] / history_file['filename']).read_text()) == receipt
     assert receipt['totalFrames'] == len(actual)
     for path, rate, start, end in segments:
         palette = pixels(path)

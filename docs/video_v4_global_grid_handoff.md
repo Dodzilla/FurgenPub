@@ -19,6 +19,9 @@ The normal video and audio MP4 paths are unchanged. A global-grid render additio
 writes `<prefix>_00001-timing.json`, appends its path to the result file list, and
 returns the same object as `ui.compositionTiming[0]`:
 
+The timing artifact is also declared in `ui.files` so Comfy history consumers
+discover and upload it. The result tuple alone is not exposed in execution history.
+
 - `version: 1`, `mode: "global-grid"`, `frameRate`, `audioSampleRate: 48000`
 - `nominalDurationSeconds`, `totalFrames`, `totalAudioSamples`
 - `boundaries`: `clipIndex`, `startSeconds`, `endSeconds`, `startFrame`, `endFrame`,
