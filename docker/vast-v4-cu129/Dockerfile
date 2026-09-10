@@ -11,3 +11,9 @@ RUN git clone --filter=blob:none https://github.com/comfyanonymous/ComfyUI.git /
     /venv/main/bin/python -m pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-vfx==0.1.0.1 && \
     /venv/main/bin/python -m pip check
 RUN /venv/main/bin/python -c 'import torch,json,pathlib; assert torch.__version__=="2.10.0+cu129"; assert torch.version.cuda=="12.9"; pathlib.Path("/opt/furgen/v4/manifest.json").write_text(json.dumps({"schema":1,"comfyCommit":"e01fb4c56b7a88149d469b99cbbfe3223d715054","torchVersion":torch.__version__,"cuda":"12.9","modelsIncluded":False}))'
+COPY bundles.json install_nodes.py seal_manifest.py /opt/furgen/v4/
+RUN /venv/main/bin/python /opt/furgen/v4/install_nodes.py && \
+    /venv/main/bin/python -m pip install --no-cache-dir --upgrade --index-url https://download.pytorch.org/whl/cu129 \
+      torch==2.10.0+cu129 torchvision==0.25.0+cu129 torchaudio==2.10.0+cu129 torchcodec==0.10.0+cu129 && \
+    /venv/main/bin/python -m pip check && \
+    /venv/main/bin/python /opt/furgen/v4/seal_manifest.py
