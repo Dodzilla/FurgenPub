@@ -1,0 +1,192 @@
+{
+  "video_gen_v3_h3_output_nodes": {
+    "schemaVersion": 2,
+    "steps": [
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/Dodzilla/easy-comfy-nodes-async",
+        "directoryName": "easy-comfy-nodes-async",
+        "ref": "a7d58d21de8a47fc42537c204650f9c03066f22a",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/kijai/ComfyUI-KJNodes",
+        "directoryName": "ComfyUI-KJNodes",
+        "ref": "35e5956193769d18a13136cdedb73a36a05c73e6",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+        "directoryName": "ComfyUI-VideoHelperSuite",
+        "ref": "4ee72c065db22c9d96c2427954dc69e7b908444b",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/GACLove/ComfyUI-VFI",
+        "directoryName": "ComfyUI-VFI",
+        "ref": "6176a430f12cd16003f4664c1e3c6af8e96cc3c6",
+        "installRequirements": true
+      }
+    ],
+    "compatibility": {
+      "steps": [
+        {
+          "type": "python_import_check",
+          "modules": [
+            "color_matcher",
+            "cv2",
+            "imageio_ffmpeg"
+          ]
+        }
+      ]
+    }
+  },
+  "video_gen_v4_ltx23_10eros_nodes": {
+    "schemaVersion": 2,
+    "steps": [
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/Lightricks/ComfyUI-LTXVideo",
+        "directoryName": "ComfyUI-LTXVideo",
+        "ref": "ac4d99839020b983e956a8ab67ec38aec1b6e65a",
+        "installRequirements": true,
+        "pipArgs": [
+          "kornia<0.8"
+        ]
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/TenStrip/10S-Comfy-nodes",
+        "directoryName": "10S-Comfy-nodes",
+        "ref": "c231acaaf66dff9153fc190a9a8e67a8198005a6",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/evanspearman/ComfyMath",
+        "directoryName": "ComfyMath",
+        "ref": "c01177221c31b8e5fbc062778fc8254aeb541638",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/ClownsharkBatwing/RES4LYF",
+        "directoryName": "RES4LYF",
+        "ref": "0dc91c00c4c3fb38e7874fcd7a2a327765e8882c",
+        "installRequirements": true
+      }
+    ],
+    "compatibility": {
+      "steps": [
+        {
+          "type": "pip_install",
+          "packages": [
+            "kornia<0.8"
+          ]
+        }
+      ]
+    }
+  },
+  "video_gen_v4_minimax_h3_sol_attention": {
+    "schemaVersion": 2,
+    "steps": [
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/Saganaki22/ComfyUI-sol-attn",
+        "directoryName": "ComfyUI-sol-attn",
+        "ref": "930a4d6e432ff8b8ed5e30ff2f72519b92d69bdf",
+        "installRequirements": false
+      }
+    ]
+  },
+  "video_gen_v4_nvidia_rtx_nodes": {
+    "schemaVersion": 2,
+    "steps": [
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI",
+        "directoryName": "Nvidia_RTX_Nodes_ComfyUI",
+        "ref": "892515e3eb9a4920a131a502a047e47adca9eb0d",
+        "installRequirements": true,
+        "pipArgs": [
+          "--extra-index-url",
+          "https://pypi.nvidia.com"
+        ]
+      }
+    ],
+    "compatibility": {
+      "steps": [
+        {
+          "type": "pip_install",
+          "packages": [
+            "nvidia-vfx==0.1.0.1"
+          ],
+          "extraIndexUrls": [
+            "https://pypi.nvidia.com"
+          ]
+        },
+        {
+          "type": "python_import_check",
+          "modules": [
+            "nvvfx"
+          ]
+        }
+      ]
+    }
+  },
+  "video_gen_v4_video_utility_nodes": {
+    "schemaVersion": 2,
+    "steps": [
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/kijai/ComfyUI-KJNodes",
+        "directoryName": "ComfyUI-KJNodes",
+        "ref": "35e5956193769d18a13136cdedb73a36a05c73e6",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+        "directoryName": "ComfyUI-VideoHelperSuite",
+        "ref": "4ee72c065db22c9d96c2427954dc69e7b908444b",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/GACLove/ComfyUI-VFI",
+        "directoryName": "ComfyUI-VFI",
+        "ref": "6176a430f12cd16003f4664c1e3c6af8e96cc3c6",
+        "installRequirements": true
+      }
+    ],
+    "compatibility": {
+      "steps": [
+        {
+          "type": "furgen_support_custom_node",
+          "packageName": "FurgenVideoTools",
+          "requiredClassTypes": [
+            "FCSConcatVideos",
+            "FCSConcatVideosV2",
+            "FCSConcatVideosV3",
+            "FCSConcatVideosV4",
+            "FCSAnalyzeVideo",
+            "FurgenAdaptiveExposureMatch",
+            "FurgenColorTransferMatch",
+            "FurgenExposureAdjust",
+            "FurgenReferenceColorMatch",
+            "FurgenBoundaryGradeMatch",
+            "FurgenSanitizeAudio",
+            "FurgenSceneAwareColorStabilize",
+            "FurgenLevelsMatch",
+            "FurgenTemporalUnsharpMask",
+            "FCSConcatVideosV4GlobalGrid"
+          ],
+          "furgenPubRawBaseUrl": "https://raw.githubusercontent.com/Dodzilla/FurgenPub/2f85546548af3a57f9e7c5164d6a14aaafc09a73/docker/support"
+        }
+      ]
+    }
+  }
+}
