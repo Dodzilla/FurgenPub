@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.182"
+AGENT_VERSION = "dm-agent-py/0.10.183"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -13809,6 +13809,43 @@ class DependencyAgent:
                     _push_path_value(value)
         return refs
 
+    def _prebuilt_node_bundle_matches(self, bundle_id: str, spec: Dict[str, Any]) -> bool:
+        """Use an image's sealed code only when its complete install proof matches."""
+        if self.server_type != "video_gen_v4":
+            return False
+        try:
+            manifest = json.loads(Path("/opt/furgen/v4/manifest.json").read_text())
+            bundle = manifest.get("nodeBundles", {}).get(bundle_id, {})
+            if manifest.get("schema") != 1 or bundle.get("spec") != spec or not bundle.get("files"):
+                return False
+            versions = json.loads(subprocess.check_output([
+                self._comfy_python_executable(), "-c",
+                "import importlib.metadata,json; print(json.dumps({d.metadata['Name'].lower().replace('_','-'):d.version for d in importlib.metadata.distributions()}))",
+            ], timeout=30, text=True))
+            if not manifest.get("packageVersions") or any(
+                versions.get(name) != version for name, version in manifest["packageVersions"].items()
+            ):
+                return False
+            root = Path(self.comfyui_dir).resolve()
+            expected = bundle["files"]
+            directories = set()
+            for relative, digest in expected.items():
+                parts = Path(relative).parts
+                if len(parts) < 3 or parts[0] != "custom_nodes" or ".." in parts:
+                    return False
+                path = (root / relative).resolve()
+                if root not in path.parents or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                    return False
+                directories.add(parts[1])
+            actual = set()
+            for directory in directories:
+                for path in (root / "custom_nodes" / directory).rglob("*"):
+                    if path.is_file() and path.suffix in {".py", ".json", ".txt", ".toml", ".yaml", ".yml"} and ".git" not in path.parts and "__pycache__" not in path.parts:
+                        actual.add(str(path.relative_to(root)))
+            return actual == set(expected)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            return False
+
     def _process_install_node_bundles_item(self, item: Dict[str, Any]) -> None:
         item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
         lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
@@ -13844,6 +13881,15 @@ class DependencyAgent:
             bundle_ids,
             verify_class_types,
         )
+
+        if verify_class_types and all(
+            self._prebuilt_node_bundle_matches(bundle_id, bundle_specs.get(bundle_id)) for bundle_id in bundle_ids
+        ) and self._local_comfy_has_all_class_types(verify_class_types):
+            logging.info("Verified prebuilt node bundles; no Git/pip/restart required: %s", ",".join(bundle_ids))
+            self._remember_node_bundle_verify_class_types(verify_class_types, bundle_ids=bundle_ids, bundle_specs=bundle_specs)
+            self._write_local_readiness_file()
+            self._agent_ack(item_id, lease_id, "command_succeeded")
+            return
 
         if self._local_comfy_has_all_class_types(verify_class_types) and not required_install_signature_bundle_ids:
             compat_changed = self._ensure_node_bundle_runtime_compatibility(
