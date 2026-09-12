@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.188"
+AGENT_VERSION = "dm-agent-py/0.10.189"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -14044,6 +14044,19 @@ class DependencyAgent:
                         seen_verify_classes.add(class_type)
                         verify_class_types.append(class_type)
         bundle_specs = payload.get("bundleSpecs") if isinstance(payload.get("bundleSpecs"), dict) else {}
+        if payload.get("verificationOnlyVersion") is not None or any(
+            isinstance(spec, dict) and spec.get("type") == "verify_installed_classes_v1" for spec in bundle_specs.values()
+        ):
+            valid = type(payload.get("verificationOnlyVersion")) is int and payload["verificationOnlyVersion"] == 1 and bool(bundle_ids) and bool(verify_class_types)
+            valid = valid and not required_install_signature_bundle_ids and all(
+                bundle_specs.get(bundle_id) == {"type": "verify_installed_classes_v1"} for bundle_id in bundle_ids
+            )
+            if not valid or not self._local_comfy_has_all_class_types(verify_class_types):
+                self._agent_ack(item_id, lease_id, "command_failed", error_code="installed_classes_verification_failed")
+                return
+            self._remember_node_bundle_verify_class_types(verify_class_types, bundle_ids=bundle_ids, bundle_specs=bundle_specs)
+            self._agent_ack(item_id, lease_id, "command_succeeded")
+            return
         if not bundle_ids:
             self._agent_ack(item_id, lease_id, "command_ignored_stale")
             return
