@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.187"
+AGENT_VERSION = "dm-agent-py/0.10.188"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -13280,7 +13280,7 @@ class DependencyAgent:
             logging.debug("Video GPU process attribution unavailable jobId=%s phase=%s", lease.job_id, phase)
 
     def _prepare_sampler_oom_retry(
-        self, lease: AgentExecuteLease, status_obj: Dict[str, Any], deadline_ms: int,
+        self, lease: AgentExecuteLease, status_obj: Dict[str, Any], deadline_ms: Optional[int],
         workflow: Dict[str, Any],
     ) -> bool:
         """Recover only a proven terminal sampler CUDA OOM, retaining GPU ownership.
@@ -13347,7 +13347,7 @@ class DependencyAgent:
                 )
                 coordinator = lease.gpu_coordinator_lease
                 return (active is lease and not lease.cancel_requested and not other_execution
-                        and not self._stop.is_set() and _now_ms() < deadline_ms
+                        and not self._stop.is_set() and (deadline_ms is None or _now_ms() < deadline_ms)
                         and (not self._gpu_coordinator.configured
                              or (coordinator is not None and not coordinator.renew_stop.is_set()
                                  and not coordinator.lost.is_set() and not coordinator.released
@@ -15276,6 +15276,12 @@ class DependencyAgent:
         if isinstance(data.get("refreshTokenExpiresAt"), str):
             url_refresh["refreshTokenExpiresAt"] = data.get("refreshTokenExpiresAt")
 
+    def _refresh_running_video_access(self, lease: AgentExecuteLease, command_state: Dict[str, Any]) -> None:
+        try:
+            self._agent_maybe_refresh_urls(lease, command_state, force=False)
+        except Exception:
+            logging.warning("Video access refresh pending retry jobId=%s", lease.job_id)
+
     def _agent_maybe_refresh_urls(self, lease: AgentExecuteLease, command_state: Dict[str, Any], force: bool = False) -> None:
         url_refresh = command_state.get("urlRefresh")
         if not isinstance(url_refresh, dict):
@@ -15676,6 +15682,8 @@ class DependencyAgent:
             timeouts = payload.get("timeouts") if isinstance(payload.get("timeouts"), dict) else {}
             dep_wait_timeout_sec = int(timeouts.get("dependencyWaitTimeoutSec")) if isinstance(timeouts.get("dependencyWaitTimeoutSec"), (int, float)) else 900
             execution_timeout_sec = int(timeouts.get("executionTimeoutSec")) if isinstance(timeouts.get("executionTimeoutSec"), (int, float)) else 2400
+            execution_timeout_disabled = (timeouts.get("disableExecutionTimeout") is True
+                                          or str(getattr(self, "server_type", "")).startswith("video_gen_"))
 
             if required_dep_ids:
                 dep_wait_started = _now_ms()
@@ -15818,7 +15826,7 @@ class DependencyAgent:
                     terminal_sent = True
                     return
 
-                if _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
+                if not execution_timeout_disabled and _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
                     self._comfy_interrupt()
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_timeout")
                     emit_durable(
@@ -15850,7 +15858,7 @@ class DependencyAgent:
                 if failed:
                     self._log_video_gpu_processes(lease, "failure")
                     if self._prepare_sampler_oom_retry(
-                        lease, status_obj, start_exec_ms + max(1, execution_timeout_sec) * 1000, workflow,
+                        lease, status_obj, None if execution_timeout_disabled else start_exec_ms + max(1, execution_timeout_sec) * 1000, workflow,
                     ):
                         if self._is_cancel_requested(lease) or self._stop.is_set():
                             continue
@@ -15884,6 +15892,8 @@ class DependencyAgent:
                     break
 
                 if _now_ms() - last_progress_emit_ms >= self.agent_progress_event_ms:
+                    if execution_timeout_disabled:
+                        self._refresh_running_video_access(lease, command_state)
                     emit_best_effort("execution_progress", {"promptId": prompt_id})
                     last_progress_emit_ms = _now_ms()
                 time.sleep(0.5)
@@ -16301,6 +16311,8 @@ class DependencyAgent:
         try:
             timeouts = lease.payload.get("timeouts") if isinstance(lease.payload.get("timeouts"), dict) else {}
             execution_timeout_sec = int(timeouts.get("executionTimeoutSec")) if isinstance(timeouts.get("executionTimeoutSec"), (int, float)) else 2400
+            execution_timeout_disabled = (timeouts.get("disableExecutionTimeout") is True
+                                          or str(getattr(self, "server_type", "")).startswith("video_gen_"))
 
             if self._is_cancel_requested(lease):
                 self._comfy_interrupt()
@@ -16464,7 +16476,7 @@ class DependencyAgent:
                     terminal_sent = True
                     return
 
-                if _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
+                if not execution_timeout_disabled and _now_ms() - start_exec_ms > max(1, execution_timeout_sec) * 1000:
                     self._comfy_interrupt()
                     self._mark_agent_gpu_work_finished(lease, "comfy_execution_timeout")
                     timeout_payload: Dict[str, Any] = {
@@ -16499,7 +16511,7 @@ class DependencyAgent:
                 if failed:
                     self._log_video_gpu_processes(lease, "failure")
                     if self._prepare_sampler_oom_retry(
-                        lease, status_obj, start_exec_ms + max(1, execution_timeout_sec) * 1000, workflow,
+                        lease, status_obj, None if execution_timeout_disabled else start_exec_ms + max(1, execution_timeout_sec) * 1000, workflow,
                     ):
                         if self._is_cancel_requested(lease) or self._stop.is_set():
                             continue
@@ -16545,6 +16557,8 @@ class DependencyAgent:
                     break
 
                 if _now_ms() - last_progress_emit_ms >= self.agent_progress_event_ms:
+                    if execution_timeout_disabled:
+                        self._refresh_running_video_access(lease, lease.command_state)
                     self._emit_agent_event_best_effort(lease, "execution_progress", {"promptId": prompt_id})
                     last_progress_emit_ms = _now_ms()
                 self._wait_for_comfy_history_poll(node_timing_collector)
