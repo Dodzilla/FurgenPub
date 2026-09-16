@@ -51,7 +51,7 @@
     "miningBytes": 6442450944
   },
   "miningFingerprint": {
-    "binarySha256": "5e07adc2a42e4d59d0c768b05eda67613c506686ea6a2e803237608693985c9d",
+    "binarySha256": "c2e6d6f13c3881d709dbce715393493fd65e8752ac3fdf68836ba36dd2970de1",
     "commandPolicy": "srbminer_pearlhash_v1",
     "gateWrapperSha256": "006c62a7dd6dd39884daac034f52eb17654567e63d53b9efce6c6e6aaa61a16b"
   },
@@ -62,8 +62,10 @@
   "validation": {
     "instanceId": "50203390",
     "date": "2026-09-07",
+    "minerFingerprintRevalidatedOn": "2026-09-15",
+    "minerVersion": "srbminer-multi-v3.6.6",
     "hardware": "RTX 5090, 32 GB",
-    "memoryPolicy": "Conservative envelopes above observed stock warmup/execution and historical two-hour stock residency; additional 15% margin and 2 GiB free guard remain enforced."
+    "memoryPolicy": "Conservative envelopes above observed stock warmup/execution and historical two-hour stock residency; additional 15% margin and 2 GiB free guard remain enforced. Mining envelope re-confirmed 2026-09-15 against SRBMiner-Multi 3.6.6 on instance 51149798: observed 5680 MiB steady-state, within the 6 GiB measured miningBytes envelope."
   },
   "validatedSamplingControls": {
     "temperature": 0.9,
