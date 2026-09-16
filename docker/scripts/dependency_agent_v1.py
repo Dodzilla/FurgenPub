@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.190"
+AGENT_VERSION = "dm-agent-py/0.10.191"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5257,7 +5257,8 @@ class DependencyAgent:
         self._active_maintenance_by_item: Dict[str, Dict[str, Any]] = {}
         self._ready_agent_item_ids: deque[str] = deque()
         self._agent_lease_order = 0
-        self._input_cache_downloading: Set[str] = set()
+        # cache key -> number of in-flight downloads (a heartbeat busy signal only).
+        self._input_cache_downloading: Dict[str, int] = {}
         self._loop_wakeup = threading.Event()
         self._dependency_poll_wakeup = threading.Event()
         self._agent_poll_wakeup = threading.Event()
@@ -13678,35 +13679,30 @@ class DependencyAgent:
         tmp_dir = self.input_cache_dir / ".tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        while True:
-            with _agent_timing_span(lease, "cacheLookup"):
-                cached_valid = self._is_cached_input_valid(cache_path, row)
-            if cached_valid:
-                _agent_timing_count(lease, "inputCacheHit")
-                self._touch_input_cache_path(cache_path)
-                return {
-                    "name": name,
-                    "cache_key": cache_key,
-                    "cache_path": str(cache_path),
-                }
+        with _agent_timing_span(lease, "cacheLookup"):
+            cached_valid = self._is_cached_input_valid(cache_path, row)
+        if cached_valid:
+            _agent_timing_count(lease, "inputCacheHit")
+            self._touch_input_cache_path(cache_path)
+            return {
+                "name": name,
+                "cache_key": cache_key,
+                "cache_path": str(cache_path),
+            }
 
-            try:
-                if cache_path.exists():
-                    cache_path.unlink()
-            except Exception:
-                pass
+        # Every lease that misses downloads for itself. Misses used to be
+        # serialized per cache key behind a single downloader, so one socket
+        # wedged on an unreachable CDN edge held every job that wanted the same
+        # file for a full download timeout each, in arbitrary order. A duplicate
+        # download of a small input is cheap; a blocked prefetch worker is not.
+        if self._is_cancel_requested(lease):
+            raise RuntimeError("Cancellation requested before input download.")
 
-            should_download = False
-            with self._lock:
-                if cache_key not in self._input_cache_downloading:
-                    self._input_cache_downloading.add(cache_key)
-                    should_download = True
-            if should_download:
-                _agent_timing_count(lease, "inputCacheMiss")
-                break
-            with _agent_timing_span(lease, "cacheSharedWait"):
-                time.sleep(0.2)
-
+        # No early unlink of a stale file: another lease may land this key at
+        # any moment, and the atomic replace below overwrites whatever is there.
+        _agent_timing_count(lease, "inputCacheMiss")
+        with self._lock:
+            self._input_cache_downloading[cache_key] = int(self._input_cache_downloading.get(cache_key, 0)) + 1
         try:
             with _agent_timing_span(lease, "inputUrlRefresh"):
                 self._agent_maybe_refresh_urls(lease, lease.command_state, force=False)
@@ -13731,6 +13727,8 @@ class DependencyAgent:
                     downloaded_valid = self._is_cached_input_valid(partial, row)
                 if not downloaded_valid:
                     raise RuntimeError(f"input_cache_validation_failed for {name}")
+                # Concurrent downloaders of the same key each land identical,
+                # validated bytes; the atomic replace makes the last one harmless.
                 os.replace(str(partial), str(cache_path))
             finally:
                 try:
@@ -13746,7 +13744,11 @@ class DependencyAgent:
             }
         finally:
             with self._lock:
-                self._input_cache_downloading.discard(cache_key)
+                remaining = int(self._input_cache_downloading.get(cache_key, 0)) - 1
+                if remaining > 0:
+                    self._input_cache_downloading[cache_key] = remaining
+                else:
+                    self._input_cache_downloading.pop(cache_key, None)
 
     def _workflow_with_image_references(
         self, lease: AgentExecuteLease, prefetched_inputs: List[Dict[str, Any]],
