@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.189"
+AGENT_VERSION = "dm-agent-py/0.10.190"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -17404,11 +17404,72 @@ class DependencyAgent:
         logging.info("Dependency agent stopped.")
 
 
+RESOLVER_OPTIONS = ("single-request-reopen", "timeout:2", "attempts:2")
+
+
+def harden_stub_resolver(path: str = "/etc/resolv.conf") -> None:
+    """Stop a host with a broken IPv6 path from costing 5s on every lookup.
+
+    glibc sends the A and AAAA queries of one getaddrinfo() in parallel over a
+    single socket. Some rented hosts drop or mangle one of the two replies, and
+    glibc then waits out the full 5s RES_TIMEOUT for a reply that never comes --
+    on EVERY name resolution. urllib uses that same AF_UNSPEC path, so input
+    prefetch and output upload both stall until their socket timeouts fire and
+    the worker pool wedges with leases held and nothing executing. Observed
+    2026-09-15 on asset_gen_v7_lite instance 51149798: dns=5.04s on nearly every
+    lookup while `curl -4` stayed at 0.008s.
+
+    `single-request-reopen` performs the two queries sequentially on separate
+    sockets, which sidesteps the confusion entirely; the bounded timeout/attempts
+    cap what a slow or dead resolver can cost. Applied before the agent opens any
+    connection so the resolver is already correct for the first lookup, and
+    re-applied after each in-process self-update.
+
+    Best effort by design: a container that cannot write the file still runs, it
+    is simply exposed to the stall. /etc/resolv.conf is a bind mount, so the file
+    is rewritten in place -- replacing it by rename would detach the mount.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            original = handle.read()
+    except OSError as exc:
+        logging.warning("Resolver hardening skipped; cannot read %s: %s", path, exc)
+        return
+
+    lines = original.splitlines()
+    present = {
+        token
+        for line in lines
+        if line.strip().startswith("options ")
+        for token in line.split()[1:]
+    }
+    missing = [option for option in RESOLVER_OPTIONS if option not in present]
+    if not missing:
+        return
+
+    for index, line in enumerate(lines):
+        if line.strip().startswith("options "):
+            lines[index] = line.rstrip() + " " + " ".join(missing)
+            break
+    else:
+        lines.append("options " + " ".join(missing))
+
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except OSError as exc:
+        logging.warning("Resolver hardening skipped; cannot write %s: %s", path, exc)
+        return
+    logging.info("Hardened stub resolver in %s: added %s", path, " ".join(missing))
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+
+    harden_stub_resolver()
 
     agent = DependencyAgent()
 
