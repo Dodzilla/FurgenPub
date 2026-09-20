@@ -143,7 +143,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.191"
+AGENT_VERSION = "dm-agent-py/0.10.192"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5121,18 +5121,19 @@ class DependencyAgent:
         self.agent_terminal_event_retry_attempts = max(1, min(20, _env_int("DM_AGENT_TERMINAL_EVENT_RETRY_ATTEMPTS", 8)))
         self.agent_upload_retry_attempts = max(1, min(8, _env_int("DM_AGENT_UPLOAD_RETRY_ATTEMPTS", 4)))
         self.agent_local_comfy_base_url = (_env_str("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188") or "http://127.0.0.1:8188").rstrip("/")
-        # Successful-job recycle stays opt-in: restarting after every video
-        # unnecessarily sacrifices throughput. V4 execution failures recycle
-        # by default so an OOM cannot leave mixed/quantized model residency in
-        # place for the next queued job. The FORCE variables remain explicit
-        # per-outcome overrides, including `false` to disable during diagnosis.
+        # Successful-job recycle stays opt-in: restarting after every job
+        # unnecessarily sacrifices throughput. V4 and V7-lite execution
+        # failures recycle by default because an OOM or device-side assertion
+        # can leave the live Comfy process reachable while its CUDA context is
+        # permanently unusable. The FORCE variables remain explicit per-outcome
+        # overrides, including `false` to disable during diagnosis.
         self.restart_comfy_after_successful_job = _env_bool(
             "DM_FORCE_RESTART_COMFY_AFTER_SUCCESSFUL_JOB",
             False,
         )
         self.restart_comfy_after_failed_job = _env_bool(
             "DM_FORCE_RESTART_COMFY_AFTER_FAILED_JOB",
-            self.server_type == "video_gen_v4",
+            self.server_type in ("video_gen_v4", "asset_gen_v7_lite"),
         )
         self.comfy_node_timing_enabled = _env_bool(
             "DM_COMFY_NODE_TIMING_ENABLED",
