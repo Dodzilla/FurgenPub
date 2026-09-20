@@ -87,6 +87,7 @@ Optional knobs:
   - DM_GPU_ADMISSION_MAX_DEPTH   (shared foreground queue bound; default: 64)
   - DM_COMFY_FULL_TRIM_MEM_AVAILABLE_GIB (full Comfy cache trim threshold; default: 24)
   - DM_COMFY_FULL_TRIM_MEMORY_PSI_AVG10 (full Comfy cache trim PSI avg10 threshold; default: 5)
+  - DM_COMFY_OUTPUT_CLEANUP_MAX_AGE_SECONDS (periodic-restart output retention; default: payload value, disabled when unset)
   - DM_MINING_ONLY                (set to 1 for PRL mining-only instances; skips Comfy probes and job execution)
   - DM_INPUT_CACHE_DIR            (persistent remote-input cache dir; default: $WORKSPACE/.dm_input_cache)
   - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 20GiB)
@@ -143,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.192"
+AGENT_VERSION = "dm-agent-py/0.10.193"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5068,6 +5069,10 @@ class DependencyAgent:
         self.comfy_full_trim_memory_psi_avg10 = max(
             0.0,
             min(100.0, _env_float("DM_COMFY_FULL_TRIM_MEMORY_PSI_AVG10", 5.0)),
+        )
+        self.comfy_output_cleanup_max_age_seconds = max(
+            0.0,
+            min(7 * 24 * 60 * 60.0, _env_float("DM_COMFY_OUTPUT_CLEANUP_MAX_AGE_SECONDS", 0.0)),
         )
 
         # Agent control channel knobs (execute pull mode).
@@ -14276,6 +14281,12 @@ class DependencyAgent:
         self._comfy_restart_command_active.set()
         self._remove_local_readiness_file()
         try:
+            payload_cleanup_age = payload.get("cleanupOutputOlderThanSeconds")
+            cleanup_age_seconds = self.comfy_output_cleanup_max_age_seconds
+            if isinstance(payload_cleanup_age, (int, float)) and not isinstance(payload_cleanup_age, bool):
+                cleanup_age_seconds = max(0.0, min(7 * 24 * 60 * 60.0, float(payload_cleanup_age)))
+            if cleanup_age_seconds > 0:
+                self._prune_comfy_output_files(cleanup_age_seconds)
             verify_class_types = self._node_bundle_restart_verify_class_types()
             self._restart_local_comfy_and_wait(
                 prefer_process_restart=prefer_process_restart,
@@ -14308,6 +14319,57 @@ class DependencyAgent:
             )
         finally:
             self._comfy_restart_command_active.clear()
+
+    def _prune_comfy_output_files(self, max_age_seconds: float) -> Dict[str, int]:
+        """Delete aged files from ComfyUI/output without following directory symlinks."""
+        output_dir = self.comfyui_dir / "output"
+        if not output_dir.exists():
+            logging.info("ComfyUI output cleanup skipped because %s does not exist.", output_dir)
+            return {"deletedFiles": 0, "deletedBytes": 0, "removedDirectories": 0}
+        if output_dir.is_symlink() or not output_dir.is_dir():
+            raise RuntimeError(f"Refusing ComfyUI output cleanup for unsafe path: {output_dir}")
+
+        cutoff = time.time() - max(1.0, float(max_age_seconds))
+        deleted_files = 0
+        deleted_bytes = 0
+        removed_directories = 0
+        for root, directory_names, file_names in os.walk(output_dir, topdown=False, followlinks=False):
+            root_path = Path(root)
+            for file_name in file_names:
+                candidate = root_path / file_name
+                try:
+                    stat_result = candidate.lstat()
+                    if stat_result.st_mtime >= cutoff:
+                        continue
+                    candidate.unlink()
+                    deleted_files += 1
+                    deleted_bytes += int(stat_result.st_size)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    logging.warning("Unable to delete aged ComfyUI output %s: %s", candidate, exc)
+            for directory_name in directory_names:
+                candidate_dir = root_path / directory_name
+                try:
+                    if candidate_dir.is_symlink():
+                        continue
+                    candidate_dir.rmdir()
+                    removed_directories += 1
+                except (FileNotFoundError, OSError):
+                    continue
+        logging.info(
+            "Pruned aged ComfyUI outputs path=%s maxAgeSeconds=%d deletedFiles=%d deletedBytes=%d removedDirectories=%d",
+            output_dir,
+            int(max_age_seconds),
+            deleted_files,
+            deleted_bytes,
+            removed_directories,
+        )
+        return {
+            "deletedFiles": deleted_files,
+            "deletedBytes": deleted_bytes,
+            "removedDirectories": removed_directories,
+        }
 
     def _agent_handle_prl_miner_command(self, item: Dict[str, Any]) -> None:
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
