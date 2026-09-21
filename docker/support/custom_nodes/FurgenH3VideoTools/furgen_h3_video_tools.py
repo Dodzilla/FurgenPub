@@ -373,16 +373,19 @@ class FCSConcatVideos:
                 audio_path=audio_path,
             )
 
-        preview = {
-            "filename": audio_file,
-            "subfolder": subfolder,
-            "type": "output" if save_output else "temp",
-            "format": "video/h264-mp4",
-            "frame_rate": frame_rate,
-            "fullpath": audio_path,
-        }
+        previews = [
+            {
+                "filename": output_file,
+                "subfolder": subfolder,
+                "type": "output" if save_output else "temp",
+                "format": "video/h264-mp4",
+                "frame_rate": frame_rate,
+                "fullpath": output_path,
+            }
+            for output_file, output_path in ((base_file, base_path), (audio_file, audio_path))
+        ]
         return {
-            "ui": {"gifs": [preview]},
+            "ui": {"gifs": previews},
             "result": ((save_output, [base_path, audio_path]),),
         }
 
@@ -1072,16 +1075,19 @@ class FCSConcatVideosV2(FCSConcatVideos):
             audio_path=audio_path,
         )
 
-        preview = {
-            "filename": audio_file,
-            "subfolder": subfolder,
-            "type": "output" if save_output else "temp",
-            "format": "video/h264-mp4",
-            "frame_rate": frame_rate,
-            "fullpath": audio_path,
-        }
+        previews = [
+            {
+                "filename": output_file,
+                "subfolder": subfolder,
+                "type": "output" if save_output else "temp",
+                "format": "video/h264-mp4",
+                "frame_rate": frame_rate,
+                "fullpath": output_path,
+            }
+            for output_file, output_path in ((base_file, base_path), (audio_file, audio_path))
+        ]
         return {
-            "ui": {"gifs": [preview]},
+            "ui": {"gifs": previews},
             "result": ((save_output, [base_path, audio_path]),),
         }
 
@@ -3032,16 +3038,19 @@ class FCSConcatVideosV3(FCSConcatVideosV2):
             audio_path=audio_path,
         )
 
-        preview = {
-            "filename": audio_file,
-            "subfolder": subfolder,
-            "type": "output" if save_output else "temp",
-            "format": "video/h264-mp4",
-            "frame_rate": frame_rate,
-            "fullpath": audio_path,
-        }
+        previews = [
+            {
+                "filename": output_file,
+                "subfolder": subfolder,
+                "type": "output" if save_output else "temp",
+                "format": "video/h264-mp4",
+                "frame_rate": frame_rate,
+                "fullpath": output_path,
+            }
+            for output_file, output_path in ((base_file, base_path), (audio_file, audio_path))
+        ]
         return {
-            "ui": {"gifs": [preview]},
+            "ui": {"gifs": previews},
             "result": ((save_output, [base_path, audio_path]),),
         }
 
@@ -3755,12 +3764,12 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             audio_curve=audio_crossfade_curve, pix_fmt=pix_fmt, crf=crf,
             base_path=paths["video"], audio_path=paths["audio"],
         )
-        preview = {
-            "filename": os.path.basename(paths["audio"]), "subfolder": subfolder,
+        previews = [{
+            "filename": os.path.basename(paths[key]), "subfolder": subfolder,
             "type": "output" if save_output else "temp", "format": "video/h264-mp4",
-            "frame_rate": frame_rate, "fullpath": paths["audio"],
-        }
-        ui = {"gifs": [preview]}
+            "frame_rate": frame_rate, "fullpath": paths[key],
+        } for key in ("video", "audio")]
+        ui = {"gifs": previews}
         if composition_timing:
             Path(paths["timing"]).write_text(json.dumps(composition_timing, sort_keys=True), encoding="utf-8")
             ui["compositionTiming"] = [composition_timing]

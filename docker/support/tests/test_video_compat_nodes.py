@@ -55,6 +55,22 @@ def _load_furgen_video_tools():
     return module
 
 
+def _load_furgen_h3_video_tools():
+    support_dir = Path(__file__).parents[1]
+    package_dir = support_dir / "custom_nodes" / "FurgenH3VideoTools"
+    folder_paths = types.ModuleType("folder_paths")
+    folder_paths.get_annotated_filepath = lambda value: value
+    folder_paths.get_output_directory = lambda: "/tmp"
+    folder_paths.get_temp_directory = lambda: "/tmp"
+    folder_paths.get_save_image_path = lambda prefix, output_dir: (output_dir, prefix, 0, "", prefix)
+    sys.modules["folder_paths"] = folder_paths
+    spec = importlib.util.spec_from_file_location("furgen_h3_video_tools_test", package_dir / "furgen_h3_video_tools.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_sageattention_policy():
     support_dir = Path(__file__).parents[1]
     policy_path = support_dir / "custom_nodes" / "FurgenVideoTools" / "furgen_sageattention_policy.py"
@@ -398,6 +414,40 @@ def _make_test_video(
     if video_track_timescale is not None:
         command.extend(["-video_track_timescale", str(video_track_timescale)])
     subprocess.run([*command, str(path)], check=True)
+
+
+def test_h3_concat_nodes_expose_base_and_audio_mp4_outputs(tmp_path, monkeypatch):
+    module = _load_furgen_h3_video_tools()
+    monkeypatch.setattr(module.folder_paths, "get_output_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(module.folder_paths, "get_save_image_path", lambda prefix, output: (output, prefix, 0, "", prefix))
+    source = tmp_path / "source.mp4"
+    _make_test_video(source, duration=0.4)
+
+    combined = module.FCSConcatVideos().concat_videos(
+        f"{source}\n{source}", 24, 0, "combine", "yuv420p", 24, True,
+    )
+    assert [row["filename"] for row in combined["ui"]["gifs"]] == [
+        "combine_00001.mp4",
+        "combine_00001-audio.mp4",
+    ]
+
+    global_grid = module.FCSConcatVideosV4GlobalGrid().concat_videos_v4(
+        json.dumps({
+            "clips": [{
+                "sourceVideoUrl": str(source),
+                "sourceDurationSeconds": 0.4,
+                "trimStartSeconds": 0,
+                "trimEndSeconds": 0.4,
+            }],
+            "timingMode": "global-grid",
+        }),
+        96, 64, 24, "equalPower", "grid", "yuv420p", 24, True,
+    )
+    assert [row["filename"] for row in global_grid["ui"]["gifs"]] == [
+        "grid_00001.mp4",
+        "grid_00001-audio.mp4",
+    ]
+    assert global_grid["result"][0][1][-1].endswith("grid_00001-timing.json")
 
 
 @pytest.mark.parametrize("frequency", [0, 440])
