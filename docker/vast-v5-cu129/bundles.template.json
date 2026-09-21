@@ -1,0 +1,97 @@
+{
+  "video_gen_v5_h3_runtime_nodes": {
+    "schemaVersion": 2,
+    "steps": [
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/kijai/ComfyUI-KJNodes",
+        "directoryName": "ComfyUI-KJNodes",
+        "ref": "da90cca857d7dd6fb615015197f99845e72c9bd3",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite",
+        "directoryName": "ComfyUI-VideoHelperSuite",
+        "ref": "4ee72c065db22c9d96c2427954dc69e7b908444b",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/GACLove/ComfyUI-VFI",
+        "directoryName": "ComfyUI-VFI",
+        "ref": "6176a430f12cd16003f4664c1e3c6af8e96cc3c6",
+        "installRequirements": true
+      },
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/Saganaki22/ComfyUI-sol-attn",
+        "directoryName": "ComfyUI-sol-attn",
+        "ref": "930a4d6e432ff8b8ed5e30ff2f72519b92d69bdf",
+        "installRequirements": false
+      }
+    ],
+    "compatibility": {
+      "steps": [
+        {
+          "type": "furgen_support_custom_node",
+          "packageName": "FurgenH3VideoTools",
+          "requiredClassTypes": [
+            "EZAssocStrNode",
+            "EZEmptyDictNode",
+            "EZHttpPostNode",
+            "ImpactExecutionOrderController",
+            "FCSConcatVideos",
+            "FCSConcatVideosV2",
+            "FCSConcatVideosV3",
+            "FCSConcatVideosV4",
+            "FCSConcatVideosV4GlobalGrid",
+            "FCSExposeCompositionTiming",
+            "FCSAnalyzeVideo",
+            "FurgenReferenceLatentPolicy",
+            "FurgenAdaptiveExposureMatch",
+            "FurgenColorTransferMatch",
+            "FurgenExposureAdjust",
+            "FurgenReferenceColorMatch",
+            "FurgenBoundaryGradeMatch",
+            "FurgenSanitizeAudio",
+            "FurgenSceneAwareColorStabilize",
+            "FurgenLevelsMatch",
+            "FurgenTemporalUnsharpMask",
+            "FurgenModelMemoryReserve",
+            "FurgenDisableDynamicVRAM",
+            "FurgenAIMDOVRAMHeadroom"
+          ],
+          "furgenPubRawBaseUrl": "https://raw.githubusercontent.com/Dodzilla/FurgenPub/__FURGENPUB_COMMIT__/docker/support"
+        },
+        {
+          "type": "python_import_check",
+          "modules": ["color_matcher", "cv2", "imageio_ffmpeg", "requests"]
+        }
+      ]
+    }
+  },
+  "video_gen_v5_nvidia_rtx_nodes": {
+    "schemaVersion": 2,
+    "steps": [
+      {
+        "type": "git_custom_node",
+        "repository": "https://github.com/Comfy-Org/Nvidia_RTX_Nodes_ComfyUI",
+        "directoryName": "Nvidia_RTX_Nodes_ComfyUI",
+        "ref": "892515e3eb9a4920a131a502a047e47adca9eb0d",
+        "installRequirements": true,
+        "pipArgs": ["--extra-index-url", "https://pypi.nvidia.com"]
+      }
+    ],
+    "compatibility": {
+      "steps": [
+        {
+          "type": "pip_install",
+          "packages": ["nvidia-vfx==0.1.0.1"],
+          "extraIndexUrls": ["https://pypi.nvidia.com"]
+        },
+        {"type": "python_import_check", "modules": ["nvvfx"]}
+      ]
+    }
+  }
+}
