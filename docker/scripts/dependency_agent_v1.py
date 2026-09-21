@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.194"
+AGENT_VERSION = "dm-agent-py/0.10.195"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -154,6 +154,20 @@ VIDEO_GEN_V2_FURGENPUB_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/Dodzilla/FurgenPub/{VIDEO_GEN_V2_FURGENPUB_COMMIT}/docker/support"
 )
 MAX_AGENT_ERROR_MESSAGE_CHARS = 4000
+VIDEO_GEN_V5_CORE_DEP_IDS = frozenset((
+    "text_encoder_qwen3vl_32b_h3_ultra_uncensored_heretic_int8_convrot_d8454741",
+    "vae_minimax_h3_video_vae_fp16_7c1f1314",
+    "vae_minimax_h3_audio_vae_fp32_8e505d95",
+))
+VIDEO_GEN_V5_TIMELINE_EVENTS = frozenset((
+    "image_pull_complete",
+    "image_verification",
+    "rtx_kernel_smoke",
+    "bunny_probe",
+    "node_verification",
+    "ready",
+    "agent_started",
+))
 
 
 def _compact_comfy_failure(status_obj: Dict[str, Any]) -> str:
@@ -7960,6 +7974,49 @@ class DependencyAgent:
     def _runtime_payload_signature(self, payload: Dict[str, Any]) -> str:
         return _sha256_hex_bytes(_canonical_json_bytes(payload))
 
+    def _video_gen_v5_provisioning_timeline(self) -> Dict[str, int]:
+        """Read only the bounded, allowlisted milestones emitted by the sealed v5 startup."""
+        if (self.server_type or "").strip() != "video_gen_v5":
+            return {}
+        timeline_path = Path(os.environ.get("WORKSPACE") or "/workspace") / "video_gen_v5_provisioning_timeline.jsonl"
+        try:
+            lines = timeline_path.read_text(encoding="utf-8", errors="replace").splitlines()[-64:]
+        except OSError:
+            return {}
+        milestones: Dict[str, int] = {}
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            event = row.get("event") if isinstance(row, dict) else None
+            epoch_ms = row.get("epochMs") if isinstance(row, dict) else None
+            if event in VIDEO_GEN_V5_TIMELINE_EVENTS and isinstance(epoch_ms, (int, float)):
+                value = int(epoch_ms)
+                if 0 < value <= 9_007_199_254_740_991:
+                    milestones[str(event)] = value
+        return milestones
+
+    def _video_gen_v5_core_ready_at_ms(self, installed_static: Iterable[str]) -> int:
+        """Persist the first heartbeat at which every boot-prefetched H3 core asset is installed."""
+        if (self.server_type or "").strip() != "video_gen_v5" or not VIDEO_GEN_V5_CORE_DEP_IDS.issubset(set(installed_static)):
+            return 0
+        marker = Path(os.environ.get("WORKSPACE") or "/workspace") / "video_gen_v5_core_ready_at_ms"
+        try:
+            existing = int(marker.read_text(encoding="utf-8").strip())
+            if existing > 0:
+                return existing
+        except (OSError, TypeError, ValueError):
+            pass
+        ready_at_ms = _now_ms()
+        try:
+            temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+            temporary.write_text(f"{ready_at_ms}\n", encoding="utf-8")
+            os.replace(str(temporary), str(marker))
+        except OSError:
+            pass
+        return ready_at_ms
+
     def _dependency_runtime_transition_signature(self, queue_depth: Optional[int] = None) -> str:
         with self._lock:
             if isinstance(queue_depth, int):
@@ -7994,6 +8051,7 @@ class DependencyAgent:
             queue_depth_value = int(self._last_dependency_queue_depth)
 
         now_ms = _now_ms()
+        core_models_ready_at_ms = self._video_gen_v5_core_ready_at_ms(installed_static)
         manager: Dict[str, Any] = {
             "queueDepth": queue_depth_value,
             "lastHeartbeatAtMs": now_ms,
@@ -8001,6 +8059,7 @@ class DependencyAgent:
             "installedDepIdsDynamicHash": _sha256_hex_bytes(_canonical_json_bytes(installed_dynamic)),
             "downloadingDepIdsHash": _sha256_hex_bytes(_canonical_json_bytes(downloading)),
             "failedDepIdsHash": _sha256_hex_bytes(_canonical_json_bytes(failed)),
+            **({"coreModelsReadyAtMs": core_models_ready_at_ms} if core_models_ready_at_ms > 0 else {}),
         }
         if active_downloads:
             manager["activeDownloads"] = active_downloads
@@ -8037,6 +8096,7 @@ class DependencyAgent:
             "downloadingDepIdsHash": manager["downloadingDepIdsHash"],
             "failedDepIdsHash": manager["failedDepIdsHash"],
             "dynamicBytesUsed": dynamic_bytes_used,
+            **({"coreModelsReadyAtMs": core_models_ready_at_ms} if core_models_ready_at_ms > 0 else {}),
         }
         if full and "disk" in manager:
             hot_manager["disk"] = manager["disk"]
@@ -8250,6 +8310,7 @@ class DependencyAgent:
             stage_counts = self._agent_stage_counts_payload()
             memory_telemetry = collect_cgroup_memory_telemetry()
             comfy_runtime = {} if self.mining_only else self._comfy_runtime_snapshot()
+            provisioning_timeline = self._video_gen_v5_provisioning_timeline()
             body = {
                 "localComfyReachable": bool(local_comfy),
                 "localReadinessFilePresent": bool(readiness_present),
@@ -8270,6 +8331,7 @@ class DependencyAgent:
                 "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
                 **({"memoryTelemetry": memory_telemetry} if memory_telemetry else {}),
                 **({"comfyRuntime": comfy_runtime} if comfy_runtime else {}),
+                **({"provisioningTimeline": provisioning_timeline} if provisioning_timeline else {}),
                 "idleMining": self._idle_prl_miner.snapshot(),
                 "gpuCoordinator": self._gpu_coordinator_runtime_snapshot(),
                 "agentVersion": AGENT_VERSION,
@@ -8312,6 +8374,9 @@ class DependencyAgent:
         comfy_runtime = body.get("comfyRuntime")
         if isinstance(comfy_runtime, dict) and comfy_runtime:
             agent_control["comfyRuntime"] = comfy_runtime
+        provisioning_timeline = body.get("provisioningTimeline")
+        if isinstance(provisioning_timeline, dict) and provisioning_timeline:
+            agent_control["provisioningTimeline"] = provisioning_timeline
         queue_summary = body.get("queueSummary")
         if isinstance(queue_summary, dict) and queue_summary:
             agent_control["queueSummary"] = queue_summary
@@ -8361,6 +8426,8 @@ class DependencyAgent:
             hot_agent_control["memoryTelemetry"] = agent_control.get("memoryTelemetry")
         if "comfyRuntime" in agent_control:
             hot_agent_control["comfyRuntime"] = agent_control.get("comfyRuntime")
+        if "provisioningTimeline" in agent_control:
+            hot_agent_control["provisioningTimeline"] = agent_control.get("provisioningTimeline")
         if "queueSummary" in agent_control:
             hot_agent_control["queueSummary"] = agent_control.get("queueSummary")
         if "gpuCoordinator" in agent_control:
@@ -12227,6 +12294,9 @@ class DependencyAgent:
             "diskDiagnostics": self._disk_diagnostics_payload(),
             "dynamicBytesUsed": dynamic_bytes_used,
         }
+        core_models_ready_at_ms = self._video_gen_v5_core_ready_at_ms(installed_static)
+        if core_models_ready_at_ms > 0:
+            body["coreModelsReadyAtMs"] = core_models_ready_at_ms
         if state == "succeeded":
             dep_id = item.get("depId")
             with self._lock:
@@ -12780,6 +12850,7 @@ class DependencyAgent:
         stage_counts = self._agent_stage_counts_payload()
         memory_telemetry = collect_cgroup_memory_telemetry()
         comfy_runtime = {} if self.mining_only else self._comfy_runtime_snapshot()
+        provisioning_timeline = self._video_gen_v5_provisioning_timeline()
         ssh_host_key_sha256 = collect_ssh_host_key_sha256()
 
         body: Dict[str, Any] = {
@@ -12804,6 +12875,7 @@ class DependencyAgent:
             "inputCacheInventoryTruncated": bool(input_cache_inventory.get("inventoryTruncated")),
             **({"memoryTelemetry": memory_telemetry} if memory_telemetry else {}),
             **({"comfyRuntime": comfy_runtime} if comfy_runtime else {}),
+            **({"provisioningTimeline": provisioning_timeline} if provisioning_timeline else {}),
             **({"sshHostKeySha256": ssh_host_key_sha256} if ssh_host_key_sha256 else {}),
             "idleMining": self._idle_prl_miner.snapshot(),
             "gpuCoordinator": self._gpu_coordinator_runtime_snapshot(),
