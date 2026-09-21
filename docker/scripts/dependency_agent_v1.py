@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.193"
+AGENT_VERSION = "dm-agent-py/0.10.194"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -9929,6 +9929,12 @@ class DependencyAgent:
                     furgenpub_raw_base_url=pinned_raw_base,
                 )
                 return True
+            if package_name == "FurgenH3VideoTools":
+                self._install_furgen_h3_video_tools_node(
+                    required_class_types=required,
+                    furgenpub_raw_base_url=pinned_raw_base,
+                )
+                return True
             if package_name in ("furgen_video_compat_nodes.py", "FurgenVideoCompatNodes"):
                 self._install_furgen_video_compat_nodes(furgenpub_raw_base_url=pinned_raw_base)
                 return True
@@ -10395,6 +10401,67 @@ class DependencyAgent:
                 shutil.rmtree(dest_dir)
             os.replace(str(temp_dir), str(dest_dir))
             logging.info("Installed managed custom node FurgenVideoTools from raw source: %s", remote_base)
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+
+    def _install_furgen_h3_video_tools_node(
+        self,
+        required_class_types: Optional[Iterable[str]] = None,
+        furgenpub_raw_base_url: Optional[str] = None,
+    ) -> None:
+        """Install the H3/general Furgen package without legacy video-family add-ons."""
+        required = self._normalize_required_class_types(required_class_types)
+        package_name = "FurgenH3VideoTools"
+        implementation_name = "furgen_h3_video_tools.py"
+        custom_nodes_dir = self.comfyui_dir / "custom_nodes"
+        dest_dir = custom_nodes_dir / package_name
+        custom_nodes_dir.mkdir(parents=True, exist_ok=True)
+        remote_base = (
+            f"{furgenpub_raw_base_url or self.furgenpub_raw_base_url}"
+            f"/custom_nodes/{package_name}"
+        )
+        temp_dir = dest_dir.with_name(f".{dest_dir.name}.tmp-{uuid.uuid4().hex}")
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            for filename in ("__init__.py", implementation_name, "furgen_sageattention_policy.py"):
+                request = urllib.request.Request(
+                    f"{remote_base}/{filename}",
+                    headers={"User-Agent": "furgen-dependency-agent/1.0"},
+                )
+                with urllib.request.urlopen(request, timeout=60.0) as response:
+                    (temp_dir / filename).write_bytes(response.read())
+            implementation = (temp_dir / implementation_name).read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(implementation, filename=str(temp_dir / implementation_name))
+            class_names = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+            mapping_names: Set[str] = set()
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign) or not any(
+                    isinstance(target, ast.Name) and target.id == "NODE_CLASS_MAPPINGS" for target in node.targets
+                ) or not isinstance(node.value, ast.Dict):
+                    continue
+                for key in node.value.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        mapping_names.add(key.value)
+            missing = [name for name in required if name not in class_names or name not in mapping_names]
+            if missing:
+                raise RuntimeError(
+                    "Downloaded FurgenH3VideoTools source is missing required class types: "
+                    + ", ".join(missing)
+                )
+            subprocess.run(
+                [self._comfy_python_executable(), "-m", "py_compile", *map(str, temp_dir.glob("*.py"))],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=60,
+            )
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
+            os.replace(str(temp_dir), str(dest_dir))
+            logging.info("Installed managed custom node %s from raw source: %s", package_name, remote_base)
         except Exception:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
@@ -13989,12 +14056,24 @@ class DependencyAgent:
 
     def _prebuilt_node_bundle_matches(self, bundle_id: str, spec: Dict[str, Any]) -> bool:
         """Use an image's sealed code only when its complete install proof matches."""
-        if self.server_type != "video_gen_v4":
+        manifest_paths = {
+            "video_gen_v4": (Path("/opt/furgen/v4/manifest.json"), {1}),
+            "video_gen_v5": (Path("/opt/furgen/v5/manifest.json"), {2}),
+        }
+        manifest_entry = manifest_paths.get(self.server_type)
+        if manifest_entry is None:
             return False
         try:
-            manifest = json.loads(Path("/opt/furgen/v4/manifest.json").read_text())
+            manifest_path, allowed_schemas = manifest_entry
+            manifest = json.loads(manifest_path.read_text())
             bundle = manifest.get("nodeBundles", {}).get(bundle_id, {})
-            if manifest.get("schema") != 1 or bundle.get("spec") != spec or not bundle.get("files"):
+            if (
+                manifest.get("schema") not in allowed_schemas
+                or (self.server_type == "video_gen_v5" and manifest.get("serverType") != self.server_type)
+                or (self.server_type != "video_gen_v5" and manifest.get("serverType") not in (None, self.server_type))
+                or bundle.get("spec") != spec
+                or not bundle.get("files")
+            ):
                 return False
             versions = json.loads(subprocess.check_output([
                 self._comfy_python_executable(), "-c",
@@ -14044,7 +14123,7 @@ class DependencyAgent:
                 signature = required_install_signatures_raw.get(bundle_id)
                 if isinstance(signature, str) and re.match(r"^[0-9a-fA-F]{64}$", signature.strip()):
                     required_install_signature_bundle_ids.add(bundle_id)
-        if not verify_class_types and (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3", "video_gen_v4"):
+        if not verify_class_types and (self.server_type or "").strip() in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3", "video_gen_v4", "video_gen_v5"):
             seen_verify_classes: Set[str] = set()
             for bundle_id in bundle_ids:
                 for class_type in self._video_gen_v2_bundle_verify_class_types(bundle_id):
@@ -14154,7 +14233,7 @@ class DependencyAgent:
                     check=True,
                     timeout=max(1800, 300 * max(1, len(legacy_bundle_ids))),
                 )
-            elif server_type in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3", "video_gen_v4") and legacy_bundle_ids:
+            elif server_type in ("video_gen_v2", "video_gen_v2_salad", "video_gen_v3", "video_gen_v4", "video_gen_v5") and legacy_bundle_ids:
                 # Newer video server types can share compatible bundle catalogs; the
                 # installers are server-type agnostic (git nodes + managed
                 # FurgenVideoTools copies).
