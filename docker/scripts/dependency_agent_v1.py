@@ -73,7 +73,7 @@ Optional knobs:
   - DM_AGENT_MAX_PREFETCH_WORKERS  (local prefetch worker cap; default: 8, max: 32)
   - DM_AGENT_MAX_UPLOAD_WORKERS    (local output upload worker cap; default: max(4, exec*2))
   - DM_LOCAL_COMFY_BASE_URL       (local ComfyUI URL; default: http://127.0.0.1:8188)
-  - DM_COMFY_NODE_TIMING_ENABLED  (capture native Comfy node-boundary timings; default: true on video_gen_v3/video_gen_v4)
+  - DM_COMFY_NODE_TIMING_ENABLED  (capture native Comfy node-boundary timings; default: true on video_gen_v3/video_gen_v4/video_gen_v5)
   - DM_COMFY_NODE_TIMING_MAX_ROWS (maximum persisted slow-node rows per job; default/max: 64)
   - DM_LOCAL_READINESS_FILE       (readiness marker file in Comfy input dir; default: provisioning_complete.txt)
   - DM_VIDEO_GEN_V2_BOOTSTRAP_GATE_WAIT_SECONDS (max wait for the managed video bootstrap gate; default: 1800)
@@ -5044,7 +5044,7 @@ class DependencyAgent:
         if self.server_type == "image_gen_v1":
             self._idle_prl_miner.launch_allowed = self._image_mining_launch_allowed
             self._idle_prl_miner.before_launch = lambda: self._free_local_comfy_for_idle_prl_mining("image_idle_admitted")
-        elif self.server_type == "video_gen_v4":
+        elif self.server_type in ("video_gen_v4", "video_gen_v5"):
             # Use the same process-operation fence as foreground pause. A
             # queued start/resume must recheck demand at the actual launch,
             # not only when its maintenance command was received.
@@ -5152,11 +5152,11 @@ class DependencyAgent:
         )
         self.restart_comfy_after_failed_job = _env_bool(
             "DM_FORCE_RESTART_COMFY_AFTER_FAILED_JOB",
-            self.server_type in ("video_gen_v4", "asset_gen_v7_lite"),
+            self.server_type in ("video_gen_v4", "video_gen_v5", "asset_gen_v7_lite"),
         )
         self.comfy_node_timing_enabled = _env_bool(
             "DM_COMFY_NODE_TIMING_ENABLED",
-            self.server_type in ("video_gen_v3", "video_gen_v4", "image_gen_v1"),
+            self.server_type in ("video_gen_v3", "video_gen_v4", "video_gen_v5", "image_gen_v1"),
         )
         self.comfy_node_timing_max_rows = max(
             1,
@@ -5164,7 +5164,7 @@ class DependencyAgent:
         )
         self.local_comfy_allow_discovery = _env_bool(
             "DM_LOCAL_COMFY_ALLOW_DISCOVERY",
-            self.server_type not in ("video_gen_v2", "video_gen_v3", "video_gen_v4"),
+            self.server_type not in ("video_gen_v2", "video_gen_v3", "video_gen_v4", "video_gen_v5"),
         )
         self._agent_local_readiness_file_env = _env_str("DM_LOCAL_READINESS_FILE")
         default_readiness_file = "provisioned_furry_all.txt" if (self.server_type or "").strip() == "video_gen_v2" else "provisioning_complete.txt"
@@ -6195,7 +6195,7 @@ class DependencyAgent:
             if reason == "execute_job":
                 # Coordinator-managed mining must release VRAM, so suspend/resume
                 # and keep-running modes are deliberately overridden here.
-                if self._gpu_coordinator.configured or self.server_type == "video_gen_v4":
+                if self._gpu_coordinator.configured or self.server_type in ("video_gen_v4", "video_gen_v5"):
                     self._idle_prl_miner.pause_for_work(reason, force_stop=True)
                 else:
                     self._idle_prl_miner.pause_for_work(reason)
@@ -6248,7 +6248,7 @@ class DependencyAgent:
                 and time.monotonic() >= self._image_mining_idle_after)
 
     def _refresh_image_mining_demand_locked(self) -> None:
-        if getattr(self, "server_type", "") not in ("image_gen_v1", "video_gen_v4"):
+        if getattr(self, "server_type", "") not in ("image_gen_v1", "video_gen_v4", "video_gen_v5"):
             return
         demand = bool(self._active_exec_by_item) or any(
             row.get("stage") != "maintenance:prl_miner"
@@ -8741,7 +8741,7 @@ class DependencyAgent:
 
     def _video_gen_v2_sageattention_runtime_ready(self) -> bool:
         server_type = (self.server_type or "").strip()
-        if server_type not in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
+        if server_type not in ("video_gen_v2", "video_gen_v3", "video_gen_v4", "video_gen_v5"):
             return True
         if self._h3_attention_backend() in {"pytorch", "comfy_kitchen"}:
             try:
@@ -8763,7 +8763,7 @@ class DependencyAgent:
             if payload.get("kernelSmokePassed") is not True:
                 return False
 
-            if server_type in ("video_gen_v3", "video_gen_v4"):
+            if server_type in ("video_gen_v3", "video_gen_v4", "video_gen_v5"):
                 expected_torch = str(payload.get("torchVersion") or "").strip()
                 configured_torch = _env_str("FURGEN_H3_PYTORCH_RUNTIME_VERSION", "2.10.0+cu129") or ""
                 configured_sage = _env_str("FURGEN_H3_SAGEATTENTION_VERSION", "2.2.0") or ""
@@ -10859,7 +10859,7 @@ class DependencyAgent:
         env.setdefault("WORKSPACE", str(self.workspace))
         env.setdefault("DM_COMFYUI_DIR", str(self.comfyui_dir))
         env["DM_LOCAL_COMFY_BASE_URL"] = self.agent_local_comfy_base_url
-        if self.server_type in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
+        if self.server_type in ("video_gen_v2", "video_gen_v3", "video_gen_v4", "video_gen_v5"):
             env["DM_LOCAL_COMFY_ALLOW_DISCOVERY"] = "false"
         # The Vast Comfy image portal wrapper can block forever waiting for
         # /etc/portal.yaml when launched outside its original supervisor path.
@@ -10872,7 +10872,7 @@ class DependencyAgent:
         parsed = urllib.parse.urlparse(configured)
         launch_port = parsed.port or 8188
         launch_args = f"--disable-auto-launch --listen 0.0.0.0 --port {launch_port} --enable-cors-header"
-        if self.server_type in ("video_gen_v2", "video_gen_v3", "video_gen_v4"):
+        if self.server_type in ("video_gen_v2", "video_gen_v3", "video_gen_v4", "video_gen_v5"):
             launch_args += f" {self._h3_attention_cli_flag()}"
         # The provisioning env carries memory/VRAM flags that the workload
         # depends on (allocator behaviour, DynamicVRAM headroom, node cache).
@@ -13398,7 +13398,7 @@ class DependencyAgent:
 
     def _log_video_gpu_processes(self, lease: AgentExecuteLease, phase: str) -> None:
         """Local-only, bounded attribution; never collect process args or env."""
-        if getattr(self, "server_type", "") != "video_gen_v4":
+        if getattr(self, "server_type", "") not in ("video_gen_v4", "video_gen_v5"):
             return
         rows = []
         try:
@@ -13435,7 +13435,7 @@ class DependencyAgent:
         repeated history result, or cleanup failure cannot create a retry loop.
         The token is deliberately retained for the worker's lifetime.
         """
-        if getattr(self, "server_type", "") != "video_gen_v4":
+        if getattr(self, "server_type", "") not in ("video_gen_v4", "video_gen_v5"):
             return False
         # Leave coordinated recovery to its fenced recovery protocol.
         if self._gpu_coordinator.configured:
