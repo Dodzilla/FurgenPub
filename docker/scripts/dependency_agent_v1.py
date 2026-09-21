@@ -12282,7 +12282,7 @@ class DependencyAgent:
         url = f"{self.api_base_url}/dependencies/status"
         with self._lock:
             dynamic_bytes_used = int(self._dynamic_bytes_used)
-            _, _, _, _, active_downloads = self._dependency_runtime_snapshot_locked()
+            installed_static, _, _, _, active_downloads = self._dependency_runtime_snapshot_locked()
         body: Dict[str, Any] = {
             "instanceId": self._resolved_instance_id,
             "itemId": item.get("itemId") or item.get("depId"),
