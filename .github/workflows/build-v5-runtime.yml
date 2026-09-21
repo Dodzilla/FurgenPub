@@ -30,5 +30,7 @@ jobs:
           docker build --progress=plain --build-arg "FURGENPUB_COMMIT=${GITHUB_SHA}" -f docker/vast-v5-cu129/Dockerfile -t "$image" .
           docker push "$image"
           docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' >> "$GITHUB_STEP_SUMMARY"
-          docker run --rm --entrypoint /bin/cat "$image" /opt/furgen/v5/manifest.json >> "$GITHUB_STEP_SUMMARY"
+          docker run --rm --entrypoint /bin/cat "$image" /opt/furgen/v5/manifest.json > /tmp/video-gen-v5-manifest.json
+          cat /tmp/video-gen-v5-manifest.json >> "$GITHUB_STEP_SUMMARY"
+          echo "sealed-manifest-sha256=$(sha256sum /tmp/video-gen-v5-manifest.json | cut -d' ' -f1)"
           docker logout ghcr.io
