@@ -35,5 +35,6 @@ assert "rembg" not in source.lower() and "boto" not in source.lower()
 
 dockerfile = (V5 / "Dockerfile").read_text()
 assert dockerfile.count("torch==2.10.0+cu129") == 1
+assert "import color_matcher, cv2, imageio_ffmpeg, requests, nvvfx" in dockerfile
 assert "modelsIncluded" in (V5 / "seal_manifest.py").read_text()
 print("v5 sealed runtime contract validated")

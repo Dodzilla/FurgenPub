@@ -24,6 +24,7 @@ RUN set -eux; \
       'https://github.com/Comfy-Org/wheels/releases/download/sageattention-latest/sageattention-2.2.0%2Bcu129torch2.10-cp312-cp312-manylinux_2_34_x86_64.manylinux_2_35_x86_64.whl'; \
     /venv/main/bin/python -m pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com nvidia-vfx==0.1.0.1; \
     /venv/main/bin/python -m pip check; \
+    /venv/main/bin/python -c 'import color_matcher, cv2, imageio_ffmpeg, requests, nvvfx'; \
     /venv/main/bin/python -c 'import torch; assert torch.__version__ == "2.10.0+cu129"; assert torch.version.cuda == "12.9"'; \
     /venv/main/bin/python /opt/furgen/v5/seal_manifest.py; \
     find /opt/furgen/v5/ComfyUI -type d -name .git -prune -exec rm -rf '{}' +; \
