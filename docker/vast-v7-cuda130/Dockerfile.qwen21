@@ -59,7 +59,7 @@ RUN /venv/main/bin/python -c 'import importlib.metadata as m; expected={"torch":
 # The node modules must import against the new core before an instance ever
 # rents this image; a GPU is not needed to surface an API break.
 COPY verify-qwen21-nodes.py /opt/furgen/v7/verify-qwen21-nodes.py
-RUN cd /opt/workspace-internal/ComfyUI && /venv/main/bin/python /opt/furgen/v7/verify-qwen21-nodes.py
+RUN /venv/main/bin/python /opt/furgen/v7/verify-qwen21-nodes.py /opt/workspace-internal/ComfyUI
 
 FROM scratch
 COPY --from=qwen21 / /

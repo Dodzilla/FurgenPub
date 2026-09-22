@@ -1,12 +1,24 @@
 """Import every node module against the baked core, without a GPU.
 
 Runs at image build time so an API break surfaces here rather than on a rented
-worker. comfy.options must enable parsing before comfy.cli_args is imported:
-otherwise cli_args parses an empty argv, --cpu is ignored, and model_management
-initialises CUDA on the GPU-less builder.
+worker.
+
+Usage: python verify-qwen21-nodes.py /path/to/ComfyUI
+
+Two things have to happen before `import nodes`:
+  * the ComfyUI root must be on sys.path. Python seeds sys.path[0] with the
+    *script's* directory, not the working directory, so running this file from
+    /opt/furgen/v7 cannot find `comfy` however the shell has cd'd.
+  * comfy.options must enable parsing before comfy.cli_args is imported, or
+    cli_args parses an empty argv, --cpu is ignored, and model_management
+    initialises CUDA on the GPU-less builder.
 """
 import sys
 
+if len(sys.argv) != 2:
+    raise SystemExit("usage: verify-qwen21-nodes.py /path/to/ComfyUI")
+
+sys.path.insert(0, sys.argv[1])
 sys.argv = ["main.py", "--cpu"]
 
 import comfy.options  # noqa: E402
