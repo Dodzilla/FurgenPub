@@ -3,7 +3,7 @@
 set -euo pipefail
 COMFY_DIR="${DM_COMFYUI_DIR:-${WORKSPACE:-/workspace}/ComfyUI}"
 PYTHON="${FURGEN_COMFY_PYTHON:-/venv/main/bin/python}"
-PIN="e01fb4c56b7a88149d469b99cbbfe3223d715054"
+PIN="73c9bad4d21e7addbe1d13bc92eee0f1431b017d"
 if [[ -n "${COMFYUI_PIN_COMMIT:-}" && "${COMFYUI_PIN_COMMIT}" != "${PIN}" ]]; then
     echo "ERROR: v7 Comfy Kitchen requires the reviewed core pin ${PIN}." >&2
     exit 1
@@ -137,7 +137,7 @@ if template_assets:
 after = {name: metadata.version(name) for name in protected}
 if before != after:
     raise SystemExit("Protected framework versions changed")
-for name, expected in (("comfy-kitchen", "0.2.31"), ("comfy-aimdo", "0.4.13")):
+for name, expected in (("comfy-kitchen", "0.2.35"), ("comfy-aimdo", "0.5.5")):
     if metadata.version(name) != expected:
         raise SystemExit(f"Unexpected {name} version")
 print(json.dumps({"core": git("rev-parse", "HEAD"), "frameworkUnchanged": after,

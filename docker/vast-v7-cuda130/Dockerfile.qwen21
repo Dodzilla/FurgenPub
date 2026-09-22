@@ -1,0 +1,94 @@
+# Incremental v7 layer: ComfyUI core -> v0.37.0 (first release carrying
+# QwenImage21) plus the pinned GGUF loader fork Qwen-Image 2.1 needs.
+#
+# This builds ON TOP of the verified production image so the CUDA 13.0 native
+# llama-server, the Breeze-TTS-2 node and the v5 flux bundles are reused
+# byte-for-byte. Nothing here compiles: the slim image has already purged
+# cuda-nvcc, and every package added below ships a cp312 manylinux wheel.
+FROM ghcr.io/dodzilla/furgen-vast-v7@sha256:2d03b9ea836d0bc9945b6a9b162186c53b084c1ec09963bb151adfdda2f8e89c AS qwen21
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG SUPPORT_COMMIT
+ARG COMFY_CORE=73c9bad4d21e7addbe1d13bc92eee0f1431b017d
+# Dodzilla/ComfyUI-GGUF @ qwen-image-2.1-arch: city96 HEAD plus the Qwen-Image
+# 2.1 fingerprint. Upstream cannot load a stable-diffusion.cpp export because
+# those carry no general.architecture field and detect_arch() has no Qwen entry.
+ARG GGUF_NODE_COMMIT=a61991d28768a6f99f75a8e7873f5dffd9dbae7b
+ARG GGUF_PY=0.19.0
+
+RUN test -n "${SUPPORT_COMMIT}" && \
+    for name in asset_gen_v7_lite_comfy_kitchen.sh asset_gen_v7_lite_prebuilt.py; do \
+      curl -fsSL --retry 3 "https://raw.githubusercontent.com/Dodzilla/FurgenPub/${SUPPORT_COMMIT}/docker/support/${name}" \
+        -o "/opt/furgen/v7/support/${name}"; \
+    done && \
+    cp /opt/furgen/v7/support/asset_gen_v7_lite_prebuilt.py /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py && \
+    grep -q "${COMFY_CORE}" /opt/furgen/v7/support/asset_gen_v7_lite_comfy_kitchen.sh && \
+    grep -q "${COMFY_CORE}" /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py
+
+# Core update. install-core preserves the tracked FCS xformers fallback through
+# an explicit git stash and refuses on any unrelated tracked change, so a
+# surprise in the base tree fails the build instead of shipping silently.
+RUN FURGEN_COMFY_PYTHON=/venv/main/bin/python DM_COMFYUI_DIR=/opt/workspace-internal/ComfyUI \
+      bash /opt/furgen/v7/support/asset_gen_v7_lite_comfy_kitchen.sh install-core && \
+    git -c safe.directory=/opt/workspace-internal/ComfyUI -C /opt/workspace-internal/ComfyUI \
+      rev-parse HEAD | grep -qx "${COMFY_CORE}"
+
+# GGUF loader. --no-deps throughout: numpy, pyyaml, tqdm, sentencepiece and
+# protobuf are already resolved by the core requirements, and the protected
+# torch/transformers pins must not move.
+RUN /venv/main/bin/python -m pip install --no-deps --no-cache-dir "gguf==${GGUF_PY}" && \
+    git init /opt/workspace-internal/ComfyUI/custom_nodes/ComfyUI-GGUF && \
+    git -C /opt/workspace-internal/ComfyUI/custom_nodes/ComfyUI-GGUF fetch --depth 1 \
+      https://github.com/Dodzilla/ComfyUI-GGUF "${GGUF_NODE_COMMIT}" && \
+    git -C /opt/workspace-internal/ComfyUI/custom_nodes/ComfyUI-GGUF checkout --detach FETCH_HEAD && \
+    /venv/main/bin/python -c 'import gguf, sys; sys.path.insert(0, "/opt/workspace-internal/ComfyUI/custom_nodes/ComfyUI-GGUF"); \
+import importlib.util as u; s = u.spec_from_file_location("cvt", "/opt/workspace-internal/ComfyUI/custom_nodes/ComfyUI-GGUF/tools/convert.py"); \
+m = u.module_from_spec(s); s.loader.exec_module(m); \
+assert any(a.arch == "qwen_image" for a in m.arch_list), "Qwen-Image fingerprint missing from the pinned GGUF loader"; \
+assert m.detect_arch({"img_in.weight", "modulation.1.weight", "transformer_blocks.0.img_mlp.gate_layer.weight"}).arch == "qwen_image"; \
+print("GGUF loader fork carries the Qwen-Image 2.1 fingerprint")'
+
+# Framework contract, then re-seal the manifest over the new core and node set.
+RUN /venv/main/bin/python -c 'import importlib.metadata as m; expected={"torch":"2.10.0+cu130","torchvision":"0.25.0+cu130","torchaudio":"2.10.0+cu130","transformers":"5.3.0","comfy-kitchen":"0.2.35","comfy-aimdo":"0.5.5"}; bad={k:(m.version(k),v) for k,v in expected.items() if m.version(k)!=v}; assert not bad, bad' && \
+    /venv/main/bin/python /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py snapshot --comfy /opt/workspace-internal/ComfyUI && \
+    /venv/main/bin/python /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py verify --comfy /opt/workspace-internal/ComfyUI \
+      asset_gen_v5_runtime_helpers asset_gen_v5_flux_image asset_gen_v7_lite_breeze_tts2 asset_gen_v7_lite_qwen_image_21 && \
+    /venv/main/bin/python -m pip freeze --all > /opt/furgen/v7/environment.lock.txt && \
+    printf '%s\n' "${SUPPORT_COMMIT}" > /opt/furgen/v7/support-commit
+
+# The node modules must import against the new core before an instance ever
+# rents this image; a GPU is not needed to surface an API break.
+RUN cd /opt/workspace-internal/ComfyUI && \
+    /venv/main/bin/python -c 'import sys; sys.argv=["main.py","--cpu"]; \
+import nodes, asyncio; asyncio.run(nodes.init_extra_nodes(init_custom_nodes=True)); \
+missing=[n for n in ("UnetLoaderGGUF","CLIPLoader","VAELoader","TextEncodeQwenImage21","QwenImage21Cache","KSampler","EmptyLatentImage","VAEDecode") if n not in nodes.NODE_CLASS_MAPPINGS]; \
+assert not missing, missing; print("node classes present:", len(nodes.NODE_CLASS_MAPPINGS))'
+
+FROM scratch
+COPY --from=qwen21 / /
+SHELL ["/bin/bash","-o","pipefail","-c"]
+ENV PATH="/opt/instance-tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ENV IMAGE_TYPE="vast"
+ENV DATA_DIRECTORY="/workspace"
+ENV WORKSPACE="/workspace"
+ENV PIP_BREAK_SYSTEM_PACKAGES="1"
+ENV DEBIAN_FRONTEND="noninteractive"
+ENV PYTHONUNBUFFERED="1"
+ENV TCLLIBPATH="/usr/lib/tcltk/default"
+ENV NVIDIA_DRIVER_CAPABILITIES="all"
+ENV UV_CACHE_DIR="/.uv/cache"
+ENV UV_NO_CACHE="1"
+ENV UV_LINK_MODE="copy"
+ENV UV_PYTHON_BIN_DIR="/.uv/python_bin"
+ENV UV_PYTHON_INSTALL_DIR="/.uv/python_install"
+ENV PYTHON_VERSION="3.12"
+ENV PYTORCH_VERSION="2.10.0"
+ENV PYTORCH_BACKEND="cu130"
+ENV COMFYUI_ARGS="--disable-auto-launch --enable-cors-header --port 18188"
+ENV FURGEN_CUDA_VERSION="13.0"
+ENV FURGEN_REQUIRE_PREBUILT_V7="true"
+RUN /venv/main/bin/python /opt/furgen/v7/asset_gen_v7_lite_prebuilt.py verify --comfy /opt/workspace-internal/ComfyUI
+ENTRYPOINT ["/opt/instance-tools/bin/entrypoint.sh"]
+
+LABEL org.opencontainers.image.source="https://github.com/Dodzilla/FurgenPub"
+RUN env-hash > /.env_hash && sha256sum /opt/furgen/v7/manifest.json
