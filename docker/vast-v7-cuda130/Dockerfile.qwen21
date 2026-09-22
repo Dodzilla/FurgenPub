@@ -13,7 +13,10 @@ ARG COMFY_CORE=73c9bad4d21e7addbe1d13bc92eee0f1431b017d
 # Dodzilla/ComfyUI-GGUF @ qwen-image-2.1-arch: city96 HEAD plus the Qwen-Image
 # 2.1 fingerprint. Upstream cannot load a stable-diffusion.cpp export because
 # those carry no general.architecture field and detect_arch() has no Qwen entry.
-ARG GGUF_NODE_COMMIT=a61991d28768a6f99f75a8e7873f5dffd9dbae7b
+# Also dequantizes every quantized 1-D tensor at load: sd.cpp stores the 64
+# Qwen-Image 2.1 norm_q/norm_k vectors as Q8_0, and RMSNorm is not wrapped by
+# GGMLOps, so without this sampling fails on a [136]-byte weight.
+ARG GGUF_NODE_COMMIT=68b0a7e06c6b9e4d51564a174f831fed949637a2
 ARG GGUF_PY=0.19.0
 
 RUN test -n "${SUPPORT_COMMIT}" && \
@@ -46,7 +49,9 @@ import importlib.util as u; s = u.spec_from_file_location("cvt", "/opt/workspace
 m = u.module_from_spec(s); s.loader.exec_module(m); \
 assert any(a.arch == "qwen_image" for a in m.arch_list), "Qwen-Image fingerprint missing from the pinned GGUF loader"; \
 assert m.detect_arch({"img_in.weight", "modulation.1.weight", "transformer_blocks.0.img_mlp.gate_layer.weight"}).arch == "qwen_image"; \
-print("GGUF loader fork carries the Qwen-Image 2.1 fingerprint")'
+print("GGUF loader fork carries the Qwen-Image 2.1 fingerprint")' && \
+    grep -q "tensor.tensor_type not in {gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16}" \
+      /opt/workspace-internal/ComfyUI/custom_nodes/ComfyUI-GGUF/loader.py
 
 # Framework contract, then re-seal the manifest over the new core and node set.
 RUN /venv/main/bin/python -c 'import importlib.metadata as m; expected={"torch":"2.10.0+cu130","torchvision":"0.25.0+cu130","torchaudio":"2.10.0+cu130","transformers":"5.3.0","comfy-kitchen":"0.2.35","comfy-aimdo":"0.5.5"}; bad={k:(m.version(k),v) for k,v in expected.items() if m.version(k)!=v}; assert not bad, bad' && \
