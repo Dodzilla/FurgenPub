@@ -58,11 +58,8 @@ RUN /venv/main/bin/python -c 'import importlib.metadata as m; expected={"torch":
 
 # The node modules must import against the new core before an instance ever
 # rents this image; a GPU is not needed to surface an API break.
-RUN cd /opt/workspace-internal/ComfyUI && \
-    /venv/main/bin/python -c 'import sys; sys.argv=["main.py","--cpu"]; \
-import nodes, asyncio; asyncio.run(nodes.init_extra_nodes(init_custom_nodes=True)); \
-missing=[n for n in ("UnetLoaderGGUF","CLIPLoader","VAELoader","TextEncodeQwenImage21","QwenImage21Cache","KSampler","EmptyLatentImage","VAEDecode") if n not in nodes.NODE_CLASS_MAPPINGS]; \
-assert not missing, missing; print("node classes present:", len(nodes.NODE_CLASS_MAPPINGS))'
+COPY verify-qwen21-nodes.py /opt/furgen/v7/verify-qwen21-nodes.py
+RUN cd /opt/workspace-internal/ComfyUI && /venv/main/bin/python /opt/furgen/v7/verify-qwen21-nodes.py
 
 FROM scratch
 COPY --from=qwen21 / /
