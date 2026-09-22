@@ -51,7 +51,7 @@
     "miningBytes": 6442450944
   },
   "miningFingerprint": {
-    "binarySha256": "c2e6d6f13c3881d709dbce715393493fd65e8752ac3fdf68836ba36dd2970de1",
+    "binarySha256": "acc706afc9322a3eae1ef49049749e0a7c9f1a123895ac56dc8a289beb2fb5b7",
     "commandPolicy": "srbminer_pearlhash_v1",
     "gateWrapperSha256": "006c62a7dd6dd39884daac034f52eb17654567e63d53b9efce6c6e6aaa61a16b"
   },
