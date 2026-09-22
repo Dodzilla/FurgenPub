@@ -96,6 +96,14 @@ env SERVER_TYPE="${SERVER_TYPE}" DM_LOCAL_READINESS_FILE="${DM_LOCAL_READINESS_F
 rm -f "${READINESS_PATH}"
 bash "${KITCHEN_SCRIPT}" configure-launcher
 
+# Qwen 3.8 is deprecated on v7: with QWEN_INFERENCE_ENABLED=false the 20 GB
+# model is never prefetched, so provisioning must not wait for it. The GPU
+# coordinator (hosted by the gateway) still starts below; ComfyUI, TTS and idle
+# mining lease the GPU through it.
+qwen_inference_enabled() {
+    [[ "${QWEN_INFERENCE_ENABLED:-true}" != "false" ]]
+}
+if qwen_inference_enabled; then
 echo "Waiting for the pinned Qwen model and vision projector dependencies..."
 model_ready=0
 for _ in $(seq 1 420); do
@@ -112,6 +120,9 @@ if [[ "${model_ready}" != "1" ]]; then
     echo "ERROR: Qwen model or vision projector dependency did not become ready." >&2
     tail -n 250 "${WORKSPACE}/dependency_agent.log" >&2 || true
     exit 1
+fi
+else
+    echo "Qwen 3.8 inference disabled (QWEN_INFERENCE_ENABLED=false); not waiting for the LLM."
 fi
 
 download_support_file asset_gen_v7_lite_inference.sh "${INFERENCE_SCRIPT}"
@@ -159,6 +170,7 @@ print('Registered verified image-baked node signatures before accepting jobs.')
 PY
 fi
 mkdir -p "$(dirname "${READINESS_PATH}")"
+if qwen_inference_enabled; then
 printf 'asset_gen_v7_lite ready at %s\nmodel=%s\nsha256=%s\nllama_cpp=%s\n' \
     "$(date -u +%FT%TZ)" \
     "Qwen3.8-27B-Uncensored-Q5_K_M.gguf" \
@@ -169,4 +181,7 @@ printf 'vision=%s\nvision_sha256=%s\n' \
     "Qwen3.8-27B-Uncensored-vision-f16.gguf" \
     "5ac423f8a29059dc24e51bc6a43e9380dcd57a9347f28b62591e0b3f60b7081c" \
     >> "${READINESS_PATH}"
+else
+printf 'asset_gen_v7_lite ready at %s\nqwen_inference=disabled\n' "$(date -u +%FT%TZ)" > "${READINESS_PATH}"
+fi
 echo "asset_gen_v7_lite provisioning complete."

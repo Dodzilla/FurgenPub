@@ -22,6 +22,9 @@ from asset_gen_v7_lite_coordinator import (
 GATEWAY_HOST = os.environ.get("QWEN_GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.environ.get("QWEN_GATEWAY_PORT", "8080"))
 LLAMA_BASE_URL = os.environ.get("QWEN_LLAMA_BASE_URL", "http://127.0.0.1:8081").rstrip("/")
+# "false" on workers provisioned without Qwen 3.8: the gateway then only hosts
+# the GPU coordinator, never probes llama, and answers inference routes with 410.
+INFERENCE_ENABLED = os.environ.get("QWEN_INFERENCE_ENABLED", "true").strip().lower() != "false"
 COMFY_BASE_URL = os.environ.get("DM_LOCAL_COMFY_BASE_URL", "http://127.0.0.1:8188").rstrip("/")
 API_KEY = os.environ.get("INFERENCE_INSTANCE_API_KEY", "").strip()
 UPSTREAM_TIMEOUT_SECONDS = int(os.environ.get("QWEN_UPSTREAM_TIMEOUT_SECONDS", "900"))
@@ -231,6 +234,7 @@ def get_coordinator():
             comfy_release_vram_headroom_bytes=int(
                 os.environ.get("GPU_COMFY_RELEASE_VRAM_HEADROOM_BYTES", str(512 * 1024**2))
             ),
+            inference_enabled=INFERENCE_ENABLED,
             tts_config_path=(os.environ.get("TTS_RESIDENCY_CONFIG") or
                              ("/workspace/.fcs/tts/config.json" if os.path.isfile("/workspace/.fcs/tts/config.json") else None)),
         )
@@ -384,11 +388,15 @@ def health_payload():
         statuses["comfyui"] = comfy_status == 200
     except Exception:
         statuses["comfyui"] = False
-    try:
-        llama_status, _, _ = http_request(f"{LLAMA_BASE_URL}/health", timeout=10, authorize_backend=True)
-        statuses["llama"] = llama_status == 200
-    except Exception:
+    statuses["inferenceEnabled"] = INFERENCE_ENABLED
+    if not INFERENCE_ENABLED:
         statuses["llama"] = False
+    else:
+        try:
+            llama_status, _, _ = http_request(f"{LLAMA_BASE_URL}/health", timeout=10, authorize_backend=True)
+            statuses["llama"] = llama_status == 200
+        except Exception:
+            statuses["llama"] = False
     props = llama_props() if statuses["llama"] else None
     capabilities = props.get("chat_template_caps", {}) if isinstance(props, dict) else {}
     statuses["tool_calling"] = all(capabilities.get(name) is True for name in REQUIRED_TOOL_CAPABILITIES)
@@ -417,7 +425,10 @@ def health_payload():
         "maxWaiters": MAX_GATEWAY_WAITERS,
     }
     statuses["concurrency"] = stage_metrics_snapshot()
-    if statuses["llama"]:
+    if not INFERENCE_ENABLED:
+        # The worker is ready when ComfyUI is; there is no model to wait for.
+        inference_ready = True
+    elif statuses["llama"]:
         inference_ready = statuses["tool_calling"]
     elif COORDINATOR_MODE == "enforcing":
         inference_ready = inference_readiness["ready"]
@@ -713,6 +724,14 @@ class CoordinatorHandler(JsonHandler):
 class Handler(JsonHandler):
     server_version = "FurgenQwenGateway/4.0"
 
+    def send_model_deprecated(self):
+        # 410, not 503: this worker will never serve the model, so clients must
+        # not retry here and routing should treat it as permanent.
+        self.send_json(410, {"error": {
+            "message": "Qwen 3.8 inference has been deprecated on asset_gen_v7_lite workers.",
+            "code": "model_deprecated",
+        }})
+
     def authorized(self):
         if not API_KEY:
             self.send_json(503, {"error": {"message": "Instance API key is not configured.", "code": "instance_key_unconfigured"}})
@@ -782,6 +801,9 @@ class Handler(JsonHandler):
         if self.path not in ("/v1/models", "/metrics", "/props"):
             self.send_json(404, {"error": {"message": "Not found", "code": "not_found"}})
             return
+        if not INFERENCE_ENABLED:
+            self.send_model_deprecated()
+            return
         try:
             status, content_type, body = http_request(
                 f"{LLAMA_BASE_URL}{self.path}", timeout=30, authorize_backend=True
@@ -795,6 +817,9 @@ class Handler(JsonHandler):
             self.send_json(404, {"error": {"message": "Not found", "code": "not_found"}})
             return
         if not self.authorized():
+            return
+        if not INFERENCE_ENABLED:
+            self.send_model_deprecated()
             return
         if self.path == "/v1/cancel":
             try:

@@ -23,6 +23,10 @@ LOG_DIR="${WORKSPACE}/logs"
 GATEWAY_SCRIPT="${WORKSPACE}/asset_gen_v7_lite_gateway.py"
 SNAPSHOT_PATH="${QWEN_SNAPSHOT_PATH:-${WORKSPACE}/cache/qwen-slots}"
 GPU_COORDINATOR_MODE="${GPU_COORDINATOR_MODE:-shadow}"
+# "false" provisions the gateway purely as the GPU coordinator host: no model
+# verification, no page-cache warm, no llama-server. Default keeps Qwen 3.8.
+QWEN_INFERENCE_ENABLED="${QWEN_INFERENCE_ENABLED:-true}"
+qwen_inference_enabled() { [[ "${QWEN_INFERENCE_ENABLED}" != "false" ]]; }
 GPU_ADMISSION_MODE="${GPU_ADMISSION_MODE:-off}"
 
 mkdir -p "${LOG_DIR}" "$(dirname "${MODEL_PATH}")" "${WORKSPACE}/src" "${SNAPSHOT_PATH}"
@@ -376,6 +380,7 @@ launch() {
             return 1
         fi
     fi
+    if qwen_inference_enabled; then
     local llama_dir
     llama_dir="$(dirname "${LLAMA_SERVER}")"
     export LD_LIBRARY_PATH="${llama_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -432,8 +437,12 @@ launch() {
         tail -n 250 "${LOG_DIR}/asset_gen_v7_lite_llama.log" >&2 || true
         return 1
     fi
+    else
+        echo "Qwen 3.8 inference disabled; starting the gateway as the GPU coordinator host only."
+    fi
 
     nohup env \
+        QWEN_INFERENCE_ENABLED="${QWEN_INFERENCE_ENABLED}" \
         QWEN_GATEWAY_PORT="${GATEWAY_PORT}" \
         QWEN_LLAMA_BASE_URL="http://127.0.0.1:${LLAMA_PORT}" \
         GPU_COORDINATOR_PORT="${GPU_COORDINATOR_PORT:-8189}" \
@@ -475,6 +484,9 @@ launch() {
                 curl -fsS "http://127.0.0.1:${GPU_COORDINATOR_PORT:-8189}/v1/gpu/status" >/dev/null
                 return 0
             fi
+            if ! qwen_inference_enabled; then
+                return 0
+            fi
             for _ in $(seq 1 30); do
                 if curl -fsS -H "Authorization: Bearer ${INFERENCE_INSTANCE_API_KEY}" \
                     "http://127.0.0.1:${LLAMA_PORT}/props" 2>/dev/null | \
@@ -492,7 +504,9 @@ launch() {
     return 1
 }
 
-verify_model
-build_llama_server
+if qwen_inference_enabled; then
+    verify_model
+    build_llama_server
+fi
 protect_comfy_cublas_resolution
 launch

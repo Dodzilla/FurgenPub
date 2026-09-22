@@ -8,6 +8,7 @@ import threading
 import time
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -641,3 +642,49 @@ class GatewayTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def unused_local_url():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{probe.getsockname()[1]}"
+
+
+class InferenceDisabledGatewayTest(unittest.TestCase):
+    """QWEN_INFERENCE_ENABLED=false: coordinator host only, no llama at all."""
+
+    setUp_base = GatewayTest.setUp
+    tearDown = GatewayTest.tearDown
+
+    def setUp(self):
+        self.setUp_base()
+        self.gateway.INFERENCE_ENABLED = False
+        self.gateway.COORDINATOR = None
+        # Nothing listens here: a disabled worker must never depend on llama.
+        self.gateway.LLAMA_BASE_URL = unused_local_url()
+
+    def call(self, path, method="GET", payload=None):
+        try:
+            return GatewayTest.request(self, path, method=method, payload=payload)
+        except urllib.error.HTTPError as error:
+            return error.code, dict(error.headers), error.read()
+
+    def test_health_is_ready_without_a_llama_backend(self):
+        status, _, body = self.call("/health")
+        health = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(health["ready"])
+        self.assertFalse(health["inferenceEnabled"])
+        self.assertFalse(health["llama"])
+
+    def test_inference_routes_answer_410_model_deprecated(self):
+        for path, method, payload in (
+            ("/v1/chat/completions", "POST", {"model": "qwen3.8-27b-uncensored", "messages": []}),
+            ("/v1/cancel", "POST", {}),
+            ("/v1/models", "GET", None),
+            ("/props", "GET", None),
+        ):
+            with self.subTest(path=path):
+                status, _, body = self.call(path, method=method, payload=payload)
+                self.assertEqual(status, 410)
+                self.assertEqual(json.loads(body)["error"]["code"], "model_deprecated")

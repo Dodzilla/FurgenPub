@@ -1362,3 +1362,43 @@ class CoordinatorLeaseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InferenceDisabledCoordinatorTest(unittest.TestCase):
+    """Workers provisioned without Qwen keep fencing comfy/TTS/mining."""
+
+    def make(self, directory):
+        coordinator = GPUCoordinator(
+            "http://127.0.0.1:8081",
+            "http://127.0.0.1:8188",
+            FakeHttp(directory),
+            SnapshotStore(directory, "fp", min_free_bytes=0),
+            enabled=True,
+            enforce_transitions=True,
+            warm_residency=True,
+            inference_enabled=False,
+        )
+        coordinator._gpu_processes = lambda *_args, **_kwargs: []
+        return coordinator
+
+    def test_readiness_does_not_wait_on_a_model_that_was_never_provisioned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            readiness = self.make(directory).inference_readiness()
+            self.assertTrue(readiness["ready"])
+            self.assertEqual(readiness["reason"], "inference_disabled")
+            self.assertFalse(readiness["llamaConfigured"])
+
+    def test_inference_leases_are_refused_instead_of_starting_llama(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = self.make(directory)
+            with self.assertRaises(CoordinatorError):
+                coordinator.acquire("inference", "req-1", 60_000)
+            self.assertEqual(coordinator.metrics["llamaStarts"], 0)
+            self.assertIsNone(coordinator.lease)
+
+    def test_comfy_leases_still_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = self.make(directory)
+            lease = coordinator.acquire("comfy", "job-1", 60_000)
+            self.assertRegex(lease["fencingToken"], r"^[a-f0-9]{32}$")
+            self.assertEqual(coordinator.metrics["llamaStarts"], 0)

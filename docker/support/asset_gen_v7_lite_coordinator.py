@@ -375,8 +375,13 @@ class GPUCoordinator:
         comfy_idle_baseline_bytes=None,
         comfy_release_vram_headroom_bytes=512 * 1024**2,
         tts_config_path=None,
+        inference_enabled=True,
     ):
         self.llama_base_url = llama_base_url.rstrip("/")
+        # False when the worker was provisioned without Qwen: no model on disk,
+        # no llama command. The coordinator still fences comfy/TTS/mining; it
+        # just never starts llama and never reports inference as blocking.
+        self.inference_enabled = bool(inference_enabled)
         self.comfy_base_url = comfy_base_url.rstrip("/")
         self.http_request = http_request
         self.snapshot_store = snapshot_store
@@ -1008,6 +1013,17 @@ class GPUCoordinator:
 
     def inference_readiness(self):
         """Report whether a stopped llama can safely begin its GPU transition."""
+        if not self.inference_enabled:
+            # Nothing to transition to. Worker readiness must not wait on a
+            # model that was deliberately never provisioned.
+            return {
+                "ready": True,
+                "reason": "inference_disabled",
+                "llamaConfigured": False,
+                "llamaRunning": False,
+                "lastTransitionError": self.last_transition_error,
+                "ttsResidency": self.tts.status() if self.tts else {"enabled": False},
+            }
         llama_running = self.llama_running()
         configured = bool(self.llama_argv)
         used_bytes = self._comfy_gpu_bytes()
@@ -1276,6 +1292,8 @@ class GPUCoordinator:
         if holder not in HOLDERS:
             raise ValueError("invalid GPU lease holder")
         ttl_ms = min(max(int(ttl_ms or 60_000), 5_000), 30 * 60_000)
+        if holder == "inference" and not self.inference_enabled:
+            raise CoordinatorError("Qwen inference is not provisioned on this worker")
         with self.lock:
             self._expire_lease()
             if self.draining:
