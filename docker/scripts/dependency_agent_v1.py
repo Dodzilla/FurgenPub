@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.197"
+AGENT_VERSION = "dm-agent-py/0.10.198"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -275,6 +275,24 @@ PRL_MINER_SHARE_COUNTER_RE = re.compile(
     r"(?:[_\s-]*shares?)?\s*[=:]\s*(?P<value>\d+)\b",
     re.IGNORECASE,
 )
+# A miner process that exits this soon after launch without ever reporting a
+# positive hashrate is a failed start, whatever its exit code. SRBMiner exits 0
+# immediately on hosts whose GPU is gone ("No devices were found").
+PRL_MINER_EARLY_EXIT_WINDOW_MS = 60_000
+PRL_MINER_FAILURE_EXIT_WITHOUT_HASHRATE = "miner_exit_without_hashrate"
+PRL_MINER_FAILURE_GPU_UNAVAILABLE = "gpu_unavailable"
+PRL_MINER_SILENT_EXIT_FAILURE_CATEGORIES = {
+    PRL_MINER_FAILURE_EXIT_WITHOUT_HASHRATE,
+    PRL_MINER_FAILURE_GPU_UNAVAILABLE,
+}
+PRL_MINER_GPU_UNAVAILABLE_RE = re.compile(
+    r"(no (?:\w+ ){0,3}devices? (?:were |was )?(?:found|detected|available)"
+    r"|(?:can'?t|cannot|could not|couldn'?t|unable to) (?:find|detect) (?:any )?(?:\w+ )?(?:gpus?|devices?)"
+    r"|no cuda-capable device|cuda_error_no_device|failed to initialize nvml|nvml: driver not loaded"
+    r"|gpu has fallen off the bus|unable to determine the device handle)",
+    re.IGNORECASE,
+)
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 PRL_SINKHOLE_IPS = {"146.112.61.110", "::ffff:146.112.61.110"}
 PRL_CLEAN_RESOLVERS = ("1.1.1.1", "8.8.8.8")
 HASHRATE_RE = re.compile(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?H)\s*/?\s*s(?:ec)?", re.IGNORECASE)
@@ -720,6 +738,53 @@ def _read_tail_text(path: Path, max_bytes: int = 32768) -> str:
             return f.read(max_bytes).decode("utf-8", errors="replace")
     except Exception:
         return ""
+
+
+def _prl_miner_log_excerpt(text: str, max_lines: int = 4, max_chars: int = 400) -> str:
+    """Last few non-empty, ANSI-stripped log lines, preferring GPU-loss lines."""
+    lines = [
+        re.sub(r"\s+", " ", ANSI_ESCAPE_RE.sub("", line)).strip()
+        for line in re.split(r"[\r\n]+", text or "")
+    ]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    selected = lines[-max(1, int(max_lines)):]
+    gpu_lines = [line for line in lines if PRL_MINER_GPU_UNAVAILABLE_RE.search(line)]
+    if gpu_lines and gpu_lines[-1] not in selected:
+        selected = [gpu_lines[-1]] + selected[1:]
+    excerpt = " | ".join(selected)
+    if len(excerpt) > max_chars:
+        excerpt = "..." + excerpt[-(max_chars - 3):]
+    return excerpt
+
+
+def _probe_nvidia_gpu_devices(timeout_seconds: float = 5.0) -> Tuple[Optional[bool], str]:
+    """Return (available, detail). available is None when it cannot be determined."""
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "-L"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=max(1.0, float(timeout_seconds)),
+            check=False,
+        )
+    except FileNotFoundError:
+        return None, "nvidia-smi not found"
+    except subprocess.TimeoutExpired:
+        return False, f"nvidia-smi -L timed out after {float(timeout_seconds):.0f}s"
+    except Exception as exc:
+        return None, f"nvidia-smi probe failed: {exc}"[:200]
+    output = (proc.stdout or "").strip()
+    first_line = output.splitlines()[0].strip()[:200] if output else ""
+    if PRL_MINER_GPU_UNAVAILABLE_RE.search(output):
+        return False, first_line or "nvidia-smi reported no devices"
+    if proc.returncode != 0:
+        return False, first_line or f"nvidia-smi exited with code {proc.returncode}"
+    if not re.search(r"^GPU \d+:", output, flags=re.MULTILINE):
+        return False, first_line or "nvidia-smi listed no GPUs"
+    return True, ""
 
 
 def _query_gpu_telemetry() -> Dict[str, Any]:
@@ -3418,6 +3483,10 @@ class PrlMinerController:
         self._auto_restart_count = 0
         self._last_agent_update_resume_attempt_ms = 0
         self._pending_gate_path: Optional[Path] = None
+        # Byte offset of prl_miner.log when the current process was launched, so
+        # exit classification only looks at this run's output.
+        self._run_log_offset = 0
+        self._silent_exit_gpu_probe_pending = False
 
     def _reap_locked(self) -> None:
         if self._proc is None:
@@ -3436,15 +3505,47 @@ class PrlMinerController:
                 pass
         self._stopped_at_ms = _now_ms()
         if self._desired_state in ("running", "starting"):
-            self._state = "failed" if return_code != 0 else "stopped"
-            if return_code != 0 and not self._last_error:
-                self._last_error = f"miner exited with code {return_code}"
-            if return_code != 0:
-                runtime_ms = max(0, int(self._stopped_at_ms) - int(self._started_at_ms or 0))
-                if runtime_ms >= 60_000:
-                    self._consecutive_failures = 1
+            runtime_ms = max(0, int(self._stopped_at_ms) - int(self._started_at_ms or 0))
+            run_log = self._read_run_log_tail_locked()
+            run_hps, _run_hps_text = _parse_latest_hashrate_from_text(run_log)
+            produced_hashrate = run_hps is not None and float(run_hps) > 0
+            if runtime_ms < PRL_MINER_EARLY_EXIT_WINDOW_MS and not produced_hashrate:
+                # Silent failed start: the process died before it ever mined.
+                # Exit code 0 counts too, otherwise a dead-GPU host restarts the
+                # miner forever at loop cadence while reporting "running".
+                self._state = "failed"
+                self._consecutive_failures += 1
+                gpu_lost = bool(PRL_MINER_GPU_UNAVAILABLE_RE.search(ANSI_ESCAPE_RE.sub("", run_log)))
+                self._last_failure_category = (
+                    PRL_MINER_FAILURE_GPU_UNAVAILABLE if gpu_lost else PRL_MINER_FAILURE_EXIT_WITHOUT_HASHRATE
+                )
+                # A clean log may still hide a dead GPU; confirm with nvidia-smi
+                # outside the lock (see _maybe_probe_gpu_after_silent_exit).
+                self._silent_exit_gpu_probe_pending = not gpu_lost
+                message = (
+                    f"miner exited with code {return_code} after {runtime_ms / 1000.0:.1f}s "
+                    f"without reporting hashrate (consecutive={int(self._consecutive_failures)})"
+                )
+                excerpt = _prl_miner_log_excerpt(run_log)
+                if excerpt:
+                    message = f"{message}; log: {excerpt}"
+                self._last_error = message[:MAX_AGENT_ERROR_MESSAGE_CHARS]
+            else:
+                self._state = "failed" if return_code != 0 else "stopped"
+                if self._last_failure_category in PRL_MINER_SILENT_EXIT_FAILURE_CATEGORIES:
+                    # This run got past the silent-exit stage; stop reporting it.
+                    self._last_failure_category = ""
+                    self._last_error = ""
+                self._silent_exit_gpu_probe_pending = False
+                if return_code != 0 and not self._last_error:
+                    self._last_error = f"miner exited with code {return_code}"
+                if return_code != 0:
+                    if runtime_ms >= PRL_MINER_EARLY_EXIT_WINDOW_MS:
+                        self._consecutive_failures = 1
+                    else:
+                        self._consecutive_failures += 1
                 else:
-                    self._consecutive_failures += 1
+                    self._consecutive_failures = 0
         else:
             self._state = "stopped"
             self._desired_state = "stopped"
@@ -3462,6 +3563,107 @@ class PrlMinerController:
 
     def _set_failure_category(self, category: str) -> None:
         self._last_failure_category = str(category or "").strip()[:80]
+
+    def _clear_failure_category_after_binary_ready_locked(self) -> None:
+        # A ready binary resolves download failures, not a silent-exit episode
+        # (that is cleared once a run reports hashrate or outlives the window).
+        if self._last_failure_category not in PRL_MINER_SILENT_EXIT_FAILURE_CATEGORIES:
+            self._last_failure_category = ""
+
+    def _current_log_size(self) -> int:
+        try:
+            return int(self.log_path.stat().st_size)
+        except Exception:
+            return 0
+
+    def _read_run_log_tail_locked(self, max_bytes: int = 32768) -> str:
+        """Tail of prl_miner.log written since the current/last process launched."""
+        try:
+            size = int(self.log_path.stat().st_size)
+        except Exception:
+            return ""
+        start = max(0, int(self._run_log_offset or 0))
+        if start > size:
+            start = 0  # log was truncated/rotated under us
+        begin = max(start, size - max(1024, int(max_bytes)))
+        if begin >= size:
+            return ""
+        try:
+            with self.log_path.open("rb") as f:
+                f.seek(begin)
+                return f.read(size - begin).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def _prepare_silent_exit_state_for_launch_locked(self) -> None:
+        """Reset per-run failure fields at launch, keeping silent-exit evidence.
+
+        A silent-exit category (and its log excerpt) survives the auto-restart
+        so a sub-second restart window cannot mask it; it is cleared once a run
+        reports a positive hashrate or lives past the early-exit window.
+        """
+        if self._last_failure_category in PRL_MINER_SILENT_EXIT_FAILURE_CATEGORIES and self._consecutive_failures > 0:
+            return
+        self._last_error = ""
+        self._last_failure_category = ""
+
+    def _maybe_probe_gpu_after_silent_exit(self) -> None:
+        with self._lock:
+            self._reap_locked()
+            if not self._silent_exit_gpu_probe_pending:
+                return
+            self._silent_exit_gpu_probe_pending = False
+        available, detail = _probe_nvidia_gpu_devices()
+        if available is not False:
+            return
+        with self._lock:
+            if self._last_failure_category != PRL_MINER_FAILURE_EXIT_WITHOUT_HASHRATE:
+                return
+            self._last_failure_category = PRL_MINER_FAILURE_GPU_UNAVAILABLE
+            prefix = f"GPU unavailable (nvidia-smi: {detail or 'no devices'})"
+            self._last_error = f"{prefix}; {self._last_error}"[:MAX_AGENT_ERROR_MESSAGE_CHARS]
+        logging.warning("Idle PRL miner exited without hashrate and nvidia-smi reports no usable GPU: %s", detail)
+
+    @staticmethod
+    def _auto_restart_backoff_ms(failures: int) -> int:
+        failures = max(0, int(failures))
+        if failures <= 1:
+            return 2_000
+        if failures == 2:
+            return 5_000
+        if failures == 3:
+            return 15_000
+        if failures <= 6:
+            return 60_000
+        if failures <= 10:
+            return 5 * 60_000
+        return 15 * 60_000
+
+    def auto_restart_backoff_remaining_ms(self, now_ms: Optional[int] = None) -> int:
+        at_ms = int(now_ms if isinstance(now_ms, int) else _now_ms())
+        with self._lock:
+            last_attempt_ms = int(self._last_auto_restart_attempt_ms or 0)
+            if last_attempt_ms <= 0:
+                return 0
+            backoff_ms = self._auto_restart_backoff_ms(self._consecutive_failures)
+        return max(0, backoff_ms - (at_ms - last_attempt_ms))
+
+    def claim_auto_restart_attempt(self, reason: str, now_ms: Optional[int] = None) -> Tuple[bool, int, int]:
+        """Record an auto-restart attempt unless the failure backoff is active.
+
+        Returns (allowed, consecutive_failures, backoff_ms).
+        """
+        at_ms = int(now_ms if isinstance(now_ms, int) else _now_ms())
+        with self._lock:
+            failures = max(0, int(self._consecutive_failures))
+            backoff_ms = self._auto_restart_backoff_ms(failures)
+            last_attempt_ms = int(self._last_auto_restart_attempt_ms or 0)
+            if last_attempt_ms > 0 and at_ms - last_attempt_ms < backoff_ms:
+                return False, failures, backoff_ms
+            self._last_auto_restart_attempt_ms = at_ms
+            self._last_auto_restart_reason = str(reason or "auto_restart")[:120]
+            self._auto_restart_count += 1
+        return True, failures, backoff_ms
 
     def save_agent_update_resume_marker(self, reason: str) -> bool:
         with self._lock:
@@ -3555,10 +3757,18 @@ class PrlMinerController:
             return False
 
     def snapshot(self) -> Dict[str, Any]:
+        self._maybe_probe_gpu_after_silent_exit()
         with self._lock:
             self._reap_locked()
             pid = self._proc.pid if self._proc is not None and self._proc.poll() is None else None
             running = pid is not None
+            if running and self._last_failure_category in PRL_MINER_SILENT_EXIT_FAILURE_CATEGORIES:
+                run_hps, _run_hps_text = _parse_latest_hashrate_from_text(self._read_run_log_tail_locked())
+                if run_hps is not None and float(run_hps) > 0:
+                    # The restarted miner is hashing: the silent-exit episode is over.
+                    self._last_failure_category = ""
+                    self._last_error = ""
+                    self._consecutive_failures = 0
             out: Dict[str, Any] = {
                 "state": self._state,
                 "desiredState": self._desired_state,
@@ -3744,7 +3954,7 @@ class PrlMinerController:
         if package_type == "tar_gz" and self._cached_package_binary_matches(expected, package_type, executable_path):
             os.chmod(self.binary_path, 0o755)
             with self._lock:
-                self._last_failure_category = ""
+                self._clear_failure_category_after_binary_ready_locked()
             return self.binary_path
         if package_type == "binary" and self.binary_path.exists():
             try:
@@ -3755,7 +3965,7 @@ class PrlMinerController:
                     except Exception:
                         pass
                     with self._lock:
-                        self._last_failure_category = ""
+                        self._clear_failure_category_after_binary_ready_locked()
                     return self.binary_path
             except Exception:
                 pass
@@ -3798,7 +4008,7 @@ class PrlMinerController:
                     executable_path or "-",
                 )
                 with self._lock:
-                    self._last_failure_category = ""
+                    self._clear_failure_category_after_binary_ready_locked()
                 return self.binary_path
             except Exception as exc:
                 errors.append(f"{_safe_url_for_logs(download_url)}: {str(exc)[:700]}")
@@ -4129,6 +4339,7 @@ class PrlMinerController:
             return {"deferred": True}
 
         self.root.mkdir(parents=True, exist_ok=True)
+        run_log_offset = self._current_log_size()
         log_file = self.log_path.open("ab")
         try:
             proc = subprocess.Popen(
@@ -4173,8 +4384,9 @@ class PrlMinerController:
             self._started_at_ms = _now_ms()
             self._stopped_at_ms = 0
             self._last_exit_code = None
-            self._last_error = ""
-            self._last_failure_category = ""
+            self._run_log_offset = run_log_offset
+            self._silent_exit_gpu_probe_pending = False
+            self._prepare_silent_exit_state_for_launch_locked()
             self._last_start_payload = dict(payload)
             self._paused_start_payload = None
             self._paused_reason = ""
@@ -4228,6 +4440,7 @@ class PrlMinerController:
                 " except FileNotFoundError: pass\n"
                 " time.sleep(0.02)\n"
             )
+            run_log_offset = self._current_log_size()
             log_file = self.log_path.open("ab")
             try:
                 proc = subprocess.Popen(
@@ -4266,8 +4479,9 @@ class PrlMinerController:
                 self._started_at_ms = _now_ms()
                 self._stopped_at_ms = 0
                 self._last_exit_code = None
-                self._last_error = ""
-                self._last_failure_category = ""
+                self._run_log_offset = run_log_offset
+                self._silent_exit_gpu_probe_pending = False
+                self._prepare_silent_exit_state_for_launch_locked()
                 self._last_start_payload = dict(prepared.get("payload") or {})
                 self._paused_start_payload = None
                 self._paused_reason = ""
@@ -4496,43 +4710,26 @@ class PrlMinerController:
         return True
 
     def restart_if_desired(self, reason: str) -> bool:
-        now_ms = _now_ms()
+        self._maybe_probe_gpu_after_silent_exit()
         with self._lock:
             self._reap_locked()
             if self._is_running_locked():
                 return False
             desired = self._desired_state in ("running", "starting")
             payload = dict(self._last_start_payload) if desired and self._last_start_payload else None
-            failures = max(0, int(self._consecutive_failures))
-            last_attempt_ms = int(self._last_auto_restart_attempt_ms or 0)
         if not payload:
             return False
 
-        if failures <= 1:
-            backoff_ms = 2_000
-        elif failures == 2:
-            backoff_ms = 5_000
-        elif failures == 3:
-            backoff_ms = 15_000
-        elif failures <= 6:
-            backoff_ms = 60_000
-        elif failures <= 10:
-            backoff_ms = 5 * 60_000
-        else:
-            backoff_ms = 15 * 60_000
-        if last_attempt_ms > 0 and now_ms - last_attempt_ms < backoff_ms:
+        allowed, failures, backoff_ms = self.claim_auto_restart_attempt(reason)
+        if not allowed:
             return False
-
-        with self._lock:
-            self._last_auto_restart_attempt_ms = now_ms
-            self._last_auto_restart_reason = str(reason or "auto_restart")[:120]
-            self._auto_restart_count += 1
         logging.warning(
-            "Restarting failed idle PRL miner after %s (worker=%s failures=%d backoffMs=%d)",
+            "Restarting failed idle PRL miner after %s (worker=%s failures=%d backoffMs=%d category=%s)",
             reason or "auto_restart",
             payload.get("worker"),
             failures,
             backoff_ms,
+            self._last_failure_category or "-",
         )
         return not self.start(payload).get("deferred", False)
 
@@ -6407,10 +6604,27 @@ class DependencyAgent:
                     str(miner_snapshot.get("state") or "") != "running"
                 )
             )
+            restart_after_failure = (
+                should_attempt_start and
+                not should_attempt_resume and
+                str(miner_snapshot.get("state") or "") == "failed"
+            )
+            if restart_after_failure and self._idle_prl_miner.auto_restart_backoff_remaining_ms() > 0:
+                # The miner died on its own and is inside its failure backoff: do
+                # not take the GPU lease or free ComfyUI just to be refused, and
+                # do not sit on a mining lease while nothing is mining.
+                self._release_mining_gpu_lease("mining_restart_backoff")
+                return
             if self._gpu_coordinator.configured and should_attempt_start:
                 desired_payload = self._idle_prl_miner.desired_start_payload()
                 if not desired_payload:
                     return
+                if restart_after_failure:
+                    # Relaunching a miner that died on its own: honor the same
+                    # failure backoff (and restart accounting) as restart_if_desired.
+                    allowed, _failures, _backoff_ms = self._idle_prl_miner.claim_auto_restart_attempt(reason)
+                    if not allowed:
+                        return
                 try:
                     prepared = self._idle_prl_miner.prepare_gated({**desired_payload, "forceRestart": True})
                 except Exception as exc:
@@ -7843,10 +8057,16 @@ class DependencyAgent:
                 return None
         return claimed
 
-    def _coordination_fetch_agent_queue(self, limit: int) -> Optional[List[Dict[str, Any]]]:
+    def _coordination_fetch_agent_queue(
+        self,
+        limit: int,
+        control_only: bool = False,
+    ) -> Optional[List[Dict[str, Any]]]:
         incremental = (os.environ.get("SERVER_TYPE") in ("asset_gen_v7_lite", "image_gen_v1")
                        and _env_bool("DM_AGENT_INCREMENTAL_QUEUE_DISPATCH", os.environ.get("SERVER_TYPE") == "image_gen_v1"))
-        skip_execute_jobs = bool(self.mining_only)
+        # Direct RTDB claims do not enforce the execute-lease budget, so a
+        # control-only poll (no free job slot) must leave execute jobs queued.
+        skip_execute_jobs = bool(self.mining_only or control_only)
         if not skip_execute_jobs:
             try:
                 skip_execute_jobs = not (
@@ -12414,6 +12634,25 @@ class DependencyAgent:
     def _agent_effective_prefetch_capacity(self) -> int:
         return max(0, int(self._agent_max_prefetch_jobs))
 
+    def _agent_zero_budget_poll_seconds(self) -> Optional[float]:
+        """Agent-queue poll cadence while no execute/prefetch slot is free.
+
+        Control items (prl_miner start/stop, maintenance) share the queue with
+        execute jobs, so running out of job budget must not stop control intake.
+        Returns None when polling can wait for an RTDB wakeup instead.
+        """
+        if self.mining_only:
+            # A mining-only box never has job budget; control items are its only
+            # work. Execute leases it is handed are failed as mining_only_instance.
+            return float(self._coordination_agent_poll_seconds())
+        if self._coordination_should_use_safety_polls():
+            # Healthy RTDB signal stream: queued control items wake the loop, and
+            # a freed slot requests a poll locally (_finish_active_lease).
+            return None
+        # No wakeup source: poll slowly. The HTTP queue enforces the execute-lease
+        # budget server-side, so this only picks up control items when full.
+        return float(self.agent_full_capacity_poll_seconds)
+
     def _agent_register(self) -> None:
         if not self._resolved_instance_id:
             raise RuntimeError("Cannot register agent control channel before dependency registration resolves instanceId")
@@ -12513,12 +12752,22 @@ class DependencyAgent:
             self._next_agent_register_attempt_ms = now + 30_000
             logging.warning("Agent register failed: %s", e)
 
-    def _agent_fetch_queue(self, limit: int, wait_sec: Optional[int] = None) -> List[Dict[str, Any]]:
+    def _agent_fetch_queue(
+        self,
+        limit: int,
+        wait_sec: Optional[int] = None,
+        control_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Fetch/lease agent queue items.
+
+        control_only asks direct RTDB claims to skip execute jobs; the HTTP path
+        needs no hint because the server enforces the execute-lease budget.
+        """
         if not self._resolved_instance_id:
             return []
         if not self._agent_access_token:
             return []
-        rtdb_items = self._coordination_fetch_agent_queue(limit)
+        rtdb_items = self._coordination_fetch_agent_queue(limit, control_only=control_only)
         if rtdb_items is not None:
             return rtdb_items
         wait_value = self.agent_queue_wait_sec if wait_sec is None else wait_sec
@@ -17534,9 +17783,22 @@ class DependencyAgent:
                         (execute_capacity + prefetch_capacity) -
                         (active_execute_count + active_prefetch_count),
                     )
-                    if execute_and_prefetch_budget <= 0 and not agent_poll_wakeup_requested:
-                        next_agent_poll_at_ms = now + int(self.agent_full_capacity_poll_seconds * 1000)
-                        continue
+                    next_agent_poll_seconds = float(self._coordination_agent_poll_seconds())
+                    control_only_poll = False
+                    if execute_and_prefetch_budget <= 0:
+                        # The queue also carries control items (prl_miner start/stop,
+                        # maintenance). A box with no job budget -- always true for a
+                        # mining-only box -- must still poll for them unless RTDB
+                        # wakeups are known to deliver them.
+                        zero_budget_poll_seconds = self._agent_zero_budget_poll_seconds()
+                        if zero_budget_poll_seconds is None and not agent_poll_wakeup_requested:
+                            next_agent_poll_at_ms = now + int(self.agent_full_capacity_poll_seconds * 1000)
+                            continue
+                        if zero_budget_poll_seconds is not None:
+                            next_agent_poll_seconds = zero_budget_poll_seconds
+                        # A timed (not wakeup-driven) poll with no job budget is for
+                        # control items only; never direct-claim execute jobs here.
+                        control_only_poll = not agent_poll_wakeup_requested
 
                     poll_limit = max(1, min(20, execute_and_prefetch_budget + 2))
 
@@ -17557,7 +17819,11 @@ class DependencyAgent:
                         queue_wait_sec = 0
 
                     try:
-                        agent_items = self._agent_fetch_queue(limit=poll_limit, wait_sec=queue_wait_sec)
+                        agent_items = self._agent_fetch_queue(
+                            limit=poll_limit,
+                            wait_sec=queue_wait_sec,
+                            control_only=control_only_poll,
+                        )
                     except ApiError as e:
                         if e.status in (401, 403):
                             logging.warning("Agent queue unauthorized (status=%d); forcing agent re-register.", e.status)
@@ -17592,7 +17858,7 @@ class DependencyAgent:
                                 except Exception:
                                     pass
 
-                    next_agent_poll_at_ms = now + int(max(0.2, float(self._coordination_agent_poll_seconds())) * 1000)
+                    next_agent_poll_at_ms = now + int(max(0.2, float(next_agent_poll_seconds)) * 1000)
 
                 wait_seconds = max(0.05, 0.5 + random.uniform(-0.05, 0.05))
                 self._loop_wakeup.wait(timeout=wait_seconds)
