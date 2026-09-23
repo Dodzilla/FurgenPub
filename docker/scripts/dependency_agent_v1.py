@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.198"
+AGENT_VERSION = "dm-agent-py/0.10.199"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -251,6 +251,9 @@ RIFE_VFI_ZIP_SIZE_BYTES = 22869906
 RIFE_VFI_ZIP_SHA256 = "1fa9b9cda3d9b8c3e301359e2595960902f97bf926c08598b0e9957a3f3f760e"
 RIFE_VFI_FLOWNET_SIZE_BYTES = 24636301
 PRL_MINER_TRANSIENT_STOP_REASONS = {"execute_job"}
+# lastError values that only record why a wanted start is waiting (not a miner
+# failure). They are cleared as soon as mining actually starts or resumes.
+PRL_MINER_DEFERRAL_ERRORS = {"foreground_or_idle_grace", "foreground_work_active"}
 PRL_MINER_PAUSE_MODES = {"stop_start", "suspend_resume", "keep_running"}
 DEFAULT_PRL_MINER_PAUSE_MODE = "stop_start"
 PRL_MINER_KINDS = {"alpha_miner", "srbminer_multi"}
@@ -785,6 +788,49 @@ def _probe_nvidia_gpu_devices(timeout_seconds: float = 5.0) -> Tuple[Optional[bo
     if not re.search(r"^GPU \d+:", output, flags=re.MULTILINE):
         return False, first_line or "nvidia-smi listed no GPUs"
     return True, ""
+
+
+def _query_gpu_memory_mb(timeout_seconds: float = 1.5) -> Optional[Tuple[float, float]]:
+    """Return (free_mb, total_mb) for the most constrained visible GPU, or None.
+
+    Uses the same nvidia-smi source as idle-mining telemetry. Any failure is
+    reported as unknown so callers can fall back to their conservative path.
+    """
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free,memory.used,memory.total", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=max(0.2, float(timeout_seconds)),
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    best: Optional[Tuple[float, float]] = None
+    for line in proc.stdout.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            total = float(parts[2])
+        except ValueError:
+            continue
+        free: Optional[float] = None
+        try:
+            free = float(parts[0])
+        except ValueError:
+            try:
+                free = total - float(parts[1])
+            except ValueError:
+                free = None
+        if free is None or total <= 0 or free < 0:
+            continue
+        if best is None or free < best[0]:
+            best = (free, total)
+    return best
 
 
 def _query_gpu_telemetry() -> Dict[str, Any]:
@@ -3440,7 +3486,15 @@ class PrlMinerController:
         self._lock = threading.Lock()
         self._process_op_lock = threading.Lock()
         self.launch_allowed: Optional[Callable[[], bool]] = None
-        self.before_launch: Optional[Callable[[], None]] = None
+        # Runs under _process_op_lock right before a launch/resume. Returning
+        # False vetoes the transition (e.g. warm models must not be evicted yet).
+        self.before_launch: Optional[Callable[[], Optional[bool]]] = None
+        # Optional label for why launch_allowed refused (telemetry only).
+        self.launch_block_reason: Optional[Callable[[], str]] = None
+        # Optional cheap check run by start() before any preparation, so a start
+        # that before_launch would veto does not first hold the fence for DNS/TLS
+        # preflight and binary checks while foreground work may be waiting.
+        self.launch_precheck: Optional[Callable[[], bool]] = None
         self._proc: Optional[subprocess.Popen] = None
         self._state = "stopped"
         self._desired_state = "stopped"
@@ -4138,17 +4192,88 @@ class PrlMinerController:
         if allowed is not None and not allowed():
             return False
         if prepare and self.before_launch is not None:
-            self.before_launch()
+            if self.before_launch() is False:
+                return False
             if allowed is not None and not allowed():
                 return False
         return True
 
+    def _launch_deferral_reason(self) -> str:
+        reason_func = self.launch_block_reason
+        if reason_func is not None:
+            try:
+                reason = str(reason_func() or "").strip()
+                if reason:
+                    return reason
+            except Exception:
+                pass
+        return "foreground_or_idle_grace"
+
+    def _clear_deferral_error_locked(self) -> None:
+        if self._last_error in PRL_MINER_DEFERRAL_ERRORS:
+            self._last_error = ""
+
+    def holds_suspended_process(self) -> bool:
+        """True while a SIGSTOPped miner (and its VRAM) is still resident."""
+        with self._lock:
+            self._reap_locked()
+            return bool(self._suspended_for_work and self._proc is not None and self._proc.poll() is None)
+
+    def _launch_precheck_ok(self) -> bool:
+        precheck = self.launch_precheck
+        if precheck is None:
+            return True
+        try:
+            return precheck() is not False
+        except Exception:
+            return True  # The authoritative before_launch check still runs.
+
     def start(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self._process_op_lock:
-            if not self._allow_launch_serialized():
-                self.defer_start(payload, "foreground_or_idle_grace")
+            if not self._allow_launch_serialized() or not self._launch_precheck_ok():
+                self.defer_start(payload, self._launch_deferral_reason())
                 return {"deferred": True}
             return self._start_serialized(payload)
+
+    def start_deferred(self, reason: str) -> str:
+        """Start a wanted miner that was deferred (or cleanly stopped) while busy.
+
+        This is the ordinary idle start, not failure recovery: it neither claims
+        auto-restart attempts nor waits out failure backoff. A miner that failed
+        on its own (state failed / failure category set) is left to
+        restart_if_desired. Returns "not_applicable", "started" or "deferred".
+        The launch itself goes through start(), i.e. the same serialized
+        _process_op_lock fence and launch_allowed recheck as every other launch.
+        """
+        with self._lock:
+            self._reap_locked()
+            if self._is_running_locked():
+                return "not_applicable"
+            if self._desired_state not in ("running", "starting"):
+                return "not_applicable"
+            if self._state == "failed" or self._last_failure_category:
+                return "not_applicable"
+            if self._paused_start_payload:
+                return "not_applicable"  # resume_if_paused owns stop_start pauses.
+            payload = dict(self._last_start_payload) if self._last_start_payload else None
+        if not payload:
+            return "not_applicable"
+        try:
+            result = self.start(payload)
+        except Exception as exc:
+            # A start that raises is a genuine failure: hand later attempts to
+            # restart_if_desired so its backoff applies instead of retrying the
+            # download/preflight at idle-loop cadence.
+            with self._lock:
+                self._consecutive_failures = max(1, int(self._consecutive_failures) + 1)
+                if not self._last_failure_category:
+                    self._last_failure_category = "start_failed"
+                self._last_error = str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS]
+                self._last_auto_restart_attempt_ms = _now_ms()
+            raise
+        if result.get("deferred"):
+            return "deferred"
+        return "started"
 
     def prepare_gated(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Complete all non-GPU mining preparation before lease admission."""
@@ -4262,6 +4387,7 @@ class PrlMinerController:
                     if self._suspended_for_work:
                         self._state = "paused"
                     else:
+                        self._clear_deferral_error_locked()
                         self._paused_start_payload = None
                         self._paused_reason = ""
                         self._suspended_for_work = False
@@ -4335,7 +4461,7 @@ class PrlMinerController:
             }
 
         if not self._allow_launch_serialized(prepare=True):
-            self.defer_start(payload, "foreground_or_idle_grace")
+            self.defer_start(payload, self._launch_deferral_reason())
             return {"deferred": True}
 
         self.root.mkdir(parents=True, exist_ok=True)
@@ -4387,6 +4513,7 @@ class PrlMinerController:
             self._run_log_offset = run_log_offset
             self._silent_exit_gpu_probe_pending = False
             self._prepare_silent_exit_state_for_launch_locked()
+            self._clear_deferral_error_locked()
             self._last_start_payload = dict(payload)
             self._paused_start_payload = None
             self._paused_reason = ""
@@ -4689,6 +4816,7 @@ class PrlMinerController:
             with self._lock:
                 self._state = "running"
                 self._desired_state = "running"
+                self._clear_deferral_error_locked()
                 self._paused_start_payload = None
                 self._paused_reason = ""
                 self._suspended_for_work = False
@@ -4742,6 +4870,55 @@ class PrlMinerController:
                 self._state = "stopped"
             self._last_error = str(reason or "gpu_coordinator_busy")[:500]
 
+    def stop_suspended_for_vram(self, reason: str) -> bool:
+        """Release a SIGSTOPped miner's VRAM while keeping the wish to mine.
+
+        Used when a suspended miner no longer leaves the next job enough VRAM
+        and warm models may not be evicted yet. The miner becomes a stop_start
+        style pause: resume_if_paused relaunches it later through the fence.
+        """
+        with self._process_op_lock:
+            with self._lock:
+                self._reap_locked()
+                suspended = bool(self._suspended_for_work and self._proc is not None and self._proc.poll() is None)
+                payload = dict(self._paused_start_payload or self._last_start_payload or {})
+            if not suspended or not payload:
+                return False
+            raw_timeout = payload.get("stopTimeoutSec")
+            self._stop_serialized(
+                reason,
+                timeout_seconds=float(raw_timeout) if isinstance(raw_timeout, (int, float)) else 10.0,
+            )
+            with self._lock:
+                self._paused_start_payload = payload
+                self._paused_reason = str(reason or "")
+                self._pause_stop_count += 1
+            return True
+
+    def defer_start_for_foreground(self, payload: Dict[str, Any]) -> str:
+        """Record a start command that arrived while local foreground work is active.
+
+        The intent is kept (not dropped) so the idle loop starts mining once the
+        worker is idle again. A live miner is left alone: foreground admission
+        already suspends/stops it before GPU work, and resume is fenced. Only a
+        forceRestart start replaces a live process; stopping it here is safe
+        because it only releases the GPU. Returns "already_active" or "deferred".
+        """
+        with self._process_op_lock:
+            with self._lock:
+                self._reap_locked()
+                alive = self._proc is not None and self._proc.poll() is None
+            if alive and payload.get("forceRestart") is not True:
+                return "already_active"
+            if alive:
+                raw_timeout = payload.get("stopTimeoutSec")
+                self._stop_serialized(
+                    "foreground_work_active_restart",
+                    timeout_seconds=float(raw_timeout) if isinstance(raw_timeout, (int, float)) else 10.0,
+                )
+            self.defer_start(payload, "foreground_work_active")
+            return "deferred"
+
     def desired_start_payload(self) -> Optional[Dict[str, Any]]:
         with self._lock:
             payload = self._paused_start_payload or self._last_start_payload
@@ -4762,7 +4939,14 @@ class PrlMinerController:
                 timeout = float(payload.get("stopTimeoutSec")) if isinstance(payload.get("stopTimeoutSec"), (int, float)) else 10.0
                 item_reason = item.get("reason") if isinstance(item.get("reason"), str) else ""
                 reason = str(payload.get("reason") or item_reason or "backend_stop_command")
-                if reason.strip() in PRL_MINER_TRANSIENT_STOP_REASONS:
+                # The backend's active_jobs stop on an image worker only restates
+                # what the agent's fenced foreground pause already did; killing the
+                # miner there would clear the wish to mine and force a cold restart
+                # after every job instead of an instant SIGCONT resume.
+                transient = reason.strip() in PRL_MINER_TRANSIENT_STOP_REASONS or (
+                    reason.strip() == "active_jobs" and os.environ.get("SERVER_TYPE") == "image_gen_v1"
+                )
+                if transient:
                     self.pause_for_work(
                         reason,
                         timeout_seconds=timeout,
@@ -5235,12 +5419,44 @@ class DependencyAgent:
             min(30.0, _env_float("DM_IDLE_PRL_FREE_COMFY_TIMEOUT_SECONDS", 10.0)),
         )
         self._last_idle_prl_comfy_free_ms = 0
+        # Idle-mining grace after the last foreground lease. Two cases:
+        # - Eviction grace (DM_IMAGE_IDLE_MINING_GRACE_SECONDS, default 30s):
+        #   a mining start that must first unload warm Comfy GPU models. Every
+        #   eviction costs the next job a model reload, so short gaps must not
+        #   trigger it (a245eccf saw models evicted in nearly every gap). This
+        #   value is also the upper bound for the resident grace below.
+        # - Resident grace (image_gen_v1 only, DM_IMAGE_IDLE_MINING_RESIDENT_GRACE_SECONDS,
+        #   default 10s): the miner fits in free VRAM next to the resident models
+        #   plus the next job's peak. Launch/resume are fenced by _process_op_lock,
+        #   foreground suspends the miner with SIGSTOP before any GPU work, and
+        #   nothing is evicted, so a long grace only forfeits mining time.
+        # A worker-local DM_IMAGE_IDLE_MINING_GRACE_SECONDS=300 (image model-cache
+        # canary, 2026-09-10) therefore keeps protecting against evictions but no
+        # longer blocks mining that leaves models resident.
         self.image_idle_mining_grace_seconds = max(0.0, min(300.0, _env_float("DM_IMAGE_IDLE_MINING_GRACE_SECONDS", 30.0)))
+        self.image_mining_keep_models_resident = (
+            self.server_type == "image_gen_v1" and _env_bool("DM_IMAGE_MINING_KEEP_MODELS_RESIDENT", True)
+        )
+        self.image_idle_mining_resident_grace_seconds = self.image_idle_mining_grace_seconds
+        if self.image_mining_keep_models_resident:
+            self.image_idle_mining_resident_grace_seconds = min(
+                self.image_idle_mining_grace_seconds,
+                max(0.0, min(300.0, _env_float("DM_IMAGE_IDLE_MINING_RESIDENT_GRACE_SECONDS", 10.0))),
+            )
+        # SRBMiner 3.6.9 allocates ~5.7 GB on an RTX 5090; the job headroom covers
+        # the next image job's activation peak (and a checkpoint swap) while the
+        # suspended miner keeps its allocation.
+        self.image_mining_vram_reserve_mb = max(0, min(262144, _env_int("DM_IMAGE_MINING_VRAM_RESERVE_MB", 7000)))
+        self.image_job_vram_headroom_mb = max(0, min(262144, _env_int("DM_IMAGE_JOB_VRAM_HEADROOM_MB", 8000)))
+        self._image_vram_plan_cache: Optional[Tuple[float, bool, Dict[str, Any]]] = None
         self._image_mining_demand = threading.Event()
-        self._image_mining_idle_after = time.monotonic() + self.image_idle_mining_grace_seconds
+        self._image_mining_idle_since = time.monotonic()
+        self._image_mining_idle_after = self._image_mining_idle_since + self.image_idle_mining_resident_grace_seconds
         if self.server_type == "image_gen_v1":
             self._idle_prl_miner.launch_allowed = self._image_mining_launch_allowed
-            self._idle_prl_miner.before_launch = lambda: self._free_local_comfy_for_idle_prl_mining("image_idle_admitted")
+            self._idle_prl_miner.launch_block_reason = self._image_mining_launch_block_reason
+            self._idle_prl_miner.launch_precheck = self._image_mining_launch_precheck
+            self._idle_prl_miner.before_launch = self._prepare_image_idle_mining_launch
         elif self.server_type in ("video_gen_v4", "video_gen_v5"):
             # Use the same process-operation fence as foreground pause. A
             # queued start/resume must recheck demand at the actual launch,
@@ -6455,8 +6671,96 @@ class DependencyAgent:
             self._image_mining_demand.set()
         elif self._image_mining_demand.is_set():
             # Publish the deadline before clearing demand, never a false idle gap.
-            self._image_mining_idle_after = time.monotonic() + self.image_idle_mining_grace_seconds
+            now = time.monotonic()
+            self._image_mining_idle_since = now
+            self._image_mining_idle_after = now + self._image_mining_admission_grace_seconds()
             self._image_mining_demand.clear()
+
+    def _image_mining_admission_grace_seconds(self) -> float:
+        # The shortest grace any admitted launch may use; the fence
+        # (_image_mining_launch_allowed) enforces it. Starts that must evict warm
+        # models additionally wait out image_idle_mining_grace_seconds.
+        return float(getattr(self, "image_idle_mining_resident_grace_seconds", self.image_idle_mining_grace_seconds))
+
+    def _image_mining_eviction_grace_elapsed(self) -> bool:
+        idle_since = getattr(self, "_image_mining_idle_since", None)
+        if idle_since is None:
+            idle_since = self._image_mining_idle_after - self._image_mining_admission_grace_seconds()
+        return time.monotonic() >= float(idle_since) + float(self.image_idle_mining_grace_seconds)
+
+    def _image_mining_launch_block_reason(self) -> str:
+        if self._image_mining_demand.is_set():
+            return "foreground_work_active"
+        return "foreground_or_idle_grace"
+
+    def _image_idle_mining_vram_plan(self, miner_resident: bool, max_age_seconds: float = 0.0) -> Dict[str, Any]:
+        """Can the miner run next to the resident Comfy models and the next job?
+
+        Needs free VRAM >= job headroom, plus the miner's own reserve unless a
+        suspended miner already holds its allocation. Unknown memory never fits.
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_image_vram_plan_cache", None)
+        if max_age_seconds > 0 and cached is not None:
+            cached_at, cached_resident, cached_plan = cached
+            if cached_resident == miner_resident and now - cached_at <= max_age_seconds:
+                return cached_plan
+        need_mb = float(self.image_job_vram_headroom_mb) + (0.0 if miner_resident else float(self.image_mining_vram_reserve_mb))
+        memory = _query_gpu_memory_mb()
+        plan: Dict[str, Any] = {
+            "fits": False,
+            "freeMb": None,
+            "totalMb": None,
+            "needMb": need_mb,
+            "minerResident": bool(miner_resident),
+        }
+        if memory is not None:
+            free_mb, total_mb = memory
+            plan.update({"fits": free_mb >= need_mb, "freeMb": free_mb, "totalMb": total_mb})
+        self._image_vram_plan_cache = (now, bool(miner_resident), plan)
+        return plan
+
+    def _image_mining_launch_precheck(self) -> bool:
+        """Cheap (cached) form of the before_launch veto for a fresh start."""
+        if not getattr(self, "image_mining_keep_models_resident", False):
+            return self._image_mining_eviction_grace_elapsed()
+        if self._image_mining_eviction_grace_elapsed():
+            return True
+        return bool(self._image_idle_mining_vram_plan(False, max_age_seconds=2.0)["fits"])
+
+    def _prepare_image_idle_mining_launch(self) -> bool:
+        """before_launch hook for image_gen_v1 (runs under the miner fence).
+
+        Keeps warm Comfy models resident when VRAM headroom allows; otherwise it
+        falls back to unloading them, but only after the (longer) eviction grace.
+        Returning False vetoes this launch/resume; a later idle tick retries.
+        """
+        if not getattr(self, "image_mining_keep_models_resident", False):
+            if not self._image_mining_eviction_grace_elapsed():
+                return False
+            self._free_local_comfy_for_idle_prl_mining("image_idle_admitted")
+            return True
+        miner_resident = self._idle_prl_miner.holds_suspended_process()
+        plan = self._image_idle_mining_vram_plan(miner_resident)
+        if plan["fits"]:
+            logging.info(
+                "Idle PRL mining keeps Comfy models resident (VRAM headroom ok) freeMb=%s totalMb=%s needMb=%.0f minerResident=%s",
+                plan["freeMb"], plan["totalMb"], plan["needMb"], miner_resident,
+            )
+            return True
+        if not self._image_mining_eviction_grace_elapsed():
+            logging.info(
+                "Idle PRL mining waits for %.0fs eviction grace: VRAM headroom too low to keep Comfy models resident "
+                "freeMb=%s needMb=%.0f minerResident=%s",
+                self.image_idle_mining_grace_seconds, plan["freeMb"], plan["needMb"], miner_resident,
+            )
+            return False
+        logging.info(
+            "Idle PRL mining unloads Comfy models (VRAM headroom too low to keep them resident) freeMb=%s needMb=%.0f minerResident=%s",
+            plan["freeMb"], plan["needMb"], miner_resident,
+        )
+        self._free_local_comfy_for_idle_prl_mining("image_idle_admitted")
+        return True
 
     def _free_local_comfy_for_idle_prl_mining(self, reason: str) -> None:
         if self.mining_only or not self.idle_prl_free_comfy_before_start:
@@ -6559,8 +6863,16 @@ class DependencyAgent:
 
     def _resume_idle_prl_mining_if_idle(self, reason: str) -> None:
         try:
-            if getattr(self, "server_type", "") == "image_gen_v1" and not self._image_mining_launch_allowed():
-                return
+            if getattr(self, "server_type", "") == "image_gen_v1":
+                if not self._image_mining_launch_allowed():
+                    return
+                # Leases only cover agent-pull work. A backend active_jobs stop now
+                # pauses rather than kills the image miner, so never resume or start
+                # it while ComfyUI itself has a prompt queued or running (a
+                # direct_http fallback job the agent cannot see) or is unreachable.
+                queue = self._local_comfy_queue_summary(timeout_seconds=1.0, max_age_ms=1000)
+                if queue.get("source") != "agent_heartbeat" or int(queue.get("totalCount") or 0) > 0:
+                    return
             with self._lock:
                 gpu_blocking_work_count = sum(
                     1
@@ -6609,6 +6921,32 @@ class DependencyAgent:
                 not should_attempt_resume and
                 str(miner_snapshot.get("state") or "") == "failed"
             )
+            image_clean_start = (
+                getattr(self, "server_type", "") == "image_gen_v1" and not self._gpu_coordinator.configured
+            )
+            if (
+                image_clean_start and
+                should_attempt_start and
+                getattr(self, "image_mining_keep_models_resident", False) and
+                not self._image_mining_eviction_grace_elapsed()
+            ):
+                # Between the resident and eviction graces only a launch that
+                # keeps models resident may proceed. Pre-check (cached) so the
+                # idle loop does not run preflight/fence work just to be vetoed;
+                # the authoritative check repeats under the fence at launch.
+                miner_resident = bool(miner_snapshot.get("suspendedForWork"))
+                plan = self._image_idle_mining_vram_plan(miner_resident, max_age_seconds=2.0)
+                if not plan["fits"]:
+                    if miner_resident and self._idle_prl_miner.stop_suspended_for_vram("vram_headroom_low"):
+                        # A suspended miner still holds its VRAM; do not leave
+                        # the next job short while waiting for eviction grace.
+                        logging.info(
+                            "Stopped suspended idle PRL miner to release VRAM for foreground work freeMb=%s needMb=%.0f",
+                            plan["freeMb"], plan["needMb"],
+                        )
+                        self._image_vram_plan_cache = None
+                        self._force_idle_prl_runtime_refresh(reason)
+                    return
             if restart_after_failure and self._idle_prl_miner.auto_restart_backoff_remaining_ms() > 0:
                 # The miner died on its own and is inside its failure backoff: do
                 # not take the GPU lease or free ComfyUI just to be refused, and
@@ -6659,18 +6997,36 @@ class DependencyAgent:
                 self._free_local_comfy_for_idle_prl_mining(reason)
             try:
                 resumed = self._idle_prl_miner.resume_if_paused(reason)
-                restarted = False if resumed else self._idle_prl_miner.restart_if_desired(reason)
-                resumed_after_update = False if (resumed or restarted) else self._idle_prl_miner.resume_after_agent_update_if_requested(reason)
-                if resumed or restarted or resumed_after_update:
+                started = False
+                clean_start = "not_applicable"
+                if not resumed and image_clean_start:
+                    # A wanted miner that was deferred for foreground work or
+                    # grace (or cleanly stopped) is an ordinary start, not a
+                    # failure restart: no auto-restart accounting or backoff.
+                    clean_start = self._idle_prl_miner.start_deferred(reason)
+                    started = clean_start == "started"
+                restarted = (
+                    self._idle_prl_miner.restart_if_desired(reason)
+                    if not resumed and clean_start == "not_applicable"
+                    else False
+                )
+                resumed_after_update = (
+                    self._idle_prl_miner.resume_after_agent_update_if_requested(reason)
+                    if not (resumed or started or restarted) and clean_start == "not_applicable"
+                    else False
+                )
+                if resumed or started or restarted or resumed_after_update:
                     self._register_mining_process_with_gpu_coordinator()
             except Exception:
                 self._idle_prl_miner.stop_if_running("mining_process_registration_failed")
                 self._release_mining_gpu_lease("mining_start_failed")
                 raise
-            if resumed or restarted or resumed_after_update:
+            if resumed or started or restarted or resumed_after_update:
                 logging.info(
                     "%s idle PRL miner after %s",
-                    "Resumed" if resumed else ("Restarted failed" if restarted else "Restored"),
+                    "Resumed" if resumed else (
+                        "Started deferred" if started else ("Restarted failed" if restarted else "Restored")
+                    ),
                     reason,
                 )
                 self._force_idle_prl_runtime_refresh(reason)
@@ -14789,6 +15145,22 @@ class DependencyAgent:
                         self._agent_maintenance_inflight or
                         self._pending_self_update is not None
                     )
+                if local_work_active and getattr(self, "server_type", "") == "image_gen_v1":
+                    # Image workers keep the intent instead of dropping it: the
+                    # backend sends this start right after each job completes,
+                    # i.e. while the lease is still finishing, so dropping it
+                    # starved mining. Nothing launches here; the idle loop
+                    # starts it through the serialized launch fence once idle,
+                    # and a live miner stays suspended by foreground admission.
+                    outcome = self._idle_prl_miner.defer_start_for_foreground(payload)
+                    if item_id and lease_id:
+                        self._agent_ack(item_id, lease_id, "command_succeeded")
+                    logging.info(
+                        "Deferred uncoordinated PRL miner start while local foreground work is active itemId=%s outcome=%s",
+                        item_id,
+                        outcome,
+                    )
+                    return
                 if local_work_active:
                     self._idle_prl_miner.stop_if_running("foreground_work_active")
                     if item_id and lease_id:
@@ -17491,8 +17863,12 @@ class DependencyAgent:
             "yes" if self.download_debug else "no",
         )
         if self.server_type == "image_gen_v1":
-            logging.info("Image latency policy: miningGraceSeconds=%.1f guardedMining=yes asyncMining=yes incrementalDispatch=%s diagnosticPreviewPruning=%s websocketHistoryWake=yes",
+            logging.info("Image latency policy: miningGraceSeconds=%.1f residentMiningGraceSeconds=%.1f keepModelsResident=%s miningVramReserveMb=%d jobVramHeadroomMb=%d guardedMining=yes asyncMining=yes incrementalDispatch=%s diagnosticPreviewPruning=%s websocketHistoryWake=yes",
                          self.image_idle_mining_grace_seconds,
+                         self.image_idle_mining_resident_grace_seconds,
+                         "yes" if self.image_mining_keep_models_resident else "no",
+                         self.image_mining_vram_reserve_mb,
+                         self.image_job_vram_headroom_mb,
                          _env_bool("DM_AGENT_INCREMENTAL_QUEUE_DISPATCH", True),
                          _env_bool("DM_IMAGE_PRUNE_DIAGNOSTIC_PREVIEWS", True))
         logging.info("Dependency polling every %.1fs, dependency heartbeat every %.1fs, max_parallel_downloads=%d", self.poll_seconds, self.heartbeat_seconds, self.max_parallel)
