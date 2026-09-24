@@ -787,6 +787,12 @@ function provisioning_install_furgen_video_tools_node() {
         printf "ERROR: Failed to download FurgenVideoTools SageAttention2 policy from %s\n" "${remote_base}"
         return 1
     }
+    if grep -q "The certified compositor text font is missing" "${dest_dir}/furgen_video_tools.py"; then
+        mkdir -p "${dest_dir}/fonts"
+        for font_file in DejaVuSans.ttf LICENSE_DEJAVU; do
+            curl -fsSL "${remote_base}/fonts/${font_file}" -o "${dest_dir}/fonts/${font_file}" || return 1
+        done
+    fi
     if ! grep -q "FurgenTemporalUnsharpMask" "${dest_dir}/furgen_video_tools.py"; then
         printf "ERROR: Downloaded FurgenVideoTools implementation is missing FurgenTemporalUnsharpMask from %s\n" "${remote_base}"
         return 1

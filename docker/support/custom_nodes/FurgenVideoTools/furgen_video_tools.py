@@ -12,7 +12,7 @@ import folder_paths
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
@@ -4578,6 +4578,7 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
         )
         self._render_precision_filtergraph(
             entries=entries, probes=probes, soundtrack=manifest.get("soundtrack"),
+            audio_events=manifest.get("audioEvents") or [], text_events=manifest.get("textEvents") or [],
             output_width=int(output_width), output_height=int(output_height), frame_rate=float(frame_rate),
             audio_curve=audio_crossfade_curve, pix_fmt=pix_fmt, crf=crf,
             base_path=paths["video"], audio_path=paths["audio"],
@@ -4589,9 +4590,11 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
         }
         return {"ui": {"gifs": [preview]}, "result": ((save_output, [paths["video"], paths["audio"]]),)}
 
-    def _render_precision_filtergraph(self, *, entries, probes, soundtrack, output_width,
+    def _render_precision_filtergraph(self, *, entries, probes, soundtrack, audio_events, text_events, output_width,
                                       output_height, frame_rate, audio_curve, pix_fmt, crf,
                                       base_path, audio_path):
+        if not isinstance(audio_events, list) or not isinstance(text_events, list) or len(audio_events) > 60 or len(text_events) > 60:
+            raise ValueError("A finishing lane may contain at most 60 events")
         ffmpeg_inputs, filters = [], []
         for index, (entry, probe) in enumerate(zip(entries, probes)):
             ffmpeg_inputs.extend(["-i", probe["path"]])
@@ -4673,7 +4676,7 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
             if probe["has_audio"]:
                 audio_filters = [f"atrim=start={start:.6f}:end={end:.6f}", "asetpts=PTS-STARTPTS"]
                 audio_filters.extend(_atempo_chain(speed))
-                gain = 0.0 if audio.get("muted") else max(0.0, min(2.0, float(audio.get("gain", 1.0))))
+                gain = 0.0 if audio.get("muted") else max(0.0, min(1.0, float(audio.get("gain", 1.0))))
                 audio_filters.append(f"volume={gain:.6f}")
                 fade_in = min(duration, max(0.0, float(audio.get("fadeInSeconds") or 0.0)))
                 fade_out = min(duration, max(0.0, float(audio.get("fadeOutSeconds") or 0.0)))
@@ -4734,11 +4737,101 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
                 )
                 timeline_duration += float(entries[index]["_output_duration"])
             cur_v, cur_a = out_v, out_a
-        filters.append(f"{cur_v}fps={frame_rate},format={pix_fmt},setsar=1,settb=AVTB[v]")
+        text_files = []
+        next_input_index = len(entries)
+        if text_events:
+            font_candidates = (Path(__file__).parent / "fonts" / "DejaVuSans.ttf",
+                               Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
+            font_path = next((path for path in font_candidates if path.is_file() and
+                              hashlib.sha256(path.read_bytes()).hexdigest() ==
+                              "3fdf69cabf06049ea70a00b5919340e2ce1e6d02b0cc3c4b44fb6801bd1e0d22"), None)
+            if font_path is None:
+                raise RuntimeError("The certified compositor text font is missing")
+            filters.append(f"{cur_v}fps={frame_rate},format={pix_fmt},setsar=1,settb=AVTB[vbase]")
+            cur_v = "[vbase]"
+            for index, event in enumerate(text_events):
+                start = float(event["startSeconds"])
+                end = float(event["endSeconds"])
+                size = int(event["fontSize"])
+                value = event["text"]
+                color = str(event["color"])
+                position = event["position"]
+                if (not 0 <= start < end <= timeline_duration + 1e-5
+                        or not 20 <= size <= 72 or not isinstance(value, str)
+                        or not value or "\n" in value or len(value) > 120
+                        or not re.fullmatch(r"#[0-9a-fA-F]{6}", color)
+                        or position not in ("top", "center", "bottom")):
+                    raise ValueError("Invalid text event")
+                descriptor, text_path = tempfile.mkstemp(prefix="furgen_caption_", suffix=".png", dir=folder_paths.get_temp_directory())
+                os.close(descriptor)
+                text_files.append(text_path)
+                caption = Image.new("RGBA", (output_width, output_height), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(caption)
+                font = ImageFont.truetype(str(font_path), size)
+                bounds = draw.textbbox((0, 0), value, font=font)
+                width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+                x = (output_width - width) / 2 - bounds[0]
+                y = {"top": output_height * .08, "center": (output_height - height) / 2,
+                     "bottom": output_height * .92 - height}[position] - bounds[1]
+                draw.text((x + 2, y + 2), value, font=font, fill=(0, 0, 0, 217))
+                draw.text((x, y), value, font=font, fill=color)
+                caption.save(text_path)
+                overlay_input = next_input_index
+                next_input_index += 1
+                ffmpeg_inputs.extend(["-loop", "1", "-framerate", str(frame_rate), "-i", text_path])
+                output_label = "[v]" if index == len(text_events) - 1 else f"[vtext{index}]"
+                filters.append(
+                    f"{cur_v}[{overlay_input}:v]overlay=0:0:shortest=1:"
+                    f"enable='gte(t\\,{start:.6f})*lt(t\\,{end:.6f})'{output_label}"
+                )
+                cur_v = output_label
+        else:
+            filters.append(f"{cur_v}fps={frame_rate},format={pix_fmt},setsar=1,settb=AVTB[v]")
+
+        for index, event in enumerate(audio_events):
+            start = float(event["startSeconds"])
+            end = float(event["endSeconds"])
+            source_start = float(event.get("sourceStartSeconds") or 0)
+            gain = float(event.get("gain", 1))
+            fade_in = float(event.get("fadeInSeconds") or 0)
+            fade_out = float(event.get("fadeOutSeconds") or 0)
+            duration = end - start
+            if (not all(math.isfinite(value) for value in (start, end, source_start, gain, fade_in, fade_out))
+                    or not 0 <= start < end <= timeline_duration + 1e-5
+                    or source_start < 0 or not 0 <= gain <= 1
+                    or min(fade_in, fade_out) < 0 or fade_in + fade_out > duration + 1e-5):
+                raise ValueError("Invalid audio event")
+            media_path = _materialize_remote_media(event.get("sourceAudioUrl"))
+            input_index = next_input_index
+            next_input_index += 1
+            ffmpeg_inputs.extend(["-i", media_path])
+            event_filters = [
+                f"atrim=start={source_start:.6f}:end={source_start + duration:.6f}",
+                "asetpts=PTS-STARTPTS", "aresample=48000:async=0:first_pts=0",
+                "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo",
+                f"volume={gain:.6f}",
+            ]
+            if fade_in:
+                event_filters.append(f"afade=t=in:st=0:d={fade_in:.6f}")
+            if fade_out:
+                event_filters.append(f"afade=t=out:st={duration - fade_out:.6f}:d={fade_out:.6f}")
+            delay = int(round(start * 1000))
+            if delay:
+                event_filters.append(f"adelay={delay}|{delay}")
+            event_filters.extend([f"apad=whole_dur={timeline_duration:.6f}",
+                                  f"atrim=end={timeline_duration:.6f}", "asetpts=PTS-STARTPTS"])
+            filters.append(f"[{input_index}:a]{','.join(event_filters)}[event{index}]")
+        if audio_events:
+            event_labels = ''.join(f"[event{index}]" for index in range(len(audio_events)))
+            filters.append(
+                f"{cur_a}{event_labels}amix=inputs={len(audio_events) + 1}:duration=first:normalize=0,"
+                "alimiter=limit=0.99:level=0,asettb=1/48000,asetpts=PTS-STARTPTS[afinished]"
+            )
+            cur_a = "[afinished]"
 
         final_audio = cur_a
         if soundtrack:
-            music_index = len(entries)
+            music_index = next_input_index
             soundtrack["_path"] = _materialize_remote_media(soundtrack.get("sourceAudioUrl"))
             ffmpeg_inputs.extend(["-i", soundtrack["_path"]])
             music_start = max(0.0, float(soundtrack.get("trimStartSeconds") or 0.0))
@@ -4797,7 +4890,8 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
 
         command = [
             FFMPEG_BIN, "-y", "-v", "error", *ffmpeg_inputs, "-filter_complex", ";".join(filters),
-            "-map", "[v]", "-map", final_audio, "-c:v", "libx264", "-preset", "medium",
+            "-map", "[v]", "-map", final_audio, "-t", f"{timeline_duration:.6f}",
+            "-c:v", "libx264", "-preset", "medium",
             "-crf", str(crf), "-pix_fmt", pix_fmt, "-r", str(frame_rate),
             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", audio_path,
         ]
@@ -4810,6 +4904,9 @@ class FCSConcatVideosV4(FCSConcatVideosV3):
         except subprocess.CalledProcessError as error:
             failure = _precision_render_failure_detail(error.stderr, entries, soundtrack)
             raise RuntimeError(json.dumps(failure, sort_keys=True)) from None
+        finally:
+            for text_path in text_files:
+                os.unlink(text_path)
 
 
 NODE_CLASS_MAPPINGS = {

@@ -11396,6 +11396,18 @@ class DependencyAgent:
                 )
                 with urllib.request.urlopen(policy_request, timeout=60.0) as resp:
                     (temp_dir / policy_filename).write_bytes(resp.read())
+            if "The certified compositor text font is missing" in (
+                temp_dir / "furgen_video_tools.py"
+            ).read_text(encoding="utf-8", errors="replace"):
+                font_dir = temp_dir / "fonts"
+                font_dir.mkdir(exist_ok=True)
+                for filename in ("DejaVuSans.ttf", "LICENSE_DEJAVU"):
+                    request = urllib.request.Request(
+                        f"{remote_base}/fonts/{filename}",
+                        headers={"User-Agent": "furgen-dependency-agent/1.0"},
+                    )
+                    with urllib.request.urlopen(request, timeout=60.0) as resp:
+                        (font_dir / filename).write_bytes(resp.read())
             if required and not self._furgen_video_tools_source_is_usable(temp_dir, required_class_types=required):
                 raise RuntimeError(
                     "Downloaded FurgenVideoTools source is missing required class types "
