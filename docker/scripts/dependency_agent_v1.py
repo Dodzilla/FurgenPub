@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.204"
+AGENT_VERSION = "dm-agent-py/0.10.205"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -4991,8 +4991,6 @@ CPU_MINER_ALGO_RE = re.compile(r"new job from[^\n]*\balgo\s+([a-z0-9/]+)", re.I)
 CPU_MINER_CONNECTED_RE = re.compile(r"\b(?:new job from|accepted \(|accepted share)\b", re.I)
 CPU_MINER_POOL_EVENT_RE = re.compile(
     r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.\d+\]\s+(?:net\s+new job from|cpu\s+accepted \()", re.I)
-CPU_MINER_PRL_SHARE_RE = re.compile(
-    r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\][^\n]*GPU\d+[^\n]*share accepted", re.I)
 
 
 def cpu_mining_capacity(vast_effective_cpus: Any = None) -> Dict[str, Any]:
@@ -5086,13 +5084,7 @@ class CpuMinerController:
         self._gpu_current_hps = 0.0
         self._gpu_drop_since_ms = 0
         self._log_path = self.root / "miner.log"
-        self._gpu_log_path = Path(workspace) / ".fcs" / "prl" / "prl_miner.log"
         self._cleanup_orphans()
-
-    def _last_prl_share_at_ms(self) -> Optional[int]:
-        matches = CPU_MINER_PRL_SHARE_RE.findall(_read_tail_text(self._gpu_log_path, 200_000))
-        return (int(datetime.strptime(matches[-1], "%Y-%m-%d %H:%M:%S")
-                    .replace(tzinfo=timezone.utc).timestamp() * 1000) if matches else None)
 
     def _cleanup_orphans(self) -> None:
         proc_root = Path("/proc")
@@ -5169,10 +5161,6 @@ class CpuMinerController:
             raise RuntimeError(f"CPU mining threads {threads} exceed allocation/reserve: {available}/{ceiling}")
         if foreground_active or gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
             raise RuntimeError("PRL miner or foreground state is not healthy for CPU mining")
-        if self._gpu_log_path.exists():
-            last_share = self._last_prl_share_at_ms()
-            if last_share is None or _now_ms() - last_share > 10 * 60_000:
-                raise RuntimeError("PRL miner has no recent accepted share")
         with self._lock:
             if (self._proc is not None and self._proc.poll() is None and self._pool == pool and
                     self._wallet == wallet and self._worker == worker and self._threads == threads and
@@ -5257,9 +5245,6 @@ class CpuMinerController:
             elif foreground_active:
                 self.stop_if_running("foreground_work")
             elif gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
-                self.stop_if_running("prl_miner_unhealthy")
-            elif (self._gpu_log_path.exists() and
-                  ((last_share := self._last_prl_share_at_ms()) is None or now - last_share > 10 * 60_000)):
                 self.stop_if_running("prl_miner_unhealthy")
             elif cpu_mining_memory_available_bytes() < 4 * 1024 ** 3:
                 self.stop_if_running("memory_headroom_low")
