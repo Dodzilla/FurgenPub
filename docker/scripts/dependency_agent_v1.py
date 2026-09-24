@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.203"
+AGENT_VERSION = "dm-agent-py/0.10.204"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5127,7 +5127,9 @@ class CpuMinerController:
                     hashlib.sha256(binary.read_bytes()).hexdigest() == cached):
                 return binary
         unpack = self.root / f"unpack_{pool}"
-        unpack.mkdir(exist_ok=True)
+        if unpack.exists():
+            shutil.rmtree(unpack)
+        unpack.mkdir()
         with tarfile.open(archive, "r:gz") as stream:
             for member in stream.getmembers():
                 if member.name.startswith("/") or ".." in Path(member.name).parts or member.issym() or member.islnk():
