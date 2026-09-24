@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.201"
+AGENT_VERSION = "dm-agent-py/0.10.202"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5190,7 +5190,11 @@ class CpuMinerController:
                 target = ["-o", "gulf.moneroocean.stream:20128", "-a", "rx/0", "-u", wallet,
                           "-p", f"{worker}~rx/0", "--rig-id", worker, "--tls", "--keepalive"]
             self._log_path = self.root / f"{pool}_{_now_ms()}.log"
+            # Vast containers can deny NUMA memory binding even with ample free
+            # memory. XMRig then silently uses its 256 MB RandomX slow mode.
+            # A single full dataset works for our bounded, core-first threads.
             command = [str(binary), *target, f"--threads={threads}", "--cpu-priority=1", "--randomx-init=2",
+                       "--randomx-no-numa", "--randomx-mode=fast",
                        "--randomx-wrmsr=-1", "--no-color", "--no-dmi",
                        "--print-time=60", "--donate-level=1", f"--log-file={self._log_path}"]
             selected = capacity["orderedCpus"][:threads]
