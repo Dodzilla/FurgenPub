@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.200"
+AGENT_VERSION = "dm-agent-py/0.10.201"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5184,8 +5184,11 @@ class CpuMinerController:
             if pool == "tari":
                 target = ["-o", "ca-tarirx.luckypool.io:9118", "-a", "rx/0", "-u", f"{wallet}.{worker}", "-p", "x"]
             else:
-                target = ["-o", "gulf.moneroocean.stream:20004", "-u", wallet,
-                          "--rig-id", worker, "--tls", "--keepalive"]
+                # MoneroOcean's default endpoint can switch to other algorithms,
+                # whose raw H/s cannot be valued with the rx/0 profit term.
+                # Its documented worker~rx/0 password pins direct XMRig mining.
+                target = ["-o", "gulf.moneroocean.stream:20128", "-a", "rx/0", "-u", wallet,
+                          "-p", f"{worker}~rx/0", "--rig-id", worker, "--tls", "--keepalive"]
             self._log_path = self.root / f"{pool}_{_now_ms()}.log"
             command = [str(binary), *target, f"--threads={threads}", "--cpu-priority=1", "--randomx-init=2",
                        "--randomx-wrmsr=-1", "--no-color", "--no-dmi",
