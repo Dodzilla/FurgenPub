@@ -25,9 +25,9 @@
       },
       {
         "type": "git_custom_node",
-        "repository": "https://github.com/Saganaki22/ComfyUI-sol-attn",
+        "repository": "https://github.com/huihui-v/ComfyUI-sol-attn-fork-930a4d",
         "directoryName": "ComfyUI-sol-attn",
-        "ref": "930a4d6e432ff8b8ed5e30ff2f72519b92d69bdf",
+        "ref": "022abf8d7d002e1c9d69d38f9902f2fb1917b15e",
         "installRequirements": false
       }
     ],
