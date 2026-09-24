@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.202"
+AGENT_VERSION = "dm-agent-py/0.10.203"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -4978,8 +4978,11 @@ CPU_MINER_RELEASES = {
         "fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5",
     ),
     "moneroocean": (
-        "https://github.com/MoneroOcean/xmrig/releases/download/v6.26.0-mo5/xmrig-v6.26.0-mo5-lin-compat.tar.gz",
-        "d104a3f9d14a6ff0bb541cce96f5b0c8032bb6669b4c02bbaf13fc567cdb173e",
+        # The pool's documented WORKER~rx/0 login pins this direct connection.
+        # Upstream XMRig avoids the fork's unrelated multi-algorithm calibration,
+        # which can abort before the miner ever connects to the pool.
+        "https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-linux-static-x64.tar.gz",
+        "fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5",
     ),
 }
 CPU_MINER_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -5113,13 +5116,15 @@ class CpuMinerController:
         self.root.mkdir(parents=True, exist_ok=True)
         binary = self.root / f"xmrig_{pool}"
         archive = self.root / f"xmrig_{pool}.tar.gz"
+        archive_marker = self.root / f"xmrig_{pool}.archive.sha256"
         if not archive.exists() or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
             subprocess.run(["curl", "-fLsS", "--retry", "2", "--max-time", "180", "-o", str(archive), url], check=True)
         if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"CPU miner release checksum mismatch for {pool}")
         if binary.is_file() and (self.root / f"xmrig_{pool}.sha256").is_file():
             cached = (self.root / f"xmrig_{pool}.sha256").read_text().strip()
-            if hashlib.sha256(binary.read_bytes()).hexdigest() == cached:
+            if (archive_marker.is_file() and archive_marker.read_text().strip() == expected and
+                    hashlib.sha256(binary.read_bytes()).hexdigest() == cached):
                 return binary
         unpack = self.root / f"unpack_{pool}"
         unpack.mkdir(exist_ok=True)
@@ -5134,6 +5139,7 @@ class CpuMinerController:
         shutil.copy2(matches[0], binary)
         binary.chmod(0o755)
         (self.root / f"xmrig_{pool}.sha256").write_text(hashlib.sha256(binary.read_bytes()).hexdigest())
+        archive_marker.write_text(expected)
         return binary
 
     def start(self, payload: Dict[str, Any], gpu_snapshot: Dict[str, Any], foreground_active: bool = False) -> Dict[str, Any]:
@@ -11396,18 +11402,6 @@ class DependencyAgent:
                 )
                 with urllib.request.urlopen(policy_request, timeout=60.0) as resp:
                     (temp_dir / policy_filename).write_bytes(resp.read())
-            if "The certified compositor text font is missing" in (
-                temp_dir / "furgen_video_tools.py"
-            ).read_text(encoding="utf-8", errors="replace"):
-                font_dir = temp_dir / "fonts"
-                font_dir.mkdir(exist_ok=True)
-                for filename in ("DejaVuSans.ttf", "LICENSE_DEJAVU"):
-                    request = urllib.request.Request(
-                        f"{remote_base}/fonts/{filename}",
-                        headers={"User-Agent": "furgen-dependency-agent/1.0"},
-                    )
-                    with urllib.request.urlopen(request, timeout=60.0) as resp:
-                        (font_dir / filename).write_bytes(resp.read())
             if required and not self._furgen_video_tools_source_is_usable(temp_dir, required_class_types=required):
                 raise RuntimeError(
                     "Downloaded FurgenVideoTools source is missing required class types "
