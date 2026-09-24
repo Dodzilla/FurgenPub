@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.199"
+AGENT_VERSION = "dm-agent-py/0.10.200"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -4972,6 +4972,350 @@ class PrlMinerController:
             )
 
 
+CPU_MINER_RELEASES = {
+    "tari": (
+        "https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-linux-static-x64.tar.gz",
+        "fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5",
+    ),
+    "moneroocean": (
+        "https://github.com/MoneroOcean/xmrig/releases/download/v6.26.0-mo5/xmrig-v6.26.0-mo5-lin-compat.tar.gz",
+        "d104a3f9d14a6ff0bb541cce96f5b0c8032bb6669b4c02bbaf13fc567cdb173e",
+    ),
+}
+CPU_MINER_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+CPU_MINER_SPEED_RE = re.compile(r"speed\s+10s/60s/15m\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?|n/a)", re.I)
+CPU_MINER_ALGO_RE = re.compile(r"new job from[^\n]*\balgo\s+([a-z0-9/]+)", re.I)
+CPU_MINER_CONNECTED_RE = re.compile(r"\b(?:new job from|accepted \(|accepted share)\b", re.I)
+CPU_MINER_POOL_EVENT_RE = re.compile(
+    r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.\d+\]\s+(?:net\s+new job from|cpu\s+accepted \()", re.I)
+CPU_MINER_PRL_SHARE_RE = re.compile(
+    r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\][^\n]*GPU\d+[^\n]*share accepted", re.I)
+
+
+def cpu_mining_capacity(vast_effective_cpus: Any = None) -> Dict[str, Any]:
+    """Bound mining by the worker's real affinity/quota and its Vast entitlement."""
+    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(os.cpu_count() or 1))
+    limits = [len(affinity)]
+    quota_found = False
+    quota_count = len(affinity)
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if quota != "max":
+            quota_count = max(0, int(quota) // int(period))
+            limits.append(quota_count)
+            quota_found = True
+    except (OSError, ValueError):
+        pass
+    if not quota_found:
+        try:
+            quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+            period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+            if quota >= 0 and period > 0:
+                quota_count = quota // period
+                limits.append(quota_count)
+        except (OSError, ValueError):
+            pass
+    if vast_effective_cpus is not None:
+        try:
+            entitlement = int(float(vast_effective_cpus))
+            limits.append(max(0, entitlement))
+        except (TypeError, ValueError, OverflowError):
+            limits.append(0)
+    available = min(limits)
+    ceiling = max(0, available - max(2, math.ceil(available * 0.25)))
+    groups: Dict[Tuple[int, int], List[int]] = {}
+    for cpu in affinity:
+        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        try:
+            key = (int((topology / "physical_package_id").read_text()), int((topology / "core_id").read_text()))
+        except (OSError, ValueError):
+            key = (0, cpu)
+        groups.setdefault(key, []).append(cpu)
+    ordered: List[int] = []
+    for sibling in range(max((len(group) for group in groups.values()), default=0)):
+        ordered.extend(group[sibling] for group in groups.values() if sibling < len(group))
+    return {"availableLogicalCpus": available, "threadCeiling": ceiling, "orderedCpus": ordered,
+            "affinityLogicalCpus": len(affinity), "quotaLogicalCpus": quota_count}
+
+
+def cpu_mining_memory_available_bytes() -> int:
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+        match = re.search(r"^MemAvailable:\s+(\d+)\s+kB", meminfo, re.M)
+        available = int(match.group(1)) * 1024 if match else 0
+        for maximum_path, usage_path in (
+            ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+            ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ):
+            try:
+                limit_text = Path(maximum_path).read_text().strip()
+                if limit_text != "max":
+                    cgroup_free = int(limit_text) - int(Path(usage_path).read_text())
+                    available = min(available, max(0, cgroup_free))
+                break
+            except (OSError, ValueError):
+                continue
+        return available
+    except (OSError, ValueError):
+        return 0
+
+
+class CpuMinerController:
+    """Independent, expiring CPU miner; never controls the PRL GPU process."""
+
+    def __init__(self, workspace: Path) -> None:
+        self.root = Path(workspace) / ".fcs" / "cpu_mining"
+        self._lock = threading.RLock()
+        self._proc: Optional[subprocess.Popen] = None
+        self._pool = ""
+        self._wallet = ""
+        self._worker = ""
+        self._threads = 0
+        self._available = 0
+        self._ceiling = 0
+        self._entitlement = 0
+        self._selected_cpus: List[int] = []
+        self._expires_at_ms = 0
+        self._started_at_ms = 0
+        self._stopped_at_ms = 0
+        self._stop_reason = ""
+        self._gpu_baseline_hps = 0.0
+        self._gpu_current_hps = 0.0
+        self._gpu_drop_since_ms = 0
+        self._log_path = self.root / "miner.log"
+        self._gpu_log_path = Path(workspace) / ".fcs" / "prl" / "prl_miner.log"
+        self._cleanup_orphans()
+
+    def _last_prl_share_at_ms(self) -> Optional[int]:
+        matches = CPU_MINER_PRL_SHARE_RE.findall(_read_tail_text(self._gpu_log_path, 200_000))
+        return (int(datetime.strptime(matches[-1], "%Y-%m-%d %H:%M:%S")
+                    .replace(tzinfo=timezone.utc).timestamp() * 1000) if matches else None)
+
+    def _cleanup_orphans(self) -> None:
+        proc_root = Path("/proc")
+        if not proc_root.is_dir():
+            return
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
+                if str(self.root / "xmrig_") not in cmdline:
+                    continue
+                group = os.getpgid(int(entry.name))
+                if group != os.getpgrp():
+                    os.killpg(group, signal.SIGTERM)
+            except (OSError, ValueError, ProcessLookupError):
+                continue
+
+    def _binary(self, pool: str) -> Path:
+        url, expected = CPU_MINER_RELEASES[pool]
+        self.root.mkdir(parents=True, exist_ok=True)
+        binary = self.root / f"xmrig_{pool}"
+        archive = self.root / f"xmrig_{pool}.tar.gz"
+        if not archive.exists() or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+            subprocess.run(["curl", "-fLsS", "--retry", "2", "--max-time", "180", "-o", str(archive), url], check=True)
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+            raise RuntimeError(f"CPU miner release checksum mismatch for {pool}")
+        if binary.is_file() and (self.root / f"xmrig_{pool}.sha256").is_file():
+            cached = (self.root / f"xmrig_{pool}.sha256").read_text().strip()
+            if hashlib.sha256(binary.read_bytes()).hexdigest() == cached:
+                return binary
+        unpack = self.root / f"unpack_{pool}"
+        unpack.mkdir(exist_ok=True)
+        with tarfile.open(archive, "r:gz") as stream:
+            for member in stream.getmembers():
+                if member.name.startswith("/") or ".." in Path(member.name).parts or member.issym() or member.islnk():
+                    raise RuntimeError("Unsafe CPU miner release archive")
+            stream.extractall(unpack, filter="data")
+        matches = [candidate for candidate in unpack.rglob("xmrig") if candidate.is_file()]
+        if len(matches) != 1:
+            raise RuntimeError("CPU miner release lacks a unique executable")
+        shutil.copy2(matches[0], binary)
+        binary.chmod(0o755)
+        (self.root / f"xmrig_{pool}.sha256").write_text(hashlib.sha256(binary.read_bytes()).hexdigest())
+        return binary
+
+    def start(self, payload: Dict[str, Any], gpu_snapshot: Dict[str, Any], foreground_active: bool = False) -> Dict[str, Any]:
+        pool = str(payload.get("pool") or "").strip().lower()
+        wallet = str(payload.get("wallet") or "").strip()
+        worker = str(payload.get("worker") or "").strip()
+        threads = int(payload.get("threads") or 0)
+        expires_at_ms = int(payload.get("expiresAtMs") or 0)
+        if pool not in CPU_MINER_RELEASES or not re.fullmatch(r"[A-Za-z0-9]{90,128}", wallet):
+            raise RuntimeError("Invalid CPU mining pool or payout address")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", worker):
+            raise RuntimeError("Invalid CPU mining worker name")
+        if expires_at_ms <= _now_ms() + 60_000 or expires_at_ms > _now_ms() + 30 * 60_000:
+            raise RuntimeError("CPU mining lease must expire in 1-30 minutes")
+        try:
+            entitlement = int(float(payload["vastEffectiveCpus"]))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise RuntimeError("CPU mining requires a Vast effective CPU entitlement") from None
+        if entitlement < 12:
+            raise RuntimeError("Vast effective CPU entitlement is below 12")
+        capacity = cpu_mining_capacity(entitlement)
+        available = int(capacity["availableLogicalCpus"])
+        ceiling = int(capacity["threadCeiling"])
+        if available < 12 or threads < 1 or threads > ceiling:
+            raise RuntimeError(f"CPU mining threads {threads} exceed allocation/reserve: {available}/{ceiling}")
+        if foreground_active or gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
+            raise RuntimeError("PRL miner or foreground state is not healthy for CPU mining")
+        if self._gpu_log_path.exists():
+            last_share = self._last_prl_share_at_ms()
+            if last_share is None or _now_ms() - last_share > 10 * 60_000:
+                raise RuntimeError("PRL miner has no recent accepted share")
+        with self._lock:
+            if (self._proc is not None and self._proc.poll() is None and self._pool == pool and
+                    self._wallet == wallet and self._worker == worker and self._threads == threads and
+                    self._available == available and self._entitlement == entitlement and
+                    self._selected_cpus == capacity["orderedCpus"][:threads]):
+                if cpu_mining_memory_available_bytes() < 4 * 1024 ** 3:
+                    raise RuntimeError("CPU mining memory headroom fell below 4 GiB")
+                self._available, self._ceiling = available, ceiling
+                self._entitlement = entitlement
+                self._selected_cpus = capacity["orderedCpus"][:threads]
+                self._expires_at_ms = expires_at_ms
+                return self.snapshot()
+            if cpu_mining_memory_available_bytes() < 6 * 1024 ** 3:
+                raise RuntimeError("CPU mining requires at least 6 GiB available memory at startup")
+            self.stop_if_running("reconfigure")
+            binary = self._binary(pool)
+            if pool == "tari":
+                target = ["-o", "ca-tarirx.luckypool.io:9118", "-a", "rx/0", "-u", f"{wallet}.{worker}", "-p", "x"]
+            else:
+                target = ["-o", "gulf.moneroocean.stream:20004", "-u", wallet,
+                          "--rig-id", worker, "--tls", "--keepalive"]
+            self._log_path = self.root / f"{pool}_{_now_ms()}.log"
+            command = [str(binary), *target, f"--threads={threads}", "--cpu-priority=1", "--randomx-init=2",
+                       "--randomx-wrmsr=-1", "--no-color", "--no-dmi",
+                       "--print-time=60", "--donate-level=1", f"--log-file={self._log_path}"]
+            selected = capacity["orderedCpus"][:threads]
+
+            def child_setup() -> None:
+                os.nice(10)
+                if hasattr(os, "sched_setaffinity"):
+                    os.sched_setaffinity(0, set(selected))
+
+            with open(os.devnull, "wb") as stream:
+                self._proc = subprocess.Popen(command, cwd=str(self.root), stdin=subprocess.DEVNULL,
+                                              stdout=stream, stderr=subprocess.STDOUT,
+                                              start_new_session=True, preexec_fn=child_setup)
+            self._pool, self._wallet, self._worker = pool, wallet, worker
+            self._threads, self._available, self._ceiling = threads, available, ceiling
+            self._entitlement = entitlement
+            self._selected_cpus = selected
+            self._expires_at_ms, self._started_at_ms = expires_at_ms, _now_ms()
+            self._stop_reason = ""
+            self._gpu_baseline_hps = float(payload.get("baselineGpuHashrateHps") or gpu_snapshot.get("localHashrateHps") or 0)
+            self._gpu_drop_since_ms = 0
+            return self.snapshot()
+
+    def stop_if_running(self, reason: str) -> None:
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+            self._stopped_at_ms = _now_ms()
+            self._stop_reason = str(reason)[:120]
+            if proc is None or proc.poll() is not None:
+                return
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            except ProcessLookupError:
+                pass
+
+    def tick(self, gpu_snapshot: Dict[str, Any], foreground_active: bool = False) -> None:
+        with self._lock:
+            proc = self._proc
+            if proc is None:
+                return
+            if proc.poll() is not None:
+                self.stop_if_running(f"miner_exit_{proc.returncode}")
+                return
+            now = _now_ms()
+            if now >= self._expires_at_ms:
+                self.stop_if_running("lease_expired")
+            elif foreground_active:
+                self.stop_if_running("foreground_work")
+            elif gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
+                self.stop_if_running("prl_miner_unhealthy")
+            elif (self._gpu_log_path.exists() and
+                  ((last_share := self._last_prl_share_at_ms()) is None or now - last_share > 10 * 60_000)):
+                self.stop_if_running("prl_miner_unhealthy")
+            elif cpu_mining_memory_available_bytes() < 4 * 1024 ** 3:
+                self.stop_if_running("memory_headroom_low")
+            elif ((capacity := cpu_mining_capacity(self._entitlement))["availableLogicalCpus"] < 12 or
+                  capacity["availableLogicalCpus"] != self._available or
+                  self._threads > capacity["threadCeiling"] or
+                  capacity["orderedCpus"][:self._threads] != self._selected_cpus):
+                self.stop_if_running("cpu_allocation_changed")
+            else:
+                if now - self._started_at_ms > 7 * 60_000:
+                    pool = self.snapshot()
+                    last_event = int(pool.get("poolLastEventAtMs") or 0)
+                    if not pool.get("poolConnected") or (last_event and now - last_event > 10 * 60_000):
+                        self.stop_if_running("cpu_pool_unreachable")
+                        return
+                current = float(gpu_snapshot.get("localHashrateHps") or 0)
+                self._gpu_current_hps = current
+                if current > 0 and self._gpu_baseline_hps > 0 and current < self._gpu_baseline_hps * 0.99:
+                    self._gpu_drop_since_ms = self._gpu_drop_since_ms or now
+                    if now - self._gpu_drop_since_ms >= 10 * 60_000:
+                        self.stop_if_running("prl_hashrate_drop")
+                else:
+                    self._gpu_drop_since_ms = 0
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            proc = self._proc
+            running = proc is not None and proc.poll() is None
+            capacity = cpu_mining_capacity(self._entitlement or None)
+            try:
+                with self._log_path.open("rb") as stream:
+                    stream.seek(max(0, self._log_path.stat().st_size - 100_000))
+                    log_text = CPU_MINER_ANSI_RE.sub("", stream.read().decode("utf-8", "replace"))
+            except OSError:
+                log_text = ""
+            speeds = CPU_MINER_SPEED_RE.findall(log_text)
+            algorithms = CPU_MINER_ALGO_RE.findall(log_text)
+            pool_connected = bool(CPU_MINER_CONNECTED_RE.search(log_text))
+            pool_events = CPU_MINER_POOL_EVENT_RE.findall(log_text)
+            pool_last_event_at_ms = int(datetime.strptime(pool_events[-1], "%Y-%m-%d %H:%M:%S")
+                                        .replace(tzinfo=timezone.utc).timestamp() * 1000) if pool_events else None
+            hash_hps = float(speeds[-1][1]) if speeds and speeds[-1][1].lower() != "n/a" else 0.0
+            return {
+                "state": "running" if running else "stopped",
+                "pid": proc.pid if running else None,
+                "pool": self._pool or None,
+                "worker": self._worker or None,
+                "threads": self._threads,
+                "availableLogicalCpus": capacity["availableLogicalCpus"],
+                "threadCeiling": capacity["threadCeiling"],
+                "affinityLogicalCpus": capacity["affinityLogicalCpus"],
+                "quotaLogicalCpus": capacity["quotaLogicalCpus"],
+                "vastEffectiveCpus": self._entitlement or None,
+                "selectedCpus": self._selected_cpus,
+                "localHashrateHps": hash_hps,
+                "algorithm": algorithms[-1] if algorithms else None,
+                "poolConnected": pool_connected,
+                "poolLastEventAtMs": pool_last_event_at_ms,
+                "acceptedShares": len(re.findall(r"accepted", log_text, re.I)),
+                "rejectedShares": len(re.findall(r"rejected", log_text, re.I)),
+                "memoryAvailableBytes": cpu_mining_memory_available_bytes(),
+                "baselineGpuHashrateHps": self._gpu_baseline_hps,
+                "currentGpuHashrateHps": self._gpu_current_hps,
+                "gpuDropSinceMs": self._gpu_drop_since_ms or None,
+                "expiresAtMs": self._expires_at_ms or None,
+                "startedAtMs": self._started_at_ms or None,
+                "stoppedAtMs": self._stopped_at_ms or None,
+                "stopReason": self._stop_reason or None,
+            }
+
+
 class ComfyNodeTimingCollector:
     """Best-effort, dependency-free reader for ComfyUI's local WebSocket events.
 
@@ -5410,6 +5754,7 @@ class DependencyAgent:
             self.download_timeout_seconds,
             self.download_chunk_size,
         )
+        self._idle_cpu_miner = CpuMinerController(self.workspace)
         self.idle_prl_free_comfy_before_start = _env_bool("DM_IDLE_PRL_FREE_COMFY_BEFORE_START", True)
         self.idle_prl_free_comfy_min_interval_ms = int(
             max(5.0, min(600.0, _env_float("DM_IDLE_PRL_FREE_COMFY_MIN_INTERVAL_SECONDS", 30.0))) * 1000
@@ -6215,6 +6560,7 @@ class DependencyAgent:
         self._agent_poll_wakeup.set()
         self._loop_wakeup.set()
         try:
+            self._idle_cpu_miner.stop_if_running("agent_stop")
             self._idle_prl_miner.stop_if_running("agent_stop")
         except Exception as e:
             logging.warning("Failed stopping idle PRL miner during agent stop: %s", e)
@@ -6598,6 +6944,8 @@ class DependencyAgent:
 
     def _stop_idle_prl_mining_for_work(self, reason: str) -> None:
         try:
+            if reason in ("execute_job", "self_update", "restart_comfy", "install_node_bundles_comfy_restart"):
+                self._idle_cpu_miner.stop_if_running(reason)
             if getattr(self, "_tts_residency_seen_enabled", False):
                 try:
                     self._gpu_coordinator._request(
@@ -6823,7 +7171,7 @@ class DependencyAgent:
             # interrupt TTS setup. A single-item query would let an earlier
             # mining command hide foreground work. Saturation is conservative.
             if queued and (len(queued) >= queue_limit or any(
-                not isinstance(item, dict) or item.get("type") != "prl_miner"
+                not isinstance(item, dict) or item.get("type") not in ("prl_miner", "cpu_miner")
                 for item in queued.values()
             )):
                 logging.info("TTS queued foreground demand observed atMs=%d", _now_ms())
@@ -8909,6 +9257,7 @@ class DependencyAgent:
                 **({"comfyRuntime": comfy_runtime} if comfy_runtime else {}),
                 **({"provisioningTimeline": provisioning_timeline} if provisioning_timeline else {}),
                 "idleMining": self._idle_prl_miner.snapshot(),
+                "cpuMining": self._idle_cpu_miner.snapshot(),
                 "gpuCoordinator": self._gpu_coordinator_runtime_snapshot(),
                 "agentVersion": AGENT_VERSION,
                 "capabilities": {
@@ -8917,6 +9266,7 @@ class DependencyAgent:
                     "hybridOutputUploadsV1": True,
                     "dependencyDeleteFiles": True,
                     "idlePrlMining": True,
+                    "idleCpuMining": True,
                     "gpuCoordinatorLeases": True,
                     "miningOnly": bool(self.mining_only),
                     "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
@@ -8959,6 +9309,9 @@ class DependencyAgent:
         gpu_coordinator = body.get("gpuCoordinator")
         if isinstance(gpu_coordinator, dict) and gpu_coordinator:
             agent_control["gpuCoordinator"] = gpu_coordinator
+        cpu_mining = body.get("cpuMining")
+        if isinstance(cpu_mining, dict):
+            agent_control["cpuMining"] = cpu_mining
         if full:
             capabilities = {
                 "dependencyChannel": True,
@@ -8981,6 +9334,7 @@ class DependencyAgent:
                 "inputCacheMaxBytes": int(body.get("inputCacheMaxBytes") or 0),
                 "inputCacheInventoryTruncated": body.get("inputCacheInventoryTruncated") is True,
                 "idleMining": body.get("idleMining") if isinstance(body.get("idleMining"), dict) else {},
+                "cpuMining": body.get("cpuMining") if isinstance(body.get("cpuMining"), dict) else {},
                 "agentVersion": body.get("agentVersion") or AGENT_VERSION,
                 "capabilities": capabilities,
             })
@@ -9008,6 +9362,8 @@ class DependencyAgent:
             hot_agent_control["queueSummary"] = agent_control.get("queueSummary")
         if "gpuCoordinator" in agent_control:
             hot_agent_control["gpuCoordinator"] = agent_control.get("gpuCoordinator")
+        if "cpuMining" in agent_control:
+            hot_agent_control["cpuMining"] = agent_control.get("cpuMining")
         if full:
             hot_agent_control.update({
                 "localReadinessFile": agent_control.get("localReadinessFile"),
@@ -9165,6 +9521,11 @@ class DependencyAgent:
                 str(value) for value in body.get("sshHostKeySha256", []) if isinstance(value, str)
             ]),
             "idleMining": idle_signature,
+            "cpuMining": {
+                key: body["cpuMining"].get(key)
+                for key in ("state", "pid", "pool", "threads", "stopReason")
+                if isinstance(body.get("cpuMining"), dict) and key in body["cpuMining"]
+            },
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -13483,6 +13844,7 @@ class DependencyAgent:
             **({"provisioningTimeline": provisioning_timeline} if provisioning_timeline else {}),
             **({"sshHostKeySha256": ssh_host_key_sha256} if ssh_host_key_sha256 else {}),
             "idleMining": self._idle_prl_miner.snapshot(),
+            "cpuMining": self._idle_cpu_miner.snapshot(),
             "gpuCoordinator": self._gpu_coordinator_runtime_snapshot(),
             "agentVersion": AGENT_VERSION,
             "capabilities": {
@@ -13490,6 +13852,7 @@ class DependencyAgent:
                 "agentPullExecution": not self.mining_only,
                 "dependencyDeleteFiles": True,
                 "idlePrlMining": True,
+                "idleCpuMining": True,
                 "miningOnly": bool(self.mining_only),
                 "comfyRestartProcessIsolated": self._comfy_restart_process_isolated(),
                 "comfyRestartIsolationMode": self._comfy_restart_isolation_mode(),
@@ -15126,6 +15489,34 @@ class DependencyAgent:
             "deletedBytes": deleted_bytes,
             "removedDirectories": removed_directories,
         }
+
+    def _agent_handle_cpu_miner_command(self, item: Dict[str, Any]) -> None:
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        action = str(payload.get("action") or "").strip().lower()
+        item_id = item.get("itemId") if isinstance(item.get("itemId"), str) else ""
+        lease_id = item.get("leaseId") if isinstance(item.get("leaseId"), str) else ""
+        try:
+            if action == "stop":
+                self._idle_cpu_miner.stop_if_running(str(payload.get("reason") or "backend_stop"))
+            elif action == "start":
+                if self.server_type != "prl_mining_v1" or not self.mining_only:
+                    raise RuntimeError("CPU mining is restricted to dedicated PRL workers")
+                if str(payload.get("instanceId") or "") != str(self._resolved_instance_id or ""):
+                    raise RuntimeError("CPU mining command targets a different instance")
+                with self._lock:
+                    foreground_active = bool(self._active_exec_by_item or self._agent_maintenance_inflight or
+                                             self._pending_self_update)
+                self._idle_cpu_miner.start(payload, self._idle_prl_miner.snapshot(), foreground_active)
+            else:
+                raise RuntimeError("Unknown CPU mining action")
+            if item_id and lease_id:
+                self._agent_ack(item_id, lease_id, "command_succeeded")
+        except Exception as exc:
+            if item_id and lease_id:
+                self._agent_ack(item_id, lease_id, "command_failed", error_code="cpu_miner_failed",
+                                error_message=str(exc)[:MAX_AGENT_ERROR_MESSAGE_CHARS])
+        finally:
+            self._force_idle_prl_runtime_refresh("cpu_miner_command")
 
     def _agent_handle_prl_miner_command(self, item: Dict[str, Any]) -> None:
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
@@ -16914,7 +17305,7 @@ class DependencyAgent:
 
     def _submit_agent_maintenance_item(self, item: Dict[str, Any]) -> None:
         item_type = item.get("type")
-        is_prl_miner = item_type == "prl_miner"
+        is_prl_miner = item_type in ("prl_miner", "cpu_miner")
         executor = self._agent_prl_miner_executor if is_prl_miner else self._agent_maintenance_executor
         if executor is None:
             raise RuntimeError("Agent PRL miner executor is not initialized" if is_prl_miner else "Agent maintenance executor is not initialized")
@@ -16935,6 +17326,8 @@ class DependencyAgent:
                     self._agent_handle_restart_comfy_command(item)
                 elif item_type == "prl_miner":
                     self._agent_handle_prl_miner_command(item)
+                elif item_type == "cpu_miner":
+                    self._agent_handle_cpu_miner_command(item)
                 else:
                     self._process_install_node_bundles_item(item)
             finally:
@@ -17803,7 +18196,7 @@ class DependencyAgent:
             self._submit_agent_maintenance_item(item)
             return
 
-        if item_type == "prl_miner":
+        if item_type in ("prl_miner", "cpu_miner"):
             self._submit_agent_maintenance_item(item)
             return
 
@@ -17933,6 +18326,7 @@ class DependencyAgent:
 
         next_dep_poll_at_ms = 0
         next_agent_poll_at_ms = 0
+        next_cpu_miner_check_at_ms = 0
 
         # Best-effort early register for agent control channel.
         self._maybe_register_agent_control()
@@ -17940,6 +18334,16 @@ class DependencyAgent:
         while not self._stop.is_set():
             try:
                 now = _now_ms()
+                if now >= next_cpu_miner_check_at_ms:
+                    next_cpu_miner_check_at_ms = now + 15_000
+                    if self._idle_cpu_miner._proc is not None:
+                        with self._lock:
+                            foreground_active = bool(self._active_exec_by_item or self._agent_maintenance_inflight or
+                                                     self._pending_self_update)
+                        before = self._idle_cpu_miner.snapshot().get("state")
+                        self._idle_cpu_miner.tick(self._idle_prl_miner.snapshot(), foreground_active)
+                        if before != self._idle_cpu_miner.snapshot().get("state"):
+                            self._force_idle_prl_runtime_refresh("cpu_miner_health")
                 if now >= self._next_interrupted_comfy_restart_recovery_ms:
                     self._next_interrupted_comfy_restart_recovery_ms = now + 5_000
                     try:
@@ -18244,6 +18648,7 @@ class DependencyAgent:
                 _sleep_with_jitter(5.0)
 
         try:
+            self._idle_cpu_miner.stop_if_running("agent_shutdown")
             self._idle_prl_miner.stop_if_running("agent_shutdown")
         except Exception as e:
             logging.warning("Failed stopping idle PRL miner during shutdown: %s", e)
