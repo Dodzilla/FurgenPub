@@ -1,6 +1,11 @@
 name: Build free PRL miner runtime
 on:
   workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - docker/vast-prl-miner/**
+      - .github/workflows/build-prl-miner-runtime.yml
 permissions:
   contents: read
   packages: write
