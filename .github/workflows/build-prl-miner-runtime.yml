@@ -1,0 +1,33 @@
+name: Build free PRL miner runtime
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - docker/vast-prl-miner/**
+      - .github/workflows/build-prl-miner-runtime.yml
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: prl-miner-runtime-build
+  cancel-in-progress: false
+jobs:
+  build:
+    # Public repository and standard runner: free public GHCR distribution.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Build and publish minimal CUDA image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/dodzilla/furgen-prl-miner:cuda129-${GITHUB_SHA}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --progress=plain -f docker/vast-prl-miner/Dockerfile -t "$image" docker/vast-prl-miner
+          docker run --rm "$image" sh -ec 'python3 --version; command -v sshd; command -v curl; command -v git'
+          docker push "$image"
+          docker image inspect "$image" --format '{{join .RepoDigests "\n"}}' >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
