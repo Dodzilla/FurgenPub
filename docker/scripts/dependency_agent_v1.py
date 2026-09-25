@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.206"
+AGENT_VERSION = "dm-agent-py/0.10.207"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5168,12 +5168,10 @@ class CpuMinerController:
             entitlement = int(float(payload["vastEffectiveCpus"]))
         except (KeyError, TypeError, ValueError, OverflowError):
             raise RuntimeError("CPU mining requires a Vast effective CPU entitlement") from None
-        if entitlement < 12:
-            raise RuntimeError("Vast effective CPU entitlement is below 12")
         capacity = cpu_mining_capacity(entitlement)
         available = int(capacity["availableLogicalCpus"])
         ceiling = int(capacity["threadCeiling"])
-        if available < 12 or threads < 1 or threads > ceiling:
+        if ceiling < 8 or threads < 8 or threads > ceiling:
             raise RuntimeError(f"CPU mining threads {threads} exceed allocation/reserve: {available}/{ceiling}")
         if foreground_active or gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
             raise RuntimeError("PRL miner or foreground state is not healthy for CPU mining")
@@ -5264,7 +5262,7 @@ class CpuMinerController:
                 self.stop_if_running("prl_miner_unhealthy")
             elif cpu_mining_memory_available_bytes() < 4 * 1024 ** 3:
                 self.stop_if_running("memory_headroom_low")
-            elif ((capacity := cpu_mining_capacity(self._entitlement))["availableLogicalCpus"] < 12 or
+            elif ((capacity := cpu_mining_capacity(self._entitlement))["threadCeiling"] < 8 or
                   capacity["availableLogicalCpus"] != self._available or
                   self._threads > capacity["threadCeiling"] or
                   capacity["orderedCpus"][:self._threads] != self._selected_cpus):
