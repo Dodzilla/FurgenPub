@@ -144,7 +144,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.205"
+AGENT_VERSION = "dm-agent-py/0.10.206"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -3473,6 +3473,22 @@ WATCHDOG_RELEASE_ENV_KEYS = {
 }
 
 
+def _prl_miner_launch_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    # Some Vast images put CUDA's forward-compatibility libcuda ahead of the
+    # installed driver. On GeForce GPUs that library returns cuInit error 804,
+    # and SRBMiner exits before it can write a log or report hashrate.
+    for driver_dir in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib/wsl/lib"):
+        driver_library = os.path.join(driver_dir, "libcuda.so.1")
+        if os.path.isfile(driver_library) and "/compat/" not in os.path.realpath(driver_library):
+            current_path = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(
+                part for part in (driver_dir, current_path) if part
+            )
+            break
+    return env
+
+
 class PrlMinerController:
     def __init__(self, workspace: Path, download_timeout_seconds: float, download_chunk_size: int) -> None:
         self.root = Path(workspace) / ".fcs" / "prl"
@@ -4474,7 +4490,7 @@ class PrlMinerController:
                 stdin=subprocess.DEVNULL,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                env=os.environ.copy(),
+                env=_prl_miner_launch_env(),
                 preexec_fn=os.setsid if hasattr(os, "setsid") else None,
             )
         except Exception:
