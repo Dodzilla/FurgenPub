@@ -89,6 +89,9 @@ Optional knobs:
   - DM_COMFY_FULL_TRIM_MEMORY_PSI_AVG10 (full Comfy cache trim PSI avg10 threshold; default: 5)
   - DM_COMFY_OUTPUT_CLEANUP_MAX_AGE_SECONDS (periodic-restart output retention; default: payload value, disabled when unset)
   - DM_MINING_ONLY                (set to 1 for PRL mining-only instances; skips Comfy probes and job execution)
+  - DM_GPU_ADMISSION_STREAM_ENABLED (serve GPU admission reads from an RTDB event stream; default: true)
+  - DM_TTS_QUEUE_PROBE_MAX_AGE_SECONDS (reuse the TTS queued-item probe until a queue signal or this age; default: 10)
+  - DM_RUNTIME_ENV_DELIVERY_SERVER_TYPES (server types that poll /agent/runtime-env; default: video_gen_v4,video_gen_v5)
   - DM_INPUT_CACHE_DIR            (persistent remote-input cache dir; default: $WORKSPACE/.dm_input_cache)
   - DM_INPUT_CACHE_MAX_BYTES      (max remote-input cache size; default: 20GiB)
   - DM_AGENT_SELF_UPDATE_ENABLED  (allow backend-directed in-place script updates; default: true)
@@ -144,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.207"
+AGENT_VERSION = "dm-agent-py/0.10.208"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -3181,6 +3184,56 @@ class GPUCoordinatorLease:
     identity_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
+class RtdbTreeMirror:
+    """Local copy of one RTDB node, kept current by its REST event stream.
+
+    RTDB streams open with a `put` of the whole node at "/", then send `put`
+    (replace the subtree at path) and `patch` (merge children at path) events.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._root: Any = None
+        self._loaded = False
+
+    def reset(self) -> None:
+        with self._lock:
+            self._root = None
+            self._loaded = False
+
+    @property
+    def loaded(self) -> bool:
+        return self._loaded
+
+    def snapshot(self) -> Any:
+        with self._lock:
+            return json.loads(json.dumps(self._root)) if self._root is not None else None
+
+    def apply(self, event: str, path: str, data: Any) -> None:
+        keys = [part for part in str(path or "/").split("/") if part]
+        with self._lock:
+            if event == "put":
+                self._root = self._set(self._root, keys, data)
+                if not keys:
+                    self._loaded = True
+            elif event == "patch" and isinstance(data, dict):
+                for child, value in data.items():
+                    child_keys = keys + [part for part in str(child).split("/") if part]
+                    self._root = self._set(self._root, child_keys, value)
+
+    @classmethod
+    def _set(cls, node: Any, keys: List[str], value: Any) -> Any:
+        if not keys:
+            return value
+        base = dict(node) if isinstance(node, dict) else {}
+        child = cls._set(base.get(keys[0]), keys[1:], value)
+        if child is None or child == {}:
+            base.pop(keys[0], None)
+        else:
+            base[keys[0]] = child
+        return base or None
+
+
 class GPUCoordinatorClient:
     """Dependency-free client for the loopback fenced-lease API.
 
@@ -5841,6 +5894,16 @@ class DependencyAgent:
         self.gpu_admission_heartbeat_seconds = max(
             1.0, min(20.0, _env_float("DM_GPU_ADMISSION_HEARTBEAT_SECONDS", 5.0))
         )
+        # Idle mining re-checks foreground demand every 0.5-1s. Serve those reads
+        # from a streamed mirror instead of one RTDB REST request each; each such
+        # request carried ~1.3 KB of billed TLS/protocol overhead.
+        self.gpu_admission_stream_enabled = _env_bool("DM_GPU_ADMISSION_STREAM_ENABLED", True)
+        self._gpu_admission_mirror = RtdbTreeMirror()
+        self._gpu_admission_stream_thread: Optional[threading.Thread] = None
+        self._gpu_admission_stream_connected = False
+        self._gpu_admission_stream_last_line_ms = 0
+        self._tts_queue_probe_generation = 0
+        self._tts_queue_probe_cache: Optional[Tuple[int, int, Any]] = None
         self._gpu_coordinator = GPUCoordinatorClient(
             coordinator_url,
             required=coordinator_required,
@@ -6884,7 +6947,7 @@ class DependencyAgent:
                 return False
             # Close the read/acquire race: foreground work can enqueue after
             # the first RTDB check but before the local mining lease commits.
-            if self._gpu_admission_has_foreground_work():
+            if self._gpu_admission_has_foreground_work(use_stream=False):
                 self._mining_gpu_retry_after_ms = _now_ms() + 1_000
                 self._release_gpu_lease(lease, "foreground_enqueued_during_mining_handoff", keep_warm=False)
                 return False
@@ -7176,9 +7239,7 @@ class DependencyAgent:
             if not isinstance(queue_path, str) or not queue_path:
                 return True
             queue_limit = 32
-            queued = self._coordination_get_json(queue_path, timeout_seconds=timeout_seconds, allow_token_refresh=False, query={
-                "orderBy": json.dumps("state"), "equalTo": json.dumps("queued"), "limitToFirst": str(queue_limit),
-            })
+            queued = self._tts_cached_queued_items(queue_path, queue_limit, timeout_seconds)
             if queued is not None and not isinstance(queued, dict):
                 return True
             # PRL commands already use the exclusive mining lease and cannot
@@ -7195,6 +7256,28 @@ class DependencyAgent:
         except Exception:
             logging.warning("TTS pending-demand probe unavailable; withholding idle permission")
             return None
+
+    def _tts_cached_queued_items(self, queue_path: str, queue_limit: int, timeout_seconds: float) -> Any:
+        # The server bumps this instance's queue signal after every queue item
+        # write, and job pickup already relies on that signal. While the signal
+        # stream is healthy, reuse the last answer until a signal arrives (or a
+        # short safety age passes) instead of querying RTDB every second.
+        generation = getattr(self, "_tts_queue_probe_generation", 0)
+        now_ms = _now_ms()
+        max_age_ms = int(max(0.0, _env_float("DM_TTS_QUEUE_PROBE_MAX_AGE_SECONDS", 10.0)) * 1000)
+        cached = getattr(self, "_tts_queue_probe_cache", None)
+        signal_stream_healthy = bool(
+            self._coordination and getattr(self, "_coordination_stream_healthy", False) and
+            getattr(self, "agent_rtdb_signal_wait_enabled", False)
+        )
+        if (cached is not None and signal_stream_healthy and
+                cached[0] == generation and now_ms - cached[1] < max_age_ms):
+            return cached[2]
+        queued = self._coordination_get_json(queue_path, timeout_seconds=timeout_seconds, allow_token_refresh=False, query={
+            "orderBy": json.dumps("state"), "equalTo": json.dumps("queued"), "limitToFirst": str(queue_limit),
+        })
+        self._tts_queue_probe_cache = (generation, now_ms, queued)
+        return queued
 
     def _start_tts_idle_heartbeat(self) -> None:
         # This clock must not share the serialized miner executor: mining
@@ -8517,17 +8600,103 @@ class DependencyAgent:
         except Exception as exc:
             logging.error("Failed releasing FIFO GPU admission ticket=%s jobId=%s: %s", ticket_id, lease.job_id, exc)
 
+    def _gpu_admission_stream_fresh(self) -> bool:
+        mirror = getattr(self, "_gpu_admission_mirror", None)
+        return bool(
+            getattr(self, "_gpu_admission_stream_connected", False) and mirror is not None and mirror.loaded and
+            _now_ms() - int(getattr(self, "_gpu_admission_stream_last_line_ms", 0)) < 75_000
+        )
+
+    def _ensure_gpu_admission_stream(self) -> None:
+        if (not getattr(self, "gpu_admission_stream_enabled", False) or not self._coordination or
+                self._stop.is_set()):
+            return
+        thread = getattr(self, "_gpu_admission_stream_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(target=self._gpu_admission_stream_loop, name="dm-rtdb-gpu-admission", daemon=True)
+        self._gpu_admission_stream_thread = thread
+        thread.start()
+
+    def _gpu_admission_stream_loop(self) -> None:
+        backoff_seconds = 1.0
+        while not self._stop.is_set() and self._coordination:
+            conn: Optional[Any] = None
+            try:
+                id_token = self._ensure_coordination_id_token()
+                url = self._coordination_rtdb_url(self._gpu_admission_root_path(), id_token=id_token)
+                parsed = urllib.parse.urlparse(url)
+                path_with_query = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+                conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+                conn = conn_cls(parsed.hostname or "", parsed.port or (443 if parsed.scheme == "https" else 80),
+                                timeout=90.0)
+                conn.putrequest("GET", path_with_query)
+                conn.putheader("Accept", "text/event-stream")
+                conn.putheader("Cache-Control", "no-cache")
+                conn.endheaders()
+                resp = conn.getresponse()
+                if int(resp.status) != 200:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    if int(resp.status) in (401, 403):
+                        self._coordination_id_token = None
+                        self._coordination_id_token_expires_at_ms = 0
+                    raise RuntimeError(f"Unexpected RTDB GPU admission stream response: {resp.status} {raw[:200]}")
+                self._gpu_admission_mirror.reset()
+                self._gpu_admission_stream_last_line_ms = _now_ms()
+                self._gpu_admission_stream_connected = True
+                backoff_seconds = 1.0
+                current_event = ""
+                data_lines: List[str] = []
+                while not self._stop.is_set() and self._coordination:
+                    raw_line = resp.fp.readline()
+                    if not raw_line:
+                        raise RuntimeError("RTDB GPU admission stream ended")
+                    self._gpu_admission_stream_last_line_ms = _now_ms()
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if line:
+                        if line.startswith("event:"):
+                            current_event = line[6:].strip().lower()
+                        elif line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                        continue
+                    if current_event in ("cancel", "auth_revoked"):
+                        raise RuntimeError(f"RTDB GPU admission stream closed by server event={current_event}")
+                    if current_event in ("put", "patch") and data_lines:
+                        payload = _json_loads_or_none("\n".join(data_lines))
+                        if isinstance(payload, dict):
+                            self._gpu_admission_mirror.apply(current_event, str(payload.get("path") or "/"),
+                                                             payload.get("data"))
+                    current_event = ""
+                    data_lines = []
+            except Exception as exc:
+                if not self._stop.is_set():
+                    logging.warning("RTDB GPU admission stream failed; using direct reads: %s", exc)
+            finally:
+                self._gpu_admission_stream_connected = False
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            if self._stop.wait(backoff_seconds):
+                return
+            backoff_seconds = min(30.0, backoff_seconds * 1.5)
+
     def _gpu_admission_has_foreground_work(
         self, timeout_seconds: float = 5.0, *, unknown_is_demand: bool = True,
-        allow_token_refresh: bool = True,
+        allow_token_refresh: bool = True, use_stream: bool = True,
     ) -> Optional[bool]:
         if self.gpu_admission_mode != "enforcing":
             return False
         if not self._coordination:
             return True if unknown_is_demand else None
         try:
-            raw = self._coordination_get_json(self._gpu_admission_root_path(), timeout_seconds=timeout_seconds,
-                                              allow_token_refresh=allow_token_refresh)
+            self._ensure_gpu_admission_stream()
+            if use_stream and self._gpu_admission_stream_fresh():
+                raw = self._gpu_admission_mirror.snapshot()
+            else:
+                raw = self._coordination_get_json(self._gpu_admission_root_path(), timeout_seconds=timeout_seconds,
+                                                  allow_token_refresh=allow_token_refresh)
             if raw is not None and not isinstance(raw, dict):
                 raise RuntimeError("GPU admission state is malformed")
             root = self._gpu_admission_prune(raw, _now_ms())
@@ -9558,6 +9727,7 @@ class DependencyAgent:
         if not isinstance(path, str):
             path = "/"
         if path == "/" or path.startswith("/agentQueue"):
+            self._tts_queue_probe_generation = getattr(self, "_tts_queue_probe_generation", 0) + 1
             # Claim immediately (cheap direct-RTDB read) so pickup latency is unchanged,
             # but only nudge a heartbeat if one is already ~due. Forcing a heartbeat on
             # every signal is what amplified normal churn into the 2026-07-05 storm; the
@@ -12976,6 +13146,15 @@ class DependencyAgent:
 
     def _maybe_fetch_runtime_env_delivery(self, source: str) -> None:
         if self._runtime_env_delivery_id:
+            return
+        # The server only builds deliveries for these types; every other agent
+        # (every PRL miner included) polled this endpoint every 30s forever.
+        delivery_types = {
+            part.strip() for part in (_env_str("DM_RUNTIME_ENV_DELIVERY_SERVER_TYPES",
+                                               "video_gen_v4,video_gen_v5") or "").split(",")
+            if part.strip()
+        }
+        if (self.server_type or "").strip() not in delivery_types:
             return
         if not self._resolved_instance_id or not self._agent_access_token:
             return
