@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.210"
+AGENT_VERSION = "dm-agent-py/0.10.211"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5165,12 +5165,77 @@ class CpuMinerController:
         self._gpu_current_hps = 0.0
         self._gpu_drop_since_ms = 0
         self._log_path = self.root / "miner.log"
-        self._cleanup_orphans()
+        self._lifecycle_path = self.root / "lifecycle.json"
+        was_running = self._restore_lifecycle()
+        found_orphan, orphan_stopped = self._cleanup_orphans()
+        self._orphan_cleanup_unverified = not orphan_stopped
+        if self._orphan_cleanup_unverified:
+            # We cannot call a GPU sample CPU-only while an orphan might live.
+            # An absent generation keeps the controller's auto-retry closed.
+            self._started_at_ms = 0
+            self._stopped_at_ms = 0
+            self._stop_reason = "orphan_cleanup_unverified"
+        elif was_running or found_orphan:
+            # An agent crash or exec kills the orphaned miner below. Keep its
+            # generation visible so a later controller retry can prove that
+            # no CPU miner ran while it measured GPU-only output.
+            self._stopped_at_ms = _now_ms()
+            self._stop_reason = "agent_restart"
+        if was_running or found_orphan or self._orphan_cleanup_unverified:
+            try:
+                self._persist_lifecycle(False)
+            except OSError as exc:
+                # Losing CPU retry metadata must not take down the GPU agent.
+                self._started_at_ms = self._stopped_at_ms = 0
+                logging.warning("Could not persist CPU miner restart state: %s", exc)
 
-    def _cleanup_orphans(self) -> None:
+    def stop_for_agent_restart(self) -> None:
+        with self._lock:
+            if self._proc is not None:
+                self.stop_if_running("agent_self_update")
+
+    def _restore_lifecycle(self) -> bool:
+        try:
+            row = json.loads(self._lifecycle_path.read_text(encoding="utf-8"))
+            if not isinstance(row, dict) or row.get("schemaVersion") != 1:
+                return False
+            started = int(row.get("startedAtMs") or 0)
+            stopped = int(row.get("stoppedAtMs") or 0)
+            now = _now_ms()
+            if started < 0 or stopped < 0 or started > now + 60_000 or stopped > now + 60_000:
+                return False
+            was_running = row.get("running") is True and started > 0
+            if not was_running and started > 0 and stopped < started:
+                return False
+            self._started_at_ms = started
+            self._stopped_at_ms = stopped
+            self._stop_reason = str(row.get("stopReason") or "")[:120]
+            return was_running
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+
+    def _persist_lifecycle(self, running: bool) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        temporary = self.root / f"lifecycle.{os.getpid()}.{threading.get_ident()}.tmp"
+        row = {"schemaVersion": 1, "running": running,
+               "startedAtMs": self._started_at_ms, "stoppedAtMs": self._stopped_at_ms,
+               "stopReason": self._stop_reason}
+        try:
+            with temporary.open("w", encoding="utf-8") as stream:
+                os.chmod(temporary, 0o600)
+                json.dump(row, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._lifecycle_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _cleanup_orphans(self) -> Tuple[bool, bool]:
         proc_root = Path("/proc")
         if not proc_root.is_dir():
-            return
+            return False, False
+        found = False
+        stopped = True
         for entry in proc_root.iterdir():
             if not entry.name.isdigit() or int(entry.name) == os.getpid():
                 continue
@@ -5178,11 +5243,36 @@ class CpuMinerController:
                 cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
                 if str(self.root / "xmrig_") not in cmdline:
                     continue
+                found = True
                 group = os.getpgid(int(entry.name))
                 if group != os.getpgrp():
                     os.killpg(group, signal.SIGTERM)
+                    for _ in range(20):
+                        if not entry.exists() or self._process_is_zombie(entry):
+                            break
+                        time.sleep(0.1)
+                    else:
+                        os.killpg(group, signal.SIGKILL)
+                        for _ in range(20):
+                            if not entry.exists() or self._process_is_zombie(entry):
+                                break
+                            time.sleep(0.1)
+                        else:
+                            stopped = False
+                else:
+                    stopped = False
             except (OSError, ValueError, ProcessLookupError):
+                if entry.exists() and not self._process_is_zombie(entry):
+                    stopped = False
                 continue
+        return found, stopped
+
+    @staticmethod
+    def _process_is_zombie(entry: Path) -> bool:
+        try:
+            return entry.joinpath("stat").read_text().split(") ", 1)[1].startswith("Z")
+        except (OSError, IndexError):
+            return not entry.exists()
 
     def _binary(self, pool: str) -> Path:
         url, expected = CPU_MINER_RELEASES[pool]
@@ -5251,6 +5341,13 @@ class CpuMinerController:
         if foreground_active or gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
             raise RuntimeError("PRL miner or foreground state is not healthy for CPU mining")
         with self._lock:
+            if self._orphan_cleanup_unverified:
+                if not Path("/proc").is_dir():
+                    raise RuntimeError("Cannot verify that the prior CPU miner stopped")
+                _, stopped = self._cleanup_orphans()
+                if not stopped:
+                    raise RuntimeError("Prior CPU miner may still be running")
+                self._orphan_cleanup_unverified = False
             if (self._proc is not None and self._proc.poll() is None and self._pool == pool and
                     self._wallet == wallet and self._worker == worker and self._threads == threads and
                     self._available == available and self._entitlement == entitlement and
@@ -5313,24 +5410,64 @@ class CpuMinerController:
             self._stop_reason = ""
             self._gpu_baseline_hps = float(payload.get("baselineGpuHashrateHps") or gpu_snapshot.get("localHashrateHps") or 0)
             self._gpu_drop_since_ms = 0
+            try:
+                self._persist_lifecycle(True)
+            except OSError as exc:
+                self.stop_if_running("lifecycle_persist_failed")
+                raise RuntimeError(f"CPU miner start state could not be persisted: {exc}") from exc
             return self.snapshot()
 
     def stop_if_running(self, reason: str) -> None:
         with self._lock:
             proc = self._proc
+            if proc is None:
+                return
+            previous_stopped_at_ms = self._stopped_at_ms
+            previous_stop_reason = self._stop_reason
             self._proc = None
             self._stopped_at_ms = _now_ms()
             self._stop_reason = str(reason)[:120]
-            if proc is None or proc.poll() is not None:
+            if proc.poll() is not None:
+                try:
+                    self._persist_lifecycle(False)
+                except OSError as exc:
+                    logging.warning("Could not persist CPU miner stop state: %s", exc)
                 return
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
-            except ProcessLookupError:
-                pass
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=10)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    logging.warning("CPU miner process-group kill failed; trying direct kill: %s", exc)
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=10)
+                    except (OSError, subprocess.TimeoutExpired):
+                        self._proc = proc
+                        self._stopped_at_ms = previous_stopped_at_ms
+                        self._stop_reason = previous_stop_reason
+                        self._orphan_cleanup_unverified = True
+                        logging.error("CPU miner could not be stopped; blocking another start")
+                        return
+            except OSError as exc:
+                if not isinstance(exc, ProcessLookupError) or proc.poll() is None:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=10)
+                    except (OSError, subprocess.TimeoutExpired):
+                        self._proc = proc
+                        self._stopped_at_ms = previous_stopped_at_ms
+                        self._stop_reason = previous_stop_reason
+                        self._orphan_cleanup_unverified = True
+                        logging.error("CPU miner could not be stopped; blocking another start: %s", exc)
+                        return
+            try:
+                self._persist_lifecycle(False)
+            except OSError as exc:
+                logging.warning("Could not persist CPU miner stop state: %s", exc)
 
     def tick(self, gpu_snapshot: Dict[str, Any], foreground_active: bool = False) -> None:
         with self._lock:
@@ -5416,6 +5553,7 @@ class CpuMinerController:
                 "startedAtMs": self._started_at_ms or None,
                 "stoppedAtMs": self._stopped_at_ms or None,
                 "stopReason": self._stop_reason or None,
+                "orphanCleanupUnverified": self._orphan_cleanup_unverified,
             }
 
 
@@ -13344,6 +13482,7 @@ class DependencyAgent:
                 release.target_version,
                 self.self_script_path,
             )
+            self._idle_cpu_miner.stop_for_agent_restart()
             os.execv(sys.executable, [sys.executable, str(self.self_script_path), *sys.argv[1:]])
         except Exception as e:
             self._self_update_retry_at_ms = _now_ms() + int(self.self_update_retry_seconds * 1000)
