@@ -5100,7 +5100,7 @@ def cpu_mining_capacity(vast_effective_cpus: Any = None, max_threads: Any = None
     if max_threads is not None:
         try:
             requested = int(max_threads)
-            if requested >= 4:
+            if requested >= 3:
                 ceiling = min(requested, max(0, available - max(2, math.ceil(available * 0.10))))
         except (TypeError, ValueError, OverflowError):
             pass
@@ -5237,12 +5237,13 @@ class CpuMinerController:
         if raw_max_threads is not None and type(raw_max_threads) is not int:
             raise RuntimeError("Invalid CPU mining per-host thread limit") from None
         max_threads = raw_max_threads
-        if max_threads is not None and max_threads < 4:
-            raise RuntimeError("CPU mining per-host thread limit must be at least four")
+        if max_threads is not None and max_threads < 3:
+            raise RuntimeError("CPU mining per-host thread limit must be at least three")
         capacity = cpu_mining_capacity(entitlement, max_threads)
         available = int(capacity["availableLogicalCpus"])
         ceiling = int(capacity["threadCeiling"])
-        initial_threads = 4 if max_threads is not None and max_threads < 8 else 8
+        initial_threads = (3 if max_threads == 3 else
+                           4 if max_threads is not None and max_threads < 8 else 8)
         if ceiling < initial_threads or threads < initial_threads or threads > ceiling:
             raise RuntimeError(f"CPU mining threads {threads} exceed allocation/reserve: {available}/{ceiling}")
         if foreground_active or gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
@@ -5347,7 +5348,8 @@ class CpuMinerController:
             elif cpu_mining_memory_available_bytes() < 4 * 1024 ** 3:
                 self.stop_if_running("memory_headroom_low")
             elif ((capacity := cpu_mining_capacity(self._entitlement, self._max_threads))["threadCeiling"] <
-                  (4 if self._max_threads is not None and self._max_threads < 8 else 8) or
+                  (3 if self._max_threads == 3 else
+                   4 if self._max_threads is not None and self._max_threads < 8 else 8) or
                   capacity["availableLogicalCpus"] != self._available or
                   self._threads > capacity["threadCeiling"] or
                   capacity["orderedCpus"][:self._threads] != self._selected_cpus):
