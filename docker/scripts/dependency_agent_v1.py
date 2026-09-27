@@ -5066,7 +5066,7 @@ MONEROOCEAN_STRATUM_HOSTS = (
 )
 
 
-def cpu_mining_capacity(vast_effective_cpus: Any = None) -> Dict[str, Any]:
+def cpu_mining_capacity(vast_effective_cpus: Any = None, max_threads: Any = None) -> Dict[str, Any]:
     """Bound mining by the worker's real affinity/quota and its Vast entitlement."""
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(os.cpu_count() or 1))
     limits = [len(affinity)]
@@ -5097,6 +5097,13 @@ def cpu_mining_capacity(vast_effective_cpus: Any = None) -> Dict[str, Any]:
             limits.append(0)
     available = min(limits)
     ceiling = max(0, available - max(2, math.ceil(available * 0.25)))
+    if max_threads is not None:
+        try:
+            requested = int(max_threads)
+            if requested >= 4:
+                ceiling = min(requested, max(0, available - max(2, math.ceil(available * 0.10))))
+        except (TypeError, ValueError, OverflowError):
+            pass
     groups: Dict[Tuple[int, int], List[int]] = {}
     for cpu in affinity:
         topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
@@ -5148,6 +5155,7 @@ class CpuMinerController:
         self._available = 0
         self._ceiling = 0
         self._entitlement = 0
+        self._max_threads: Optional[int] = None
         self._selected_cpus: List[int] = []
         self._expires_at_ms = 0
         self._started_at_ms = 0
@@ -5225,10 +5233,17 @@ class CpuMinerController:
             entitlement = int(float(payload["vastEffectiveCpus"]))
         except (KeyError, TypeError, ValueError, OverflowError):
             raise RuntimeError("CPU mining requires a Vast effective CPU entitlement") from None
-        capacity = cpu_mining_capacity(entitlement)
+        raw_max_threads = payload.get("maxThreads")
+        if raw_max_threads is not None and type(raw_max_threads) is not int:
+            raise RuntimeError("Invalid CPU mining per-host thread limit") from None
+        max_threads = raw_max_threads
+        if max_threads is not None and max_threads < 4:
+            raise RuntimeError("CPU mining per-host thread limit must be at least four")
+        capacity = cpu_mining_capacity(entitlement, max_threads)
         available = int(capacity["availableLogicalCpus"])
         ceiling = int(capacity["threadCeiling"])
-        if ceiling < 8 or threads < 8 or threads > ceiling:
+        initial_threads = 4 if max_threads is not None and max_threads < 8 else 8
+        if ceiling < initial_threads or threads < initial_threads or threads > ceiling:
             raise RuntimeError(f"CPU mining threads {threads} exceed allocation/reserve: {available}/{ceiling}")
         if foreground_active or gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
             raise RuntimeError("PRL miner or foreground state is not healthy for CPU mining")
@@ -5241,6 +5256,7 @@ class CpuMinerController:
                     raise RuntimeError("CPU mining memory headroom fell below 4 GiB")
                 self._available, self._ceiling = available, ceiling
                 self._entitlement = entitlement
+                self._max_threads = max_threads
                 self._selected_cpus = capacity["orderedCpus"][:threads]
                 self._expires_at_ms = expires_at_ms
                 return self.snapshot()
@@ -5288,6 +5304,7 @@ class CpuMinerController:
             self._pool, self._wallet, self._worker = pool, wallet, worker
             self._threads, self._available, self._ceiling = threads, available, ceiling
             self._entitlement = entitlement
+            self._max_threads = max_threads
             self._selected_cpus = selected
             self._expires_at_ms, self._started_at_ms = expires_at_ms, _now_ms()
             self._stop_reason = ""
@@ -5329,7 +5346,8 @@ class CpuMinerController:
                 self.stop_if_running("prl_miner_unhealthy")
             elif cpu_mining_memory_available_bytes() < 4 * 1024 ** 3:
                 self.stop_if_running("memory_headroom_low")
-            elif ((capacity := cpu_mining_capacity(self._entitlement))["threadCeiling"] < 8 or
+            elif ((capacity := cpu_mining_capacity(self._entitlement, self._max_threads))["threadCeiling"] <
+                  (4 if self._max_threads is not None and self._max_threads < 8 else 8) or
                   capacity["availableLogicalCpus"] != self._available or
                   self._threads > capacity["threadCeiling"] or
                   capacity["orderedCpus"][:self._threads] != self._selected_cpus):
@@ -5354,7 +5372,7 @@ class CpuMinerController:
         with self._lock:
             proc = self._proc
             running = proc is not None and proc.poll() is None
-            capacity = cpu_mining_capacity(self._entitlement or None)
+            capacity = cpu_mining_capacity(self._entitlement or None, self._max_threads)
             try:
                 with self._log_path.open("rb") as stream:
                     stream.seek(max(0, self._log_path.stat().st_size - 100_000))
