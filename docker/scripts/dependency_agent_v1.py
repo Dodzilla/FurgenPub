@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.211"
+AGENT_VERSION = "dm-agent-py/0.10.212"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5169,19 +5169,22 @@ class CpuMinerController:
         was_running = self._restore_lifecycle()
         found_orphan, orphan_stopped = self._cleanup_orphans()
         self._orphan_cleanup_unverified = not orphan_stopped
+        established_stop_generation = False
         if self._orphan_cleanup_unverified:
             # We cannot call a GPU sample CPU-only while an orphan might live.
             # An absent generation keeps the controller's auto-retry closed.
             self._started_at_ms = 0
             self._stopped_at_ms = 0
             self._stop_reason = "orphan_cleanup_unverified"
-        elif was_running or found_orphan:
-            # An agent crash or exec kills the orphaned miner below. Keep its
-            # generation visible so a later controller retry can prove that
-            # no CPU miner ran while it measured GPU-only output.
+        elif was_running or found_orphan or self._stopped_at_ms <= 0:
+            # A verified clean process scan also establishes a fresh stopped
+            # generation for miners held before lifecycle checkpoints existed.
+            # The controller still requires an owned hold and a later stable
+            # GPU-only baseline before it can approve any retry.
             self._stopped_at_ms = _now_ms()
             self._stop_reason = "agent_restart"
-        if was_running or found_orphan or self._orphan_cleanup_unverified:
+            established_stop_generation = True
+        if established_stop_generation or self._orphan_cleanup_unverified:
             try:
                 self._persist_lifecycle(False)
             except OSError as exc:
