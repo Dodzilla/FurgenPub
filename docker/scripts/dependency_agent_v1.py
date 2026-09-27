@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.209"
+AGENT_VERSION = "dm-agent-py/0.10.210"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5191,7 +5191,9 @@ class CpuMinerController:
         archive = self.root / f"xmrig_{pool}.tar.gz"
         archive_marker = self.root / f"xmrig_{pool}.archive.sha256"
         if not archive.exists() or hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
-            subprocess.run(["curl", "-fLsS", "--retry", "2", "--max-time", "180", "-o", str(archive), url], check=True)
+            download_file_with_tool_fallback(
+                url, archive, timeout_seconds=180.0,
+                user_agent="dm-agent-cpu-miner/1.0", tools=["python", "wget", "curl"])
         if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"CPU miner release checksum mismatch for {pool}")
         if binary.is_file() and (self.root / f"xmrig_{pool}.sha256").is_file():
