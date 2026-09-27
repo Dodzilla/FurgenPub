@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.208"
+AGENT_VERSION = "dm-agent-py/0.10.209"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5060,6 +5060,10 @@ CPU_MINER_ALGO_RE = re.compile(r"new job from[^\n]*\balgo\s+([a-z0-9/]+)", re.I)
 CPU_MINER_CONNECTED_RE = re.compile(r"\b(?:new job from|accepted \(|accepted share)\b", re.I)
 CPU_MINER_POOL_EVENT_RE = re.compile(
     r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.\d+\]\s+(?:net\s+new job from|cpu\s+accepted \()", re.I)
+MONEROOCEAN_STRATUM_HOSTS = (
+    "gulf.moneroocean.stream", "us.moneroocean.stream",
+    "de.moneroocean.stream", "jp.moneroocean.stream", "fr.moneroocean.stream",
+)
 
 
 def cpu_mining_capacity(vast_effective_cpus: Any = None) -> Dict[str, Any]:
@@ -5250,8 +5254,18 @@ class CpuMinerController:
                 # MoneroOcean's default endpoint can switch to other algorithms,
                 # whose raw H/s cannot be valued with the rx/0 profit term.
                 # Its documented worker~rx/0 password pins direct XMRig mining.
-                target = ["-o", "gulf.moneroocean.stream:20128", "-a", "rx/0", "-u", wallet,
-                          "-p", f"{worker}~rx/0", "--rig-id", worker, "--tls", "--keepalive"]
+                # XMRig retries then fails over across the pool array, so a host
+                # with a broken route to Gulf can still reach another region.
+                self.root.mkdir(parents=True, exist_ok=True)
+                config_path = self.root / "xmrig_moneroocean.config.json"
+                config = {"autosave": False, "retries": 2, "retry-pause": 5,
+                          "pools": [{"url": f"{host}:20128", "algo": "rx/0", "user": wallet,
+                                     "pass": f"{worker}~rx/0", "rig-id": worker,
+                                     "tls": True, "keepalive": True, "enabled": True}
+                                    for host in MONEROOCEAN_STRATUM_HOSTS]}
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                config_path.chmod(0o600)
+                target = ["--config", str(config_path)]
             self._log_path = self.root / f"{pool}_{_now_ms()}.log"
             # Vast containers can deny NUMA memory binding even with ample free
             # memory. XMRig then silently uses its 256 MB RandomX slow mode.
