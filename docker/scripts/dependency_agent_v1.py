@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.217"
+AGENT_VERSION = "dm-agent-py/0.10.218"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -669,44 +669,59 @@ def _remove_blocked_prl_host_overrides(
 
 
 PRL_POOL_LATENCY_PROBE_ATTEMPTS = 3
-PRL_POOL_LATENCY_CONNECT_TIMEOUT_SEC = 1.5
+PRL_POOL_LATENCY_TIMEOUT_SEC = 2.0
 PRL_POOL_LATENCY_PROBE_CACHE_MS = 60 * 60 * 1000
 PRL_POOL_LATENCY_MAX_CANDIDATES = 12
+# Any stratum pool answers a well-formed request, even with "method not
+# supported"; that reply has to come from the pool, not a middlebox.
+PRL_POOL_LATENCY_PROBE_REQUEST = (
+    json.dumps({"id": 1, "method": "mining.subscribe", "params": ["fcs-latency-probe/1.0"]}) + "\n"
+).encode("utf-8")
 
 
-def _probe_tcp_connect_ms(
+def _probe_stratum_rtt_ms(
     url: str,
     attempts: int = PRL_POOL_LATENCY_PROBE_ATTEMPTS,
-    timeout_seconds: float = PRL_POOL_LATENCY_CONNECT_TIMEOUT_SEC,
-) -> Optional[float]:
-    """Best-of-N TCP connect time to a stratum endpoint, or None if unreachable.
+    timeout_seconds: float = PRL_POOL_LATENCY_TIMEOUT_SEC,
+) -> Dict[str, Optional[float]]:
+    """Best-of-N stratum request/reply time to a pool endpoint.
 
+    TCP connect time alone is not trusted: some hosts sit behind transparent
+    proxies that complete the handshake locally, so every endpoint looks
+    equally close. The reply round trip covers the real path to the pool.
     IPv4 only, so a host with broken IPv6 cannot stall the probe on AAAA lookups.
     """
+    out: Dict[str, Optional[float]] = {"rttMs": None, "tcpMs": None}
     try:
         parsed = urllib.parse.urlparse(str(url or "").strip())
         host = str(parsed.hostname or "").strip()
         port = parsed.port
     except Exception:
-        return None
+        return out
     if not host or not port:
-        return None
+        return out
     try:
         infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
     except Exception:
-        return None
+        return out
     if not infos:
-        return None
+        return out
     address = infos[0][4]
-    best: Optional[float] = None
+    best_rtt: Optional[float] = None
+    best_tcp: Optional[float] = None
     for _ in range(max(1, attempts)):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout_seconds)
-        started = time.monotonic()
         try:
+            started = time.monotonic()
             sock.connect(address)
-            elapsed_ms = (time.monotonic() - started) * 1000.0
-            best = elapsed_ms if best is None else min(best, elapsed_ms)
+            tcp_ms = (time.monotonic() - started) * 1000.0
+            best_tcp = tcp_ms if best_tcp is None else min(best_tcp, tcp_ms)
+            sent = time.monotonic()
+            sock.sendall(PRL_POOL_LATENCY_PROBE_REQUEST)
+            if sock.recv(1):
+                rtt_ms = (time.monotonic() - sent) * 1000.0
+                best_rtt = rtt_ms if best_rtt is None else min(best_rtt, rtt_ms)
         except Exception:
             pass
         finally:
@@ -714,7 +729,9 @@ def _probe_tcp_connect_ms(
                 sock.close()
             except Exception:
                 pass
-    return round(best, 1) if best is not None else None
+    out["rttMs"] = round(best_rtt, 1) if best_rtt is not None else None
+    out["tcpMs"] = round(best_tcp, 1) if best_tcp is not None else None
+    return out
 
 
 def _normalize_pool_latency_candidates(urls: Any) -> List[str]:
@@ -729,8 +746,8 @@ def _probe_prl_pool_latencies(urls: List[str]) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
     if urls:
         with ThreadPoolExecutor(max_workers=len(urls)) as pool:
-            rtts = list(pool.map(_probe_tcp_connect_ms, urls))
-        results = [{"url": url, "rttMs": rtt} for url, rtt in zip(urls, rtts)]
+            measured = list(pool.map(_probe_stratum_rtt_ms, urls))
+        results = [{"url": url, **timing} for url, timing in zip(urls, measured)]
     return {"checkedAtMs": int(_now_ms()), "results": results}
 
 
