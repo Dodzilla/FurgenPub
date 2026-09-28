@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.216"
+AGENT_VERSION = "dm-agent-py/0.10.217"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -666,6 +666,72 @@ def _remove_blocked_prl_host_overrides(
         return True, f"removed:{','.join(sorted(set(removed)))[:220]}"
     except Exception as exc:
         return False, str(exc)[:300]
+
+
+PRL_POOL_LATENCY_PROBE_ATTEMPTS = 3
+PRL_POOL_LATENCY_CONNECT_TIMEOUT_SEC = 1.5
+PRL_POOL_LATENCY_PROBE_CACHE_MS = 60 * 60 * 1000
+PRL_POOL_LATENCY_MAX_CANDIDATES = 12
+
+
+def _probe_tcp_connect_ms(
+    url: str,
+    attempts: int = PRL_POOL_LATENCY_PROBE_ATTEMPTS,
+    timeout_seconds: float = PRL_POOL_LATENCY_CONNECT_TIMEOUT_SEC,
+) -> Optional[float]:
+    """Best-of-N TCP connect time to a stratum endpoint, or None if unreachable.
+
+    IPv4 only, so a host with broken IPv6 cannot stall the probe on AAAA lookups.
+    """
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+        host = str(parsed.hostname or "").strip()
+        port = parsed.port
+    except Exception:
+        return None
+    if not host or not port:
+        return None
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    except Exception:
+        return None
+    if not infos:
+        return None
+    address = infos[0][4]
+    best: Optional[float] = None
+    for _ in range(max(1, attempts)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout_seconds)
+        started = time.monotonic()
+        try:
+            sock.connect(address)
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            best = elapsed_ms if best is None else min(best, elapsed_ms)
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return round(best, 1) if best is not None else None
+
+
+def _normalize_pool_latency_candidates(urls: Any) -> List[str]:
+    if not isinstance(urls, list):
+        return []
+    cleaned = [str(url).strip()[:500] for url in urls if isinstance(url, str) and str(url).strip()]
+    return list(dict.fromkeys(cleaned))[:PRL_POOL_LATENCY_MAX_CANDIDATES]
+
+
+def _probe_prl_pool_latencies(urls: List[str]) -> Dict[str, Any]:
+    """Measure every candidate in parallel; the server picks the pool from these results."""
+    results: List[Dict[str, Any]] = []
+    if urls:
+        with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+            rtts = list(pool.map(_probe_tcp_connect_ms, urls))
+        results = [{"url": url, "rttMs": rtt} for url, rtt in zip(urls, rtts)]
+    return {"checkedAtMs": int(_now_ms()), "results": results}
 
 
 def _prl_network_preflight(pool_url: str, miner_urls: List[str]) -> Dict[str, Any]:
@@ -3586,6 +3652,7 @@ class PrlMinerController:
         self._last_error = ""
         self._last_failure_category = ""
         self._last_network_diagnostics: Dict[str, Any] = {}
+        self._pool_latency_probe: Dict[str, Any] = {}
         self._static_difficulty = ""
         self._static_difficulty_source = ""
         self._static_difficulty_matched_gpu_name = ""
@@ -3949,8 +4016,11 @@ class PrlMinerController:
             # Keep the key present so RTDB PATCH mirrors delete a stale failure
             # category after a later start succeeds.
             out["lastFailureCategory"] = self._last_failure_category or None
-            if self._last_network_diagnostics:
-                out["networkDiagnostics"] = self._last_network_diagnostics
+            if self._last_network_diagnostics or self._pool_latency_probe:
+                diagnostics = dict(self._last_network_diagnostics)
+                if self._pool_latency_probe:
+                    diagnostics["poolLatency"] = self._pool_latency_probe
+                out["networkDiagnostics"] = diagnostics
             out["pauseMode"] = self._pause_mode
             out["pauseStopCount"] = int(self._pause_stop_count)
             out["resumeStartCount"] = int(self._resume_start_count)
@@ -4383,6 +4453,30 @@ class PrlMinerController:
             return "deferred"
         return "started"
 
+    def _refresh_pool_latency_probe(self, raw_urls: Any) -> None:
+        candidates = _normalize_pool_latency_candidates(raw_urls)
+        if not candidates:
+            return
+        with self._lock:
+            cached = dict(self._pool_latency_probe)
+        cached_urls = [row.get("url") for row in cached.get("results") or [] if isinstance(row, dict)]
+        if cached_urls == candidates and _now_ms() - int(cached.get("checkedAtMs") or 0) < PRL_POOL_LATENCY_PROBE_CACHE_MS:
+            return
+        try:
+            probe = _probe_prl_pool_latencies(candidates)
+        except Exception as exc:
+            logging.warning("PRL pool latency probe failed: %s", exc)
+            return
+        with self._lock:
+            self._pool_latency_probe = probe
+        logging.info(
+            "PRL pool latency probe: %s",
+            ", ".join(
+                f"{_host_from_url(row['url']) or row['url']}={row['rttMs'] if row['rttMs'] is not None else 'unreachable'}"
+                for row in probe["results"]
+            ),
+        )
+
     def prepare_gated(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Complete all non-GPU mining preparation before lease admission."""
         with self._process_op_lock:
@@ -4457,6 +4551,9 @@ class PrlMinerController:
                     self._last_failure_category = "dns_sinkhole"
                     self._last_network_diagnostics = exc.diagnostics
                 raise
+        # Runs before the same-target check, so the server can ask a running
+        # miner to re-measure without restarting it.
+        self._refresh_pool_latency_probe(payload.get("poolLatencyProbeUrls"))
 
         with self._lock:
             already_running = self._is_running_locked()
