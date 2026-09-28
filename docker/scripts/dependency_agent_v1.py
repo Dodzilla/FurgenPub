@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.213"
+AGENT_VERSION = "dm-agent-py/0.10.214"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -274,6 +274,10 @@ PRL_MINER_POOL_ACTIVITY_RE = re.compile(
 )
 PRL_MINER_POOL_ERROR_RE = re.compile(
     r"(stratum (?:connection closed|recv timeout|recv\(\) failed|send\(\) failed|send\(\) timed out)|pool did not accept|share submission returned error)",
+    re.IGNORECASE,
+)
+PRL_MINER_DISCONNECTED_RE = re.compile(
+    r"(?:reconnecting to\s+\S+|not connected to a pool|stratum (?:connection closed|recv timeout|recv\(\) failed|send\(\) failed|send\(\) timed out))",
     re.IGNORECASE,
 )
 PRL_MINER_SHARE_COUNTER_RE = re.compile(
@@ -3609,6 +3613,9 @@ class PrlMinerController:
         # Byte offset of prl_miner.log when the current process was launched, so
         # exit classification only looks at this run's output.
         self._run_log_offset = 0
+        self._run_log_inode = 0
+        self._telemetry_log_offset = 0
+        self._last_share_like_log_at_ms = 0
         self._silent_exit_gpu_probe_pending = False
 
     def _reap_locked(self) -> None:
@@ -3964,28 +3971,60 @@ class PrlMinerController:
         try:
             existing_pids = self._find_existing_miner_pids()
             out["minerProcessCount"] = int(len(existing_pids))
-            if existing_pids:
-                out["minerProcessPids"] = [int(existing_pid) for existing_pid in existing_pids[:20]]
+            out["minerProcessPids"] = [int(existing_pid) for existing_pid in existing_pids[:20]]
             out.update(_query_gpu_telemetry())
+            # RTDB receives flattened PATCHes, so omitted metrics retain the
+            # previous process's values. Clear them on every snapshot before
+            # parsing only the log segment written by this miner run.
+            out.update({
+                "localHashrateHps": 0.0,
+                "localHashrateText": "",
+                "recentAcceptedShares": 0,
+                "recentSubmittedShares": 0,
+                "recentRejectedShares": 0,
+                "recentShareErrors": 0,
+                "lastShareLikeLogAtMs": 0,
+                "poolHealthy": False,
+            })
             if self.log_path.exists():
                 stat = self.log_path.stat()
+                if running and (
+                    (self._run_log_inode and stat.st_ino != self._run_log_inode)
+                    or stat.st_size < self._run_log_offset
+                    or stat.st_size < self._telemetry_log_offset
+                ):
+                    self._run_log_offset = 0
+                    self._telemetry_log_offset = 0
+                    self._last_share_like_log_at_ms = 0
+                    self._run_log_inode = int(stat.st_ino)
                 out["logSizeBytes"] = int(stat.st_size)
                 out["logUpdatedAtMs"] = int(stat.st_mtime * 1000)
-                tail = _read_tail_text(self.log_path)
-                hps, text = _parse_latest_hashrate_from_text(tail)
+                tail = self._read_run_log_tail_locked() if running else ""
+                disconnects = list(PRL_MINER_DISCONNECTED_RE.finditer(tail))
+                active_tail = tail[disconnects[-1].end():] if disconnects else tail
+                hps, text = _parse_latest_hashrate_from_text(active_tail)
                 if hps is not None:
                     out["localHashrateHps"] = float(hps)
                     out["localHashrateText"] = text
-                if tail:
-                    signals = _parse_prl_miner_log_signals(tail)
+                if active_tail:
+                    signals = _parse_prl_miner_log_signals(active_tail)
                     out["recentAcceptedShares"] = int(signals["accepted"])
                     out["recentSubmittedShares"] = int(signals["submitted"])
                     out["recentRejectedShares"] = int(signals["rejected"])
                     out["recentShareErrors"] = int(signals["shareErrors"])
-                    if signals["hasShareSignal"]:
-                        out["lastShareLikeLogAtMs"] = int(stat.st_mtime * 1000)
                     if signals["poolHealthy"]:
                         out["poolHealthy"] = True
+                if running:
+                    start = max(int(self._run_log_offset), int(self._telemetry_log_offset))
+                    with self.log_path.open("rb") as stream:
+                        stream.seek(max(start, stat.st_size - 32768))
+                        appended = stream.read().decode("utf-8", errors="replace")
+                    self._telemetry_log_offset = int(stat.st_size)
+                    new_disconnects = list(PRL_MINER_DISCONNECTED_RE.finditer(appended))
+                    active_appended = appended[new_disconnects[-1].end():] if new_disconnects else appended
+                    if PRL_MINER_SHARE_SIGNAL_RE.search(active_appended) or PRL_MINER_POOL_ACTIVITY_RE.search(active_appended):
+                        self._last_share_like_log_at_ms = int(stat.st_mtime * 1000)
+                    out["lastShareLikeLogAtMs"] = int(self._last_share_like_log_at_ms)
         except Exception as exc:
             out["telemetryError"] = str(exc)[:300]
         out["watch"] = {
@@ -4580,6 +4619,9 @@ class PrlMinerController:
             self._stopped_at_ms = 0
             self._last_exit_code = None
             self._run_log_offset = run_log_offset
+            self._run_log_inode = int(self.log_path.stat().st_ino)
+            self._telemetry_log_offset = run_log_offset
+            self._last_share_like_log_at_ms = 0
             self._silent_exit_gpu_probe_pending = False
             self._prepare_silent_exit_state_for_launch_locked()
             self._clear_deferral_error_locked()
@@ -4676,6 +4718,9 @@ class PrlMinerController:
                 self._stopped_at_ms = 0
                 self._last_exit_code = None
                 self._run_log_offset = run_log_offset
+                self._run_log_inode = int(self.log_path.stat().st_ino)
+                self._telemetry_log_offset = run_log_offset
+                self._last_share_like_log_at_ms = 0
                 self._silent_exit_gpu_probe_pending = False
                 self._prepare_silent_exit_state_for_launch_locked()
                 self._last_start_payload = dict(prepared.get("payload") or {})
