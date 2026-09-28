@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.214"
+AGENT_VERSION = "dm-agent-py/0.10.215"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5109,10 +5109,14 @@ MONEROOCEAN_STRATUM_HOSTS = (
     "gulf.moneroocean.stream", "us.moneroocean.stream",
     "de.moneroocean.stream", "jp.moneroocean.stream", "fr.moneroocean.stream",
 )
+MONEROOCEAN_STRATUM_ROUTES = (
+    *((host, 20128, True) for host in MONEROOCEAN_STRATUM_HOSTS),
+    *((host, 10128, False) for host in MONEROOCEAN_STRATUM_HOSTS),
+)
 
 
-def probe_moneroocean_stratum_routes(wallet: str, worker: str, timeout_seconds: float = 2.0) -> Optional[str]:
-    """Confirm a worker can log in over TLS to one of its configured XMR routes.
+def probe_moneroocean_stratum_routes(wallet: str, worker: str, timeout_seconds: float = 2.0) -> Optional[Tuple[str, int, bool]]:
+    """Confirm a worker can log in to a configured XMR route, preferring TLS.
 
     The probe submits no shares and never starts a mining process. Each route
     has a short socket timeout so an unreachable host cannot delay GPU work.
@@ -5127,12 +5131,13 @@ def probe_moneroocean_stratum_routes(wallet: str, worker: str, timeout_seconds: 
     # required before the controller may consider the route reachable.
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
-    for host in MONEROOCEAN_STRATUM_HOSTS:
+    for host, port, tls in MONEROOCEAN_STRATUM_ROUTES:
         try:
             deadline = time.monotonic() + timeout_seconds
-            with socket.create_connection((host, 20128), timeout=timeout_seconds) as raw:
+            with socket.create_connection((host, port), timeout=timeout_seconds) as raw:
                 raw.settimeout(max(0.1, deadline - time.monotonic()))
-                with context.wrap_socket(raw, server_hostname=host) as stream:
+                stream_context = context.wrap_socket(raw, server_hostname=host) if tls else raw
+                with stream_context as stream:
                     stream.settimeout(max(0.1, deadline - time.monotonic()))
                     stream.sendall(login)
                     response = bytearray()
@@ -5147,9 +5152,9 @@ def probe_moneroocean_stratum_routes(wallet: str, worker: str, timeout_seconds: 
                     result = reply.get("result") if isinstance(reply, dict) else None
                     if (isinstance(reply, dict) and reply.get("error") is None and isinstance(result, dict) and
                             isinstance(result.get("job"), dict)):
-                        return host
+                        return host, port, tls
         except (OSError, ValueError, ssl.SSLError, json.JSONDecodeError) as exc:
-            logging.debug("MoneroOcean route probe failed host=%s: %s", host, exc)
+            logging.debug("MoneroOcean route probe failed host=%s port=%s tls=%s: %s", host, port, tls, exc)
     return None
 
 
@@ -5461,15 +5466,23 @@ class CpuMinerController:
                 # MoneroOcean's default endpoint can switch to other algorithms,
                 # whose raw H/s cannot be valued with the rx/0 profit term.
                 # Its documented worker~rx/0 password pins direct XMRig mining.
-                # XMRig retries then fails over across the pool array, so a host
-                # with a broken route to Gulf can still reach another region.
+                # XMRig retries then fails over across regional TLS and plain
+                # routes. Put a successful stopped-generation probe first so a
+                # host with blocked TLS can begin earning without five timeouts.
                 self.root.mkdir(parents=True, exist_ok=True)
                 config_path = self.root / "xmrig_moneroocean.config.json"
+                routes = list(MONEROOCEAN_STRATUM_ROUTES)
+                proof = self._pool_route_probe
+                selected = (proof.get("host"), proof.get("port"), proof.get("tls"))
+                if (proof.get("reachable") is True and proof.get("stoppedAtMs") == self._stopped_at_ms and
+                        selected in routes):
+                    routes.remove(selected)
+                    routes.insert(0, selected)
                 config = {"autosave": False, "retries": 2, "retry-pause": 5,
-                          "pools": [{"url": f"{host}:20128", "algo": "rx/0", "user": wallet,
+                          "pools": [{"url": f"{host}:{port}", "algo": "rx/0", "user": wallet,
                                      "pass": f"{worker}~rx/0", "rig-id": worker,
-                                     "tls": True, "keepalive": True, "enabled": True}
-                                    for host in MONEROOCEAN_STRATUM_HOSTS]}
+                                     "tls": tls, "keepalive": True, "enabled": True}
+                                    for host, port, tls in routes]}
                 config_path.write_text(json.dumps(config), encoding="utf-8")
                 config_path.chmod(0o600)
                 target = ["--config", str(config_path)]
@@ -5570,13 +5583,16 @@ class CpuMinerController:
             if (self._orphan_cleanup_unverified or self._proc is not None or
                     stopped_at_ms <= 0 or self._stopped_at_ms != stopped_at_ms):
                 raise RuntimeError("CPU pool probe targets a stale or running generation")
-        host = probe_moneroocean_stratum_routes(wallet, worker)
+        route = probe_moneroocean_stratum_routes(wallet, worker)
         with self._lock:
             if (self._orphan_cleanup_unverified or self._proc is not None or
                     self._stopped_at_ms != stopped_at_ms):
                 raise RuntimeError("CPU pool probe generation changed")
-            self._pool_route_probe = {"checkedAtMs": _now_ms(), "reachable": bool(host),
-                                      "stoppedAtMs": stopped_at_ms, "host": host}
+            self._pool_route_probe = {"checkedAtMs": _now_ms(), "reachable": bool(route),
+                                      "stoppedAtMs": stopped_at_ms,
+                                      "host": route[0] if route else None,
+                                      "port": route[1] if route else None,
+                                      "tls": route[2] if route else None}
             return dict(self._pool_route_probe)
 
     def tick(self, gpu_snapshot: Dict[str, Any], foreground_active: bool = False) -> None:
