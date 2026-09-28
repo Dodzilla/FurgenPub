@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.215"
+AGENT_VERSION = "dm-agent-py/0.10.216"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5115,11 +5115,34 @@ MONEROOCEAN_STRATUM_ROUTES = (
 )
 
 
-def probe_moneroocean_stratum_routes(wallet: str, worker: str, timeout_seconds: float = 2.0) -> Optional[Tuple[str, int, bool]]:
+def _connect_stratum_prefer_ipv4(host: str, port: int, timeout_seconds: float) -> socket.socket:
+    """Connect like XMRig's default DNS policy: IPv4 first, IPv6 only as a fallback.
+
+    MoneroOcean publishes AAAA records; a host with a black-holed IPv6 route
+    must not spend each route's budget on IPv6 before trying IPv4.
+    """
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    infos.sort(key=lambda info: info[0] != socket.AF_INET)
+    last_exc: Optional[OSError] = None
+    for family, socktype, proto, _, address in infos:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(timeout_seconds)
+            sock.connect(address)
+            return sock
+        except OSError as exc:
+            last_exc = exc
+            sock.close()
+    raise last_exc or OSError(f"No stratum address for {host}:{port}")
+
+
+def probe_moneroocean_stratum_routes(wallet: str, worker: str, timeout_seconds: float = 2.0,
+                                     total_budget_seconds: float = 30.0) -> Optional[Tuple[str, int, bool]]:
     """Confirm a worker can log in to a configured XMR route, preferring TLS.
 
     The probe submits no shares and never starts a mining process. Each route
-    has a short socket timeout so an unreachable host cannot delay GPU work.
+    has a short socket timeout and the whole probe a total budget, so an
+    unreachable host cannot delay GPU work queued behind it.
     """
     login = (json.dumps({"id": 1, "jsonrpc": "2.0", "method": "login",
                          "params": {"login": wallet, "pass": f"{worker}~rx/0",
@@ -5131,10 +5154,16 @@ def probe_moneroocean_stratum_routes(wallet: str, worker: str, timeout_seconds: 
     # required before the controller may consider the route reachable.
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
+    probe_deadline = time.monotonic() + total_budget_seconds
     for host, port, tls in MONEROOCEAN_STRATUM_ROUTES:
+        if time.monotonic() >= probe_deadline:
+            logging.warning("MoneroOcean route probe exhausted its %.0fs budget", total_budget_seconds)
+            break
         try:
-            deadline = time.monotonic() + timeout_seconds
-            with socket.create_connection((host, port), timeout=timeout_seconds) as raw:
+            with _connect_stratum_prefer_ipv4(host, port, timeout_seconds) as raw:
+                # Connect time (DNS, address fallback) must not eat the
+                # handshake/login budget, or a slow route reads as unreachable.
+                deadline = time.monotonic() + timeout_seconds
                 raw.settimeout(max(0.1, deadline - time.monotonic()))
                 stream_context = context.wrap_socket(raw, server_hostname=host) if tls else raw
                 with stream_context as stream:
@@ -5257,6 +5286,7 @@ class CpuMinerController:
         self._gpu_current_hps = 0.0
         self._gpu_drop_since_ms = 0
         self._pool_route_probe: Dict[str, Any] = {}
+        self._stop_retry_not_before_ms = 0
         self._log_path = self.root / "miner.log"
         self._lifecycle_path = self.root / "lifecycle.json"
         was_running = self._restore_lifecycle()
@@ -5436,6 +5466,10 @@ class CpuMinerController:
             raise RuntimeError(f"CPU mining threads {threads} exceed allocation/reserve: {available}/{ceiling}")
         if foreground_active or gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
             raise RuntimeError("PRL miner or foreground state is not healthy for CPU mining")
+        if not self._orphan_cleanup_unverified and (self._proc is None or self._proc.poll() is not None):
+            # A first download can take minutes; do it before the lock that
+            # heartbeat snapshots share. The locked call below is then a cache hit.
+            self._binary(pool)
         with self._lock:
             if self._orphan_cleanup_unverified:
                 if not Path("/proc").is_dir():
@@ -5459,6 +5493,8 @@ class CpuMinerController:
             if cpu_mining_memory_available_bytes() < 6 * 1024 ** 3:
                 raise RuntimeError("CPU mining requires at least 6 GiB available memory at startup")
             self.stop_if_running("reconfigure")
+            if self._proc is not None or self._orphan_cleanup_unverified:
+                raise RuntimeError("Prior CPU miner could not be stopped")
             binary = self._binary(pool)
             if pool == "tari":
                 target = ["-o", "ca-tarirx.luckypool.io:9118", "-a", "rx/0", "-u", f"{wallet}.{worker}", "-p", "x"]
@@ -5556,6 +5592,7 @@ class CpuMinerController:
                         self._stopped_at_ms = previous_stopped_at_ms
                         self._stop_reason = previous_stop_reason
                         self._orphan_cleanup_unverified = True
+                        self._stop_retry_not_before_ms = _now_ms() + 5 * 60_000
                         logging.error("CPU miner could not be stopped; blocking another start")
                         return
             except OSError as exc:
@@ -5568,6 +5605,7 @@ class CpuMinerController:
                         self._stopped_at_ms = previous_stopped_at_ms
                         self._stop_reason = previous_stop_reason
                         self._orphan_cleanup_unverified = True
+                        self._stop_retry_not_before_ms = _now_ms() + 5 * 60_000
                         logging.error("CPU miner could not be stopped; blocking another start: %s", exc)
                         return
             try:
@@ -5599,6 +5637,8 @@ class CpuMinerController:
         with self._lock:
             proc = self._proc
             if proc is None:
+                return
+            if self._orphan_cleanup_unverified and _now_ms() < self._stop_retry_not_before_ms:
                 return
             if proc.poll() is not None:
                 self.stop_if_running(f"miner_exit_{proc.returncode}")
