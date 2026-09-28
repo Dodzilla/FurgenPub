@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.212"
+AGENT_VERSION = "dm-agent-py/0.10.213"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5066,6 +5066,48 @@ MONEROOCEAN_STRATUM_HOSTS = (
 )
 
 
+def probe_moneroocean_stratum_routes(wallet: str, worker: str, timeout_seconds: float = 2.0) -> Optional[str]:
+    """Confirm a worker can log in over TLS to one of its configured XMR routes.
+
+    The probe submits no shares and never starts a mining process. Each route
+    has a short socket timeout so an unreachable host cannot delay GPU work.
+    """
+    login = (json.dumps({"id": 1, "jsonrpc": "2.0", "method": "login",
+                         "params": {"login": wallet, "pass": f"{worker}~rx/0",
+                                    "agent": "XMRig/6.26.0"}}) + "\n").encode("utf-8")
+    context = ssl.create_default_context()
+    # MoneroOcean's stratum TLS endpoint currently serves a self-signed
+    # certificate. XMRig connects with tls=true and no certificate pin, so
+    # mirror that transport behavior here; a successful login job is still
+    # required before the controller may consider the route reachable.
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    for host in MONEROOCEAN_STRATUM_HOSTS:
+        try:
+            deadline = time.monotonic() + timeout_seconds
+            with socket.create_connection((host, 20128), timeout=timeout_seconds) as raw:
+                raw.settimeout(max(0.1, deadline - time.monotonic()))
+                with context.wrap_socket(raw, server_hostname=host) as stream:
+                    stream.settimeout(max(0.1, deadline - time.monotonic()))
+                    stream.sendall(login)
+                    response = bytearray()
+                    while b"\n" not in response and len(response) < 8192:
+                        stream.settimeout(max(0.1, deadline - time.monotonic()))
+                        chunk = stream.recv(min(4096, 8192 - len(response)))
+                        if not chunk:
+                            break
+                        response.extend(chunk)
+                    first_line = bytes(response).split(b"\n", 1)[0]
+                    reply = json.loads(first_line)
+                    result = reply.get("result") if isinstance(reply, dict) else None
+                    if (isinstance(reply, dict) and reply.get("error") is None and isinstance(result, dict) and
+                            isinstance(result.get("job"), dict)):
+                        return host
+        except (OSError, ValueError, ssl.SSLError, json.JSONDecodeError) as exc:
+            logging.debug("MoneroOcean route probe failed host=%s: %s", host, exc)
+    return None
+
+
 def cpu_mining_capacity(vast_effective_cpus: Any = None, max_threads: Any = None) -> Dict[str, Any]:
     """Bound mining by the worker's real affinity/quota and its Vast entitlement."""
     affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(os.cpu_count() or 1))
@@ -5164,6 +5206,7 @@ class CpuMinerController:
         self._gpu_baseline_hps = 0.0
         self._gpu_current_hps = 0.0
         self._gpu_drop_since_ms = 0
+        self._pool_route_probe: Dict[str, Any] = {}
         self._log_path = self.root / "miner.log"
         self._lifecycle_path = self.root / "lifecycle.json"
         was_running = self._restore_lifecycle()
@@ -5411,6 +5454,7 @@ class CpuMinerController:
             self._selected_cpus = selected
             self._expires_at_ms, self._started_at_ms = expires_at_ms, _now_ms()
             self._stop_reason = ""
+            self._pool_route_probe = {}
             self._gpu_baseline_hps = float(payload.get("baselineGpuHashrateHps") or gpu_snapshot.get("localHashrateHps") or 0)
             self._gpu_drop_since_ms = 0
             try:
@@ -5430,6 +5474,7 @@ class CpuMinerController:
             self._proc = None
             self._stopped_at_ms = _now_ms()
             self._stop_reason = str(reason)[:120]
+            self._pool_route_probe = {}
             if proc.poll() is not None:
                 try:
                     self._persist_lifecycle(False)
@@ -5471,6 +5516,23 @@ class CpuMinerController:
                 self._persist_lifecycle(False)
             except OSError as exc:
                 logging.warning("Could not persist CPU miner stop state: %s", exc)
+
+    def probe_pool_routes(self, stopped_at_ms: int, wallet: str, worker: str) -> Dict[str, Any]:
+        """Probe only the stopped generation named by a controller-owned hold."""
+        if not re.fullmatch(r"[A-Za-z0-9]{90,128}", wallet) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", worker):
+            raise RuntimeError("Invalid CPU pool probe identity")
+        with self._lock:
+            if (self._orphan_cleanup_unverified or self._proc is not None or
+                    stopped_at_ms <= 0 or self._stopped_at_ms != stopped_at_ms):
+                raise RuntimeError("CPU pool probe targets a stale or running generation")
+        host = probe_moneroocean_stratum_routes(wallet, worker)
+        with self._lock:
+            if (self._orphan_cleanup_unverified or self._proc is not None or
+                    self._stopped_at_ms != stopped_at_ms):
+                raise RuntimeError("CPU pool probe generation changed")
+            self._pool_route_probe = {"checkedAtMs": _now_ms(), "reachable": bool(host),
+                                      "stoppedAtMs": stopped_at_ms, "host": host}
+            return dict(self._pool_route_probe)
 
     def tick(self, gpu_snapshot: Dict[str, Any], foreground_active: bool = False) -> None:
         with self._lock:
@@ -5556,6 +5618,7 @@ class CpuMinerController:
                 "startedAtMs": self._started_at_ms or None,
                 "stoppedAtMs": self._stopped_at_ms or None,
                 "stopReason": self._stop_reason or None,
+                "poolRouteProbe": dict(self._pool_route_probe),
                 "orphanCleanupUnverified": self._orphan_cleanup_unverified,
             }
 
@@ -15878,6 +15941,16 @@ class DependencyAgent:
                     foreground_active = bool(self._active_exec_by_item or self._agent_maintenance_inflight or
                                              self._pending_self_update)
                 self._idle_cpu_miner.start(payload, self._idle_prl_miner.snapshot(), foreground_active)
+            elif action == "probe_pool":
+                if self.server_type != "prl_mining_v1" or not self.mining_only:
+                    raise RuntimeError("CPU pool probe is restricted to dedicated PRL workers")
+                if str(payload.get("instanceId") or "") != str(self._resolved_instance_id or ""):
+                    raise RuntimeError("CPU pool probe targets a different instance")
+                if payload.get("pool") != "moneroocean":
+                    raise RuntimeError("CPU pool probe requires MoneroOcean")
+                self._idle_cpu_miner.probe_pool_routes(int(payload.get("stoppedAtMs") or 0),
+                                                       str(payload.get("wallet") or ""),
+                                                       str(payload.get("worker") or ""))
             else:
                 raise RuntimeError("Unknown CPU mining action")
             if item_id and lease_id:
