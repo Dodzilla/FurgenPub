@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.220"
+AGENT_VERSION = "dm-agent-py/0.10.221"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -4645,6 +4645,12 @@ class PrlMinerController:
                 "--wallet",
                 f"{payout_address}.{worker_arg}",
             ]
+            # SRBMiner 3.7+ suppresses console output when stdout is a file.
+            # Append its native log to the agent log so run offsets and share
+            # telemetry remain valid; older pinned miners keep their launch.
+            version_match = re.search(r"(?:^|v)(\d+)\.(\d+)\.(\d+)$", miner_version or "")
+            if version_match and tuple(int(v) for v in version_match.groups()) >= (3, 7, 0):
+                args.extend(["--log-file", str(self.log_path), "--log-file-mode", "1"])
         else:
             args = [
                 str(binary),
