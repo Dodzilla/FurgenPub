@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.219"
+AGENT_VERSION = "dm-agent-py/0.10.220"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5201,10 +5201,6 @@ class PrlMinerController:
 
 
 CPU_MINER_RELEASES = {
-    "xdag": (
-        "https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-linux-static-x64.tar.gz",
-        "fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5",
-    ),
     "tari": (
         "https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-linux-static-x64.tar.gz",
         "fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5",
@@ -5217,18 +5213,6 @@ CPU_MINER_RELEASES = {
         "fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5",
     ),
 }
-def valid_xdag_address(address: str) -> bool:
-    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{26,33}", address):
-        return False
-    number = 0
-    for char in address:
-        number = number * 58 + alphabet.index(char)
-    raw = number.to_bytes((number.bit_length() + 7) // 8, "big")
-    raw = b"\x00" * (len(address) - len(address.lstrip("1"))) + raw
-    return len(raw) == 24 and raw[20:] == hashlib.sha256(hashlib.sha256(raw[:20]).digest()).digest()[:4]
-
-
 CPU_MINER_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 CPU_MINER_SPEED_RE = re.compile(r"speed\s+10s/60s/15m\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?|n/a)", re.I)
 CPU_MINER_ALGO_RE = re.compile(r"new job from[^\n]*\balgo\s+([a-z0-9/]+)", re.I)
@@ -5571,19 +5555,12 @@ class CpuMinerController:
         worker = str(payload.get("worker") or "").strip()
         threads = int(payload.get("threads") or 0)
         expires_at_ms = int(payload.get("expiresAtMs") or 0)
-        wallet_valid = valid_xdag_address(wallet) if pool == "xdag" else bool(re.fullmatch(r"[A-Za-z0-9]{90,128}", wallet))
-        if pool not in CPU_MINER_RELEASES or not wallet_valid:
+        if pool not in CPU_MINER_RELEASES or not re.fullmatch(r"[A-Za-z0-9]{90,128}", wallet):
             raise RuntimeError("Invalid CPU mining pool or payout address")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", worker):
             raise RuntimeError("Invalid CPU mining worker name")
         if expires_at_ms <= _now_ms() + 60_000 or expires_at_ms > _now_ms() + 30 * 60_000:
             raise RuntimeError("CPU mining lease must expire in 1-30 minutes")
-        if pool == "xdag":
-            trial_end = payload.get("xdagTrialEndsAtMs")
-            if (type(trial_end) is not int or trial_end < expires_at_ms or
-                    trial_end > _now_ms() + 48 * 60 * 60_000 or
-                    not re.fullmatch(r"[a-f0-9-]{36}", str(payload.get("xdagTrialToken") or ""))):
-                raise RuntimeError("XDAG requires a bounded trial and matching lease")
         try:
             entitlement = int(float(payload["vastEffectiveCpus"]))
         except (KeyError, TypeError, ValueError, OverflowError):
@@ -5635,9 +5612,6 @@ class CpuMinerController:
             binary = self._binary(pool)
             if pool == "tari":
                 target = ["-o", "ca-tarirx.luckypool.io:9118", "-a", "rx/0", "-u", f"{wallet}.{worker}", "-p", "x"]
-            elif pool == "xdag":
-                target = ["-o", "stratum.xdag.org:23656", "-a", "rx/0", "-u", wallet,
-                          "-p", worker, "--rig-id", worker, "--keepalive"]
             else:
                 # MoneroOcean's default endpoint can switch to other algorithms,
                 # whose raw H/s cannot be valued with the rx/0 profit term.
