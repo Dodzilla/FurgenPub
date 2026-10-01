@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.225"
+AGENT_VERSION = "dm-agent-py/0.10.226"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5445,12 +5445,15 @@ class MediaCpuPerformanceGuard:
         key = hashlib.sha256(json.dumps(graph, sort_keys=True).encode()).hexdigest()[:24]
         row = self.rows.setdefault(key, {"off": [], "on": {}, "jobs": 0})
         row["jobs"] += 1
-        # Refresh controls regularly and require three CPU-off controls first.
+        # Small three-thread experiments may run before a matched reference
+        # exists. Higher counts require measured controls and successful trials.
         safe = int(row.get("safeThreads", 0))
         allowed_trial = 3 if not safe else safe + max(2, int(row.get("step", 2)))
         if threads > allowed_trial:
             self.recommended_threads = allowed_trial
-        control = (len(row["off"]) < 3 or row["jobs"] % (10 if safe else 4) == 0 or
+        initial_control = len(row["off"]) < 3 and row["jobs"] % 2 == 0
+        refresh_control = len(row["off"]) >= 3 and row["jobs"] % (10 if safe else 4) == 0
+        control = (threads <= 0 or initial_control or refresh_control or
                    self.hold_until_ms > _now_ms() or threads > allowed_trial)
         self.active[job_id] = {"key": key, "startedAtMs": _now_ms(),
                                "threads": 0 if control else threads, "control": control}
