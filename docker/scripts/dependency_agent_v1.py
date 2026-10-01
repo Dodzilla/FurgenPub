@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.227"
+AGENT_VERSION = "dm-agent-py/0.10.228"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5415,7 +5415,7 @@ class MediaCpuPerformanceGuard:
             row = json.loads(self.path.read_text())
             if row.get("schemaVersion") == 1:
                 self.rows = row.get("rows", {})
-                self.recommended_threads = max(3, int(row.get("recommendedThreads", 3)))
+                self.recommended_threads = max(1, int(row.get("recommendedThreads", 3)))
                 self.hold_until_ms = int(row.get("holdUntilMs", 0))
                 self.last_result = row.get("lastResult", {})
                 self.idle_trials = row.get("idleTrials", {})
@@ -5491,7 +5491,7 @@ class MediaCpuPerformanceGuard:
                                     "threads": threads, "durationMs": duration,
                                     "baselineMs": baseline, "ratio": ratio, "atMs": _now_ms()}
                 if ratio > 1.03:
-                    self.recommended_threads = max(3, threads // 2)
+                    self.recommended_threads = max(1, threads // 2)
                     self.hold_until_ms = _now_ms() + 30 * 60_000
                     self.persist()
                     return True
@@ -5736,7 +5736,7 @@ class CpuMinerController:
         available = int(capacity["availableLogicalCpus"])
         ceiling = int(capacity["threadCeiling"])
         concurrent = payload.get("concurrentMedia") is True
-        initial_threads = (3 if concurrent or max_threads == 3 else
+        initial_threads = (1 if concurrent else 3 if max_threads == 3 else
                            4 if max_threads is not None and max_threads < 8 else 8)
         if ceiling < initial_threads or threads < initial_threads or threads > ceiling:
             raise RuntimeError(f"CPU mining threads {threads} exceed allocation/reserve: {available}/{ceiling}")
@@ -5949,7 +5949,7 @@ class CpuMinerController:
             elif cpu_mining_memory_available_bytes() < 4 * 1024 ** 3:
                 self.stop_if_running("memory_headroom_low")
             elif ((capacity := cpu_mining_capacity(self._entitlement, self._max_threads))["threadCeiling"] <
-                  (3 if self._concurrent_media or self._max_threads == 3 else
+                  (1 if self._concurrent_media else 3 if self._max_threads == 3 else
                    4 if self._max_threads is not None and self._max_threads < 8 else 8) or
                   capacity["availableLogicalCpus"] != self._available or
                   self._threads > capacity["threadCeiling"] or
@@ -5969,7 +5969,7 @@ class CpuMinerController:
                             controls = row.get("off", [])
                             if not job["control"] and len(controls) >= 3 and now - job["startedAtMs"] > max(controls[-3:]) * 1.05:
                                 self._media_guard.hold_until_ms = now + 30 * 60_000
-                                self._media_guard.recommended_threads = max(3, self._threads // 2)
+                                self._media_guard.recommended_threads = max(1, self._threads // 2)
                                 self._media_guard.persist()
                                 self.stop_if_running("job_latency_watchdog")
                                 return
@@ -6013,7 +6013,7 @@ class CpuMinerController:
                         self._media_gpu_good_ms = 0
                         if self._media_gpu_bad_ms >= 10 * 60_000:
                             safe_trials = {int(k): v for k, v in self._media_guard.idle_trials.items() if int(k) < self._threads}
-                            self._media_guard.recommended_threads = max(safe_trials, key=safe_trials.get) if safe_trials else 3
+                            self._media_guard.recommended_threads = max(safe_trials, key=safe_trials.get) if safe_trials else max(1, self._threads // 2)
                             self._media_guard.hold_until_ms = now + 30 * 60_000
                             self._media_guard.persist()
                             self.stop_if_running("media_gpu_hashrate_drop")
