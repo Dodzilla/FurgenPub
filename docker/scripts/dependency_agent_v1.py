@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.224"
+AGENT_VERSION = "dm-agent-py/0.10.225"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5399,6 +5399,130 @@ def cpu_mining_memory_available_bytes() -> int:
         return 0
 
 
+class MediaCpuPerformanceGuard:
+    """Persist matched CPU-off/on job timings; never infer safety from idle CPU %."""
+
+    def __init__(self, root: Path) -> None:
+        self.path = root / "media_performance.json"
+        self.rows: Dict[str, Any] = {}
+        self.active: Dict[str, Any] = {}
+        self.recommended_threads = 3
+        self.hold_until_ms = 0
+        self.last_result: Dict[str, Any] = {}
+        self.idle_trials: Dict[str, float] = {}
+        self.idle_thread_ceiling = 0
+        try:
+            row = json.loads(self.path.read_text())
+            if row.get("schemaVersion") == 1:
+                self.rows = row.get("rows", {})
+                self.recommended_threads = max(3, int(row.get("recommendedThreads", 3)))
+                self.hold_until_ms = int(row.get("holdUntilMs", 0))
+                self.last_result = row.get("lastResult", {})
+                self.idle_trials = row.get("idleTrials", {})
+                self.idle_thread_ceiling = int(row.get("idleThreadCeiling", 0))
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def persist(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"schemaVersion": 1, "rows": self.rows,
+                                  "recommendedThreads": self.recommended_threads,
+                                  "holdUntilMs": self.hold_until_ms, "lastResult": self.last_result,
+                                  "idleTrials": self.idle_trials, "idleThreadCeiling": self.idle_thread_ceiling}))
+        tmp.replace(self.path)
+
+    def begin(self, job_id: str, workflow: Dict[str, Any], threads: int) -> bool:
+        # Exact model, shape, steps, text and input references remain in the key.
+        # Only RNG seeds and output filenames differ between comparable jobs.
+        graph = json.loads(json.dumps(workflow))
+        for node in graph.values():
+            if isinstance(node, dict):
+                inputs = node.get("inputs", {})
+                for key in ("seed", "noise_seed", "filename_prefix"):
+                    if key in inputs:
+                        inputs[key] = "<varying>"
+        key = hashlib.sha256(json.dumps(graph, sort_keys=True).encode()).hexdigest()[:24]
+        row = self.rows.setdefault(key, {"off": [], "on": {}, "jobs": 0})
+        row["jobs"] += 1
+        # Refresh controls regularly and require three CPU-off controls first.
+        safe = int(row.get("safeThreads", 0))
+        allowed_trial = 3 if not safe else safe + max(2, int(row.get("step", 2)))
+        if threads > allowed_trial:
+            self.recommended_threads = allowed_trial
+        control = (len(row["off"]) < 3 or row["jobs"] % (10 if safe else 4) == 0 or
+                   self.hold_until_ms > _now_ms() or threads > allowed_trial)
+        self.active[job_id] = {"key": key, "startedAtMs": _now_ms(),
+                               "threads": 0 if control else threads, "control": control}
+        return control
+
+    def finish(self, job_id: str, history: Dict[str, Any], threads: int, hps: float,
+               ceiling: int, valid: bool) -> bool:
+        job = self.active.pop(job_id, None)
+        if not job or not valid:
+            return False
+        duration = _now_ms() - job["startedAtMs"]
+        if duration < 1000:
+            return False
+        # Cached executions are a different workload. Never compare a cache hit
+        # against an uncached reference or mix it into the first controls.
+        cached = []
+        for event in (history.get("status", {}).get("messages") or []):
+            if isinstance(event, (list, tuple)) and len(event) == 2 and event[0] == "execution_cached":
+                cached.extend(event[1].get("nodes", []))
+        cache_key = hashlib.sha256(json.dumps(sorted(cached), sort_keys=True).encode()).hexdigest()[:12]
+        row = self.rows[job["key"]]
+        samples = row.setdefault("samples", {}).setdefault(cache_key, {"off": [], "on": {}})
+        if job["control"]:
+            samples["off"] = (samples["off"] + [duration])[-7:]
+            row["off"] = (row["off"] + [duration])[-7:]
+        elif threads == job["threads"] and hps > 0:
+            bucket = samples["on"].setdefault(str(threads), [])
+            bucket.append({"ms": duration, "hps": hps})
+            del bucket[:-5]
+            controls = samples["off"]
+            if len(controls) >= 3:
+                baseline = sorted(controls)[len(controls) // 2]
+                ratio = duration / baseline
+                self.last_result = {"key": job["key"], "cacheKey": cache_key,
+                                    "threads": threads, "durationMs": duration,
+                                    "baselineMs": baseline, "ratio": ratio, "atMs": _now_ms()}
+                if ratio > 1.03:
+                    self.recommended_threads = max(3, threads // 2)
+                    self.hold_until_ms = _now_ms() + 30 * 60_000
+                    self.persist()
+                    return True
+                if len(bucket) >= 3 and all(x["ms"] <= baseline * 1.03 for x in bucket[-3:]):
+                    # More SMT threads can reduce RandomX throughput. Keep the
+                    # lower thread count if throughput fails to improve by 2%.
+                    row["safeThreads"] = threads
+                    row["step"] = max(2, ceiling // 4)
+                    smaller = [(int(k), v) for k, v in samples["on"].items()
+                               if int(k) < threads and len(v) >= 3 and all(x["ms"] <= baseline * 1.03 for x in v[-3:])]
+                    current_hps = sum(x["hps"] for x in bucket[-3:]) / 3
+                    best = max(smaller, key=lambda pair: sum(x["hps"] for x in pair[1][-3:]) / 3,
+                               default=None)
+                    if best and current_hps <= sum(x["hps"] for x in best[1][-3:]) / 3 * 1.02:
+                        row["beneficialThreadCeiling"] = best[0]
+                        self.recommended_threads = best[0]
+                    else:
+                        self.recommended_threads = min(ceiling, int(row.get("beneficialThreadCeiling", ceiling)),
+                                                       threads + max(2, ceiling // 4))
+        if len(self.rows) > 64:
+            active_keys = {j["key"] for j in self.active.values()}
+            for key in list(self.rows):
+                if key not in active_keys and key != job["key"]:
+                    self.rows.pop(key)
+                    break
+        self.persist()
+        return False
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {"recommendedThreads": self.recommended_threads, "holdUntilMs": self.hold_until_ms,
+                "lastResult": self.last_result, "activeJobs": len(self.active),
+                "matchedWorkflowCount": len(self.rows), "idleTrials": dict(self.idle_trials)}
+
+
 class CpuMinerController:
     """Independent, expiring CPU miner; never controls the PRL GPU process."""
 
@@ -5423,6 +5547,17 @@ class CpuMinerController:
         self._gpu_current_hps = 0.0
         self._gpu_drop_since_ms = 0
         self._pool_route_probe: Dict[str, Any] = {}
+        self._concurrent_media = False
+        self._benchmark_paused = False
+        self._media_guard = MediaCpuPerformanceGuard(self.root)
+        self._media_idle_since_ms = 0
+        self._media_idle_hash_candidate = 0.0
+        self._media_gpu_good_ms = 0
+        self._media_gpu_bad_ms = 0
+        self._media_gpu_sample_ms = 0
+        self._media_hashing_ms = 0
+        self._media_tick_ms = 0
+        self._media_idle_trial_done = False
         self._stop_retry_not_before_ms = 0
         self._log_path = self.root / "miner.log"
         self._lifecycle_path = self.root / "lifecycle.json"
@@ -5597,11 +5732,12 @@ class CpuMinerController:
         capacity = cpu_mining_capacity(entitlement, max_threads)
         available = int(capacity["availableLogicalCpus"])
         ceiling = int(capacity["threadCeiling"])
-        initial_threads = (3 if max_threads == 3 else
+        concurrent = payload.get("concurrentMedia") is True
+        initial_threads = (3 if concurrent or max_threads == 3 else
                            4 if max_threads is not None and max_threads < 8 else 8)
         if ceiling < initial_threads or threads < initial_threads or threads > ceiling:
             raise RuntimeError(f"CPU mining threads {threads} exceed allocation/reserve: {available}/{ceiling}")
-        if foreground_active or gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
+        if foreground_active or (not concurrent and (gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1)):
             raise RuntimeError("PRL miner or foreground state is not healthy for CPU mining")
         if not self._orphan_cleanup_unverified and (self._proc is None or self._proc.poll() is not None):
             # A first download can take minutes; do it before the lock that
@@ -5616,6 +5752,7 @@ class CpuMinerController:
                     raise RuntimeError("Prior CPU miner may still be running")
                 self._orphan_cleanup_unverified = False
             if (self._proc is not None and self._proc.poll() is None and self._pool == pool and
+                    self._concurrent_media == concurrent and
                     self._wallet == wallet and self._worker == worker and self._threads == threads and
                     self._available == available and self._entitlement == entitlement and
                     self._selected_cpus == capacity["orderedCpus"][:threads]):
@@ -5670,7 +5807,9 @@ class CpuMinerController:
             selected = capacity["orderedCpus"][:threads]
 
             def child_setup() -> None:
-                os.nice(10)
+                os.nice(19 if concurrent else 10)
+                if concurrent and hasattr(os, "SCHED_IDLE"):
+                    os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
                 if hasattr(os, "sched_setaffinity"):
                     os.sched_setaffinity(0, set(selected))
 
@@ -5683,16 +5822,23 @@ class CpuMinerController:
             self._entitlement = entitlement
             self._max_threads = max_threads
             self._selected_cpus = selected
+            self._concurrent_media = concurrent
+            self._benchmark_paused = False
+            self._media_gpu_good_ms = self._media_gpu_bad_ms = self._media_gpu_sample_ms = 0
+            self._media_hashing_ms = self._media_tick_ms = 0
+            self._media_idle_trial_done = False
             self._expires_at_ms, self._started_at_ms = expires_at_ms, _now_ms()
             self._stop_reason = ""
             self._pool_route_probe = {}
-            self._gpu_baseline_hps = float(payload.get("baselineGpuHashrateHps") or gpu_snapshot.get("localHashrateHps") or 0)
+            self._gpu_baseline_hps = float(payload.get("baselineGpuHashrateHps") or (0 if concurrent else gpu_snapshot.get("localHashrateHps")) or 0)
             self._gpu_drop_since_ms = 0
             try:
                 self._persist_lifecycle(True)
             except OSError as exc:
                 self.stop_if_running("lifecycle_persist_failed")
                 raise RuntimeError(f"CPU miner start state could not be persisted: {exc}") from exc
+            if concurrent and any(j["control"] for j in self._media_guard.active.values()):
+                self.set_benchmark_paused(True)
             return self.snapshot()
 
     def stop_if_running(self, reason: str) -> None:
@@ -5703,6 +5849,12 @@ class CpuMinerController:
             previous_stopped_at_ms = self._stopped_at_ms
             previous_stop_reason = self._stop_reason
             self._proc = None
+            if self._benchmark_paused:
+                try:
+                    os.killpg(proc.pid, signal.SIGCONT)
+                except OSError:
+                    pass
+            self._benchmark_paused = False
             self._stopped_at_ms = _now_ms()
             self._stop_reason = str(reason)[:120]
             self._pool_route_probe = {}
@@ -5770,7 +5922,7 @@ class CpuMinerController:
                                       "tls": route[2] if route else None}
             return dict(self._pool_route_probe)
 
-    def tick(self, gpu_snapshot: Dict[str, Any], foreground_active: bool = False) -> None:
+    def tick(self, gpu_snapshot: Dict[str, Any], foreground_active: bool = False, media_jobs_active: bool = False) -> None:
         with self._lock:
             proc = self._proc
             if proc is None:
@@ -5781,22 +5933,67 @@ class CpuMinerController:
                 self.stop_if_running(f"miner_exit_{proc.returncode}")
                 return
             now = _now_ms()
+            if self._concurrent_media:
+                if self._media_tick_ms and not self._benchmark_paused:
+                    self._media_hashing_ms += min(30_000, max(0, now - self._media_tick_ms))
+                self._media_tick_ms = now
             if now >= self._expires_at_ms:
                 self.stop_if_running("lease_expired")
             elif foreground_active:
                 self.stop_if_running("foreground_work")
-            elif gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
+            elif not self._concurrent_media and (gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1):
                 self.stop_if_running("prl_miner_unhealthy")
             elif cpu_mining_memory_available_bytes() < 4 * 1024 ** 3:
                 self.stop_if_running("memory_headroom_low")
             elif ((capacity := cpu_mining_capacity(self._entitlement, self._max_threads))["threadCeiling"] <
-                  (3 if self._max_threads == 3 else
+                  (3 if self._concurrent_media or self._max_threads == 3 else
                    4 if self._max_threads is not None and self._max_threads < 8 else 8) or
                   capacity["availableLogicalCpus"] != self._available or
                   self._threads > capacity["threadCeiling"] or
                   capacity["orderedCpus"][:self._threads] != self._selected_cpus):
                 self.stop_if_running("cpu_allocation_changed")
             else:
+                if self._concurrent_media:
+                    if self._media_guard.hold_until_ms > now:
+                        self.stop_if_running("job_latency_regression")
+                        return
+                    if media_jobs_active:
+                        self._media_idle_since_ms = 0
+                        self._gpu_drop_since_ms = 0
+                        self._media_gpu_sample_ms = 0
+                        for job in self._media_guard.active.values():
+                            row = self._media_guard.rows.get(job["key"], {})
+                            controls = row.get("off", [])
+                            if not job["control"] and len(controls) >= 3 and now - job["startedAtMs"] > max(controls[-3:]) * 1.05:
+                                self._media_guard.hold_until_ms = now + 30 * 60_000
+                                self._media_guard.recommended_threads = max(3, self._threads // 2)
+                                self._media_guard.persist()
+                                self.stop_if_running("job_latency_watchdog")
+                                return
+                        return
+                    if gpu_snapshot.get("state") != "running" or gpu_snapshot.get("minerProcessCount") != 1:
+                        self.set_benchmark_paused(True)
+                        self._media_idle_since_ms = 0
+                        return
+                    if self._gpu_baseline_hps <= 0:
+                        # Establish the GPU reference with the CPU process
+                        # frozen, retaining RandomX memory between controls.
+                        self.set_benchmark_paused(True)
+                        current = float(gpu_snapshot.get("localHashrateHps") or 0)
+                        if current <= 0:
+                            return
+                        if not self._media_idle_since_ms:
+                            self._media_idle_since_ms = now
+                            self._media_idle_hash_candidate = current
+                        elif now - self._media_idle_since_ms >= 10 * 60_000:
+                            if 0.85 <= current / self._media_idle_hash_candidate <= 1.15:
+                                self._gpu_baseline_hps = (current + self._media_idle_hash_candidate) / 2
+                                self.set_benchmark_paused(False)
+                            else:
+                                self._media_idle_since_ms = now
+                                self._media_idle_hash_candidate = current
+                        return
+                    self.set_benchmark_paused(False)
                 if now - self._started_at_ms > 7 * 60_000:
                     pool = self.snapshot()
                     last_event = int(pool.get("poolLastEventAtMs") or 0)
@@ -5805,12 +6002,73 @@ class CpuMinerController:
                         return
                 current = float(gpu_snapshot.get("localHashrateHps") or 0)
                 self._gpu_current_hps = current
+                if self._concurrent_media and current > 0 and self._gpu_baseline_hps > 0:
+                    delta = min(30_000, max(0, now - self._media_gpu_sample_ms)) if self._media_gpu_sample_ms else 0
+                    self._media_gpu_sample_ms = now
+                    if current < self._gpu_baseline_hps * 0.99:
+                        self._media_gpu_bad_ms += delta
+                        self._media_gpu_good_ms = 0
+                        if self._media_gpu_bad_ms >= 10 * 60_000:
+                            safe_trials = {int(k): v for k, v in self._media_guard.idle_trials.items() if int(k) < self._threads}
+                            self._media_guard.recommended_threads = max(safe_trials, key=safe_trials.get) if safe_trials else 3
+                            self._media_guard.hold_until_ms = now + 30 * 60_000
+                            self._media_guard.persist()
+                            self.stop_if_running("media_gpu_hashrate_drop")
+                            return
+                    else:
+                        self._media_gpu_good_ms += delta
+                        self._media_gpu_bad_ms = 0
+                    if self._media_gpu_good_ms >= 10 * 60_000 and not self._media_idle_trial_done:
+                        hps = float(self.snapshot().get("localHashrateHps") or 0)
+                        if hps > 0:
+                            self._media_idle_trial_done = True
+                            trials = self._media_guard.idle_trials
+                            trials[str(self._threads)] = hps
+                            best_threads = max((int(k) for k in trials), key=lambda k: trials[str(k)])
+                            if best_threads < self._threads and hps <= trials[str(best_threads)] * 1.02:
+                                self._media_guard.recommended_threads = best_threads
+                                self._media_guard.idle_thread_ceiling = best_threads
+                            else:
+                                self._media_guard.recommended_threads = min(self._ceiling,
+                                    self._media_guard.idle_thread_ceiling or self._ceiling,
+                                    self._threads + max(2, self._ceiling // 4))
+                            self._media_guard.persist()
                 if current > 0 and self._gpu_baseline_hps > 0 and current < self._gpu_baseline_hps * 0.99:
                     self._gpu_drop_since_ms = self._gpu_drop_since_ms or now
                     if now - self._gpu_drop_since_ms >= 10 * 60_000:
                         self.stop_if_running("prl_hashrate_drop")
                 else:
                     self._gpu_drop_since_ms = 0
+
+    def set_benchmark_paused(self, paused: bool) -> None:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None and paused != self._benchmark_paused:
+                try:
+                    os.killpg(self._proc.pid, signal.SIGSTOP if paused else signal.SIGCONT)
+                    self._benchmark_paused = paused
+                except OSError:
+                    self.stop_if_running("benchmark_signal_failed")
+
+    def begin_media_job(self, job_id: str, workflow: Dict[str, Any]) -> None:
+        with self._lock:
+            mining = self._concurrent_media and self._proc is not None and self._proc.poll() is None
+            control = self._media_guard.begin(job_id, workflow, self._threads if mining else 0)
+            self._media_guard.active[job_id]["minerStartedAtMs"] = self._started_at_ms if mining else 0
+            if self._concurrent_media:
+                self.set_benchmark_paused(control or any(j["control"] for j in self._media_guard.active.values()))
+
+    def finish_media_job(self, job_id: str, history: Dict[str, Any], valid: bool) -> None:
+        with self._lock:
+            snap = self.snapshot()
+            job = self._media_guard.active.get(job_id, {})
+            uninterrupted = job.get("control") or (snap.get("state") == "running" and
+                            job.get("minerStartedAtMs") == self._started_at_ms)
+            slow = self._media_guard.finish(job_id, history, self._threads,
+                                           float(snap.get("localHashrateHps") or 0), self._ceiling, valid and uninterrupted)
+            if slow and self._concurrent_media:
+                self.stop_if_running("job_latency_regression")
+            elif self._concurrent_media and self._media_guard.active:
+                self.set_benchmark_paused(any(j["control"] for j in self._media_guard.active.values()))
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -5831,7 +6089,14 @@ class CpuMinerController:
                                         .replace(tzinfo=timezone.utc).timestamp() * 1000) if pool_events else None
             hash_hps = float(speeds[-1][1]) if speeds and speeds[-1][1].lower() != "n/a" else 0.0
             return {
-                "state": "running" if running else "stopped",
+                "state": "paused" if running and self._benchmark_paused else "running" if running else "stopped",
+                "supportsConcurrentMedia": True,
+                "hashingObservedMs": self._media_hashing_ms,
+                "concurrentMedia": self._concurrent_media,
+                "mediaPerformance": {**self._media_guard.snapshot(),
+                                     "idleGpuVerified": self._media_gpu_good_ms >= 10 * 60_000,
+                                     "idleGpuGoodMs": self._media_gpu_good_ms,
+                                     "idleGpuLossMs": self._media_gpu_bad_ms},
                 "pid": proc.pid if running else None,
                 "pool": self._pool or None,
                 "worker": self._worker or None,
@@ -5842,7 +6107,7 @@ class CpuMinerController:
                 "quotaLogicalCpus": capacity["quotaLogicalCpus"],
                 "vastEffectiveCpus": self._entitlement or None,
                 "selectedCpus": self._selected_cpus,
-                "localHashrateHps": hash_hps,
+                "localHashrateHps": hash_hps if running and not self._benchmark_paused else 0,
                 "algorithm": algorithms[-1] if algorithms else None,
                 "poolConnected": pool_connected,
                 "poolLastEventAtMs": pool_last_event_at_ms,
@@ -7500,7 +7765,8 @@ class DependencyAgent:
     def _stop_idle_prl_mining_for_work(self, reason: str) -> None:
         try:
             if reason in ("execute_job", "self_update", "restart_comfy", "install_node_bundles_comfy_restart"):
-                self._idle_cpu_miner.stop_if_running(reason)
+                if reason != "execute_job" or not self._idle_cpu_miner._concurrent_media:
+                    self._idle_cpu_miner.stop_if_running(reason)
             if getattr(self, "_tts_residency_seen_enabled", False):
                 try:
                     self._gpu_coordinator._request(
@@ -16179,7 +16445,11 @@ class DependencyAgent:
                 with self._lock:
                     foreground_active = bool(self._active_exec_by_item or self._agent_maintenance_inflight or
                                              self._pending_self_update)
-                if self.server_type != "prl_mining_v1":
+                if payload.get("concurrentMedia") is True and self.server_type == "prl_mining_v1":
+                    raise RuntimeError("Concurrent media mode requires a media worker")
+                if payload.get("concurrentMedia") is True:
+                    foreground_active = bool(self._agent_maintenance_inflight or self._pending_self_update)
+                elif self.server_type != "prl_mining_v1":
                     foreground_active = foreground_active or self._gpu_admission_has_foreground_work()
                 self._idle_cpu_miner.start(payload, self._idle_prl_miner.snapshot(), foreground_active)
             elif action == "probe_pool":
@@ -18354,6 +18624,11 @@ class DependencyAgent:
                     client_id=client_id,
                     prompt_id=requested_prompt_id,
                 )
+            try:
+                self._idle_cpu_miner.begin_media_job(lease.item_id, workflow)
+            except Exception as cpu_exc:
+                logging.warning("CPU job baseline unavailable: %s", cpu_exc)
+                self._idle_cpu_miner.stop_if_running("job_measurement_unavailable")
             prompt_id = self._comfy_submit_prompt(
                 workflow,
                 client_id=client_id,
@@ -18497,6 +18772,11 @@ class DependencyAgent:
                     active.stage = "uploading"
                     active.history_entry = history_entry
                     active.prompt_id = prompt_id
+            try:
+                self._idle_cpu_miner.finish_media_job(lease.item_id, history_entry, valid=True)
+            except Exception as cpu_exc:
+                logging.warning("CPU job measurement unavailable: %s", cpu_exc)
+                self._idle_cpu_miner.stop_if_running("job_measurement_unavailable")
             _agent_stage(lease, "history_complete")
             lease.history_entry = history_entry
             lease.prompt_id = prompt_id
@@ -18574,6 +18854,11 @@ class DependencyAgent:
                 e,
             )
         finally:
+            try:
+                self._idle_cpu_miner.finish_media_job(lease.item_id, {}, valid=False)
+            except Exception as cpu_exc:
+                logging.warning("CPU job measurement cleanup unavailable: %s", cpu_exc)
+                self._idle_cpu_miner.stop_if_running("job_measurement_unavailable")
             if node_timing_collector is not None:
                 node_timing_collector.stop()
             if not retain_lease:
@@ -19025,12 +19310,18 @@ class DependencyAgent:
                         with self._lock:
                             foreground_active = bool(self._active_exec_by_item or self._agent_maintenance_inflight or
                                                      self._pending_self_update)
+                        media_jobs_active = foreground_active or self._gpu_admission_has_foreground_work()
+                        if self._idle_cpu_miner._concurrent_media:
+                            foreground_active = bool(self._agent_maintenance_inflight or self._pending_self_update)
                         before = self._idle_cpu_miner.snapshot().get("state")
                         gpu_snapshot = self._idle_prl_miner.snapshot()
-                        if self.server_type != "prl_mining_v1":
+                        if self.server_type != "prl_mining_v1" and not self._idle_cpu_miner._concurrent_media:
                             foreground_active = (foreground_active or self._gpu_admission_has_foreground_work() or
                                                  gpu_snapshot.get("state") in ("stopped", "suspended", "paused"))
-                        self._idle_cpu_miner.tick(gpu_snapshot, foreground_active)
+                        if self._idle_cpu_miner._concurrent_media:
+                            self._idle_cpu_miner.tick(gpu_snapshot, foreground_active, media_jobs_active)
+                        else:
+                            self._idle_cpu_miner.tick(gpu_snapshot, foreground_active)
                         if before != self._idle_cpu_miner.snapshot().get("state"):
                             self._force_idle_prl_runtime_refresh("cpu_miner_health")
                 if now >= self._next_interrupted_comfy_restart_recovery_ms:
