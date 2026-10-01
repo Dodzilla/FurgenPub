@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.228"
+AGENT_VERSION = "dm-agent-py/0.10.229"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5561,6 +5561,7 @@ class CpuMinerController:
         self._media_hashing_ms = 0
         self._media_tick_ms = 0
         self._media_idle_trial_done = False
+        self._pool_unhealthy_since_ms = 0
         self._stop_retry_not_before_ms = 0
         self._log_path = self.root / "miner.log"
         self._lifecycle_path = self.root / "lifecycle.json"
@@ -5830,6 +5831,7 @@ class CpuMinerController:
             self._media_gpu_good_ms = self._media_gpu_bad_ms = self._media_gpu_sample_ms = 0
             self._media_hashing_ms = self._media_tick_ms = 0
             self._media_idle_trial_done = False
+            self._pool_unhealthy_since_ms = 0
             self._expires_at_ms, self._started_at_ms = expires_at_ms, _now_ms()
             self._stop_reason = ""
             self._pool_route_probe = {}
@@ -6000,7 +6002,18 @@ class CpuMinerController:
                 if now - self._started_at_ms > 7 * 60_000:
                     pool = self.snapshot()
                     last_event = int(pool.get("poolLastEventAtMs") or 0)
-                    if not pool.get("poolConnected") or (last_event and now - last_event > 10 * 60_000):
+                    unhealthy = not pool.get("poolConnected") or (last_event and now - last_event > 10 * 60_000)
+                    if self._concurrent_media:
+                        # A CPU-off control can freeze XMRig before it opens its
+                        # log or socket. Wall-clock age is not connection time.
+                        # Require a fresh uninterrupted unpaused failure window.
+                        if not unhealthy:
+                            self._pool_unhealthy_since_ms = 0
+                        elif not self._pool_unhealthy_since_ms:
+                            self._pool_unhealthy_since_ms = now
+                        unhealthy = bool(unhealthy and self._pool_unhealthy_since_ms and
+                                         now - self._pool_unhealthy_since_ms >= 7 * 60_000)
+                    if unhealthy:
                         self.stop_if_running("cpu_pool_unreachable")
                         return
                 current = float(gpu_snapshot.get("localHashrateHps") or 0)
@@ -6045,6 +6058,8 @@ class CpuMinerController:
 
     def set_benchmark_paused(self, paused: bool) -> None:
         with self._lock:
+            if paused:
+                self._pool_unhealthy_since_ms = 0
             if self._proc is not None and self._proc.poll() is None and paused != self._benchmark_paused:
                 try:
                     os.killpg(self._proc.pid, signal.SIGSTOP if paused else signal.SIGCONT)
