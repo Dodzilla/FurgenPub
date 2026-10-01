@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.221"
+AGENT_VERSION = "dm-agent-py/0.10.222"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -16154,13 +16154,16 @@ class DependencyAgent:
             if action == "stop":
                 self._idle_cpu_miner.stop_if_running(str(payload.get("reason") or "backend_stop"))
             elif action == "start":
-                if self.server_type != "prl_mining_v1" or not self.mining_only:
-                    raise RuntimeError("CPU mining is restricted to dedicated PRL workers")
+                if self.server_type not in ("prl_mining_v1", "asset_gen_v7_lite", "image_gen_v1",
+                                            "video_gen_v4", "video_gen_v5"):
+                    raise RuntimeError("CPU mining is not enabled for this server type")
                 if str(payload.get("instanceId") or "") != str(self._resolved_instance_id or ""):
                     raise RuntimeError("CPU mining command targets a different instance")
                 with self._lock:
                     foreground_active = bool(self._active_exec_by_item or self._agent_maintenance_inflight or
                                              self._pending_self_update)
+                if self.server_type != "prl_mining_v1":
+                    foreground_active = foreground_active or self._gpu_admission_has_foreground_work()
                 self._idle_cpu_miner.start(payload, self._idle_prl_miner.snapshot(), foreground_active)
             elif action == "probe_pool":
                 if self.server_type != "prl_mining_v1" or not self.mining_only:
@@ -19006,7 +19009,11 @@ class DependencyAgent:
                             foreground_active = bool(self._active_exec_by_item or self._agent_maintenance_inflight or
                                                      self._pending_self_update)
                         before = self._idle_cpu_miner.snapshot().get("state")
-                        self._idle_cpu_miner.tick(self._idle_prl_miner.snapshot(), foreground_active)
+                        gpu_snapshot = self._idle_prl_miner.snapshot()
+                        if self.server_type != "prl_mining_v1":
+                            foreground_active = (foreground_active or self._gpu_admission_has_foreground_work() or
+                                                 gpu_snapshot.get("state") in ("stopped", "suspended"))
+                        self._idle_cpu_miner.tick(gpu_snapshot, foreground_active)
                         if before != self._idle_cpu_miner.snapshot().get("state"):
                             self._force_idle_prl_runtime_refresh("cpu_miner_health")
                 if now >= self._next_interrupted_comfy_restart_recovery_ms:
