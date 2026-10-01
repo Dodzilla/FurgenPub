@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.223"
+AGENT_VERSION = "dm-agent-py/0.10.224"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -5666,7 +5666,7 @@ class CpuMinerController:
             command = [str(binary), *target, f"--threads={threads}", "--cpu-priority=1", "--randomx-init=2",
                        "--randomx-no-numa", "--randomx-mode=fast",
                        "--randomx-wrmsr=-1", "--no-color", "--no-dmi",
-                       "--print-time=60", "--donate-level=1", f"--log-file={self._log_path}"]
+                       "--print-time=10", "--donate-level=1", f"--log-file={self._log_path}"]
             selected = capacity["orderedCpus"][:threads]
 
             def child_setup() -> None:
