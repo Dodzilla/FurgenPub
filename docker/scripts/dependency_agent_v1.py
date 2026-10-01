@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.222"
+AGENT_VERSION = "dm-agent-py/0.10.223"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -3656,6 +3656,7 @@ class PrlMinerController:
         self._desired_state = "stopped"
         self._worker = ""
         self._pool_url = ""
+        self._payout_address = ""
         self._miner_version = ""
         self._miner_kind = DEFAULT_PRL_MINER_KIND
         self._miner_package_type = DEFAULT_PRL_MINER_PACKAGE_TYPE
@@ -3994,6 +3995,8 @@ class PrlMinerController:
                 out["worker"] = self._worker
             if self._pool_url:
                 out["poolUrl"] = self._pool_url
+            if self._payout_address:
+                out["payoutAddress"] = self._payout_address
             if self._miner_version:
                 out["minerVersion"] = self._miner_version
             if self._miner_kind:
@@ -4426,6 +4429,14 @@ class PrlMinerController:
     def start(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with self._process_op_lock:
             if not self._allow_launch_serialized() or not self._launch_precheck_ok():
+                # A blocked restart must replace a suspended miner's old
+                # intent too. Otherwise SIGCONT can resume the PRL-only wallet
+                # after acknowledging a PRL+NOCK command as successful.
+                with self._lock:
+                    replace_target = payload.get("forceRestart") is True or (
+                        self._proc is not None and self._payout_address != payload.get("payoutAddress"))
+                if replace_target:
+                    self._stop_serialized("deferred_target_changed", timeout_seconds=float(payload.get("stopTimeoutSec") or 2))
                 self.defer_start(payload, self._launch_deferral_reason())
                 return {"deferred": True}
             return self._start_serialized(payload)
@@ -4577,6 +4588,7 @@ class PrlMinerController:
             same_target = (
                 already_running and
                 self._pool_url == pool_url and
+                self._payout_address == payout_address and
                 self._worker == worker and
                 self._miner_kind == miner_kind and
                 self._miner_package_type == miner_package_type and
@@ -4671,6 +4683,7 @@ class PrlMinerController:
                 "payload": dict(payload),
                 "worker": worker,
                 "poolUrl": pool_url,
+                "payoutAddress": payout_address,
                 "minerVersion": miner_version,
                 "minerKind": miner_kind,
                 "minerPackageType": miner_package_type,
@@ -4720,6 +4733,7 @@ class PrlMinerController:
             self._desired_state = "running"
             self._worker = worker
             self._pool_url = pool_url
+            self._payout_address = payout_address
             self._miner_version = miner_version
             self._miner_kind = miner_kind
             self._miner_package_type = miner_package_type
@@ -4819,6 +4833,7 @@ class PrlMinerController:
                 self._desired_state = "running"
                 self._worker = str(prepared.get("worker") or "")
                 self._pool_url = str(prepared.get("poolUrl") or "")
+                self._payout_address = str(prepared.get("payoutAddress") or "")
                 self._miner_version = str(prepared.get("minerVersion") or "")
                 self._miner_kind = str(prepared.get("minerKind") or DEFAULT_PRL_MINER_KIND)
                 self._miner_package_type = str(prepared.get("minerPackageType") or DEFAULT_PRL_MINER_PACKAGE_TYPE)
@@ -5099,6 +5114,8 @@ class PrlMinerController:
         """Remember a backend mining request without starting GPU work yet."""
         with self._lock:
             self._last_start_payload = dict(payload)
+            if self._paused_start_payload is not None:
+                self._paused_start_payload = dict(payload)
             self._desired_state = "starting"
             if self._state not in ("running", "paused"):
                 self._state = "stopped"
@@ -19012,7 +19029,7 @@ class DependencyAgent:
                         gpu_snapshot = self._idle_prl_miner.snapshot()
                         if self.server_type != "prl_mining_v1":
                             foreground_active = (foreground_active or self._gpu_admission_has_foreground_work() or
-                                                 gpu_snapshot.get("state") in ("stopped", "suspended"))
+                                                 gpu_snapshot.get("state") in ("stopped", "suspended", "paused"))
                         self._idle_cpu_miner.tick(gpu_snapshot, foreground_active)
                         if before != self._idle_cpu_miner.snapshot().get("state"):
                             self._force_idle_prl_runtime_refresh("cpu_miner_health")
