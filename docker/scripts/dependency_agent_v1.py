@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.229"
+AGENT_VERSION = "dm-agent-py/0.10.230"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -15006,6 +15006,11 @@ class DependencyAgent:
 
     def _pop_next_ready_lease(self) -> Optional[AgentExecuteLease]:
         with self._lock:
+            if getattr(self, "server_type", "") == "image_gen_v1" and any(
+                row.get("maintenanceType") in ("install_node_bundles", "restart_comfy")
+                for row in self._active_maintenance_by_item.values()
+            ):
+                return None
             # Reserve prompt preparation atomically too: concurrent prefetch
             # completions must not race each other into FIFO admission.
             counts = self._agent_stage_counts_map_locked()
@@ -18291,34 +18296,69 @@ class DependencyAgent:
                     "itemId": item_id,
                     "leaseId": lease_id,
                     "stage": f"maintenance:{item_type}" if isinstance(item_type, str) and item_type else "maintenance",
+                    "maintenanceType": item_type,
                 }
                 self._refresh_image_mining_demand_locked()
 
+        def _clear_pending() -> None:
+            if item_id:
+                with self._lock:
+                    active = self._active_maintenance_by_item.get(item_id)
+                    if isinstance(active, dict) and active.get("leaseId") == lease_id:
+                        self._active_maintenance_by_item.pop(item_id, None)
+                        self._refresh_image_mining_demand_locked()
+            if not self._stop.is_set():
+                self._drain_ready_agent_leases()
+                self._request_agent_queue_poll()
+
+        def _perform() -> None:
+            if item_type == "restart_comfy":
+                self._agent_handle_restart_comfy_command(item)
+            elif item_type == "prl_miner":
+                self._agent_handle_prl_miner_command(item)
+            elif item_type == "cpu_miner":
+                self._agent_handle_cpu_miner_command(item)
+            else:
+                self._process_install_node_bundles_item(item)
+
         def _run() -> None:
             try:
-                if item_type == "restart_comfy":
-                    self._agent_handle_restart_comfy_command(item)
-                elif item_type == "prl_miner":
-                    self._agent_handle_prl_miner_command(item)
-                elif item_type == "cpu_miner":
-                    self._agent_handle_cpu_miner_command(item)
+                if getattr(self, "server_type", "") == "image_gen_v1" and item_type in ("install_node_bundles", "restart_comfy"):
+                    self._run_image_comfy_maintenance(_perform)
                 else:
-                    self._process_install_node_bundles_item(item)
+                    _perform()
             finally:
-                if item_id:
-                    with self._lock:
-                        active = self._active_maintenance_by_item.get(item_id)
-                        if isinstance(active, dict) and active.get("leaseId") == lease_id:
-                            self._active_maintenance_by_item.pop(item_id, None)
-                            self._refresh_image_mining_demand_locked()
+                _clear_pending()
 
-        future = executor.submit(_run)
+        try:
+            future = executor.submit(_run)
+        except BaseException:
+            _clear_pending()
+            raise
+        future.add_done_callback(lambda completed: _clear_pending() if completed.cancelled() else None)
         with self._lock:
             if is_prl_miner:
                 self._agent_prl_miner_inflight.add(future)
             else:
                 self._agent_maintenance_inflight.add(future)
         self._request_agent_queue_poll()
+
+    def _run_image_comfy_maintenance(self, perform: Any) -> None:
+        # Admission was fenced atomically before the maintenance task was submitted.
+        # Do not wait for prefetched/ready/dependency-waiting leases: this install
+        # may be exactly what those leases need. External uploads stay concurrent.
+        while not self._stop.is_set():
+            with self._lock:
+                counts = self._agent_stage_counts_map_locked()
+                busy = counts["preparing_prompt"] + counts["executing"] > 0
+            if not busy:
+                # Local /view readers share this reentrant restart lock. An
+                # already-running download must finish before Comfy is restarted.
+                with self._comfy_restart_lock:
+                    if not self._stop.is_set():
+                        perform()
+                return
+            self._stop.wait(0.05)
 
     def _prefetch_agent_execute_lease(self, lease: AgentExecuteLease) -> None:
         _agent_stage(lease, "prefetch_started")
@@ -18897,6 +18937,13 @@ class DependencyAgent:
                     )
                 self._cleanup_agent_lease(lease)
 
+    def _download_agent_output_from_comfy(self, url: str, destination: Path, **kwargs: Any) -> None:
+        if getattr(self, "server_type", "") == "image_gen_v1":
+            with self._comfy_restart_lock:
+                http_download_to_file(url, destination, **kwargs)
+        else:
+            http_download_to_file(url, destination, **kwargs)
+
     def _upload_agent_outputs(self, lease: AgentExecuteLease) -> None:
         _agent_stage(lease, "upload_started")
         terminal_sent = False
@@ -18953,7 +19000,7 @@ class DependencyAgent:
 
                 local_output = output_tmp_dir / f"{len(uploaded_outputs):02d}_{os.path.basename(filename)}"
                 download_started_ms = _now_ms()
-                http_download_to_file(
+                self._download_agent_output_from_comfy(
                     self._comfy_view_url(filename=filename, subfolder=subfolder if subfolder else None, file_type=file_type),
                     local_output,
                     timeout_seconds=max(60.0, float(self.download_timeout_seconds)),
