@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
-AGENT_VERSION = "dm-agent-py/0.10.230"
+AGENT_VERSION = "dm-agent-py/0.10.231"
 RUNTIME_ENV_DELIVERY_KEYS = frozenset(("HF_TOKEN", "CIVITAI_TOKEN", "FURGEN_H3_ATTENTION_BACKEND"))
 CIVITAI_DELIVERY_DOMAINS = frozenset((
     "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com",
@@ -2972,8 +2972,16 @@ def http_put_file_stream_then_head(
             chunk_size=chunk_size,
         )
         upload_ms = max(0, _now_ms() - upload_started_ms)
+        if not 200 <= upload_status < 300:
+            return upload_status, upload_body, upload_headers, 0, {}, upload_ms, 0, False
         verify_started_ms = _now_ms()
-        head_status, head_headers = http_head(verify_url, timeout_seconds=verify_timeout_seconds)
+        try:
+            head_status, head_headers = http_head(verify_url, timeout_seconds=verify_timeout_seconds)
+        except (OSError, socket.timeout, TimeoutError, http.client.HTTPException):
+            # Preserve the successful PUT so the caller retries only HEAD.
+            if not 200 <= upload_status < 300:
+                raise
+            head_status, head_headers = 0, {}
         verify_ms = max(0, _now_ms() - verify_started_ms)
         return upload_status, upload_body, upload_headers, head_status, head_headers, upload_ms, verify_ms, False
 
@@ -3034,7 +3042,11 @@ def http_put_file_stream_then_head(
                 conn.close()
             except Exception:
                 pass
-            head_status, head_headers = http_head(verify_url, timeout_seconds=verify_timeout_seconds)
+            try:
+                head_status, head_headers = http_head(verify_url, timeout_seconds=verify_timeout_seconds)
+            except (OSError, socket.timeout, TimeoutError, http.client.HTTPException):
+                # The object was uploaded; never repeat PUT for a HEAD failure.
+                head_status, head_headers = 0, {}
             verify_ms = max(0, _now_ms() - verify_started_ms)
             return upload_status, upload_body, upload_headers, head_status, head_headers, upload_ms, verify_ms, False
     finally:
@@ -17580,6 +17592,103 @@ class DependencyAgent:
             return idx, row
         return None
 
+    def _verify_signed_output_with_retries(
+        self, verify_url: str, expected_bytes: int, *, allow_absent: bool,
+    ) -> Tuple[int, Dict[str, str], int]:
+        started_ms = _now_ms()
+        attempts = max(1, int(getattr(self, "agent_upload_retry_attempts", 1) or 1))
+        for attempt_idx in range(attempts):
+            try:
+                status, headers = http_head(verify_url, timeout_seconds=30.0)
+            except (OSError, socket.timeout, TimeoutError, http.client.HTTPException) as error:
+                if attempt_idx == attempts - 1:
+                    raise RuntimeError(f"Signed output verification network failure: {error}") from error
+                self._sleep_agent_api_retry("signed output verification", attempt_idx, error)
+                continue
+            if status in (200, 204):
+                length = headers.get("content-length")
+                if not isinstance(length, str) or not length.isdigit() or int(length) != expected_bytes:
+                    raise RuntimeError(f"Staged output verification failed (status={status}, bytes={length or 'missing'}).")
+                return status, headers, max(0, _now_ms() - started_ms)
+            if status == 404 and allow_absent:
+                return status, headers, max(0, _now_ms() - started_ms)
+            if (status == 404 or status in RETRYABLE_HTTP_STATUS_CODES or status >= 500) and attempt_idx < attempts - 1:
+                self._sleep_agent_api_retry("signed output verification", attempt_idx, RuntimeError(f"status={status}"))
+                continue
+            # Expired/unauthorized signed reads must not trigger blind PUT retries.
+            raise RuntimeError(f"Staged output verification failed (status={status}).")
+        raise RuntimeError("Signed output verification exhausted retries")
+
+    def _upload_signed_output_with_retries(
+        self, upload_url: str, verify_url: Optional[str], local_output: Path,
+        content_type: str, expected_bytes: int,
+    ) -> Tuple[int, str, int, Dict[str, str], int, int, bool, int]:
+        attempts = max(1, int(getattr(self, "agent_upload_retry_attempts", 1) or 1))
+        upload_ms = verify_ms = 0
+        for attempt_idx in range(attempts):
+            started_ms = _now_ms()
+            try:
+                if verify_url:
+                    status, body, _headers, head_status, head_headers, put_ms, head_ms, reused = http_put_file_stream_then_head(
+                        upload_url, verify_url, local_output,
+                        headers={"Content-Type": content_type},
+                        upload_timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                        verify_timeout_seconds=30.0,
+                    )
+                    upload_ms += put_ms
+                    verify_ms += head_ms
+                else:
+                    status, body, _headers = http_put_file_stream(
+                        upload_url, local_output, headers={"Content-Type": content_type},
+                        timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
+                    )
+                    upload_ms += max(0, _now_ms() - started_ms)
+                    head_status, head_headers, reused = 0, {}, False
+            except (OSError, socket.timeout, TimeoutError, http.client.HTTPException) as error:
+                upload_ms += max(0, _now_ms() - started_ms)
+                # A lost response can follow a committed PUT. Resolve it before
+                # writing the same bytes again to this attempt-scoped object.
+                if verify_url:
+                    head_status, head_headers, head_ms = self._verify_signed_output_with_retries(
+                        verify_url, expected_bytes, allow_absent=True,
+                    )
+                    verify_ms += head_ms
+                    if head_status in (200, 204):
+                        return 200, "", head_status, head_headers, upload_ms, verify_ms, False, attempt_idx + 1
+                if attempt_idx == attempts - 1:
+                    raise RuntimeError(f"Signed output upload network failure: {error}") from error
+                self._sleep_agent_api_retry("signed output upload", attempt_idx, error)
+                continue
+
+            if 200 <= status < 300:
+                if verify_url:
+                    if head_status in (200, 204):
+                        length = head_headers.get("content-length")
+                        if not isinstance(length, str) or not length.isdigit() or int(length) != expected_bytes:
+                            raise RuntimeError(f"Staged output verification failed (status={head_status}, bytes={length or 'missing'}).")
+                    else:
+                        # PUT success is known: all subsequent attempts are HEAD.
+                        head_status, head_headers, head_ms = self._verify_signed_output_with_retries(
+                            verify_url, expected_bytes, allow_absent=False,
+                        )
+                        verify_ms += head_ms
+                        reused = False
+                return status, body, head_status, head_headers, upload_ms, verify_ms, reused, attempt_idx + 1
+
+            retryable = status in RETRYABLE_HTTP_STATUS_CODES or status >= 500
+            if verify_url and (status == 412 or retryable):
+                head_status, head_headers, head_ms = self._verify_signed_output_with_retries(
+                    verify_url, expected_bytes, allow_absent=True,
+                )
+                verify_ms += head_ms
+                if head_status in (200, 204):
+                    return 200, "", head_status, head_headers, upload_ms, verify_ms, False, attempt_idx + 1
+            if retryable and attempt_idx < attempts - 1:
+                self._sleep_agent_api_retry("signed output upload", attempt_idx, RuntimeError(f"status={status}"))
+                continue
+            raise RuntimeError(f"GCS signed output upload failed (status={status}): {body[:200]}")
+        raise RuntimeError("Signed output upload exhausted retries")
+
     def _upload_output_artifact(
         self,
         lease: AgentExecuteLease,
@@ -17621,6 +17730,7 @@ class DependencyAgent:
         )
 
         if should_stage:
+            attempts_used = 1
             upload_started_ms = _now_ms()
             head_status = 0
             head_headers: Dict[str, str] = {}
@@ -17628,36 +17738,13 @@ class DependencyAgent:
             upload_verify_connection_reused = False
             if staged_upload_method == "gcs_signed_url_put":
                 verify_url = target.get("verifyHeadUrl") if target.get("publishStagedReadUrl") is True else None
-                if isinstance(verify_url, str) and verify_url:
-                    (
-                        upload_status,
-                        upload_body,
-                        _upload_headers,
-                        head_status,
-                        head_headers,
-                        upload_ms,
-                        staged_verify_ms,
-                        upload_verify_connection_reused,
-                    ) = http_put_file_stream_then_head(
-                        staged_upload_url,
-                        verify_url,
-                        local_output,
-                        headers={"Content-Type": content_type},
-                        upload_timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
-                        verify_timeout_seconds=30.0,
-                    )
-                else:
-                    upload_status, upload_body, _upload_headers = http_put_file_stream(
-                        staged_upload_url,
-                        local_output,
-                        headers={"Content-Type": content_type},
-                        timeout_seconds=max(120.0, float(self.download_timeout_seconds)),
-                    )
-                    upload_ms = max(0, _now_ms() - upload_started_ms)
-                if upload_status < 200 or upload_status >= 300:
-                    raise RuntimeError(
-                        f"GCS signed output upload failed (status={upload_status}): {upload_body[:200]}"
-                    )
+                (
+                    upload_status, upload_body, head_status, head_headers, upload_ms,
+                    staged_verify_ms, upload_verify_connection_reused, attempts_used,
+                ) = self._upload_signed_output_with_retries(
+                    staged_upload_url, verify_url if isinstance(verify_url, str) and verify_url else None,
+                    local_output, content_type, bytes_written,
+                )
             else:
                 gcs_resumable_upload_file(
                     staged_upload_url,
@@ -17692,7 +17779,7 @@ class DependencyAgent:
                 "deliveryPath": "gcs_staged",
                 "uploadTiming": {
                     "agentUploadMs": upload_ms,
-                    "agentUploadAttempts": 1,
+                    "agentUploadAttempts": attempts_used,
                     "deliveryPath": "gcs_staged",
                     **({"agentStagedVerifyMs": staged_verify_ms} if staged_public_url else {}),
                     **({"agentUploadVerifyConnectionReused": upload_verify_connection_reused} if staged_public_url else {}),
