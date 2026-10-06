@@ -4164,7 +4164,172 @@ class FCSExposeCompositionTiming:
         }
 
 
+class FCSComposeVideos:
+    """Bounded exact-asset composition on the existing queued FFmpeg worker."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"composition_manifest": ("STRING", {"multiline": True}),
+                             "filename_prefix": ("STRING", {"default": "compose"}),
+                             "save_output": ("BOOLEAN", {"default": True})}}
+
+    RETURN_TYPES = ("VHS_FILENAMES",)
+    FUNCTION = "compose"
+    CATEGORY = "Furgen/video"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _fetch(url, target):
+        import ipaddress
+        import socket
+        current = url
+        for _ in range(4):
+            parsed = urllib.parse.urlsplit(current)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None, 443):
+                raise ValueError("Composition media requires a public HTTPS URL")
+            addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+            if not addresses or any(not ipaddress.ip_address(row[4][0]).is_global for row in addresses):
+                raise ValueError("Composition media address is private")
+            # Pin the verified address to close the DNS-rebinding gap while preserving TLS SNI.
+            cmd = ["curl", "--fail", "--silent", "--show-error", "--proto", "=https", "--max-time", "120",
+                   "--max-filesize", str(512 * 1024 * 1024), "--resolve", f"{parsed.hostname}:443:{addresses[0][4][0]}",
+                   "--dump-header", str(target) + ".headers", "--output", str(target), current]
+            subprocess.run(cmd, check=True, timeout=130)
+            headers = Path(str(target) + ".headers").read_text()
+            blocks = re.split(r"\n\s*\n", headers.strip())
+            status = int(blocks[-1].splitlines()[0].split()[1])
+            if status in (301, 302, 303, 307, 308):
+                location = next((line.split(":", 1)[1].strip() for line in blocks[-1].splitlines() if line.lower().startswith("location:")), None)
+                if not location:
+                    raise ValueError("Composition redirect has no destination")
+                current = urllib.parse.urljoin(current, location)
+                continue
+            if Path(target).stat().st_size > 512 * 1024 * 1024:
+                raise ValueError("Composition asset exceeds 512 MiB")
+            return str(target)
+        raise ValueError("Composition media has too many redirects")
+
+    @staticmethod
+    def render(manifest, sources, output):
+        with tempfile.TemporaryDirectory(prefix="fcs-held-") as temporary:
+            FCSComposeVideos._render(manifest, sources, output, temporary)
+
+    @staticmethod
+    def _render(manifest, sources, output, temporary):
+        width, height = int(manifest["width"]), int(manifest["height"])
+        fps, duration = int(manifest.get("frameRate", 30)), float(manifest["durationSeconds"])
+        layers = manifest["layers"]
+        if width < 2 or height < 2 or width % 2 or height % 2 or width * height > 8294400 or not 0 < duration <= 600 or not 1 <= len(layers) <= 64:
+            raise ValueError("Invalid composition dimensions, duration or layer count")
+        color = manifest.get("backgroundColor", "#000000")
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            raise ValueError("Composition background requires RGB hex")
+        cmd = [FFMPEG_BIN, "-y", "-v", "error", "-filter_complex_threads", "1", "-f", "lavfi", "-i", f"color=c={color}:s={width}x{height}:r={fps}:d={duration}"]
+        filters, audio_labels = ["[0:v]format=rgba[canvas0]"], []
+        input_index = 1
+        ordered = sorted(enumerate(layers), key=lambda pair: (pair[1].get("zIndex", 0), pair[0]))
+        for position, (_, layer) in enumerate(ordered):
+            kind = layer["kind"]
+            if kind not in ("image", "video"):
+                raise ValueError("Exact composition supports image and video layers")
+            start = float(layer.get("startOffsetSeconds", 0))
+            end = float(layer.get("endOffsetSeconds", duration))
+            trim_start = float(layer.get("trimStartSeconds", 0))
+            trim_end = float(layer.get("trimEndSeconds", trim_start + end - start))
+            if not 0 <= start < end <= duration + .001 or trim_start < 0 or trim_end <= trim_start:
+                raise ValueError("Invalid layer visibility or source excerpt")
+            placement = layer.get("placement", {})
+            x, y = float(placement.get("x", 0)), float(placement.get("y", 0))
+            w, h = float(placement.get("width", 1)), float(placement.get("height", 1))
+            if min(x, y) < 0 or min(w, h) < .02 or x + w > 1.000001 or y + h > 1.000001:
+                raise ValueError("Layer rectangle exceeds canvas")
+            px, py, pw, ph = round(x * width), round(y * height), max(2, round(w * width)), max(2, round(h * height))
+            fit = placement.get("objectFit", "contain")
+            if fit not in ("contain", "cover") or placement.get("rotationDegrees", 0) or layer.get("matting", {}).get("enabled") or layer.get("compositing", {}).get("blendMode", "normal") != "normal":
+                raise ValueError("Unsupported exact composition transform")
+            opacity = float(layer.get("opacity", 1))
+            if not 0 <= opacity <= 1:
+                raise ValueError("Invalid opacity")
+            if kind == "image":
+                cmd += ["-loop", "1", "-framerate", str(fps), "-i", sources[layer["sourceUrl"]]]
+                timing = f"trim=duration={end-start},setpts=PTS-STARTPTS"
+            else:
+                path = sources[layer["sourceUrl"]]
+                if layer.get("holdOnly"):
+                    held = os.path.join(temporary, f"held-{position}.png")
+                    seek = max(0, trim_end - 1)
+                    subprocess.run([FFMPEG_BIN, "-y", "-v", "error", "-ss", str(seek), "-i", path, "-t", str(trim_end - seek), "-an", "-fps_mode", "passthrough", "-update", "1", held], check=True, capture_output=True, timeout=60)
+                    path = held
+                    cmd += ["-loop", "1", "-framerate", str(fps)]
+                    trim_start, trim_end = 0, end - start
+                cmd += ["-i", path]
+                timing = f"trim=start={trim_start}:end={trim_end},setpts=PTS-STARTPTS,fps={fps},tpad=stop_mode=clone:stop_duration={end-start},trim=duration={end-start}"
+            sizing = (f"scale={pw}:{ph}:force_original_aspect_ratio=decrease,format=rgba,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black@0" if fit == "contain" else
+                      f"scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},format=rgba")
+            filters += [f"[{input_index}:v]{timing},{sizing},colorchannelmixer=aa={opacity},setpts=PTS+{start}/TB[layer{position}]",
+                        f"[canvas{position}][layer{position}]overlay=x={px}:y={py}:enable='gte(t,{start})*lt(t,{end})':eof_action=pass:repeatlast=0:format=auto[canvas{position+1}]"]
+            input_index += 1
+        for track in manifest.get("audioTracks", []):
+            if track.get("muted"):
+                continue
+            for clip in track["clips"]:
+                if clip.get("muted"):
+                    continue
+                path = sources[clip["sourceAudioUrl"]]
+                probe = subprocess.run([FFPROBE_BIN, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "json", path], check=True, capture_output=True, text=True, timeout=30)
+                if not json.loads(probe.stdout).get("streams"):
+                    continue
+                start, end = float(clip.get("startSeconds", 0)), float(clip.get("endSeconds", duration))
+                trim_start = float(clip.get("trimStartSeconds", 0))
+                trim_end = float(clip.get("trimEndSeconds", trim_start + end - start))
+                length = min(end - start, trim_end - trim_start)
+                gain = float(clip.get("gainDb", 0))
+                if not 0 <= start < end <= duration + .001 or length <= 0 or not -60 <= gain <= 18:
+                    raise ValueError("Invalid audio window or gain")
+                cmd += ["-i", path]
+                label = f"audio{len(audio_labels)}"
+                filters.append(f"[{input_index}:a]atrim=start={trim_start}:duration={length},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,volume={gain}dB,adelay={round(start*1000)}|{round(start*1000)},apad,atrim=duration={duration}[{label}]")
+                audio_labels.append(label)
+                input_index += 1
+        filters.append(f"[canvas{len(layers)}]format=yuv420p[outv]")
+        if audio_labels:
+            filters.append("".join(f"[{label}]" for label in audio_labels) + f"amix=inputs={len(audio_labels)}:normalize=0:dropout_transition=0[outa]")
+        cmd += ["-filter_complex", ";".join(filters), "-map", "[outv]"]
+        if audio_labels:
+            cmd += ["-map", "[outa]", "-c:a", "aac", "-b:a", "192k"]
+        cmd += ["-t", str(duration), "-r", str(fps), "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart", output]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, timeout=max(180, duration * 20))
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(error.stderr.decode(errors="replace")[-4000:]) from error
+
+    def compose(self, composition_manifest, filename_prefix="compose", save_output=True):
+        manifest = json.loads(composition_manifest)
+        urls = list(dict.fromkeys([layer["sourceUrl"] for layer in manifest["layers"]] +
+                                 [clip["sourceAudioUrl"] for track in manifest.get("audioTracks", []) for clip in track["clips"]]))
+        if len(urls) > 96:
+            raise ValueError("Composition exceeds 96 source assets")
+        folder, subfolder, _, outputs = _output_bundle(filename_prefix, {"video": ".mp4"}, save_output)
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        output = outputs["video"]
+        try:
+            with tempfile.TemporaryDirectory(prefix="fcs-compose-") as temporary:
+                sources = {}
+                for index, url in enumerate(urls):
+                    sources[url] = self._fetch(url, Path(temporary) / f"asset-{index}")
+                    if sum(Path(path).stat().st_size for path in sources.values()) > 2 * 1024 * 1024 * 1024:
+                        raise ValueError("Composition sources exceed 2 GiB")
+                self.render(manifest, sources, output)
+        except Exception:
+            Path(output).unlink(missing_ok=True)
+            raise
+        return {"ui": {"gifs": [{"filename": os.path.basename(output), "subfolder": subfolder,
+                                "type": "output" if save_output else "temp", "format": "video/h264-mp4",
+                                "frame_rate": manifest.get("frameRate", 30), "fullpath": output}]},
+                "result": ((save_output, [output]),)}
+
+
 NODE_CLASS_MAPPINGS = {
+    "FCSComposeVideos": FCSComposeVideos,
     "FurgenReferenceLatentPolicy": FurgenReferenceLatentPolicy,
     "FCSConcatVideos": FCSConcatVideos,
     "FCSConcatVideosV2": FCSConcatVideosV2,
@@ -4192,6 +4357,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "FCSComposeVideos": "Furgen Exact Media Composition",
     "FurgenReferenceLatentPolicy": "Furgen Reference Latent Policy",
     "FCSConcatVideos": "Furgen Concat Videos",
     "FCSConcatVideosV2": "Furgen Concat Videos V2 (trims)",
